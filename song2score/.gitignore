@@ -1,0 +1,5 @@
+venv/
+stems/
+*.wav
+__pycache__/
+.python-version
