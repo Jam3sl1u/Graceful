@@ -8,6 +8,7 @@ is the biggest single accuracy lever for dense songs.
 Usage:
     python separate.py path/to/song.mp3
     python separate.py path/to/song.mp3 --model htdemucs_6s --out stems/
+    python separate.py path/to/song.mp3 --device mps
 """
 
 import argparse
@@ -23,7 +24,26 @@ from pathlib import Path
 DEFAULT_MODEL = "htdemucs_6s"
 
 
-def separate(audio_path: Path, model: str, out_dir: Path) -> Path:
+def default_device() -> str:
+    """Pick the fastest available backend: CUDA > Apple MPS > CPU."""
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def separate(
+    audio_path: Path,
+    model: str,
+    out_dir: Path,
+    device: str,
+    segment: int | None = None,
+) -> Path:
     """Run Demucs on one file. Returns the folder containing the stem WAVs."""
     if not audio_path.exists():
         sys.exit(f"File not found: {audio_path}")
@@ -34,14 +54,17 @@ def separate(audio_path: Path, model: str, out_dir: Path) -> Path:
     # stable, documented interface and handles model download/caching for us.
     cmd = [
         sys.executable, "-m", "demucs",
+        "-d", device,
         "-n", model,
         "--out", str(out_dir),
-        # "--mp3",            # uncomment to write mp3 stems instead of wav
-        # "--device", "cuda", # demucs auto-detects GPU; force here if needed
+        # "--mp3",  # uncomment to write mp3 stems instead of wav
         str(audio_path),
     ]
+    if segment is not None:
+        cmd[-1:-1] = ["--segment", str(segment)]
 
     print(f"[separate] model={model}")
+    print(f"[separate] device={device}")
     print(f"[separate] input={audio_path}")
     print(f"[separate] running: {' '.join(cmd)}\n")
 
@@ -66,9 +89,14 @@ def main():
                    help=f"demucs model (default: {DEFAULT_MODEL})")
     p.add_argument("--out", type=Path, default=Path("stems"),
                    help="output directory (default: stems/)")
+    p.add_argument("--device", default=None,
+                   help="compute device: mps, cuda, or cpu (default: auto-detect)")
+    p.add_argument("--segment", type=int, default=None,
+                   help="chunk size in seconds; lower if you hit GPU OOM (e.g. 8)")
     args = p.parse_args()
 
-    stems_dir = separate(args.audio, args.model, args.out)
+    device = args.device or default_device()
+    stems_dir = separate(args.audio, args.model, args.out, device, args.segment)
 
     print("\n[separate] done. Next stage will transcribe each stem:")
     print("    bass/vocals  -> CREPE or pYIN (monophonic)")
