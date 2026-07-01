@@ -1,0 +1,6 @@
+import { NextRequest } from "next/server";
+import { notImplemented } from "@/lib/api/response";
+
+export async function PATCH(_req: NextRequest) {
+  return notImplemented("PATCH /api/notifications/[id]/read");
+}

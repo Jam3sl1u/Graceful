@@ -1,0 +1,20 @@
+// Enums from PRD §20.2 (Data Model / Schema). Kept as string-literal unions so
+// they line up 1:1 with the Postgres enum types created in Sprint 0 #7-12.
+
+export type UserRole = "admin" | "set_leader" | "member" | "guest";
+
+export type InvitationStatus = "pending" | "accepted" | "denied" | "withdrawn" | "expired";
+
+export type EventType = "pre_practice" | "rehearsal" | "sound_check" | "service";
+
+export type ResolutionType = "withdraw" | "member_reconfirmed" | "admin_dismissed";
+
+export type SetlistStatus = "draft" | "published";
+
+export type VocalCapability = "lead" | "harmony" | "both" | "none";
+
+export type ChatPref = "sms" | "email" | "in_app";
+
+export type JobStatus = "queued" | "processing" | "succeeded" | "failed";
+
+export type AudioSource = "upload" | "spotify";

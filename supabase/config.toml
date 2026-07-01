@@ -1,0 +1,4 @@
+# Placeholder Supabase CLI project config.
+# Run `bunx supabase init` to populate this fully once Sprint 0 #7-14
+# (schema migrations + RLS policies) begin.
+project_id = "graceful"
