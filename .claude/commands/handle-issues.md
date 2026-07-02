@@ -1,7 +1,9 @@
 ---
-description: Work down the open-issue backlog oldest-first, running the feature pipeline on each issue via subagents, until the queue is empty or a safe per-run cap is hit. Meant to run unattended/in the background.
+description: "LEGACY FALLBACK — foreground/manual only. For on-demand automated runs, prefer Workflow({name: 'handle-issues'}); see callout below. This command works down the open-issue backlog oldest-first via a freeform chat orchestrator, until the queue is empty or a safe per-run cap is hit."
 argument-hint: "[max-issues] (optional, default 3 — hard cap on how many issues this run will process)"
 ---
+
+> **Prefer `Workflow({name: 'handle-issues'})` instead of this command for on-demand runs.** This command's Agent-tool background path was found to be unreliable in practice: it can silently no-op (narrate "kicking off work" without doing any), and a running instance is not reliably stoppable via `TaskStop`, unlike a `Workflow`-tracked run. `.claude/workflows/handle-issues.js` is a deterministic script (one issue per invocation — call it in a loop or repeatedly for a batch) that doesn't have either failure mode. Recommended pattern for an isolated, on-demand run: `EnterWorktree({name: '...'})` → `Workflow({name: 'handle-issues', args: {issueNumber?: N}})` (runs in the background automatically) → `ExitWorktree({action: 'keep'})` to return to your main checkout immediately while it keeps working in the isolated worktree. Keep this command around as a foreground fallback for watching every subagent's reasoning live, e.g. while iterating on the agent prompt files themselves.
 
 You are the batch orchestrator for working down the open-issue backlog. You do **not** do implementation work yourself — every issue's plan/code/test/review work happens inside the `feature` skill, which you invoke once per issue via the Skill tool. That skill already delegates to the planner/coder/tester/reviewer subagents and opens the PR; do not duplicate that logic here.
 
