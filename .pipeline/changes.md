@@ -1,130 +1,39 @@
-# Changes: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
-
-## Summary
-
-Closed the remaining gap on an otherwise-complete Next.js + TypeScript setup:
-Prettier now actually passes on a clean checkout, and the README documents the
-top-level folder structure. No dependencies, config strictness, routes, or
-auth were touched.
+# Changes — Issue #14: Integrate Clerk authentication (Sprint 0)
 
 ## Files changed
 
-- **`.prettierignore`** (new) — scopes Prettier to real developer source.
-  Mirrors `eslint.config.mjs`'s ignore list (`song2score/`, `.pipeline/`,
-  `documentation/`, `.next/`) plus `node_modules`, `out`, `coverage`,
-  `.claude`, and generated/lockfiles (`bun.lock`, `package-lock.json`,
-  `next-env.d.ts`). This was the root cause of the failing Prettier
-  acceptance criterion — without it, `prettier --check .` was scanning docs
-  and pipeline markdown that were never meant to be formatted.
+1. **`middleware.ts`**
+   - Replaced the no-op `export default clerkMiddleware();` with a callback that calls `await auth.protect()` for any request that doesn't match `isPublicRoute`.
+   - Removed the stale "enforcement deferred" comment block and replaced it with a one-line note that request-level auth is enforced here while role-level checks (`requireRole`) still land in #6.
+   - `isPublicRoute` matcher and `config.matcher` left untouched.
 
-- **`package.json`** — added two bun scripts, inserted right after
-  `typecheck` (no reordering/removal of existing scripts, no dependency
-  changes):
-  - `"format": "prettier --write ."`
-  - `"format:check": "prettier --check ."`
+2. **`.env.example`**
+   - Added four new public Clerk env vars under the existing `# Clerk (Auth)` block: `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in`, `NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up`, `NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/dashboard`, `NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/dashboard`, so Clerk routes to the app's own sign-in/up pages instead of the hosted account portal.
 
-- **`app/(auth)/layout.tsx`**, **`components/ui/Button.tsx`**,
-  **`lib/api/webhook-verify.ts`**, **`app/globals.css`** — reformatted via
-  `bunx prettier --write .` to fix real `printWidth: 100` violations (long
-  single-line JSX/function signatures got wrapped; the CSS `font-family`
-  list got collapsed to fit under 100 chars). All four diffs are pure
-  whitespace/line-wrapping — verified via `git diff` that no logic, strings,
-  or identifiers changed. See diffs below for exact deltas.
+3. **`app/(app)/profile/page.tsx`**
+   - Converted the static `<h1>Profile — coming soon</h1>` stub into an async server component that calls `currentUser()` from `@clerk/nextjs/server` and renders the user's name (falls back through `fullName` -> `firstName` -> `lastName` -> `"—"`) and primary email (`primaryEmailAddress?.emailAddress ?? "—"`).
+   - Follows the inline-style `<main>` markup pattern from `app/(marketing)/page.tsx`. No new components/CSS.
+   - Does not use `lib/clerk/server.ts`'s `getAuthContext` (left untouched, out of scope).
 
-- **`README.md`** — expanded from a 2-line title/tagline into: Getting
-  Started (bun install / bun run dev), a Scripts list (dev/build/lint/
-  typecheck/format/format:check), and a new "Project Structure" section
-  listing `app/`, `components/`, `lib/`, `schemas/`, `types/`, `supabase/`,
-  `tests/` with one line each. Kept intentionally minimal per the issue's
-  "don't over-engineer" instruction — no deep architecture doc. This file
-  was itself reformatted by Prettier after being written (blank line added
-  after the `# Graceful` title).
+4. **`app/api/profile/route.ts`**
+   - Implemented `GET` to call `auth()` from `@clerk/nextjs/server`, returning `fail("Not authenticated", ErrorCode.UNAUTHENTICATED, 401)` when `userId` is null, otherwise `ok({ userId })`.
+   - `PUT` left exactly as-is (`notImplemented("PUT /api/profile")`).
+   - Removed the now-unused `_req: NextRequest` param from `GET` (kept the `NextRequest` import since `PUT` still uses it).
 
-## Exact diffs for the four reformatted source files
+## Out of scope (untouched, per spec)
+- `lib/clerk/server.ts` (`getAuthContext`) and `lib/api/auth.ts` (`requireAuth`/`requireRole`) — unchanged.
+- `app/api/webhooks/clerk/route.ts` — unchanged, still `notImplemented`.
+- `app/(auth)/sign-in`, `app/(auth)/sign-up` pages, `app/layout.tsx` `<ClerkProvider>` — unchanged, already correct.
+- No dependency, route-structure, or other config changes.
 
-```diff
---- a/app/(auth)/layout.tsx
-+++ b/app/(auth)/layout.tsx
-@@ -1,3 +1,7 @@
- export default function AuthLayout({ children }: { children: React.ReactNode }) {
--  return <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>{children}</div>;
-+  return (
-+    <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>
-+      {children}
-+    </div>
-+  );
- }
+## Verification performed
+- `bun run lint` — passes (no warnings/errors).
+- `bun run typecheck` — passes.
+- `bun run test` (jest unit tests) — all 3 existing tests pass (`tests/unit/lib/api/response.test.ts`).
+- Did not run `bun run test:e2e` (Playwright) — requires a running dev server / Clerk env keys; left for the tester stage per the spec's "Suggested verification" section.
 
---- a/app/globals.css
-+++ b/app/globals.css
-@@ -15,12 +15,7 @@ body {
-   margin: 0;
-   background: var(--color-bg);
-   color: var(--color-fg);
--  font-family:
--    -apple-system,
--    BlinkMacSystemFont,
--    "Segoe UI",
--    Roboto,
--    sans-serif;
-+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
- }
-
---- a/components/ui/Button.tsx
-+++ b/components/ui/Button.tsx
-@@ -6,7 +6,5 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
- };
-
- export function Button({ variant = "primary", className, ...props }: ButtonProps) {
--  return (
--    <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />
--  );
-+  return <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />;
- }
-
---- a/lib/api/webhook-verify.ts
-+++ b/lib/api/webhook-verify.ts
-@@ -10,10 +10,7 @@ export async function verifyClerkWebhook(_rawBody: string, _headers: Headers): P
- }
-
- // TODO(Sprint 4 #58): verify using PINGRAM_WEBHOOK_SECRET.
--export async function verifyPingramWebhook(
--  _rawBody: string,
--  _headers: Headers,
--): Promise<boolean> {
-+export async function verifyPingramWebhook(_rawBody: string, _headers: Headers): Promise<boolean> {
-   throw new Error("verifyPingramWebhook not implemented — see Sprint 4 #58");
- }
-```
-
-## Verification performed (all passed)
-
-1. `bun run format:check` — "All matched files use Prettier code style!"
-2. `bun run lint` — passes, no output/errors.
-3. `bun run typecheck` — passes, no output/errors.
-4. `bun run dev` — started cleanly; `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/` returned `200`. Dev server stopped afterward.
-
-## What the Tester should focus on
-
-- Confirm `bun run format:check` fails if any of the 4 reformatted files (or
-  README.md) is reverted to its old formatting — i.e. the check is real, not
-  a no-op.
-- Confirm `.prettierignore` actually excludes `.pipeline/`, `documentation/`,
-  and `song2score/` from `prettier --check .` (these directories contain
-  markdown/config that would otherwise false-fail).
-- Confirm no logic changed in the 4 reformatted files — behavior of
-  `AuthLayout`, `Button`, and the four `verify*Webhook` functions should be
-  byte-identical modulo whitespace (diffs above are the full deltas).
-- Confirm `eslint.config.mjs`, `tsconfig.json`, `next.config.ts`,
-  `.prettierrc`, and `.github/workflows/ci.yml` were NOT touched (out of
-  scope per spec section 4).
-- `package.json` scripts: verify `format` and `format:check` were inserted
-  without disturbing existing scripts (`dev`, `build`, `start`, `lint`,
-  `typecheck`, `test`, `test:e2e` all still present, same commands).
-
-## Out of scope (confirmed not touched)
-
-- No dependency changes (prettier@^3.4.0 was already present).
-- No changes to `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`,
-  `.prettierrc`, `.github/workflows/ci.yml`.
-- No route/auth/UI logic changes beyond formatting.
+## Focus for the tester
+- Confirm unauthenticated `GET /api/profile` returns 401 with `ErrorCode.UNAUTHENTICATED` (or that middleware's `auth.protect()` intercepts it first with a redirect/404, per Clerk's behavior for API vs. browser requests).
+- Confirm unauthenticated browser GET to a protected page (e.g. `/dashboard`, `/profile`) redirects toward `/sign-in`.
+- Confirm public routes (`/`, `/sign-in(.*)`, `/sign-up(.*)`, `/join(.*)`, `/invite(.*)`, `/api/health`, `/api/webhooks(.*)`) remain reachable while signed out.
+- Confirm the profile page renders gracefully with `"—"` fallbacks when Clerk user has no name (email-only signup) — cannot be fully exercised without live Clerk test data, so reasoning-based review of the fallback logic in `app/(app)/profile/page.tsx` may be needed.
