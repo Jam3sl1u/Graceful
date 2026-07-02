@@ -1,194 +1,167 @@
-# Spec: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Spec — Issue #15: JWT verification + role-check middleware
 
-## OPEN QUESTIONS
+## OPEN QUESTIONS (non-blocking — decisions made below, flag if you disagree)
 
-None. The gap is concrete and unambiguous — proceed as specified below.
+1. **The `users` table (#16) does not exist yet.** `supabase/migrations/` contains only
+   `.gitkeep`, and `lib/supabase/client.ts` is a stub that throws. The acceptance criteria
+   say role must be read from the `users` table "not just the JWT claim." We cannot query a
+   table that isn't built, and creating it is issue #16's job (out of scope here).
+   **Decision:** introduce a thin, injectable lookup seam (`UserLookup`) so the middleware's
+   contract and unit tests land now, and the real DB query is dropped in when #16 lands. The
+   real query is stubbed to throw a clear "pending #16" error; unit tests inject a fake
+   lookup. This is the same stub-and-seam pattern already used across `lib/` in this repo.
+   If the pipeline owner would rather block this issue until #16 merges, stop here.
 
----
-
-## 1. Summary
-
-Issue #11 is **~90% already satisfied** by pre-existing code committed to
-`main`. A full Next.js App Router + TypeScript codebase already exists. Three of
-the four acceptance criteria are already met. The Coder's job is small and
-**purely additive** — do NOT re-scaffold, do NOT touch dependencies, do NOT
-touch the `app/` route structure, config strictness, or auth.
-
-Acceptance criteria status (verified against current checkout):
-
-| AC | Status |
-|----|--------|
-| Next.js (App Router) + TypeScript initialized | DONE — no action |
-| ESLint + Prettier configured AND passing on clean checkout | **PARTIAL — Prettier gap, this is the work** |
-| Base folder structure documented | **MISSING — this is the work** |
-| `bun run dev` works with no errors | DONE — no action |
-
-Scope of this issue = **(a) make Prettier actually pass on a clean checkout**
-and **(b) document the folder structure in the README.** Nothing else.
+2. Everything else is unambiguous. No invented requirements below.
 
 ---
 
-## 2. Verified current state (do not redo this work)
+## Scope
 
-- `package.json`: `next@^15.3.0`, `react@^19`, `react-dom@^19`,
-  `typescript@^5.7.0`, `prettier@^3.4.0`, `eslint@^9`, `eslint-config-next`.
-  Scripts present: `dev`, `build`, `start`, `lint` (`eslint .`),
-  `typecheck` (`tsc --noEmit`), `test`, `test:e2e`.
-  **No `format` or `format:check` script exists.**
-- App Router only. Route groups `app/(app)/`, `app/(auth)/`,
-  `app/(marketing)/`, `app/(public)/`, plus `app/api/*` handlers and root
-  `app/layout.tsx` + `app/globals.css`. No `pages/` directory anywhere.
-- `tsconfig.json`: strict, `noUncheckedIndexedAccess`, `@/*` path alias, Next
-  plugin. Excludes `node_modules`, `song2score`, `.pipeline`, `documentation`.
-- `next.config.ts`: minimal (`reactStrictMode`, `outputFileTracingRoot`,
-  scoped `eslint.dirs`). Do not change.
-- `eslint.config.mjs`: flat config extending `next/core-web-vitals` +
-  `next/typescript`; `ignores: ["song2score/**", ".pipeline/**",
-  "documentation/**", ".next/**", "next-env.d.ts"]`; one relaxed rule
-  (`no-unused-vars` warn with `^_` ignore). Leave as-is.
-- `.prettierrc` exists:
-  `{ "semi": true, "singleQuote": false, "trailingComma": "all", "printWidth": 100 }`.
-  Leave the config values as-is.
-- `.prettierignore`: **does not exist** — root cause of the failing Prettier AC.
-- `README.md`: only 2 lines (title + tagline). No folder-structure docs.
-- Top-level source dirs present: `app/`, `components/`, `lib/`, `schemas/`,
-  `types/`, `supabase/`, `tests/`.
-- `.github/workflows/ci.yml` exists (uses bun). **Out of scope** — do NOT edit
-  it (CI is issue #12).
+Implement the two existing stubs in `lib/api/auth.ts` (`requireAuth`, `requireRole`) plus a
+lookup seam, and unit-test all four roles against an admin-only route. API-layer only. NOT in
+scope: RLS (#22), rate limiting (#76), wiring middleware.ts enforcement, the `users` migration
+(#16), or converting existing stub routes.
+
+## Existing patterns to follow (do not deviate)
+
+- Error type: `ApiException(message, code, status)` from `lib/api/errors.ts`. `ErrorCode.UNAUTHENTICATED` and `ErrorCode.FORBIDDEN` already exist.
+- Response envelope + `fail()`: `lib/api/response.ts`.
+- Role type: `UserRole = "admin" | "set_leader" | "member" | "guest"` from `types/domain.ts`. Use this; do not redefine.
+- `AuthContext` type already declared in `lib/api/auth.ts` — keep its shape: `{ userId, churchGroupId, role }`.
+- Every server file starts with `import "server-only";`.
+- Unit test style: copy `tests/unit/lib/api/response.test.ts` (Jest `describe`/`it`, `@/` path alias). Tests live under `tests/unit/**/*.test.ts` (see `jest.config.ts` `testMatch`). `server-only` is auto-mocked via `tests/mocks/server-only.js`.
 
 ---
 
-## 3. Files to create / modify
+## Files to modify
 
-### 3.1 CREATE `/Users/jamesliu/Documents/Graceful/.prettierignore`
+### 1. `lib/api/auth.ts` (rewrite the two stub bodies + add lookup seam)
 
-Purpose: scope `prettier --check .` to source only, so docs/config/generated
-files stop false-failing the check. Mirror the dirs already ignored by ESLint
-and TS, plus build/vendor output. Exact contents:
+Keep the existing `AuthContext` type. Implement:
 
-```
-# Dependencies & build output
-node_modules
-.next
-out
-coverage
+```ts
+import "server-only";
+import type { NextRequest } from "next/server";
+import { auth } from "@clerk/nextjs/server";
+import { ApiException, ErrorCode } from "@/lib/api/errors";
+import type { UserRole } from "@/types/domain";
 
-# Nested project with its own toolchain
-song2score
+export type AuthContext = {
+  userId: string;        // internal users.id (uuid), NOT the Clerk id
+  churchGroupId: string;
+  role: UserRole;
+};
 
-# Pipeline & docs (not developer source; not Prettier's concern)
-.pipeline
-documentation
-.claude
+// Lookup seam — real impl added when #16 (users table) lands. Injected in tests.
+export type UserLookup = (clerkId: string) => Promise<AuthContext | null>;
 
-# Lockfiles / generated
-bun.lock
-package-lock.json
-next-env.d.ts
-```
+// requireAuth: verify the Clerk JWT, then resolve the DB-backed AuthContext.
+// `lookup` defaults to the real (currently pending) DB lookup; tests pass a fake.
+export async function requireAuth(
+  _req: NextRequest,
+  lookup: UserLookup = lookupUserByClerkId,
+): Promise<AuthContext>;
 
-Notes for the Coder:
-- `README.md` is intentionally NOT ignored — it is real developer-facing
-  source and must be Prettier-clean (see 3.3).
-- Keep `documentation/` and `.pipeline/` ignored (matches ESLint/TS config and
-  avoids reformatting PRD/planning markdown).
-
-### 3.2 MODIFY `/Users/jamesliu/Documents/Graceful/package.json`
-
-Add two scripts to the `"scripts"` block (do not remove or reorder existing
-ones). Insert after the existing `"typecheck"` entry:
-
-```json
-"format": "prettier --write .",
-"format:check": "prettier --check .",
+export function requireRole(ctx: AuthContext, roles: UserRole[]): void;
 ```
 
-Do NOT add or bump any dependency — `prettier@^3.4.0` is already a devDep.
+Behaviour:
 
-### 3.3 REFORMAT source files that violate the Prettier config
+- `requireAuth`:
+  1. Call Clerk `const { userId: clerkId } = await auth();` (App Router server helper). If `clerkId` is null/undefined → `throw new ApiException("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`.
+  2. `const ctx = await lookup(clerkId);`. If `null` (authenticated Clerk user with no matching `users` row) → `throw new ApiException("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`. (No user record ⇒ cannot authorize ⇒ treat as unauthenticated, not 403.)
+  3. Return `ctx`.
+  - Note the `req` arg is retained for signature stability / future use even though Clerk `auth()` reads request context ambiently. Do not remove it.
 
-After 3.1 is in place, run `bunx prettier --write .` (or `bun run format`).
-This will reformat any tracked source file that violates `printWidth: 100` /
-the other rules. Known offenders from prior inspection (long lines Prettier
-wraps) — but rely on `prettier --write` to find the authoritative set, do not
-hand-edit:
-- `app/(auth)/layout.tsx`
-- `components/ui/Button.tsx`
-- `lib/api/webhook-verify.ts`
-- `app/globals.css`
-- `README.md` (will be reformatted; see 3.4 for the content you add first)
+- `requireRole(ctx, roles)`:
+  - If `roles.includes(ctx.role)` → return (void).
+  - Else → `throw new ApiException("Insufficient permissions", ErrorCode.FORBIDDEN, 403)`.
+  - `roles` is an array so callers can allow multiple (e.g. `["admin", "set_leader"]`).
 
-**Constraint:** every diff produced here MUST be pure formatting
-(whitespace / line wrapping / quotes / trailing commas). If `prettier --write`
-would change anything that looks like logic, stop — that indicates a config
-problem, not expected behavior. There is none expected here.
+- `lookupUserByClerkId` (the default real lookup): a `UserLookup` that currently throws `new Error("user lookup not implemented — blocked on #16 (users table) / #7-14 (supabase client)")`. Keep it internal (not exported) or export it — either is fine, but it must be the default arg. Add a `// TODO(#16): SELECT id, church_group_id, role FROM users WHERE clerk_id = $1` comment describing the real query (maps clerk_id → AuthContext per PRD §20.3 `users` table).
 
-### 3.4 MODIFY `/Users/jamesliu/Documents/Graceful/README.md`
+Import note: import `ApiException` and `ErrorCode` from `@/lib/api/errors` (both are exported there).
 
-Add a concise "Project Structure" section documenting the top-level layout.
-Keep it minimal per the issue's explicit "avoid over-engineering" instruction —
-a short list with one line each, NOT a deep architecture doc. Preserve the
-existing title/tagline. Suggested content (adjust wording, keep it brief):
+### 2. `lib/clerk/server.ts` — LEAVE AS-IS.
 
-```markdown
-# Graceful
-Planning Center capabilities with internal ML features
-
-## Getting Started
-
-```bash
-bun install
-bun run dev
-```
-
-Open http://localhost:3000 to view the app.
-
-## Scripts
-
-- `bun run dev` — start the Next.js dev server
-- `bun run build` — production build
-- `bun run lint` — ESLint
-- `bun run typecheck` — TypeScript check (no emit)
-- `bun run format` — format all files with Prettier
-- `bun run format:check` — verify formatting
-
-## Project Structure
-
-- `app/` — Next.js App Router routes, layouts, and API route handlers (`app/api/*`)
-- `components/` — shared React UI components
-- `lib/` — server-side clients and integrations (Supabase, Clerk, etc.)
-- `schemas/` — Zod validation schemas
-- `types/` — shared TypeScript types
-- `supabase/` — Supabase project config and migrations
-- `tests/` — Jest and Playwright tests
-```
-
-Only document dirs that actually exist (all listed above do). Do not invent
-subfolders or describe files that don't exist.
+Do not implement `getAuthContext` here; it is a separate concern (session-claim reader, #5/#6) and not required by this issue. Touching it risks scope creep.
 
 ---
 
-## 4. Out of scope (do NOT do)
+## Files to create
 
-- Do NOT edit `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`, or
-  `.prettierrc` config values.
-- Do NOT add/remove/bump dependencies.
-- Do NOT edit `.github/workflows/ci.yml` (CI wiring is issue #12).
-- Do NOT touch auth, or add any UI/pages beyond what exists.
-- Do NOT change route structure or any `app/api/*` logic.
+### 3. `app/api/_examples/admin-only/route.ts` (test fixture route)
+
+An admin-only route used only to exercise the middleware end-to-end in unit tests. Keep it
+minimal and clearly marked as an example.
+
+```ts
+import { NextRequest } from "next/server";
+import { requireAuth, requireRole, type UserLookup } from "@/lib/api/auth";
+import { ok, fail } from "@/lib/api/response";
+import { ApiException, ErrorCode } from "@/lib/api/errors";
+
+// Example admin-only route — demonstrates the requireAuth + requireRole pattern
+// every Sprint 1–4 endpoint will copy. Exists primarily for #15 unit tests.
+export async function GET(req: NextRequest, lookup?: UserLookup) {
+  try {
+    const ctx = await requireAuth(req, lookup);
+    requireRole(ctx, ["admin"]);
+    return ok({ ok: true });
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+```
+
+- The optional `lookup` param is a test seam mirroring `requireAuth`. It is NOT part of the Next.js route contract (Next passes only `(req, { params })`); in production `lookup` is `undefined` and the real default is used. This keeps the fixture testable without a real DB.
+- `_examples` prefix (underscore) keeps it out of any future route-convention sweeps and signals it is not a product endpoint.
 
 ---
 
-## 5. Verification (all must pass on a clean checkout after changes)
+## Tests to create
 
-Run from repo root:
+### 4. `tests/unit/lib/api/auth.test.ts`
 
-1. `bun run format:check` — must pass with zero warnings (was failing before).
-2. `bun run lint` — must still pass (already passes today).
-3. `bun run typecheck` — must still pass (already passes today).
-4. `bun run dev` — must start with no errors; `curl http://localhost:3000/`
-   returns HTTP 200.
+Cover `requireAuth` + `requireRole` directly:
 
-If `format:check` reports files outside real source (e.g. `documentation/`,
-`.pipeline/`, node vendor dirs), the `.prettierignore` in 3.1 is incomplete —
-fix the ignore file rather than reformatting those files.
+- Mock Clerk: at top of file, `jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }));` then import `auth` and cast, e.g. `const mockAuth = auth as jest.Mock;`. Reset in `beforeEach`.
+- `requireAuth` throws `ApiException` with `code === "UNAUTHENTICATED"` and `status === 401` when `auth()` returns `{ userId: null }`.
+- `requireAuth` throws 401 UNAUTHENTICATED when Clerk `userId` is set but the injected `lookup` returns `null`.
+- `requireAuth` returns the `AuthContext` from the injected `lookup` when Clerk `userId` is set and lookup resolves a user.
+- `requireRole` returns void (does not throw) when `ctx.role` is in the allowed list.
+- `requireRole` throws `ApiException` with `code === "FORBIDDEN"` and `status === 403` when `ctx.role` is not allowed.
+- Assert on thrown error via `await expect(...).rejects.toMatchObject({ code, status })` or a try/catch with `instanceof ApiException`.
+
+### 5. `tests/unit/app/api/admin-only-route.test.ts`
+
+This satisfies the acceptance criterion "Unit tests cover all four roles against an admin-only route." Import the `GET` from `app/api/_examples/admin-only/route.ts`.
+
+- Mock `@clerk/nextjs/server` `auth` to return a fixed authenticated `{ userId: "clerk_test" }`.
+- Build a fake `UserLookup` factory that returns an `AuthContext` with a given `role`.
+- Table-driven test over all four roles:
+  - `admin` → response `status === 200`, body `{ data: { ok: true } }`.
+  - `set_leader` → `status === 403`, body `code === "FORBIDDEN"`.
+  - `member` → `status === 403`, `code === "FORBIDDEN"`.
+  - `guest` → `status === 403`, `code === "FORBIDDEN"`.
+- One additional case: `auth()` returns `{ userId: null }` → `status === 401`, `code === "UNAUTHENTICATED"` (lookup never consulted).
+- Read the response via `res.status` and `await res.json()` exactly like `tests/unit/lib/api/response.test.ts`.
+
+---
+
+## Edge cases the implementation must handle
+
+- Clerk `auth()` returns `userId: null` (unauthenticated) → 401, before any lookup.
+- Authenticated Clerk user with no `users` row → 401 (not 403). Documented rationale above.
+- `requireRole` called with a multi-role allow-list → any match passes.
+- Non-`ApiException` errors bubbling out of a handler → the route's `catch` maps to 500 `INTERNAL` (see fixture). Do not let a raw error escape as an unhandled 500 with a stack.
+- `requireAuth` must not perform the DB lookup before confirming the JWT is valid (auth check strictly precedes lookup — avoids unauthenticated DB hits).
+
+## Definition of done
+
+- `npm run typecheck` passes.
+- `npm test` passes, including the two new test files.
+- No changes to `middleware.ts`, `lib/supabase/*`, `lib/clerk/server.ts`, or any existing route.
+- `lib/api/auth.ts` no longer throws "not implemented"; `lookupUserByClerkId` remains the single point that is intentionally deferred to #16.
