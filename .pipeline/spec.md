@@ -1,125 +1,113 @@
-# Spec — Issue #16: Migrate schema, Cluster 1 (Organization)
+# Spec — Issue #14: Integrate Clerk authentication (Sprint 0)
 
 ## OPEN QUESTIONS
+None blocking. Two clarifying notes (proceed with the stated default):
 
-None that block implementation. Two decisions are made explicit below (both low-risk, chosen to match repo conventions and the PRD). Flag if you disagree:
+1. **Scope boundary with #15 / #5 / #6.** This issue is *base authentication only*: Clerk sign-up/sign-in flows, session availability, redirect of signed-out users, and reading basic profile (email/name) from the Clerk session. JWT verification middleware for API routes (#15), and church-group/role resolution (#5/#6) are explicitly downstream and MUST NOT be implemented here. Do **not** touch the role/church-group TODOs in `lib/api/auth.ts` or `lib/clerk/server.ts`.
+2. **Acceptance criterion "session/JWT usable by API routes."** For this issue, "usable" means the Clerk session reaches API route handlers (i.e. `auth()` from `@clerk/nextjs/server` resolves a `userId` inside a route). Full signature-verified middleware enforcement is #15. Deliver the minimal proof: one API route that returns the caller's `userId` (or 401 if signed out).
 
-1. **Down migration format.** Supabase CLI migrations are forward-only `.sql` files with no native up/down file pair. To satisfy the "reversible / down migration written" acceptance criterion without inventing tooling the repo doesn't have, include the down SQL in the same migration file inside a commented `-- DOWN` block. Lowest-friction, keeps one CLI-applicable file.
-2. **`vocal_capability` enum ownership.** `member_profiles.vocal_capability` (Cluster 1) needs the `vocal_capability` enum, which the backlog nominally assigns to a later cluster (#11/Cluster 5). Cluster 1 cannot compile without it, so create it here. See "Enum ownership decision".
+## Current state (already done — do NOT recreate)
+- `@clerk/nextjs@^6.12.0` is installed (`package.json`). No dependency changes needed.
+- `<ClerkProvider>` already wraps the app in `app/layout.tsx`.
+- `app/(auth)/sign-in/[[...sign-in]]/page.tsx` renders `<SignIn />`; `app/(auth)/sign-up/[[...sign-up]]/page.tsx` renders `<SignUp />`. These are the Clerk-default flows the issue asks for — leave as-is.
+- `middleware.ts` runs `clerkMiddleware()` with a correct `config.matcher` and an `isPublicRoute` matcher — but does **not** enforce auth yet (it calls `clerkMiddleware()` with no callback).
+- Clerk env placeholders exist in `.env.example` (`NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET`).
 
-## Scope
+## Gaps to close (the actual work — 4 changes)
 
-ONLY the three Organization tables (`church_groups`, `users`, `member_profiles`) and the enums they require (`user_role`, `vocal_capability`). Do NOT add RLS policies (#22), seed data, PostgREST lockdown (#14), other clusters' tables, or TypeScript type generation.
+### 1. Enforce authentication in middleware (redirect signed-out users)
+**File:** `middleware.ts` (modify)
 
-## Current repo state (verified)
+Replace the no-op `export default clerkMiddleware();` (line 20) with a callback that protects every non-public route:
 
-- `supabase/migrations/` contains only `.gitkeep` — this is the FIRST migration in the project; there is no prior SQL to copy from. This file becomes the reference pattern for all later cluster migrations.
-- `supabase/config.toml` is a placeholder (`project_id = "graceful"` only). Do not edit it for this issue.
-- `supabase/seed.sql`, `lib/supabase/types.ts`, `lib/supabase/client.ts` are all placeholders for later issues — leave untouched.
-- PRD source of truth for the schema: `documentation/prd/graceful_requirements_v10.md` §20.2 (enums) and §20.3 (Cluster 1). Column definitions below are transcribed from there.
-
-## File to create
-
-### `supabase/migrations/20260702000001_cluster_1_organization.sql` (NEW)
-
-Timestamp prefix `20260702000001` — Supabase orders migrations lexicographically by the `YYYYMMDDHHMMSS_` prefix, so this must sort before any future cluster migration. Structure:
-
-```
--- Migration: Cluster 1 — Organization
--- Tables: church_groups, users, member_profiles
--- Enums: user_role, vocal_capability (vocal_capability is created here and reused by Cluster 5)
-
--- ============ UP ============
-create extension if not exists "pgcrypto";  -- gen_random_uuid()
-
--- enums (user_role, vocal_capability)
--- tables in FK dependency order: church_groups -> users -> member_profiles
--- index on users.church_group_id
-
--- ============ DOWN ============
--- (commented; run to reverse — drop in reverse dependency order)
--- drop table if exists member_profiles;
--- drop table if exists users;
--- drop table if exists church_groups;
--- drop type if exists vocal_capability;
--- drop type if exists user_role;
+```ts
+export default clerkMiddleware(async (auth, req) => {
+  if (!isPublicRoute(req)) {
+    await auth.protect();
+  }
+});
 ```
 
-## Enum ownership decision
+- Keep the existing `isPublicRoute` matcher (lines 10–18) and `config.matcher` (lines 22–24) exactly as-is.
+- Remove the now-stale comment block (lines 3–9) that says enforcement is deferred to #5/#6 — we are enabling it now. Replace it with a one-line comment noting that request-level auth is enforced here while role-level checks (`requireRole`) still land in #6.
+- Effect: `auth.protect()` redirects unauthenticated browser requests to the Clerk sign-in and returns 404 for unauthenticated API requests. Satisfies "signed-out users are redirected away from authenticated routes."
 
-Create BOTH enums in this migration:
-- `user_role` — values in order: `admin`, `set_leader`, `member`, `guest`.
-- `vocal_capability` — values in order: `none`, `lead`, `harmony`, `both`.
+### 2. Point Clerk at the app's own sign-in/up routes
+**File:** `.env.example` (modify)
 
-Add a comment noting `vocal_capability` is created here and must NOT be redefined by the later Cluster 5 migration.
+Under the existing `# Clerk (Auth)` block (after line 12, `CLERK_WEBHOOK_SECRET=`), add these public env vars so Clerk uses the in-app `/sign-in` and `/sign-up` routes rather than the hosted account portal. Give the URL vars concrete route values (they are paths, not secrets):
 
-## Exact schema (from PRD §20.2 / §20.3)
+```
+NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
+NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
+NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/dashboard
+NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/dashboard
+```
 
-### Table `church_groups` (root — has NO church_group_id FK)
-| Column | Type | Constraints |
-| --- | --- | --- |
-| id | uuid | PK, default `gen_random_uuid()` |
-| name | varchar(100) | not null |
-| denomination | varchar(100) | null |
-| timezone | varchar(50) | not null, default `'America/Chicago'` |
-| logo_url | text | null (R2 object key, never a public URL) |
-| invite_code | varchar(20) | not null, **unique** |
-| created_at | timestamptz | not null, default `now()` |
-| updated_at | timestamptz | not null, default `now()` |
+`/dashboard` exists at `app/(app)/dashboard/page.tsx` and is a protected route, so a freshly-authenticated user lands there. Match the file's placeholder style (`# fill in later`-type comments not required for these path values).
 
-### Table `users`
-| Column | Type | Constraints |
-| --- | --- | --- |
-| id | uuid | PK, default `gen_random_uuid()` |
-| clerk_id | varchar(50) | not null, **unique** |
-| church_group_id | uuid | not null, FK → `church_groups(id)` on delete cascade |
-| role | user_role | not null, default `'member'` |
-| name | varchar(100) | not null |
-| email | varchar(255) | **null**, **unique** (nullable-unique: Postgres allows multiple NULLs) |
-| phone | varchar(20) | null |
-| sms_opted_in | boolean | not null, default `false` |
-| created_at | timestamptz | not null, default `now()` |
-| updated_at | timestamptz | not null, default `now()` |
+### 3. Expose basic profile data from the Clerk session (email + name)
+**File:** `app/(app)/profile/page.tsx` (modify — currently the static stub `<h1>Profile — coming soon</h1>`)
 
-### Table `member_profiles`
-| Column | Type | Constraints |
-| --- | --- | --- |
-| id | uuid | PK, default `gen_random_uuid()` |
-| user_id | uuid | not null, **unique**, FK → `users(id)` on delete cascade |
-| vocal_capability | vocal_capability | not null, default `'none'` |
-| bio | text | null |
-| created_at | timestamptz | not null, default `now()` |
+Convert to an async server component that reads the current user from Clerk and renders their name and primary email, proving profile data is available from the session:
 
-Note: `member_profiles` per PRD has NO `updated_at` — do not add one.
+```tsx
+import { currentUser } from "@clerk/nextjs/server";
 
-## Requirements the implementation must satisfy
+export default async function ProfilePage() {
+  const user = await currentUser();
+  // Guaranteed non-null because middleware protects this route; guard anyway.
+  // Render: name (user.fullName, falling back to firstName/lastName, then "—")
+  //         and email (user.primaryEmailAddress?.emailAddress ?? "—").
+}
+```
 
-- UUID v4 PKs everywhere via `gen_random_uuid()` (pgcrypto). Do NOT depend on `uuid-ossp`.
-- Create tables in FK-dependency order (church_groups, then users, then member_profiles) so the UP migration runs top-to-bottom on a fresh DB.
-- Add a b-tree index on `users.church_group_id` (queried on nearly every request per the issue's Implementation Notes). `clerk_id` and `email` uniqueness already provide their own indexes; no extra index needed for those.
-- `users.email` must be nullable AND unique — a plain `unique` constraint is correct (Postgres treats NULLs as distinct, so multiple phone-only guest users insert fine). Do NOT mark it `not null`.
-- FKs use `on delete cascade`: deleting a church group removes its users; deleting a user removes their profile. Matches PRD §20 relationships ("One-to-many: church_groups → users"; "One-to-one: users → member_profiles").
-- DOWN block drops in reverse dependency order: member_profiles, users, church_groups, then enum types last.
+- Use `currentUser()` from `@clerk/nextjs/server`. Do **NOT** use `lib/clerk/server.ts`'s `getAuthContext` — it intentionally throws until #5/#6.
+- Minimal markup only. Follow the inline-style `<main>` pattern in `app/(marketing)/page.tsx`. No new UI components, no CSS module. Polish is out of scope.
+
+### 4. Prove the session reaches API routes
+**File:** `app/api/profile/route.ts` (modify — currently returns `notImplemented` for GET and PUT)
+
+Implement **only** the `GET` handler to return the authenticated caller's `userId` from the Clerk session. Leave `PUT` exactly as-is (`notImplemented` — profile mutation is out of scope for #14).
+
+```ts
+import { auth } from "@clerk/nextjs/server";
+import { ok, fail } from "@/lib/api/response";
+import { ErrorCode } from "@/lib/api/errors";
+
+export async function GET() {
+  const { userId } = await auth();
+  if (!userId) return fail("Not authenticated", ErrorCode.UNAUTHENTICATED, 401);
+  return ok({ userId });
+}
+```
+
+- Use `ErrorCode.UNAUTHENTICATED` (confirmed to exist in `lib/api/errors.ts`). Do NOT invent new codes.
+- Use the existing helpers from `lib/api/response.ts`: `ok(data, status?)` and `fail(error, code, status)`.
+- Keep the `import { NextRequest }` line only if `PUT` still needs it; `GET` here takes no args. Ensure no unused imports remain (lint is strict).
+- Do NOT call `requireAuth` from `lib/api/auth.ts` — it throws until #6. Reading `auth()` directly is the #14-scoped proof.
 
 ## Edge cases the implementation must handle
+- Signed-out browser request to a protected route (`/dashboard`, `/profile`, etc.) -> redirected to `/sign-in` by middleware.
+- Signed-out request to `GET /api/profile` -> middleware `auth.protect()` handles it; the handler's own `userId` null-check returns a clean 401 as a second layer.
+- Public routes stay reachable while signed out — verify `isPublicRoute` list is unchanged: `/`, `/sign-in(.*)`, `/sign-up(.*)`, `/join(.*)`, `/invite(.*)`, `/api/health`, `/api/webhooks(.*)`.
+- `currentUser()` returning a user with no name (Clerk allows email-only signup): the profile page must not crash — fall back gracefully (show email only / `—`) when `fullName`/`firstName`/`lastName` are null.
+- Missing Clerk env keys at runtime is a deploy/config concern (#10), not a code concern — do not add runtime key-presence guards.
 
-1. **Fresh-instance idempotency** of the extension: `create extension if not exists "pgcrypto"`.
-2. **Nullable-unique email**: two guest users with no email must both insert successfully — verify the constraint is `unique`, not a `not null` variant.
-3. **Enum defaults declared explicitly**: `role` default `'member'` (3rd value), `vocal_capability` default `'none'` (1st value). Do not rely on enum ordinal.
-4. **Timezone default** must be exactly the IANA string `'America/Chicago'`.
-5. **Cascade paths**: deleting a `church_groups` row must cascade to `users` and transitively (via the users→member_profiles FK cascade) to `member_profiles`. Confirm both FKs declare `on delete cascade`.
-6. **Reversibility with no orphans**: running the DOWN block after the UP block on a fresh DB must remove every Cluster 1 object, including both enum types. Enums must be dropped AFTER all referencing tables.
-7. **Clean run on fresh Supabase**: the whole UP block must execute with zero errors against an empty database (acceptance criterion). No forward references, no reliance on objects from other clusters.
+## Patterns to follow
+- API route + response helpers: `lib/api/response.ts` (signatures) and `lib/api/errors.ts` (codes). Any existing `app/api/*` route using `ok`/`fail` shows the shape.
+- Server component reading Clerk: `@clerk/nextjs/server` (`auth`, `currentUser`) — same package already imported in `middleware.ts`.
+- Minimal inline-style markup: `app/(marketing)/page.tsx`.
+- Env placeholder style: existing `# Clerk (Auth)` block in `.env.example`.
 
-## Pattern to follow
+## Explicitly OUT OF SCOPE (do not implement)
+- Any change to `lib/clerk/server.ts` (`getAuthContext`) or `lib/api/auth.ts` (`requireAuth`/`requireRole`) — that is #5/#6.
+- JWT signature verification / claim extraction beyond `auth()`'s built-in resolution — that is #15.
+- Clerk webhook (`app/api/webhooks/clerk/route.ts`) user-sync — leave as `notImplemented`.
+- Custom-branded auth UI, social providers, password reset (Clerk defaults only).
+- `PUT /api/profile` implementation.
+- Any change to route structure, dependencies, or config files.
 
-No prior migration exists — this file establishes the pattern for later clusters (#8–#12 in the backlog). Keep it clean:
-- lowercase SQL keywords, snake_case identifiers (matches PRD naming).
-- `-- ============ UP ============` / `-- ============ DOWN ============` section banners.
-- One migration file per cluster (per `supabase/README.md`).
-
-## Out of scope (do not touch)
-
-- `supabase/seed.sql`, `supabase/config.toml`, `lib/supabase/types.ts`, `lib/supabase/client.ts`.
-- RLS policies (#22), PostgREST lockdown (#14), any Cluster 2–6 tables/enums beyond the two enums Cluster 1 needs.
-- Regenerating TypeScript types.
+## Suggested verification (for the tester stage)
+- `bun run lint` and `bun run typecheck` must pass.
+- Playwright (fixture style in `tests/e2e/health.spec.ts`): unauthenticated `GET /api/profile` returns 401 (or a redirect/404 from middleware); unauthenticated GET of a protected page redirects toward `/sign-in`.

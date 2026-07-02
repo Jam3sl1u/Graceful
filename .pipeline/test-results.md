@@ -1,63 +1,49 @@
-# Test Results — Issue #16: Migrate schema, Cluster 1 (Organization)
+# Test Results — Issue #14: Integrate Clerk authentication (Sprint 0)
 
-## Overall: PASS
+## Verdict: PASS
 
-All checks below were independently re-run (not taken on the coder's word).
+All automated checks pass and manual verification confirms the implementation matches the spec. No code defects found.
 
-## 1. App-code regression checks
+## What was independently re-run (not just trusted from changes.md)
 
-- `bun run lint` (`eslint .`) — PASS, no output/errors.
-- `bun run typecheck` (`tsc --noEmit`) — PASS, no output/errors.
-- `bun run test` (`jest`, the actual test script defined in `package.json`) — PASS:
-  `tests/unit/lib/api/response.test.ts` — 3/3 tests passed. No regressions.
-  - Note: raw `bun test` (bun's own runner, not the repo's `test` script) throws
-    on this repo regardless of this change — it tries to execute
-    `tests/e2e/health.spec.ts` (a Playwright spec) and a Jest test that imports
-    `server-only` outside a Next.js server context, both of which are pre-existing
-    test-runner-selection issues unrelated to the migration. Using the correct
-    script (`bun run test` → `jest`) is clean. Confirms coder's claim that no app
-    code was touched and nothing else regressed.
+### 1. Lint
+`bun run lint` → **pass**, no warnings/errors.
 
-## 2. Migration file review
+### 2. Typecheck
+`bun run typecheck` (`tsc --noEmit`) → **pass**.
 
-Read `supabase/migrations/20260702000001_cluster_1_organization.sql` in full and
-diffed column-by-column against spec's exact schema tables. Matches exactly:
-tables (`church_groups`, `users`, `member_profiles`), columns, types, defaults,
-constraints, FK cascade behavior, index, and enum definitions/order. Scope is
-clean — `git show --stat fe3a6b6` confirms only this one file was committed; no
-edits to `config.toml`, `seed.sql`, `types.ts`, `client.ts`.
+### 3. Unit tests
+`bun run test` (jest) → **pass**, 3/3 tests in `tests/unit/lib/api/response.test.ts`.
 
-Migration timestamp `20260702000001` is the only file in `supabase/migrations/`
-(sorts correctly as first/only migration).
+### 4. E2E (Playwright)
+`bun run test:e2e` → **pass**, 1/1 (`tests/e2e/health.spec.ts` — `GET /api/health returns ok`). This is the only existing e2e spec; no new e2e tests were added for the auth changes by the coder. I verified the auth behavior manually against a live `next dev` server instead (see below).
 
-## 3. Live Postgres verification (independent, via fresh throwaway Docker container `postgres:16`, removed after)
+### 5. Code-vs-spec diff review
+Read all four changed files (`middleware.ts`, `.env.example`, `app/(app)/profile/page.tsx`, `app/api/profile/route.ts`) and compared line-by-line against the spec's prescribed snippets and constraints:
+- `middleware.ts`: callback matches spec exactly (`if (!isPublicRoute(req)) await auth.protect();`), `isPublicRoute` and `config.matcher` untouched, stale comment replaced with the one-line note as instructed.
+- `.env.example`: exactly the 4 new vars, correct values, placed after `CLERK_WEBHOOK_SECRET=` as instructed.
+- `app/(app)/profile/page.tsx`: uses `currentUser()` (not `getAuthContext`), fallback chain `fullName || firstName || lastName || "—"` and `primaryEmailAddress?.emailAddress ?? "—"`, minimal inline-style markup consistent with `app/(marketing)/page.tsx`.
+- `app/api/profile/route.ts`: `GET` uses `auth()` + `ok`/`fail` + `ErrorCode.UNAUTHENTICATED` exactly per spec; `PUT` untouched (`notImplemented`); `NextRequest` import retained only because `PUT` still needs it — no unused imports (confirmed by lint passing under the strict eslint config).
+- Out-of-scope items confirmed untouched: `lib/clerk/server.ts`, `lib/api/auth.ts`, `app/api/webhooks/clerk/route.ts`, `app/(auth)/sign-in`/`sign-up`, `app/layout.tsx`.
 
-- UP block ran top-to-bottom with zero errors: `CREATE EXTENSION`, `CREATE TYPE` x2,
-  `CREATE TABLE` x3, `CREATE INDEX` — PASS.
-- **Happy path**: inserted a `church_groups` row with only `name`/`invite_code` —
-  `timezone` defaulted to `'America/Chicago'` — PASS.
-- Inserted two `users` rows with no `role`/`email` — both succeeded (nullable-unique
-  email allows multiple NULLs — **edge case from spec** #2), `role` defaulted to
-  `'member'` — PASS.
-- Inserted matching `member_profiles` rows with no `vocal_capability` — defaulted
-  to `'none'` — PASS (spec edge case #3).
-- **Cascade edge case** (spec #5): deleted the `church_groups` row — confirmed 0
-  `users` and 0 `member_profiles` rows remained (transitive cascade through
-  users→member_profiles) — PASS.
-- **Failure case**: attempted to insert a second `church_groups` row reusing an
-  existing `invite_code` — correctly rejected with
-  `duplicate key value violates unique constraint "church_groups_invite_code_key"`
-  — PASS (uniqueness constraint enforced as specified).
-- **Reversibility** (spec edge case #6): ran the commented DOWN block (all 5
-  statements) on the now-fresh DB — all drops succeeded; verified via
-  `information_schema.tables` and `pg_type` that 0 Cluster 1 tables and 0 Cluster 1
-  enum types remain — PASS.
+### 6. Manual runtime verification (live `next dev` server, since the Playwright suite doesn't cover auth)
+Started `bun run dev` and exercised the routes directly with curl.
 
-## Conclusion
+**Pass 1 — no Clerk keys set (Clerk falls back to "keyless" dev mode, auto-provisioning temp keys):**
+- `GET /api/health` → 200 (public, reachable while signed out — correct).
+- `GET /api/profile` (signed out) → **401** with body `{"error":"Not authenticated","code":"UNAUTHENTICATED"}` — this is the route handler's own `auth()` null-check firing correctly, proving the "second layer" 401 described in the spec/changes.md works as designed.
+- `GET /dashboard`, `GET /profile` (signed out) → returned 200 with actual page content instead of a sign-in redirect. In keyless mode Clerk does not enforce `auth.protect()` the same way (documented Clerk dev convenience), so this by itself doesn't confirm/deny the middleware logic.
 
-Independently verified UP migration runs clean on a fresh DB, all constraints/
-defaults/cascades match spec exactly, a representative failure case (duplicate
-invite_code) is correctly rejected, DOWN block fully reverses with no orphaned
-objects, scope is untouched outside the one new migration file, and existing
-lint/typecheck/test suite (via the repo's actual `bun run test` script) shows no
-regressions. No issues found. Ready for Reviewer.
+**Pass 2 — retried with format-valid (fabricated, non-live) `pk_test_.../sk_test_...` values in a scratch `.env.local`** to escape keyless mode, repeating requests with browser-navigation headers (`Sec-Fetch-Dest: document`, `Accept: text/html`, which Clerk's redirect-vs-404 heuristic depends on):
+- `GET /dashboard`, `GET /profile` (signed out, browser-like request) → **307 redirect** issued by `auth.protect()` (target was Clerk's hosted handshake URL, not directly `/sign-in`, because the fake key's domain isn't a real reachable Clerk instance — an artifact of using synthetic keys, not a bug in the code).
+- `GET /api/profile` (signed out, fetch-like request, no navigate headers) → **404**, matching Clerk's documented `auth.protect()` behavior for non-navigational/API requests.
+- Public routes (`/`, `/sign-in`, `/sign-up`, `/join`, `/invite`, `/api/health`) also redirected in this pass — but that was Clerk's "dev-browser-missing" handshake step (`__clerk_hs_reason=dev-browser-missing`), which fires for *any* route on first contact with an unclaimed/fake Clerk instance, independent of `isPublicRoute`. Not evidence of a public-route regression; the `isPublicRoute` matcher itself is unchanged from the pre-existing code (confirmed by diff) and code review confirms `auth.protect()` is only called when `!isPublicRoute(req)`.
+- Cleanup performed afterward: killed both dev server background processes, deleted the temporary `.env.local`, reverted an incidental `.gitignore` change auto-added by the Clerk CLI while in keyless mode (`/.clerk/` entry), and removed the stray `.clerk/` directory it created. `git status` is clean except for the pre-existing `.pipeline/spec.md` diff from the earlier spec/coder stages (unrelated to this testing session).
+
+## Findings / caveats for the reviewer
+- No code defects found. Implementation matches spec exactly for all 4 files.
+- Full black-box confirmation that unauthenticated `/dashboard` and `/profile` redirect specifically to the app's own `/sign-in` route (vs. Clerk's hosted domain) could not be completed in this sandbox because there are no live Clerk test credentials available — that requires real `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`/`CLERK_SECRET_KEY` values, which is a deploy/env concern (issue #10 per spec), not a code concern for #14. The middleware code itself (`await auth.protect()` gated by `isPublicRoute`) is correct per Clerk's documented API and behaved as expected once real-shaped keys were supplied (redirect for browser navigation, 404 for API/fetch), confirming the wiring functions correctly.
+- The 401-from-the-route-handler layer (spec's "minimal proof" that `auth()` resolves `userId` inside a route) is fully verified and deterministic — it does not depend on Clerk's dev-browser handshake at all, since `auth()` in keyless mode still resolves `userId: null` correctly for a signed-out request.
+- The profile page's fallback-to-"—" logic for name/email was verified by code inspection only (cannot exercise a real Clerk user object without live test data — consistent with the limitation changes.md already flagged).
+
+**Result: PASS. No blocking issues found. Ready for Reviewer.**
