@@ -1,130 +1,80 @@
-# Changes: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
-
-## Summary
-
-Closed the remaining gap on an otherwise-complete Next.js + TypeScript setup:
-Prettier now actually passes on a clean checkout, and the README documents the
-top-level folder structure. No dependencies, config strictness, routes, or
-auth were touched.
+# Changes — Issue #15: JWT verification + role-check middleware
 
 ## Files changed
 
-- **`.prettierignore`** (new) — scopes Prettier to real developer source.
-  Mirrors `eslint.config.mjs`'s ignore list (`song2score/`, `.pipeline/`,
-  `documentation/`, `.next/`) plus `node_modules`, `out`, `coverage`,
-  `.claude`, and generated/lockfiles (`bun.lock`, `package-lock.json`,
-  `next-env.d.ts`). This was the root cause of the failing Prettier
-  acceptance criterion — without it, `prettier --check .` was scanning docs
-  and pipeline markdown that were never meant to be formatted.
+- `lib/api/auth.ts` (rewrite of the two stubs)
+  - Implemented `requireAuth(req, lookup = lookupUserByClerkId)`:
+    1. Calls Clerk's `auth()` to get `clerkId`. Throws `ApiException("Authentication
+       required", ErrorCode.UNAUTHENTICATED, 401)` if null/undefined — this check
+       strictly precedes any DB lookup.
+    2. Calls the injected `lookup(clerkId)`. Throws the same 401 UNAUTHENTICATED
+       (not 403) if it resolves to `null` (Clerk-authenticated user with no matching
+       `users` row).
+    3. Returns the resolved `AuthContext`.
+  - Implemented `requireRole(ctx, roles)`: returns void if `roles.includes(ctx.role)`,
+    otherwise throws `ApiException("Insufficient permissions", ErrorCode.FORBIDDEN, 403)`.
+  - Added the `UserLookup` type (`(clerkId: string) => Promise<AuthContext | null>`) as
+    the lookup seam called out in the spec's open question — real `users` table query
+    is blocked on #16, so `lookupUserByClerkId` (kept internal/unexported) throws
+    `"user lookup not implemented — blocked on #16 ..."` and carries a
+    `// TODO(#16): SELECT id, church_group_id, role FROM users WHERE clerk_id = $1`
+    comment. It is the default `lookup` argument; tests inject a fake instead.
+  - `AuthContext` shape (`{ userId, churchGroupId, role }`) unchanged.
 
-- **`package.json`** — added two bun scripts, inserted right after
-  `typecheck` (no reordering/removal of existing scripts, no dependency
-  changes):
-  - `"format": "prettier --write ."`
-  - `"format:check": "prettier --check ."`
+## Files created
 
-- **`app/(auth)/layout.tsx`**, **`components/ui/Button.tsx`**,
-  **`lib/api/webhook-verify.ts`**, **`app/globals.css`** — reformatted via
-  `bunx prettier --write .` to fix real `printWidth: 100` violations (long
-  single-line JSX/function signatures got wrapped; the CSS `font-family`
-  list got collapsed to fit under 100 chars). All four diffs are pure
-  whitespace/line-wrapping — verified via `git diff` that no logic, strings,
-  or identifiers changed. See diffs below for exact deltas.
+- `app/api/_examples/admin-only/route.ts` — minimal example admin-only `GET` route
+  (per spec verbatim) that calls `requireAuth` then `requireRole(ctx, ["admin"])`,
+  wrapping `ApiException` into `fail()` and any other error into a 500 `INTERNAL`.
+  Takes an optional `lookup` test seam parameter (unused by Next's route contract in
+  production, where it's `undefined` and the real default lookup applies). Exists only
+  to support #15's unit tests, not a product endpoint (`_examples` prefix).
 
-- **`README.md`** — expanded from a 2-line title/tagline into: Getting
-  Started (bun install / bun run dev), a Scripts list (dev/build/lint/
-  typecheck/format/format:check), and a new "Project Structure" section
-  listing `app/`, `components/`, `lib/`, `schemas/`, `types/`, `supabase/`,
-  `tests/` with one line each. Kept intentionally minimal per the issue's
-  "don't over-engineer" instruction — no deep architecture doc. This file
-  was itself reformatted by Prettier after being written (blank line added
-  after the `# Graceful` title).
+- `tests/unit/lib/api/auth.test.ts` — unit tests for `requireAuth`/`requireRole`
+  directly, mocking `@clerk/nextjs/server`'s `auth`:
+  - 401 UNAUTHENTICATED when Clerk `userId` is null (lookup never called).
+  - 401 UNAUTHENTICATED when Clerk `userId` is set but injected lookup returns null.
+  - Returns the injected lookup's `AuthContext` when Clerk `userId` is set.
+  - `requireRole` no-op when role is in the allow-list.
+  - `requireRole` throws `ApiException` (`FORBIDDEN`, 403) when role is not allowed.
 
-## Exact diffs for the four reformatted source files
+- `tests/unit/app/api/admin-only-route.test.ts` — table-driven test importing `GET`
+  from the fixture route, covering all four `UserRole` values (`admin` → 200,
+  `set_leader`/`member`/`guest` → 403 `FORBIDDEN`), plus the `auth()` returning
+  `{ userId: null }` case → 401 `UNAUTHENTICATED` (lookup never consulted). This
+  satisfies the "unit tests cover all four roles against an admin-only route"
+  acceptance criterion.
 
-```diff
---- a/app/(auth)/layout.tsx
-+++ b/app/(auth)/layout.tsx
-@@ -1,3 +1,7 @@
- export default function AuthLayout({ children }: { children: React.ReactNode }) {
--  return <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>{children}</div>;
-+  return (
-+    <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>
-+      {children}
-+    </div>
-+  );
- }
+## Deviation from spec (typecheck-driven, non-functional)
 
---- a/app/globals.css
-+++ b/app/globals.css
-@@ -15,12 +15,7 @@ body {
-   margin: 0;
-   background: var(--color-bg);
-   color: var(--color-fg);
--  font-family:
--    -apple-system,
--    BlinkMacSystemFont,
--    "Segoe UI",
--    Roboto,
--    sans-serif;
-+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
- }
+The spec's test snippet used `const mockAuth = auth as jest.Mock;`. `tsc --noEmit`
+rejected this direct cast (Clerk's `auth` export type doesn't sufficiently overlap
+with `jest.Mock`). Used `auth as unknown as jest.Mock` instead in both test files —
+purely a cast-syntax fix to satisfy `npm run typecheck`; no behavioral change and no
+scope added.
 
---- a/components/ui/Button.tsx
-+++ b/components/ui/Button.tsx
-@@ -6,7 +6,5 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
- };
+## Verification performed
 
- export function Button({ variant = "primary", className, ...props }: ButtonProps) {
--  return (
--    <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />
--  );
-+  return <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />;
- }
+- `bun run typecheck` — passes.
+- `bun run test` — all 3 suites / 13 tests pass, including the two new files and the
+  pre-existing `tests/unit/lib/api/response.test.ts`.
+- `bun run lint` — clean.
 
---- a/lib/api/webhook-verify.ts
-+++ b/lib/api/webhook-verify.ts
-@@ -10,10 +10,7 @@ export async function verifyClerkWebhook(_rawBody: string, _headers: Headers): P
- }
+## Out of scope / untouched (per spec)
 
- // TODO(Sprint 4 #58): verify using PINGRAM_WEBHOOK_SECRET.
--export async function verifyPingramWebhook(
--  _rawBody: string,
--  _headers: Headers,
--): Promise<boolean> {
-+export async function verifyPingramWebhook(_rawBody: string, _headers: Headers): Promise<boolean> {
-   throw new Error("verifyPingramWebhook not implemented — see Sprint 4 #58");
- }
-```
-
-## Verification performed (all passed)
-
-1. `bun run format:check` — "All matched files use Prettier code style!"
-2. `bun run lint` — passes, no output/errors.
-3. `bun run typecheck` — passes, no output/errors.
-4. `bun run dev` — started cleanly; `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/` returned `200`. Dev server stopped afterward.
+- `middleware.ts`, `lib/supabase/*`, `lib/clerk/server.ts` — not modified.
+- No existing route handlers converted to use `requireAuth`/`requireRole`.
+- No `users` table / migration work (#16) — `lookupUserByClerkId` remains an
+  intentional stub pending that issue.
 
 ## What the Tester should focus on
 
-- Confirm `bun run format:check` fails if any of the 4 reformatted files (or
-  README.md) is reverted to its old formatting — i.e. the check is real, not
-  a no-op.
-- Confirm `.prettierignore` actually excludes `.pipeline/`, `documentation/`,
-  and `song2score/` from `prettier --check .` (these directories contain
-  markdown/config that would otherwise false-fail).
-- Confirm no logic changed in the 4 reformatted files — behavior of
-  `AuthLayout`, `Button`, and the four `verify*Webhook` functions should be
-  byte-identical modulo whitespace (diffs above are the full deltas).
-- Confirm `eslint.config.mjs`, `tsconfig.json`, `next.config.ts`,
-  `.prettierrc`, and `.github/workflows/ci.yml` were NOT touched (out of
-  scope per spec section 4).
-- `package.json` scripts: verify `format` and `format:check` were inserted
-  without disturbing existing scripts (`dev`, `build`, `start`, `lint`,
-  `typecheck`, `test`, `test:e2e` all still present, same commands).
-
-## Out of scope (confirmed not touched)
-
-- No dependency changes (prettier@^3.4.0 was already present).
-- No changes to `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`,
-  `.prettierrc`, `.github/workflows/ci.yml`.
-- No route/auth/UI logic changes beyond formatting.
+- Confirm the 401-vs-403 distinction: authenticated-but-no-`users`-row is 401
+  (`UNAUTHENTICATED`), only a resolved user with a disallowed role is 403
+  (`FORBIDDEN`).
+- Confirm `requireAuth` never invokes `lookup` when Clerk `auth()` returns no
+  `userId` (ordering: JWT check strictly before DB lookup).
+- Confirm the `app/api/_examples/admin-only/route.ts` fixture's `catch` maps any
+  non-`ApiException` to a 500 `INTERNAL` response rather than leaking a raw error.
+- The `auth as unknown as jest.Mock` cast deviation above — confirm it's acceptable
+  as a typecheck fix rather than a spec violation.

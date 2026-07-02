@@ -1,49 +1,54 @@
-# Review: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Review — Issue #15: JWT verification + role-check middleware
 
 VERDICT: SHIP
 
-## What was verified (independently, not trusted from prior summaries)
+## Scope & branch
+Branch `issue-15-jwt-verification-role-check-middleware`, commit 660fff0.
+Diff reviewed firsthand via `git diff main...HEAD` — not trusted from summaries.
 
-Ran `git diff e4acd21..HEAD` firsthand. The change set is exactly the seven files
-the spec calls for and nothing else:
+## What was verified independently
+- `bun run test` — 3 suites / 13 tests pass (re-run, not trusted).
+- `bun run typecheck` — clean.
+- Cross-checked `lib/api/errors.ts`, `types/domain.ts`, `lib/api/response.ts`
+  against the implementation and test assertions.
 
-- `.prettierignore` (new) — matches spec 3.1 byte-for-byte.
-- `package.json` — only a clean 2-line insertion of `format` / `format:check`
-  after `typecheck`. Grepped for dependency lines: none changed. All existing
-  scripts (dev/build/start/lint/typecheck/test/test:e2e) intact.
-- `app/(auth)/layout.tsx`, `app/globals.css`, `components/ui/Button.tsx`,
-  `lib/api/webhook-verify.ts` — pure formatting. Confirmed each diff is only
-  JSX-wrapping parens / line-wrapping / whitespace. No identifier, string,
-  error message, TODO, or return type changed. Semantically inert.
-- `README.md` — added Getting Started, Scripts, and Project Structure sections.
-  Verified all 7 documented directories (app, components, lib, schemas, types,
-  supabase, tests) actually exist on disk. No invented subfolders.
+## Correctness assessment (genuinely critical pass)
+- **Auth-before-lookup ordering** is real, not just claimed: `requireAuth` calls
+  `auth()` and throws 401 before touching `lookup`. The test asserts
+  `lookup` is never called on the null-userId path — meaningful, not superficial.
+- **401 vs 403 distinction** is implemented as specified: no `users` row → 401
+  UNAUTHENTICATED (not 403). Rationale documented; matches spec.
+- **`requireRole`** uses `roles.includes(ctx.role)`; multi-role allow-list is
+  actually exercised (`["admin","set_leader"]`), not just single-role.
+- **Response envelope match**: `fail()` returns `{ error, code }` and `ok()`
+  returns `{ data }`. Route test asserts `body.code === "FORBIDDEN"` and
+  `body === { data: { ok: true } }` — both consistent with the real envelope.
+  This is a place a superficial test could have been wrong; it is correct.
+- **All four UserRole values** (`admin`/`set_leader`/`member`/`guest`) are
+  table-driven and exhaustive against `types/domain.ts`. Confirmed the union
+  has exactly these four members, so the table is complete.
+- **Error-mapping in fixture**: `catch` maps `ApiException` → `fail(...)` and any
+  other throw → 500 INTERNAL. No raw stack can escape.
+- **`ErrorCode.UNAUTHENTICATED`/`FORBIDDEN`/`INTERNAL`** all exist in errors.ts.
 
-## Checks re-run by the reviewer
+## Deviations
+- `auth as unknown as jest.Mock` instead of the spec's `auth as jest.Mock`.
+  Confirmed this is a required typecheck fix (Clerk's `auth` type does not
+  overlap `jest.Mock`), purely cast syntax, no behavioral change. Acceptable.
 
-- `bun run format:check` — PASS ("All matched files use Prettier code style!")
-- `bun run lint` — PASS (no errors)
-- `bun run typecheck` — PASS (no errors)
-- `.prettierignore` is a real filter, not a no-op: temporarily removed it and
-  `prettier --check .` reported 7 violations, all in ignored dirs
-  (.claude, .pipeline, documentation). Restored; check passes again.
+## Scope discipline
+- Only `lib/api/auth.ts` (modified), `app/api/_examples/admin-only/route.ts`
+  (new), and the two new test files touched (plus `.pipeline/spec.md`).
+- `middleware.ts`, `lib/supabase/*`, `lib/clerk/server.ts`, existing routes —
+  untouched, matching Definition of Done.
+- `lookupUserByClerkId` remains the single deferred stub for #16, with the
+  TODO(#16) SQL comment present. Correct.
 
-## Out-of-scope confirmation
+## Residual notes (non-blocking, for follow-up issues — NOT fixes for #15)
+- The real `lookupUserByClerkId` throw path is not unit-tested. Spec explicitly
+  does not require it (needs real Clerk/DB context). Fine for #15; #16 must add
+  the real impl + its test.
+- Middleware enforcement wiring is intentionally out of scope; nothing enforces
+  `requireAuth` on real routes yet. Tracked elsewhere per spec — acceptable.
 
-`git diff` on eslint.config.mjs, tsconfig.json, next.config.ts, .prettierrc,
-and .github/workflows/ci.yml produced zero output — none touched. No dependency
-bumps. No route/auth/UI logic changes. No scope creep into other issues.
-
-## Critical assessment
-
-The prior chain (planner/coder/tester) was accurate; spot-checks reproduced
-every material claim. The one substantive judgment worth flagging — that the
-4 reformatted files are behavior-preserving — I re-derived from the raw diff
-rather than taking it on faith, and it holds: wrapping JSX in grouping parens
-and spreading a function signature across lines are non-semantic. The tester
-correctly wrote no new tests (there is no new behavior to test) and instead
-re-ran the existing Jest suite and re-verified the tooling claims — the right
-call for a formatting/docs change.
-
-All four acceptance criteria for issue #11 are now met on a clean checkout.
-No security, performance, or correctness concerns. Ship it.
+Green tests here reflect correct behavior, not just passing assertions. Ship it.
