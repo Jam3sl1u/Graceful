@@ -1,130 +1,91 @@
-# Changes: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Changes — Issue #20: Migrate schema — Cluster 5 partial
 
-## Summary
+## File created
 
-Closed the remaining gap on an otherwise-complete Next.js + TypeScript setup:
-Prettier now actually passes on a clean checkout, and the README documents the
-top-level folder structure. No dependencies, config strictness, routes, or
-auth were touched.
+- `supabase/migrations/0005_cluster5_partial.sql`
 
-## Files changed
+## What it does
 
-- **`.prettierignore`** (new) — scopes Prettier to real developer source.
-  Mirrors `eslint.config.mjs`'s ignore list (`song2score/`, `.pipeline/`,
-  `documentation/`, `.next/`) plus `node_modules`, `out`, `coverage`,
-  `.claude`, and generated/lockfiles (`bun.lock`, `package-lock.json`,
-  `next-env.d.ts`). This was the root cause of the failing Prettier
-  acceptance criterion — without it, `prettier --check .` was scanning docs
-  and pipeline markdown that were never meant to be formatted.
+Single reversible SQL migration with `-- migrate:up` / `-- migrate:down` sections
+(no paired `_down.sql`, matching the spec's chosen convention since no prior
+migrations exist in the repo).
 
-- **`package.json`** — added two bun scripts, inserted right after
-  `typecheck` (no reordering/removal of existing scripts, no dependency
-  changes):
-  - `"format": "prettier --write ."`
-  - `"format:check": "prettier --check ."`
+**Up section**, in order:
+1. Two enums, each guarded with `DO $$ ... EXCEPTION WHEN duplicate_object $$`:
+   - `chat_pref` — `('all', 'mentions')`
+   - `notification_type` — the 11-value catalog from PRD §14 (`set_invitation`,
+     `invitation_reminder`, `invitation_accepted`, `invitation_denied`,
+     `practice_reminder`, `setlist_released`, `scheduling_conflict`,
+     `chat_mention`, `devotion_shared`, `new_church_document`,
+     `google_calendar_event`). This enum is not in PRD §20.2's list but is
+     referenced by `notifications.type` in §20.7 — the spec resolves this gap
+     by having the migration define it here.
+2. `availability` table (uuid PK, FK to `users`/`church_groups` ON DELETE
+   CASCADE, `date`, `is_available` default true, nullable `note`,
+   `created_at`), with `UNIQUE (user_id, date)` and an index on
+   `(church_group_id, date)`.
+3. `notification_preferences` table (uuid PK, `user_id` UNIQUE FK, the 8
+   boolean/int preference columns with PRD-specified defaults — notably
+   `reminder_email` defaults `false` while the other booleans default `true`
+   — `chat_preference chat_pref` default `'mentions'`, `gcal_sync_enabled`
+   default `false`). No BR-14 CHECK constraint (intentionally left to the API
+   layer per spec).
+4. `notifications` table (uuid PK, FKs to `church_groups`/`users`, `type
+   notification_type`, `title varchar(200)`, nullable `body`, nullable
+   polymorphic `link_entity_type`/`link_entity_id` pair with no FK on the
+   latter, `is_read` default false, `created_at`), with indexes on
+   `(user_id, is_read)` and `(user_id, created_at DESC)`.
 
-- **`app/(auth)/layout.tsx`**, **`components/ui/Button.tsx`**,
-  **`lib/api/webhook-verify.ts`**, **`app/globals.css`** — reformatted via
-  `bunx prettier --write .` to fix real `printWidth: 100` violations (long
-  single-line JSX/function signatures got wrapped; the CSS `font-family`
-  list got collapsed to fit under 100 chars). All four diffs are pure
-  whitespace/line-wrapping — verified via `git diff` that no logic, strings,
-  or identifiers changed. See diffs below for exact deltas.
+**Down section** drops in reverse dependency order: `notifications` →
+`notification_preferences` → `availability` → `notification_type` →
+`chat_pref`. Does not touch `users` or `church_groups` (owned by issue #16).
 
-- **`README.md`** — expanded from a 2-line title/tagline into: Getting
-  Started (bun install / bun run dev), a Scripts list (dev/build/lint/
-  typecheck/format/format:check), and a new "Project Structure" section
-  listing `app/`, `components/`, `lib/`, `schemas/`, `types/`, `supabase/`,
-  `tests/` with one line each. Kept intentionally minimal per the issue's
-  "don't over-engineer" instruction — no deep architecture doc. This file
-  was itself reformatted by Prettier after being written (blank line added
-  after the `# Graceful` title).
+## Out of scope (confirmed not done)
 
-## Exact diffs for the four reformatted source files
+- No `chat_rooms` / `chat_messages` / `chat_mentions` (Phase 2).
+- No RLS / `ENABLE ROW LEVEL SECURITY` (issue #13).
+- No `vocal_capability` enum (Cluster 1 / #16).
+- No BR-14 CHECK constraint.
+- No seed data, no API routes, no TS types/Zod schemas, no config.toml changes.
 
-```diff
---- a/app/(auth)/layout.tsx
-+++ b/app/(auth)/layout.tsx
-@@ -1,3 +1,7 @@
- export default function AuthLayout({ children }: { children: React.ReactNode }) {
--  return <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>{children}</div>;
-+  return (
-+    <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>
-+      {children}
-+    </div>
-+  );
- }
+## Verification performed
 
---- a/app/globals.css
-+++ b/app/globals.css
-@@ -15,12 +15,7 @@ body {
-   margin: 0;
-   background: var(--color-bg);
-   color: var(--color-fg);
--  font-family:
--    -apple-system,
--    BlinkMacSystemFont,
--    "Segoe UI",
--    Roboto,
--    sans-serif;
-+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
- }
+No SQL lint/test tooling exists in this repo's `package.json` scripts
+(`lint`/`typecheck`/`test` are all JS/TS-oriented and don't touch `.sql`
+files), so verification was done directly against Postgres:
 
---- a/components/ui/Button.tsx
-+++ b/components/ui/Button.tsx
-@@ -6,7 +6,5 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
- };
+- Spun up a throwaway `postgres:15-alpine` Docker container, created stub
+  `church_groups`/`users` tables (standing in for issue #16's not-yet-present
+  migration), then applied this migration's `migrate:up` block — it applied
+  cleanly.
+- Confirmed via `\d` that every column, type, default, nullability, unique
+  constraint, index, and FK on `availability`, `notification_preferences`,
+  and `notifications` matches the spec's tables exactly (§3.3–3.5), and that
+  `chat_pref` / `notification_type` enum values match exactly (§3.2).
+- Applied `migrate:down` and confirmed all 3 tables and both enums were
+  removed, leaving only the stub `users`/`church_groups` tables intact.
+- Re-ran `migrate:down` a second time and confirmed `DROP ... IF EXISTS`
+  guards make it a no-op (NOTICE: does not exist, skipping) rather than an
+  error.
+- Re-ran `migrate:up` again and separately re-ran the `chat_pref` enum
+  `CREATE TYPE` guard block to confirm the `duplicate_object` exception
+  handler prevents an error on re-creation.
+- Removed the Docker container after verification (no artifacts left behind
+  in the repo).
 
- export function Button({ variant = "primary", className, ...props }: ButtonProps) {
--  return (
--    <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />
--  );
-+  return <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />;
- }
+## Focus for Tester
 
---- a/lib/api/webhook-verify.ts
-+++ b/lib/api/webhook-verify.ts
-@@ -10,10 +10,7 @@ export async function verifyClerkWebhook(_rawBody: string, _headers: Headers): P
- }
+- Confirm the migration is a no-op / correctly errors (missing relation) when
+  applied to a DB that does not yet have `church_groups`/`users` — this is
+  expected behavior per the spec, not a bug.
+- Confirm the migration applies cleanly and matches schema exactly once
+  issue #16's Cluster 1 migration is present ahead of it.
+- Confirm no RLS, no Phase-2 chat tables, and no `vocal_capability` enum were
+  introduced.
 
- // TODO(Sprint 4 #58): verify using PINGRAM_WEBHOOK_SECRET.
--export async function verifyPingramWebhook(
--  _rawBody: string,
--  _headers: Headers,
--): Promise<boolean> {
-+export async function verifyPingramWebhook(_rawBody: string, _headers: Headers): Promise<boolean> {
-   throw new Error("verifyPingramWebhook not implemented — see Sprint 4 #58");
- }
-```
+## Git
 
-## Verification performed (all passed)
-
-1. `bun run format:check` — "All matched files use Prettier code style!"
-2. `bun run lint` — passes, no output/errors.
-3. `bun run typecheck` — passes, no output/errors.
-4. `bun run dev` — started cleanly; `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/` returned `200`. Dev server stopped afterward.
-
-## What the Tester should focus on
-
-- Confirm `bun run format:check` fails if any of the 4 reformatted files (or
-  README.md) is reverted to its old formatting — i.e. the check is real, not
-  a no-op.
-- Confirm `.prettierignore` actually excludes `.pipeline/`, `documentation/`,
-  and `song2score/` from `prettier --check .` (these directories contain
-  markdown/config that would otherwise false-fail).
-- Confirm no logic changed in the 4 reformatted files — behavior of
-  `AuthLayout`, `Button`, and the four `verify*Webhook` functions should be
-  byte-identical modulo whitespace (diffs above are the full deltas).
-- Confirm `eslint.config.mjs`, `tsconfig.json`, `next.config.ts`,
-  `.prettierrc`, and `.github/workflows/ci.yml` were NOT touched (out of
-  scope per spec section 4).
-- `package.json` scripts: verify `format` and `format:check` were inserted
-  without disturbing existing scripts (`dev`, `build`, `start`, `lint`,
-  `typecheck`, `test`, `test:e2e` all still present, same commands).
-
-## Out of scope (confirmed not touched)
-
-- No dependency changes (prettier@^3.4.0 was already present).
-- No changes to `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`,
-  `.prettierrc`, `.github/workflows/ci.yml`.
-- No route/auth/UI logic changes beyond formatting.
+Committed on the current branch
+(`issue-20-sprint-0-migrate-schema-cluster-5-partial-availability-notification-prefs-notifications`)
+as commit `b42ad83`: "Add Cluster 5 partial migration (availability,
+notification_preferences, notifications)". Not pushed.

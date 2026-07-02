@@ -1,49 +1,74 @@
-# Review: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Review: Issue #20 — [Sprint 0] Migrate schema — Cluster 5 partial
 
 VERDICT: SHIP
 
 ## What was verified (independently, not trusted from prior summaries)
 
-Ran `git diff e4acd21..HEAD` firsthand. The change set is exactly the seven files
-the spec calls for and nothing else:
+Ran `git diff main...HEAD` firsthand. The change set is exactly one new file,
+`supabase/migrations/0005_cluster5_partial.sql` (94 lines), and nothing else in
+the code tree. The only other modified files are the expected `.pipeline/*`
+pipeline artifacts. Confirmed the on-disk file matches HEAD (`git diff HEAD` on
+the migration is empty) and that the file is present in this worktree checkout.
 
-- `.prettierignore` (new) — matches spec 3.1 byte-for-byte.
-- `package.json` — only a clean 2-line insertion of `format` / `format:check`
-  after `typecheck`. Grepped for dependency lines: none changed. All existing
-  scripts (dev/build/start/lint/typecheck/test/test:e2e) intact.
-- `app/(auth)/layout.tsx`, `app/globals.css`, `components/ui/Button.tsx`,
-  `lib/api/webhook-verify.ts` — pure formatting. Confirmed each diff is only
-  JSX-wrapping parens / line-wrapping / whitespace. No identifier, string,
-  error message, TODO, or return type changed. Semantically inert.
-- `README.md` — added Getting Started, Scripts, and Project Structure sections.
-  Verified all 7 documented directories (app, components, lib, schemas, types,
-  supabase, tests) actually exist on disk. No invented subfolders.
+## Column-by-column check against the PRD source of truth
 
-## Checks re-run by the reviewer
+Verified against `documentation/prd/graceful_requirements_v10.md` directly, not
+just against spec.md:
 
-- `bun run format:check` — PASS ("All matched files use Prettier code style!")
-- `bun run lint` — PASS (no errors)
-- `bun run typecheck` — PASS (no errors)
-- `.prettierignore` is a real filter, not a no-op: temporarily removed it and
-  `prettier --check .` reported 7 violations, all in ignored dirs
-  (.claude, .pipeline, documentation). Restored; check passes again.
+- **availability** (PRD §20.5, line 792): id/user_id/church_group_id/date/
+  is_available(default true)/note(nullable)/created_at — all match. Migration
+  adds the required UNIQUE(user_id, date) ("one per user per calendar date") and
+  index on (church_group_id, date). Correct.
+- **notification_preferences** (PRD §20.7, lines 998-1009): every column,
+  default, and nullability matches exactly — including the easy-to-flip
+  `reminder_email` default `false` (all other booleans `true`),
+  `reminder_hours_before` default 24, `chat_preference chat_pref` default
+  `'mentions'`, `gcal_sync_enabled` default false, and UNIQUE on user_id.
+- **notifications** (PRD §20.7, lines 1011-1023): all columns match, including
+  `title varchar(200)`, nullable `body`, the polymorphic
+  `link_entity_type varchar(50)` / `link_entity_id uuid` pair with NO FK on
+  link_entity_id (intentional, correct). Both required indexes present:
+  (user_id, is_read) and (user_id, created_at DESC).
+- **chat_pref** enum: values ('all','mentions') match PRD §20.2 (line 727).
+
+## Enum resolution — reviewed and accepted
+
+`notification_type` is genuinely absent from PRD §20.2's 9-enum list (confirmed
+firsthand). The spec resolved this documented gap by defining an 11-value enum
+here. The literal values do not appear verbatim in the PRD, so they are a
+reasonable synthesis of the app's notification-generating events — but the blast
+radius is isolated: if a human disagrees, only the enum definition changes, not
+the table structure. Acceptable for Sprint 0 and correctly flagged in the spec's
+OPEN QUESTIONS.
+
+## Reversibility & guards
+
+- `-- migrate:up` / `-- migrate:down` single-file split matches the chosen
+  convention (no prior migrations exist to conflict with).
+- Down block drops in correct reverse-dependency order: notifications →
+  notification_preferences → availability → notification_type → chat_pref, with
+  IF EXISTS guards. Does not touch users/church_groups (owned by #16). Correct.
+- Both CREATE TYPE statements are wrapped in
+  `DO $$ ... EXCEPTION WHEN duplicate_object $$` guards; tables are deliberately
+  NOT guarded with IF NOT EXISTS, so a missing Cluster 1 (#16) hard-fails rather
+  than silently masking — matches spec §5 intent.
 
 ## Out-of-scope confirmation
 
-`git diff` on eslint.config.mjs, tsconfig.json, next.config.ts, .prettierrc,
-and .github/workflows/ci.yml produced zero output — none touched. No dependency
-bumps. No route/auth/UI logic changes. No scope creep into other issues.
+No chat_rooms/chat_messages/chat_mentions (Phase 2), no RLS / ENABLE ROW LEVEL
+SECURITY (issue #13), no vocal_capability enum (Cluster 1 / #16), no BR-14 CHECK
+constraint (API layer), no seed data, no config.toml changes. The out-of-scope
+names appear only in the header comment noting they are excluded.
 
 ## Critical assessment
 
-The prior chain (planner/coder/tester) was accurate; spot-checks reproduced
-every material claim. The one substantive judgment worth flagging — that the
-4 reformatted files are behavior-preserving — I re-derived from the raw diff
-rather than taking it on faith, and it holds: wrapping JSX in grouping parens
-and spreading a function signature across lines are non-semantic. The tester
-correctly wrote no new tests (there is no new behavior to test) and instead
-re-ran the existing Jest suite and re-verified the tooling claims — the right
-call for a formatting/docs change.
+The tester's verification was appropriately SQL-level (there is no JS/TS behavior
+to unit-test) and included the right checks: a real Postgres round-trip up/down,
+idempotency of the down block, the enum duplicate_object guard, and the
+intentional missing-relation failure case. I re-derived the substantive claims
+against the PRD rather than trusting the summaries; every material assertion
+holds. No security, performance, or correctness concerns.
 
-All four acceptance criteria for issue #11 are now met on a clean checkout.
-No security, performance, or correctness concerns. Ship it.
+Note for the caller: this migration cannot apply until issue #16 (Cluster 1)
+creates users/church_groups — that is expected ordering, not a defect in this
+migration. Ship it.

@@ -1,194 +1,263 @@
-# Spec: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Spec: Issue #20 — [Sprint 0] Migrate schema — Cluster 5 partial (availability, notification_preferences, notifications)
 
 ## OPEN QUESTIONS
 
-None. The gap is concrete and unambiguous — proceed as specified below.
+None that block implementation. One PRD gap is resolved below with a concrete,
+PRD-derived decision the Coder should follow as-is:
+
+- **`notification_type` enum is referenced but never defined in the PRD.**
+  `notifications.type` is typed `notification_type` (PRD §20.7), but that enum is
+  NOT in the 9-enum list (§20.2) — it is a 10th, undefined enum. Rather than block
+  the pipeline, this migration **creates a `notification_type` enum** with values
+  derived directly from the notification catalog in PRD §14. See section 3.2 for the
+  exact value list. If a human later disagrees with the value set, only the enum
+  definition changes — the table structure is unaffected.
+
+Everything else is fully specified by PRD §20.2 and §20.7.
 
 ---
 
 ## 1. Summary
 
-Issue #11 is **~90% already satisfied** by pre-existing code committed to
-`main`. A full Next.js App Router + TypeScript codebase already exists. Three of
-the four acceptance criteria are already met. The Coder's job is small and
-**purely additive** — do NOT re-scaffold, do NOT touch dependencies, do NOT
-touch the `app/` route structure, config strictness, or auth.
+Create **one new, reversible migration** adding the Phase-1 subset of Cluster 5:
+the `availability`, `notification_preferences`, and `notifications` tables, plus the
+enums those tables require. The `supabase/migrations/` directory is currently empty
+(only `.gitkeep`) — there are **no prior migrations to copy from and no existing
+enums/tables in the repo**. This migration is written to be self-contained and idempotent-safe on its own enum creation, but it **assumes the referenced tables
+`church_groups` and `users` already exist** (created by the blocking issue #16 /
+Cluster 1 migration).
 
-Acceptance criteria status (verified against current checkout):
-
-| AC | Status |
-|----|--------|
-| Next.js (App Router) + TypeScript initialized | DONE — no action |
-| ESLint + Prettier configured AND passing on clean checkout | **PARTIAL — Prettier gap, this is the work** |
-| Base folder structure documented | **MISSING — this is the work** |
-| `bun run dev` works with no errors | DONE — no action |
-
-Scope of this issue = **(a) make Prettier actually pass on a clean checkout**
-and **(b) document the folder structure in the README.** Nothing else.
+Scope is strictly the three tables above and only the enums they need. Do NOT create
+`chat_rooms`, `chat_messages`, or `chat_mentions` (Phase 2, explicitly out of scope).
 
 ---
 
-## 2. Verified current state (do not redo this work)
+## 2. Verified current repo state (do not redo this investigation)
 
-- `package.json`: `next@^15.3.0`, `react@^19`, `react-dom@^19`,
-  `typescript@^5.7.0`, `prettier@^3.4.0`, `eslint@^9`, `eslint-config-next`.
-  Scripts present: `dev`, `build`, `start`, `lint` (`eslint .`),
-  `typecheck` (`tsc --noEmit`), `test`, `test:e2e`.
-  **No `format` or `format:check` script exists.**
-- App Router only. Route groups `app/(app)/`, `app/(auth)/`,
-  `app/(marketing)/`, `app/(public)/`, plus `app/api/*` handlers and root
-  `app/layout.tsx` + `app/globals.css`. No `pages/` directory anywhere.
-- `tsconfig.json`: strict, `noUncheckedIndexedAccess`, `@/*` path alias, Next
-  plugin. Excludes `node_modules`, `song2score`, `.pipeline`, `documentation`.
-- `next.config.ts`: minimal (`reactStrictMode`, `outputFileTracingRoot`,
-  scoped `eslint.dirs`). Do not change.
-- `eslint.config.mjs`: flat config extending `next/core-web-vitals` +
-  `next/typescript`; `ignores: ["song2score/**", ".pipeline/**",
-  "documentation/**", ".next/**", "next-env.d.ts"]`; one relaxed rule
-  (`no-unused-vars` warn with `^_` ignore). Leave as-is.
-- `.prettierrc` exists:
-  `{ "semi": true, "singleQuote": false, "trailingComma": "all", "printWidth": 100 }`.
-  Leave the config values as-is.
-- `.prettierignore`: **does not exist** — root cause of the failing Prettier AC.
-- `README.md`: only 2 lines (title + tagline). No folder-structure docs.
-- Top-level source dirs present: `app/`, `components/`, `lib/`, `schemas/`,
-  `types/`, `supabase/`, `tests/`.
-- `.github/workflows/ci.yml` exists (uses bun). **Out of scope** — do NOT edit
-  it (CI is issue #12).
+- `supabase/migrations/` contains only `.gitkeep` — **no migrations exist yet**.
+- `supabase/seed.sql` is a placeholder comment only.
+- `supabase/config.toml` is a minimal placeholder (`project_id = "graceful"`).
+- No SQL enum or table definitions exist anywhere in the repo.
+- Cluster 1 (`church_groups`, `users`, `member_profiles`) is issue #16 and is the
+  declared blocker. Its migration is NOT present in this checkout. FKs in this
+  migration reference `church_groups(id)` and `users(id)` and will fail to apply if
+  #16 has not run first — that ordering is expected and acceptable (the up/down
+  migration itself must still be internally correct and reversible).
+
+Conventions to adopt (there is no in-repo precedent, so establish these cleanly):
+- Supabase-style timestamped filename, plain SQL, UUID v4 PKs, `timestamptz` for all
+  timestamps, `church_group_id` FK for RLS-scopability (matches PRD §20 preamble).
+- RLS policies are **out of scope** for this issue — they are issue #13. Do NOT add
+  `ENABLE ROW LEVEL SECURITY` or policies here.
 
 ---
 
-## 3. Files to create / modify
+## 3. Files to create
 
-### 3.1 CREATE `/Users/jamesliu/Documents/Graceful/.prettierignore`
+### 3.1 CREATE the migration file
 
-Purpose: scope `prettier --check .` to source only, so docs/config/generated
-files stop false-failing the check. Mirror the dirs already ignored by ESLint
-and TS, plus build/vendor output. Exact contents:
+Path (use exactly this name):
+`/Users/jamesliu/Documents/Graceful/supabase/migrations/0005_cluster5_partial.sql`
 
-```
-# Dependencies & build output
-node_modules
-.next
-out
-coverage
+Rationale for `0005`: Cluster 5 is sprint-backlog item after Clusters 1–4. A
+zero-padded ordinal prefix keeps lexical = apply order. If the team's tooling
+requires the `<timestamp>_name.sql` Supabase convention instead, the Coder may use a
+UTC timestamp prefix (e.g. `20260702000000_cluster5_partial.sql`) — pick ONE and be
+consistent; the ordinal form above is preferred for readability. The `.gitkeep` file
+may remain.
 
-# Nested project with its own toolchain
-song2score
+The file must contain, in order: an **Up** section (enums → tables → indexes) and a
+**Down** section that fully reverses it. Because Supabase applies raw SQL forward
+only, put the reverse SQL in a clearly delimited `-- ==== DOWN ====` comment block AND
+also ensure the forward SQL is written so it can be cleanly reversed. Concretely:
 
-# Pipeline & docs (not developer source; not Prettier's concern)
-.pipeline
-documentation
-.claude
+- Provide the reverse statements as an executable trailing block guarded by comment
+  markers `-- migrate:down` … end-of-file, and the forward block under
+  `-- migrate:up`. (This dbmate/`supabase`-compatible convention makes the migration
+  reversible per the acceptance criterion.)
 
-# Lockfiles / generated
-bun.lock
-package-lock.json
-next-env.d.ts
-```
+If the Coder confirms the repo uses the Supabase CLI's own up-only convention with a
+paired `..._down.sql` is NOT in use (it is not — nothing exists), the single-file
+`-- migrate:up` / `-- migrate:down` split is the required format.
 
-Notes for the Coder:
-- `README.md` is intentionally NOT ignored — it is real developer-facing
-  source and must be Prettier-clean (see 3.3).
-- Keep `documentation/` and `.pipeline/` ignored (matches ESLint/TS config and
-  avoids reformatting PRD/planning markdown).
+### 3.2 Enums to create (Up)
 
-### 3.2 MODIFY `/Users/jamesliu/Documents/Graceful/package.json`
+Create only the enums the three in-scope tables use. Guard each with existence checks
+so re-running against a DB where Cluster 1 already created an overlapping enum does
+not error. Use this pattern for every enum:
 
-Add two scripts to the `"scripts"` block (do not remove or reorder existing
-ones). Insert after the existing `"typecheck"` entry:
-
-```json
-"format": "prettier --write .",
-"format:check": "prettier --check .",
+```sql
+DO $$ BEGIN
+  CREATE TYPE chat_pref AS ENUM ('all', 'mentions');
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
 ```
 
-Do NOT add or bump any dependency — `prettier@^3.4.0` is already a devDep.
+Enums required by THIS migration:
 
-### 3.3 REFORMAT source files that violate the Prettier config
+1. **`chat_pref`** — values `('all', 'mentions')`. (PRD §20.2.) Used by
+   `notification_preferences.chat_preference`, default `'mentions'`.
+   Created here per the issue's implementation note even though chat ships Phase 2.
 
-After 3.1 is in place, run `bunx prettier --write .` (or `bun run format`).
-This will reformat any tracked source file that violates `printWidth: 100` /
-the other rules. Known offenders from prior inspection (long lines Prettier
-wraps) — but rely on `prettier --write` to find the authoritative set, do not
-hand-edit:
-- `app/(auth)/layout.tsx`
-- `components/ui/Button.tsx`
-- `lib/api/webhook-verify.ts`
-- `app/globals.css`
-- `README.md` (will be reformatted; see 3.4 for the content you add first)
+2. **`notification_type`** — RESOLVED per OPEN QUESTIONS. Create with exactly these
+   values, derived from PRD §14's notification catalog:
+   ```
+   ('set_invitation',
+    'invitation_reminder',
+    'invitation_accepted',
+    'invitation_denied',
+    'practice_reminder',
+    'setlist_released',
+    'scheduling_conflict',
+    'chat_mention',
+    'devotion_shared',
+    'new_church_document',
+    'google_calendar_event')
+   ```
+   Use snake_case values matching the rows in §14 (in listed order).
 
-**Constraint:** every diff produced here MUST be pure formatting
-(whitespace / line wrapping / quotes / trailing commas). If `prettier --write`
-would change anything that looks like logic, stop — that indicates a config
-problem, not expected behavior. There is none expected here.
+Do NOT create `vocal_capability` here. The Phase-1 sprint backlog line for this item
+mentions it, but `vocal_capability` belongs to `member_profiles` (Cluster 1, PRD
+§20.3) and is **out of scope for the three tables in this issue's acceptance
+criteria**. None of `availability`, `notification_preferences`, or `notifications`
+uses it. Creating it here would duplicate Cluster 1's enum. Skip it.
 
-### 3.4 MODIFY `/Users/jamesliu/Documents/Graceful/README.md`
+### 3.3 Table: `availability`
 
-Add a concise "Project Structure" section documenting the top-level layout.
-Keep it minimal per the issue's explicit "avoid over-engineering" instruction —
-a short list with one line each, NOT a deep architecture doc. Preserve the
-existing title/tagline. Suggested content (adjust wording, keep it brief):
+Per PRD §20.5 (the canonical column definition; the issue lists a subset). Columns:
 
-```markdown
-# Graceful
-Planning Center capabilities with internal ML features
+| Column | Type | Constraints |
+| --- | --- | --- |
+| `id` | uuid | PK, default `gen_random_uuid()` |
+| `user_id` | uuid | NOT NULL, FK → `users(id)` ON DELETE CASCADE |
+| `church_group_id` | uuid | NOT NULL, FK → `church_groups(id)` ON DELETE CASCADE |
+| `date` | date | NOT NULL |
+| `is_available` | boolean | NOT NULL, default `true` |
+| `note` | text | NULL |
+| `created_at` | timestamptz | NOT NULL, default `now()` |
 
-## Getting Started
+Constraints / indexes:
+- **UNIQUE `(user_id, date)`** — PRD §20.5 states "One per user per calendar date".
+  This is required so upsert-by-date works (API `PUT /api/availability`, issue #34).
+- Index on `(church_group_id, date)` — supports the team availability grid query
+  (`GET /api/availability/team`, PRD §19).
 
-```bash
-bun install
-bun run dev
-```
+### 3.4 Table: `notification_preferences`
 
-Open http://localhost:3000 to view the app.
+Per PRD §20.7. One row per user. Columns:
 
-## Scripts
+| Column | Type | Constraints |
+| --- | --- | --- |
+| `id` | uuid | PK, default `gen_random_uuid()` |
+| `user_id` | uuid | NOT NULL, **UNIQUE**, FK → `users(id)` ON DELETE CASCADE |
+| `invitation_sms` | boolean | NOT NULL, default `true` |
+| `invitation_email` | boolean | NOT NULL, default `true` |
+| `invitation_inapp` | boolean | NOT NULL, default `true` |
+| `reminder_sms` | boolean | NOT NULL, default `true` |
+| `reminder_email` | boolean | NOT NULL, default `false` |
+| `reminder_hours_before` | integer | NOT NULL, default `24` |
+| `setlist_sms` | boolean | NOT NULL, default `true` |
+| `setlist_email` | boolean | NOT NULL, default `true` |
+| `chat_preference` | chat_pref | NOT NULL, default `'mentions'` |
+| `gcal_sync_enabled` | boolean | NOT NULL, default `false` |
 
-- `bun run dev` — start the Next.js dev server
-- `bun run build` — production build
-- `bun run lint` — ESLint
-- `bun run typecheck` — TypeScript check (no emit)
-- `bun run format` — format all files with Prettier
-- `bun run format:check` — verify formatting
+Notes:
+- `reminder_email` default is **`false`** (PRD §20.7: "Defaults true / false" for
+  `reminder_sms / reminder_email`). Do not flip these.
+- **Do NOT** encode BR-14 ("at least one invitation channel must stay active") as a DB
+  CHECK constraint. BR-14 is enforced at the API layer (PRD §19, `PUT
+  /api/notifications/preferences` "Rejects disabling all 3 invitation channels").
+  Adding it as a DB constraint is out of scope and not requested by this issue.
 
-## Project Structure
+### 3.5 Table: `notifications`
 
-- `app/` — Next.js App Router routes, layouts, and API route handlers (`app/api/*`)
-- `components/` — shared React UI components
-- `lib/` — server-side clients and integrations (Supabase, Clerk, etc.)
-- `schemas/` — Zod validation schemas
-- `types/` — shared TypeScript types
-- `supabase/` — Supabase project config and migrations
-- `tests/` — Jest and Playwright tests
-```
+Per PRD §20.7. The always-on in-app inbox. Columns:
 
-Only document dirs that actually exist (all listed above do). Do not invent
-subfolders or describe files that don't exist.
+| Column | Type | Constraints |
+| --- | --- | --- |
+| `id` | uuid | PK, default `gen_random_uuid()` |
+| `church_group_id` | uuid | NOT NULL, FK → `church_groups(id)` ON DELETE CASCADE |
+| `user_id` | uuid | NOT NULL, FK → `users(id)` ON DELETE CASCADE |
+| `type` | notification_type | NOT NULL |
+| `title` | varchar(200) | NOT NULL |
+| `body` | text | NULL |
+| `link_entity_type` | varchar(50) | NULL |
+| `link_entity_id` | uuid | NULL |
+| `is_read` | boolean | NOT NULL, default `false` |
+| `created_at` | timestamptz | NOT NULL, default `now()` |
+
+Indexes:
+- Index on `(user_id, is_read)` — powers the unread-count badge
+  (`GET /api/notifications/unread-count`) and the inbox list filtered by read state.
+- Index on `(user_id, created_at DESC)` — powers the paginated inbox feed
+  (`GET /api/notifications`, newest first).
+
+`link_entity_type` / `link_entity_id` are a loose (non-FK) polymorphic deep-link
+pair (e.g. `'invitation'` + that invitation's id). Do NOT add a foreign key on
+`link_entity_id` — it is intentionally polymorphic.
 
 ---
 
-## 4. Out of scope (do NOT do)
+## 4. Reversibility (acceptance criterion "Migration is reversible")
 
-- Do NOT edit `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`, or
-  `.prettierrc` config values.
-- Do NOT add/remove/bump dependencies.
-- Do NOT edit `.github/workflows/ci.yml` (CI wiring is issue #12).
-- Do NOT touch auth, or add any UI/pages beyond what exists.
-- Do NOT change route structure or any `app/api/*` logic.
+The `-- migrate:down` block must drop objects in reverse dependency order:
+
+1. `DROP TABLE IF EXISTS notifications;`
+2. `DROP TABLE IF EXISTS notification_preferences;`
+3. `DROP TABLE IF EXISTS availability;`
+4. `DROP TYPE IF EXISTS notification_type;`
+5. `DROP TYPE IF EXISTS chat_pref;`
+
+Indexes drop automatically with their tables — no separate DROP INDEX needed.
+Do NOT drop `users` or `church_groups` in the down migration (owned by #16).
+
+Edge case: because `chat_pref` and `notification_type` are created with
+`DO $$ … duplicate_object … $$` guards, the down migration's `DROP TYPE IF EXISTS`
+is safe even if another migration also references the type — but note that if a
+future Cluster 5 Phase-2 migration reuses `chat_pref`, dropping it here on rollback is
+correct for THIS migration's own scope. That is acceptable for Sprint 0.
 
 ---
 
-## 5. Verification (all must pass on a clean checkout after changes)
+## 5. Edge cases the implementation must handle
 
-Run from repo root:
+- **Apply order dependency:** FKs reference `users` and `church_groups`. If #16 has
+  not been applied, `CREATE TABLE` will fail with a missing-relation error. This is
+  expected; do not add `IF NOT EXISTS` fallbacks that would silently mask a missing
+  Cluster 1. The migration is correct; the environment ordering is the caller's job.
+- **Enum re-creation:** the `DO $$ … EXCEPTION WHEN duplicate_object $$` guard must
+  wrap every `CREATE TYPE` so applying alongside/after another migration that already
+  defined the same enum does not abort.
+- **`gen_random_uuid()`** requires the `pgcrypto` extension (built into Supabase/
+  Postgres 13+; available by default on Supabase). Do NOT add
+  `CREATE EXTENSION` here unless the Coder confirms it is missing — Supabase enables
+  it. If a truly clean local Postgres is targeted, prefer `gen_random_uuid()` over
+  `uuid_generate_v4()` (no extension needed on PG13+).
+- **One-row-per-user tables:** the UNIQUE constraint on
+  `notification_preferences.user_id` and on `availability (user_id, date)` are the
+  only uniqueness guarantees required. Do not add others.
+- **`note` and `body` are nullable** — do not make them NOT NULL.
 
-1. `bun run format:check` — must pass with zero warnings (was failing before).
-2. `bun run lint` — must still pass (already passes today).
-3. `bun run typecheck` — must still pass (already passes today).
-4. `bun run dev` — must start with no errors; `curl http://localhost:3000/`
-   returns HTTP 200.
+---
 
-If `format:check` reports files outside real source (e.g. `documentation/`,
-`.pipeline/`, node vendor dirs), the `.prettierignore` in 3.1 is incomplete —
-fix the ignore file rather than reformatting those files.
+## 6. Out of scope (do NOT do)
+
+- No `chat_rooms`, `chat_messages`, `chat_mentions` (Phase 2).
+- No RLS policies or `ENABLE ROW LEVEL SECURITY` (issue #13).
+- No seed data (`seed.sql` stays as-is).
+- No API routes, no TypeScript types, no Zod schemas — schema migration only.
+- No `vocal_capability` enum (Cluster 1 / #16 owns it).
+- No BR-14 CHECK constraint (API-layer concern).
+- No changes to `supabase/config.toml` or `supabase/README.md`.
+
+---
+
+## 7. Verification
+
+- `supabase/migrations/0005_cluster5_partial.sql` exists with a `-- migrate:up` and a
+  `-- migrate:down` section.
+- Up section creates exactly: enums `chat_pref`, `notification_type`; tables
+  `availability`, `notification_preferences`, `notifications`; the indexes in §3.
+- Down section drops exactly those objects in reverse order and nothing else.
+- Every column, default, nullability, and unique constraint matches §3.3–3.5.
+- No table, enum, or policy outside this issue's scope is present.
