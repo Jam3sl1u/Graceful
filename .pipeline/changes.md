@@ -1,130 +1,66 @@
-# Changes: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Changes for Issue #13 — [Sprint 0] Set up staging environment
 
-## Summary
+## Scope
 
-Closed the remaining gap on an otherwise-complete Next.js + TypeScript setup:
-Prettier now actually passes on a clean checkout, and the README documents the
-top-level folder structure. No dependencies, config strictness, routes, or
-auth were touched.
+Per the spec's OPEN QUESTIONS note, three of the four acceptance criteria
+(separate Supabase project, test/sandbox API keys, automatic Vercel deploy
+from `main`) are external dashboard provisioning actions and out of scope for
+the Coder. Only the "staging config documented in README or /docs" criterion
+produces a repo artifact — that documentation is what was implemented here.
 
 ## Files changed
 
-- **`.prettierignore`** (new) — scopes Prettier to real developer source.
-  Mirrors `eslint.config.mjs`'s ignore list (`song2score/`, `.pipeline/`,
-  `documentation/`, `.next/`) plus `node_modules`, `out`, `coverage`,
-  `.claude`, and generated/lockfiles (`bun.lock`, `package-lock.json`,
-  `next-env.d.ts`). This was the root cause of the failing Prettier
-  acceptance criterion — without it, `prettier --check .` was scanning docs
-  and pipeline markdown that were never meant to be formatted.
+- **`documentation/staging-environment.md`** (new) — single source of truth
+  for the staging setup. Covers all six required sections: Purpose,
+  Environments overview (dev/staging/production table), Vercel setup
+  (step-by-step + the explicit environment-variable naming convention —
+  Vercel's native per-Environment scoping with identical variable names
+  across environments, values only differ; no `STAGING_`-prefixed names),
+  Test/sandbox keys (Clerk/Pingram/Resend, with "test mode if available,
+  otherwise dedicated staging key" phrasing where a sandbox tier isn't
+  confirmed), Supabase (separate project, schema parity via
+  `supabase/migrations/`, migrate staging before production), and a
+  Verification checklist that maps 1:1 to the issue's four acceptance
+  criteria. Cites PRD §25.7 (Environment isolation), §26.2 (E2E tests target
+  staging), and §26.5 (CI/CD Pipeline / staging deploy gate); references
+  issue #83 (production deploy gate) as a forward pointer only. (Note: the
+  spec suggested citing "§16/§25/§26.5"; verified against the actual PRD text
+  and used the precise subsections that contain the relevant content —
+  §25.7, not a bare §16 which is the unrelated Audio-to-Sheet-Music pipeline
+  section.)
+- **`README.md`** — added a short "Environments" section (4 lines) linking to
+  `documentation/staging-environment.md`. No other content changed.
+- **`.env.example`** — added a top-of-file comment block (above `# App`)
+  stating these are environment-agnostic placeholders, that staging/production
+  need distinct values set per-environment in Vercel (never committed here),
+  and pointing to the new doc. No variables were added, renamed, or had
+  values changed.
 
-- **`package.json`** — added two bun scripts, inserted right after
-  `typecheck` (no reordering/removal of existing scripts, no dependency
-  changes):
-  - `"format": "prettier --write ."`
-  - `"format:check": "prettier --check ."`
+## Explicitly not touched
 
-- **`app/(auth)/layout.tsx`**, **`components/ui/Button.tsx`**,
-  **`lib/api/webhook-verify.ts`**, **`app/globals.css`** — reformatted via
-  `bunx prettier --write .` to fix real `printWidth: 100` violations (long
-  single-line JSX/function signatures got wrapped; the CSS `font-family`
-  list got collapsed to fit under 100 chars). All four diffs are pure
-  whitespace/line-wrapping — verified via `git diff` that no logic, strings,
-  or identifiers changed. See diffs below for exact deltas.
+- No `vercel.json`, Terraform/Pulumi, or other IaC files.
+- No changes to `.github/workflows/ci.yml` or any new deploy workflow.
+- No Playwright/E2E setup.
+- No production environment setup.
+- No new/renamed env vars, no real secrets or URLs (placeholders only).
 
-- **`README.md`** — expanded from a 2-line title/tagline into: Getting
-  Started (bun install / bun run dev), a Scripts list (dev/build/lint/
-  typecheck/format/format:check), and a new "Project Structure" section
-  listing `app/`, `components/`, `lib/`, `schemas/`, `types/`, `supabase/`,
-  `tests/` with one line each. Kept intentionally minimal per the issue's
-  "don't over-engineer" instruction — no deep architecture doc. This file
-  was itself reformatted by Prettier after being written (blank line added
-  after the `# Graceful` title).
+## Verification
 
-## Exact diffs for the four reformatted source files
-
-```diff
---- a/app/(auth)/layout.tsx
-+++ b/app/(auth)/layout.tsx
-@@ -1,3 +1,7 @@
- export default function AuthLayout({ children }: { children: React.ReactNode }) {
--  return <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>{children}</div>;
-+  return (
-+    <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>
-+      {children}
-+    </div>
-+  );
- }
-
---- a/app/globals.css
-+++ b/app/globals.css
-@@ -15,12 +15,7 @@ body {
-   margin: 0;
-   background: var(--color-bg);
-   color: var(--color-fg);
--  font-family:
--    -apple-system,
--    BlinkMacSystemFont,
--    "Segoe UI",
--    Roboto,
--    sans-serif;
-+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
- }
-
---- a/components/ui/Button.tsx
-+++ b/components/ui/Button.tsx
-@@ -6,7 +6,5 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
- };
-
- export function Button({ variant = "primary", className, ...props }: ButtonProps) {
--  return (
--    <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />
--  );
-+  return <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />;
- }
-
---- a/lib/api/webhook-verify.ts
-+++ b/lib/api/webhook-verify.ts
-@@ -10,10 +10,7 @@ export async function verifyClerkWebhook(_rawBody: string, _headers: Headers): P
- }
-
- // TODO(Sprint 4 #58): verify using PINGRAM_WEBHOOK_SECRET.
--export async function verifyPingramWebhook(
--  _rawBody: string,
--  _headers: Headers,
--): Promise<boolean> {
-+export async function verifyPingramWebhook(_rawBody: string, _headers: Headers): Promise<boolean> {
-   throw new Error("verifyPingramWebhook not implemented — see Sprint 4 #58");
- }
-```
-
-## Verification performed (all passed)
-
-1. `bun run format:check` — "All matched files use Prettier code style!"
-2. `bun run lint` — passes, no output/errors.
-3. `bun run typecheck` — passes, no output/errors.
-4. `bun run dev` — started cleanly; `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/` returned `200`. Dev server stopped afterward.
+- `bun run lint` — passes (no errors).
+- `bun run typecheck` — passes (no errors).
+- Changes are documentation/comment-only; no application code touched, so
+  `bun test` behavior is unaffected.
 
 ## What the Tester should focus on
 
-- Confirm `bun run format:check` fails if any of the 4 reformatted files (or
-  README.md) is reverted to its old formatting — i.e. the check is real, not
-  a no-op.
-- Confirm `.prettierignore` actually excludes `.pipeline/`, `documentation/`,
-  and `song2score/` from `prettier --check .` (these directories contain
-  markdown/config that would otherwise false-fail).
-- Confirm no logic changed in the 4 reformatted files — behavior of
-  `AuthLayout`, `Button`, and the four `verify*Webhook` functions should be
-  byte-identical modulo whitespace (diffs above are the full deltas).
-- Confirm `eslint.config.mjs`, `tsconfig.json`, `next.config.ts`,
-  `.prettierrc`, and `.github/workflows/ci.yml` were NOT touched (out of
-  scope per spec section 4).
-- `package.json` scripts: verify `format` and `format:check` were inserted
-  without disturbing existing scripts (`dev`, `build`, `start`, `lint`,
-  `typecheck`, `test`, `test:e2e` all still present, same commands).
-
-## Out of scope (confirmed not touched)
-
-- No dependency changes (prettier@^3.4.0 was already present).
-- No changes to `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`,
-  `.prettierrc`, `.github/workflows/ci.yml`.
-- No route/auth/UI logic changes beyond formatting.
+- Confirm `documentation/staging-environment.md` covers all six §2a sections
+  from the spec and that the Verification checklist's four items map 1:1 to
+  the GitHub issue's four acceptance criteria.
+- Confirm the Vercel environment-variable naming convention is stated
+  unambiguously (identical names, per-Environment values, no prefixing) since
+  this was called out as an edge case the doc must nail.
+- Confirm no secrets/real values were introduced anywhere, and that
+  `.env.example`'s existing variable list is untouched other than the new
+  header comment.
+- Confirm `README.md`'s new section links correctly and doesn't bloat the
+  stub.
