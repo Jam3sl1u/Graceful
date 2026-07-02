@@ -18,11 +18,7 @@
       "Bash(git push origin issue-*)",
       "Bash(gh issue list *)",
       "Bash(gh issue view *)",
-      "Bash(gh issue edit *)",
       "Bash(gh pr create *)",
-      "Bash(gh pr list *)",
-      "Bash(git fetch origin main*)",
-      "Bash(git worktree list*)",
       "Bash(bun test*)",
       "Bash(bun run*)",
       "Bash(bun install*)",
@@ -30,12 +26,7 @@
       "Bash(bunx jest*)",
       "Bash(pytest*)",
       "Bash(python -m pytest*)",
-      "Bash(python3 -m pytest*)",
-      "Workflow",
-      "EnterWorktree",
-      "ExitWorktree",
-      "Monitor",
-      "TaskStop"
+      "Bash(python3 -m pytest*)"
     ],
     "deny": [
       "Bash(git push --force*)",
