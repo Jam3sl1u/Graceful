@@ -15,15 +15,6 @@ export const meta = {
 // returning. No loop, no parallel()/pipeline() -- to process another issue, invoke this
 // workflow again. That keeps exactly one agent active at a time and makes each run trivial
 // to reason about and resume (Workflow({name: 'handle-issues', resumeFromRunId: ...})).
-//
-// INVOCATION CONTRACT: if launching this from inside an EnterWorktree-created worktree for
-// isolation, the caller must stay cwd-pinned to that worktree for the entire run -- do not
-// call ExitWorktree (or otherwise change the session's current directory) until this run
-// completes. Only the FIRST agent() call below reliably inherits the worktree's cwd; every
-// later agent() call re-resolves against the caller's *live* current directory at the moment
-// it fires. Exiting the worktree right after launch causes every stage past the first to
-// silently execute against whatever directory the caller moved to instead -- verified via
-// live testing, not a theoretical concern.
 
 phase('Setup')
 
@@ -44,11 +35,6 @@ if (args && args.issueNumber) {
     { phase: 'Setup', schema: ISSUE_SCHEMA }
   )
 } else {
-  // Deliberately excludes `body` here -- with a large open-issue backlog, fetching every
-  // issue's full body just to pick the oldest unclaimed one caused the subagent to blow past
-  // context limits (100k+ tokens) round-tripping the payload through scratch files. Only the
-  // winning issue's body is ever needed downstream, so it's fetched separately below, once,
-  // by number -- same cheap pattern as the args.issueNumber branch above.
   const ISSUES_SCHEMA = {
     type: 'object',
     properties: {
@@ -59,17 +45,18 @@ if (args && args.issueNumber) {
           properties: {
             number: { type: 'number' },
             title: { type: 'string' },
+            body: { type: 'string' },
             url: { type: 'string' },
             createdAt: { type: 'string' },
           },
-          required: ['number', 'title', 'url', 'createdAt'],
+          required: ['number', 'title', 'body', 'url', 'createdAt'],
         },
       },
     },
     required: ['issues'],
   }
   const issuesResult = await agent(
-    `Fetch open GitHub issues in this repo's working directory and return them raw, unsorted, unfiltered: \`gh issue list --state open --limit 100 --json number,title,url,createdAt\`. Return the parsed JSON array as-is under "issues". Do not sort, filter, or interpret it -- note that \`gh issue list\` has no --sort/--order flags, so do not attempt to use them. Do NOT fetch issue bodies -- they are not needed here.`,
+    `Fetch open GitHub issues in this repo's working directory and return them raw, unsorted, unfiltered: \`gh issue list --state open --limit 100 --json number,title,body,url,createdAt\`. Return the parsed JSON array as-is under "issues". Do not sort, filter, or interpret it -- note that \`gh issue list\` has no --sort/--order flags, so do not attempt to use them.`,
     { phase: 'Setup', schema: ISSUES_SCHEMA }
   )
 
@@ -92,13 +79,8 @@ if (args && args.issueNumber) {
     { phase: 'Setup', schema: PRS_SCHEMA }
   )
 
-  if (!issuesResult || !prsResult) {
-    log('Fetching open issues/PRs failed (agent-level failure, e.g. a session/usage limit or transient API error) -- NOT the same as an empty queue. Stopping here so this is not silently misreported as "no open issues." Re-invoke this workflow once whatever caused the failure has cleared.')
-    return { status: 'fetch-failed', reason: !issuesResult ? 'issues fetch failed' : 'PR fetch failed' }
-  }
-
-  const openIssues = issuesResult.issues || []
-  const openPrs = prsResult.prs || []
+  const openIssues = (issuesResult && issuesResult.issues) || []
+  const openPrs = (prsResult && prsResult.prs) || []
 
   const claimed = new Set()
   for (const pr of openPrs) {
@@ -112,26 +94,7 @@ if (args && args.issueNumber) {
     .filter(i => !claimed.has(i.number))
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
 
-  const picked = unclaimed[0] || null
-
-  if (picked) {
-    const ISSUE_SCHEMA = {
-      type: 'object',
-      properties: {
-        number: { type: 'number' },
-        title: { type: 'string' },
-        body: { type: 'string' },
-        url: { type: 'string' },
-      },
-      required: ['number', 'title', 'body', 'url'],
-    }
-    issue = await agent(
-      `Fetch GitHub issue #${picked.number} in this repo's working directory: \`gh issue view ${picked.number} --json number,title,body,url\`. Return its number, title, body, and url exactly as given.`,
-      { phase: 'Setup', schema: ISSUE_SCHEMA }
-    )
-  } else {
-    issue = null
-  }
+  issue = unclaimed[0] || null
 }
 
 if (!issue) {

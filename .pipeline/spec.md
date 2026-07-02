@@ -1,158 +1,172 @@
-# Spec: Issue #13 — [Sprint 0] Set up staging environment
+# Spec: Issue #12 — [Sprint 0] Set up CI pipeline skeleton
 
 ## OPEN QUESTIONS
 
-None that block the in-repo work. **But read this first — it defines scope:**
+**None that block coding.** One decision was already made for you and one item
+is out of scope for a code change — read both before starting:
 
-Three of the four acceptance criteria (separate Supabase project, test/sandbox
-API keys, automatic Vercel deploy from `main`) are **provisioning actions
-performed in external dashboards** (Supabase, Vercel, Clerk, Pingram, Resend).
-They cannot be done by editing files in this repo and are **out of scope for the
-Coder**. The one criterion that produces a repo artifact is:
+1. **`npm` vs `bun`.** The issue text says `npm audit` / Jest / ESLint / `tsc`,
+   but this repo is a **bun** project: it has `bun.lock` (no `package-lock.json`),
+   and `.claude/settings.json` standardizes on `bun` commands. The existing
+   `.github/workflows/ci.yml` already uses `bun`. **Follow the repo — keep bun.**
+   Do NOT convert the workflow to npm. The acceptance criteria (type errors,
+   lint, tests, dependency audit run on every PR) are satisfied by the bun
+   equivalents.
 
-> Staging config documented in README or `/docs`
-
-**The Coder's entire job for this issue is to write that documentation** (plus a
-small, matching addition to `.env.example` header comment — see §3). The doc
-must describe the setup precisely enough that a human can execute the dashboard
-steps and verify them. Do NOT invent scripts, CI jobs, or Terraform — none were
-requested and there is no IaC pattern in this repo.
-
-Do NOT commit any real secrets, keys, project IDs, or URLs. Placeholders only
-(the repo convention in `.env.example`).
-
----
-
-## 1. Current repo state (verified)
-
-- No `/docs` directory exists. Documentation lives under `documentation/`
-  (`documentation/phase-1/`, `documentation/prd/`).
-- `README.md` is a 2-line stub (title + one sentence).
-- `.env.example` exists at repo root with all service env vars as empty
-  placeholders, grouped by section header comments (App, Supabase, Clerk,
-  Pingram, Resend, Google, R2, Upstash, QStash, Modal, Spotify). It is currently
-  **environment-agnostic** — no dev/staging/prod namespacing.
-- `.github/workflows/ci.yml` runs on `pull_request` only (typecheck, lint, test,
-  audit). It does **not** deploy — Vercel handles deploys via its Git
-  integration, not GitHub Actions. Do NOT add a deploy job to CI.
-- No `vercel.json` exists. Vercel config is dashboard-managed. Do NOT create one
-  unless the doc step below genuinely requires it — it does not.
-- PRD §25 (Environment isolation) and §26.5 (CI/CD Pipeline) are the governing
-  requirements. Key facts to mirror in the doc:
-  - Three environments: development (local), staging, production.
-  - Staging mirrors production: same Vercel config, **separate** Supabase
-    project (identical schema), **separate** R2 bucket, Pingram test
-    environment, Clerk test mode.
-  - Staging always deploys from `main` after merge.
-  - Production secrets are never used in dev or staging.
+2. **"PR blocked from merging if any step fails"** is a GitHub **branch
+   protection / required-status-check** setting on the repo, configured through
+   the GitHub UI or API — it is **not** something that lives in a file in this
+   repo. It is out of scope for the Coder. Do not attempt to encode it in the
+   workflow. (Note it in the PR description so a human enables the required
+   check named `checks` on `main`.)
 
 ---
 
-## 2. Files to create / modify
+## 1. Summary
 
-### 2a. CREATE: `documentation/staging-environment.md`
+Issue #12 is **already ~95% implemented** on this branch. `.github/workflows/ci.yml`
+exists and already:
 
-This is the single source of truth for the staging setup. Follow the tone and
-Markdown structure of existing docs in `documentation/` (heading levels, tables
-where enumerating config). Sections required:
+- triggers on `pull_request` (every PR),
+- installs deps with a frozen lockfile,
+- runs `bun run typecheck` (`tsc --noEmit`), `bun run lint` (ESLint),
+  `bun run test` (Jest), and `bun audit --audit-level=high`.
 
-1. **Purpose** — one paragraph: staging mirrors production so Phase 1 changes are
-   validated end-to-end before shipping; it is the future target for Playwright
-   E2E (§26.2) and the production deploy gate (#83). Cite PRD §16 / §25 / §26.5.
+All four `package.json` scripts it depends on exist (`typecheck`, `lint`,
+`test`). The lockfile (`bun.lock`), `eslint.config.mjs`, `jest.config.ts`, and
+`tsconfig.json` all exist.
 
-2. **Environments overview** — a table of the three environments
-   (development / staging / production) with columns: purpose, host, branch,
-   Supabase project, API-key mode. Fill development and staging concretely;
-   mark production as "set up later — same pattern (issue out of scope here)".
-
-3. **Vercel setup** — step-by-step for a human operator:
-   - Staging is a Vercel deployment target that auto-deploys from the `main`
-     branch. (Production, when set up, will map to git tags / a `production`
-     branch or promotion — note as future, do not specify.)
-   - Environment variables must be namespaced per environment using Vercel's
-     built-in **Environment** scoping (Production / Preview / Development), OR an
-     explicit naming convention if the operator prefers. State the chosen
-     convention explicitly so it is unambiguous — see §4 Edge Cases.
-   - List every env var group from `.env.example` and note which need a
-     **distinct staging value** vs. which can be shared. Distinct-per-env
-     (staging-specific): Supabase (URL, anon key, service role), Clerk keys +
-     webhook secret, Pingram key + webhook secret, Resend key + webhook secret,
-     R2 bucket/credentials, `NEXT_PUBLIC_APP_URL`, `TOKEN_ENCRYPTION_KEY`,
-     Upstash/QStash, Modal, Google OAuth redirect URI + client. Keep this a
-     table mirroring the `.env.example` sections.
-
-4. **Test / sandbox keys** — for each of Clerk, Pingram, Resend: state to use
-   test/sandbox mode where the provider offers it (Clerk test instance, Pingram
-   test environment, Resend test API key / sandbox domain). Where a provider has
-   no sandbox tier, note "use a dedicated staging key on the same account, never
-   the production key." Do not assert a provider has a sandbox you cannot
-   confirm — phrase as "use test mode if available, otherwise a separate key."
-
-5. **Supabase** — separate Supabase project for staging, schema kept identical to
-   production via the migrations under `supabase/migrations/` (currently empty —
-   reference `supabase/README.md`). Note migrations run against staging before
-   production (§26.5 Migration safety).
-
-6. **Verification checklist** — a checkbox list a human can walk to confirm all
-   four acceptance criteria are met (staging Supabase project exists and is
-   distinct; test keys in use; push to `main` triggers a staging deploy; this doc
-   exists and is linked from README).
-
-### 2b. MODIFY: `README.md`
-
-Add a short "Environments" section (2–4 lines) that links to
-`documentation/staging-environment.md`. This satisfies the "documented in README
-**or** /docs" criterion via README linkage. Do not bloat the README stub with the
-full content — link only.
-
-### 2c. MODIFY: `.env.example`
-
-Add a top-of-file comment block (above the existing `# App` section) explaining
-that these are environment-agnostic placeholders and that **staging and
-production must each get their own distinct values**, set per-environment in
-Vercel (never committed here). Reference `documentation/staging-environment.md`.
-Do NOT add new variables, do NOT duplicate the var list per-environment, do NOT
-change any existing variable names or values.
+**The Coder's job is small and surgical.** Do the verification/hardening items
+in §3. Do NOT rewrite the workflow from scratch, do NOT switch package managers,
+do NOT add deploy/E2E steps.
 
 ---
 
-## 3. Explicitly OUT OF SCOPE (do not do)
+## 2. Current file state (already on branch — do not recreate)
 
-- Creating the actual Supabase/Vercel/Clerk/etc. projects or keys (external).
-- Any `vercel.json`, Terraform, Pulumi, or other IaC file.
-- Any change to `.github/workflows/ci.yml` or a new deploy workflow.
-- Staging smoke tests / Playwright E2E setup (explicitly Sprint 4, #83, #82).
-- Production environment setup (issue's Out of Scope).
-- Adding or renaming environment variables.
+Existing `.github/workflows/ci.yml`:
+
+```yaml
+name: CI
+
+on:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run typecheck
+
+      - run: bun run lint
+
+      - run: bun run test
+
+      - run: bun audit --audit-level=high
+```
+
+Relevant `package.json` scripts (present, do not change):
+`"lint": "eslint ."`, `"typecheck": "tsc --noEmit"`, `"test": "jest"`.
 
 ---
 
-## 4. Edge cases / decisions the Coder must nail
+## 3. Required changes
 
-- **Namespacing convention (issue Implementation Note: "clearly namespaced in
-  Vercel").** The doc must state ONE unambiguous convention. Recommended: use
-  Vercel's native per-Environment scoping (Preview→staging via `main`,
-  Production→prod later) with identical variable *names* across environments and
-  different *values* — do NOT prefix var names like `STAGING_SUPABASE_URL`,
-  because the app code reads plain names (e.g. `NEXT_PUBLIC_SUPABASE_URL`).
-  Document this reasoning so no one later prefixes names.
-- **README says "or /docs" — this repo uses `documentation/`, not `/docs`.**
-  Put the doc under `documentation/` (existing convention) and link from README.
-  Do not create a new top-level `/docs` directory.
-- **No secrets in source (PRD §15).** Every value in the doc and `.env.example`
-  must be a placeholder or a `<describe-what-goes-here>` token.
-- **Providers without sandbox tiers.** Do not fabricate a sandbox mode; use the
-  "test mode if available, otherwise a separate dedicated staging key" phrasing.
-- The `main` branch is the staging deploy trigger — be explicit that merging to
-  `main` deploys staging (matches §26.5 and current repo's single-branch flow).
+Modify **only** `/Users/jamesliu/Documents/Graceful/.github/workflows/ci.yml`.
+Apply these hardening edits to the existing file (keep the bun toolchain):
+
+1. **Pin the workflow to a concurrency guard** so redundant runs on rapid
+   pushes to a PR are cancelled (keeps runs fast/cheap, supports the
+   "~under 5 minutes" criterion). Add at the top level (after `on:`):
+
+   ```yaml
+   concurrency:
+     group: ci-${{ github.ref }}
+     cancel-in-progress: true
+   ```
+
+2. **Pin `bun-version` to a fixed minor** instead of `latest`, so CI is
+   reproducible and a new bun release can't break the pipeline unexpectedly.
+   Use a concrete recent version, e.g.:
+
+   ```yaml
+       - uses: oven-sh/setup-bun@v2
+         with:
+           bun-version: 1.2.x
+   ```
+
+   (If you cannot confirm a valid `1.2.x` tag resolves, fall back to `1.2`.)
+
+3. **Verify `bun audit --audit-level=high` is a valid invocation** for the bun
+   version being used. `bun audit` and its `--audit-level` flag exist in modern
+   bun. **If — and only if — you confirm the flag is unsupported** by the pinned
+   version, replace that single step with:
+
+   ```yaml
+       - run: bun audit --audit-level=high
+   ```
+   staying as-is is preferred; do not silently drop the audit step. The audit
+   MUST remain and MUST be gated at `high` per PRD §16. Do not lower it to
+   `low`/`moderate` (that reintroduces the noise the issue explicitly avoids).
+
+4. **Do not add `continue-on-error` to any step.** Every step must be able to
+   fail the job — that is the whole point (broken code can't merge).
+
+5. Keep the job name as `checks` (this is the status-check name a human will
+   mark "required" in branch protection — keep it stable and predictable).
+
+If any of items 1–2 are judged unnecessary polish and the reviewer prefers
+minimalism, item 1 (concurrency) and item 4 (no continue-on-error) are the
+non-negotiable correctness items; item 2 is a reproducibility nicety.
 
 ---
 
-## 5. Definition of done
+## 4. Edge cases the implementation must handle
 
-- `documentation/staging-environment.md` exists and covers all six sections in §2a.
-- `README.md` links to it under an Environments heading.
-- `.env.example` has the top comment block; no vars added/renamed.
-- No secrets, no external side effects, no CI or IaC changes.
-- Verification checklist in the doc maps 1:1 to the issue's four acceptance
-  criteria.
+- **Frozen lockfile drift:** `bun install --frozen-lockfile` fails if
+  `bun.lock` is out of sync with `package.json`. This is desired behavior
+  (catches un-committed lockfile changes) — keep `--frozen-lockfile`, do not
+  weaken it to a plain `bun install`.
+- **Empty/minimal test suite:** Jest exits non-zero when it finds zero test
+  files by default. If the current codebase has no test files, the `bun run test`
+  step will FAIL and block the workflow, contradicting the "empty/minimal
+  codebase completes" criterion. Confirm whether test files exist; if none do,
+  ensure the `test` script tolerates no tests by passing `--passWithNoTests`
+  (Jest flag) — check `jest.config.ts` / the `test` script first and add the
+  flag only if there are currently no tests. Do not add test files (out of
+  scope). Prefer adding `--passWithNoTests` in the `package.json` `test` script
+  so both CI and local runs behave identically.
+- **Audit step false-positives:** transitive high-severity advisories with no
+  fix available could block all PRs. Do not pre-emptively suppress; leave the
+  gate at `high`. Handling a specific unfixable advisory is a future issue, not
+  this one.
+
+---
+
+## 5. Patterns to follow
+
+- The existing `.github/workflows/ci.yml` on this branch **is** the pattern —
+  edit it in place rather than introducing a differently-structured workflow.
+- Toolchain convention comes from `.claude/settings.json` (bun-based) and the
+  presence of `bun.lock`. Match it.
+
+---
+
+## 6. Explicitly OUT OF SCOPE (do not touch)
+
+- Playwright / E2E in CI (the `test:e2e` script exists but must NOT be added to
+  this workflow — deferred to a later sprint per the issue).
+- Any staging/deploy gate (issues #13 / #83).
+- Branch-protection / required-status-check configuration (GitHub setting, not a
+  repo file). Mention in the PR body; do not implement.
+- Any change to `tsconfig.json`, `eslint.config.mjs`, `jest.config.ts`,
+  application/source code, or dependencies beyond the `--passWithNoTests` note
+  above.
