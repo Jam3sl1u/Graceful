@@ -1,194 +1,197 @@
-# Spec: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Spec: Issue #21 — [Sprint 0] Migrate schema — Cluster 6 (Auth & Audit)
 
 ## OPEN QUESTIONS
 
-None. The gap is concrete and unambiguous — proceed as specified below.
+None blocking. Two decisions were made for you (see notes inline); both are
+low-risk and reversible. Proceed as specified.
+
+- **Migration filename timestamp.** The `supabase/migrations/` directory is
+  currently empty (only `.gitkeep`), so no prior-cluster migration files
+  (#7–#11 / #16) exist in this repo yet. Cluster 6 is the *last* cluster, so
+  its migration must sort after all others. Use the exact filename given in
+  §2. If a real Supabase CLI timestamp convention is later adopted, renaming
+  is trivial.
+- **FK targets `users` and `church_groups` may not exist in the repo yet.**
+  This issue is *blocked by #16* (Cluster 1), which creates those tables. Write
+  the FK references as specified; if the migration cannot run because Cluster 1
+  is absent, that is expected and out of scope for #21. Do not create `users`
+  or `church_groups` here.
 
 ---
 
 ## 1. Summary
 
-Issue #11 is **~90% already satisfied** by pre-existing code committed to
-`main`. A full Next.js App Router + TypeScript codebase already exists. Three of
-the four acceptance criteria are already met. The Coder's job is small and
-**purely additive** — do NOT re-scaffold, do NOT touch dependencies, do NOT
-touch the `app/` route structure, config strictness, or auth.
+Create ONE new, reversible SQL migration adding two tables from PRD §20.8
+(Cluster 6 — Auth & Audit): `google_calendar_tokens` and `audit_logs`.
 
-Acceptance criteria status (verified against current checkout):
+Scope is **schema only**:
+- Tables, columns, PKs, FKs, unique constraints, defaults per PRD §20.8.
+- Append-only enforcement on `audit_logs` via `REVOKE UPDATE, DELETE` (BR-13).
+- A matching down/rollback migration.
 
-| AC | Status |
-|----|--------|
-| Next.js (App Router) + TypeScript initialized | DONE — no action |
-| ESLint + Prettier configured AND passing on clean checkout | **PARTIAL — Prettier gap, this is the work** |
-| Base folder structure documented | **MISSING — this is the work** |
-| `bun run dev` works with no errors | DONE — no action |
-
-Scope of this issue = **(a) make Prettier actually pass on a clean checkout**
-and **(b) document the folder structure in the README.** Nothing else.
+**Out of scope for this issue — do NOT add:**
+- RLS policies (that is issue #13; not this issue).
+- Encryption/decryption logic (columns store ciphertext only — #61 / audit writer).
+- Any TypeScript types, API routes, seed data, or PostgREST config.
+- The `users` / `church_groups` tables themselves (from #16).
 
 ---
 
-## 2. Verified current state (do not redo this work)
+## 2. Files to create
 
-- `package.json`: `next@^15.3.0`, `react@^19`, `react-dom@^19`,
-  `typescript@^5.7.0`, `prettier@^3.4.0`, `eslint@^9`, `eslint-config-next`.
-  Scripts present: `dev`, `build`, `start`, `lint` (`eslint .`),
-  `typecheck` (`tsc --noEmit`), `test`, `test:e2e`.
-  **No `format` or `format:check` script exists.**
-- App Router only. Route groups `app/(app)/`, `app/(auth)/`,
-  `app/(marketing)/`, `app/(public)/`, plus `app/api/*` handlers and root
-  `app/layout.tsx` + `app/globals.css`. No `pages/` directory anywhere.
-- `tsconfig.json`: strict, `noUncheckedIndexedAccess`, `@/*` path alias, Next
-  plugin. Excludes `node_modules`, `song2score`, `.pipeline`, `documentation`.
-- `next.config.ts`: minimal (`reactStrictMode`, `outputFileTracingRoot`,
-  scoped `eslint.dirs`). Do not change.
-- `eslint.config.mjs`: flat config extending `next/core-web-vitals` +
-  `next/typescript`; `ignores: ["song2score/**", ".pipeline/**",
-  "documentation/**", ".next/**", "next-env.d.ts"]`; one relaxed rule
-  (`no-unused-vars` warn with `^_` ignore). Leave as-is.
-- `.prettierrc` exists:
-  `{ "semi": true, "singleQuote": false, "trailingComma": "all", "printWidth": 100 }`.
-  Leave the config values as-is.
-- `.prettierignore`: **does not exist** — root cause of the failing Prettier AC.
-- `README.md`: only 2 lines (title + tagline). No folder-structure docs.
-- Top-level source dirs present: `app/`, `components/`, `lib/`, `schemas/`,
-  `types/`, `supabase/`, `tests/`.
-- `.github/workflows/ci.yml` exists (uses bun). **Out of scope** — do NOT edit
-  it (CI is issue #12).
+The repo uses plain SQL migrations under `supabase/migrations/` (see
+`supabase/README.md`, which states "one migration file per schema cluster").
+There is no established up/down file convention yet because the directory is
+empty. Follow the Supabase CLI convention: a single `.sql` file whose leading
+`YYYYMMDDHHMMSS` timestamp orders it, containing the forward migration, with a
+rollback provided as a companion `.down.sql` file so the migration is
+demonstrably reversible.
+
+Create BOTH of these files:
+
+1. **`supabase/migrations/20260702000006_cluster6_auth_audit.sql`** — forward migration.
+2. **`supabase/migrations/20260702000006_cluster6_auth_audit.down.sql`** — rollback.
+
+(The `000006` suffix reflects Cluster 6 and keeps it ordered last among the six
+cluster migrations.)
+
+Do not modify `supabase/config.toml`, `supabase/seed.sql`, or
+`supabase/README.md`.
 
 ---
 
-## 3. Files to create / modify
+## 3. Forward migration — exact contents
 
-### 3.1 CREATE `/Users/jamesliu/Documents/Graceful/.prettierignore`
+Wrap the whole forward migration in a single transaction (`BEGIN; ... COMMIT;`).
 
-Purpose: scope `prettier --check .` to source only, so docs/config/generated
-files stop false-failing the check. Mirror the dirs already ignored by ESLint
-and TS, plus build/vendor output. Exact contents:
+### 3.1 `google_calendar_tokens` (PRD §20.8)
 
-```
-# Dependencies & build output
-node_modules
-.next
-out
-coverage
+One row per user; `user_id` is a UNIQUE FK. Columns store ciphertext produced by
+the application layer (AES-256) — the DB just stores text.
 
-# Nested project with its own toolchain
-song2score
+| Column | Type | Null | Constraint / Default |
+| --- | --- | --- | --- |
+| id | uuid | NOT NULL | PK, default `gen_random_uuid()` |
+| user_id | uuid | NOT NULL | UNIQUE, FK → `users(id)` ON DELETE CASCADE |
+| access_token_encrypted | text | NOT NULL | ciphertext (never logged plaintext) |
+| refresh_token_encrypted | text | NOT NULL | ciphertext |
+| token_expiry | timestamptz | NOT NULL | |
+| calendar_id | varchar(200) | NOT NULL | specific calendar to write to |
+| scope | text | NOT NULL | always `calendar.events` (write-only) |
+| created_at | timestamptz | NOT NULL | default `now()` |
+| updated_at | timestamptz | NOT NULL | default `now()` |
 
-# Pipeline & docs (not developer source; not Prettier's concern)
-.pipeline
-documentation
-.claude
+Notes:
+- `user_id` UNIQUE enforces the one-token-per-user (1:1) relationship from §20.9.
+- No CHECK on `scope` value — PRD documents the intended value but does not
+  require a DB constraint; keep it a plain `text` column.
 
-# Lockfiles / generated
-bun.lock
-package-lock.json
-next-env.d.ts
-```
+### 3.2 `audit_logs` (PRD §20.8) — append-only (BR-13)
 
-Notes for the Coder:
-- `README.md` is intentionally NOT ignored — it is real developer-facing
-  source and must be Prettier-clean (see 3.3).
-- Keep `documentation/` and `.pipeline/` ignored (matches ESLint/TS config and
-  avoids reformatting PRD/planning markdown).
+| Column | Type | Null | Constraint / Default |
+| --- | --- | --- | --- |
+| id | uuid | NOT NULL | PK, default `gen_random_uuid()` |
+| church_group_id | uuid | NOT NULL | FK → `church_groups(id)` ON DELETE CASCADE |
+| user_id | uuid | NULL | FK → `users(id)` ON DELETE SET NULL — NULL for system-triggered actions |
+| action | varchar(100) | NOT NULL | dot-notation, e.g. `invitation.sent`, `role.changed` |
+| entity_type | varchar(50) | NOT NULL | |
+| entity_id | uuid | NOT NULL | |
+| metadata | jsonb | NOT NULL | default `'{}'::jsonb` (e.g. old_value → new_value) |
+| created_at | timestamptz | NOT NULL | default `now()`, immutable |
 
-### 3.2 MODIFY `/Users/jamesliu/Documents/Graceful/package.json`
+Notes:
+- `user_id` is nullable (per §20.8 "Null for system-triggered actions"); use
+  `ON DELETE SET NULL` so deleting a user preserves the immutable log row.
+- `church_group_id` FK matches the app-wide RLS pattern (every table except
+  `church_groups` carries it) but this issue adds NO RLS policy.
 
-Add two scripts to the `"scripts"` block (do not remove or reorder existing
-ones). Insert after the existing `"typecheck"` entry:
+### 3.3 Append-only enforcement (BR-13) — required
 
-```json
-"format": "prettier --write .",
-"format:check": "prettier --check .",
-```
+Immediately after creating `audit_logs`, enforce append-only at the DB layer.
+No application role may UPDATE or DELETE audit rows. INSERT and SELECT remain
+allowed.
 
-Do NOT add or bump any dependency — `prettier@^3.4.0` is already a devDep.
+Emit:
 
-### 3.3 REFORMAT source files that violate the Prettier config
-
-After 3.1 is in place, run `bunx prettier --write .` (or `bun run format`).
-This will reformat any tracked source file that violates `printWidth: 100` /
-the other rules. Known offenders from prior inspection (long lines Prettier
-wraps) — but rely on `prettier --write` to find the authoritative set, do not
-hand-edit:
-- `app/(auth)/layout.tsx`
-- `components/ui/Button.tsx`
-- `lib/api/webhook-verify.ts`
-- `app/globals.css`
-- `README.md` (will be reformatted; see 3.4 for the content you add first)
-
-**Constraint:** every diff produced here MUST be pure formatting
-(whitespace / line wrapping / quotes / trailing commas). If `prettier --write`
-would change anything that looks like logic, stop — that indicates a config
-problem, not expected behavior. There is none expected here.
-
-### 3.4 MODIFY `/Users/jamesliu/Documents/Graceful/README.md`
-
-Add a concise "Project Structure" section documenting the top-level layout.
-Keep it minimal per the issue's explicit "avoid over-engineering" instruction —
-a short list with one line each, NOT a deep architecture doc. Preserve the
-existing title/tagline. Suggested content (adjust wording, keep it brief):
-
-```markdown
-# Graceful
-Planning Center capabilities with internal ML features
-
-## Getting Started
-
-```bash
-bun install
-bun run dev
+```sql
+REVOKE UPDATE, DELETE ON TABLE audit_logs FROM PUBLIC;
 ```
 
-Open http://localhost:3000 to view the app.
+Then, defensively, also revoke from the Supabase-standard application roles so
+the grant cannot be inherited:
 
-## Scripts
-
-- `bun run dev` — start the Next.js dev server
-- `bun run build` — production build
-- `bun run lint` — ESLint
-- `bun run typecheck` — TypeScript check (no emit)
-- `bun run format` — format all files with Prettier
-- `bun run format:check` — verify formatting
-
-## Project Structure
-
-- `app/` — Next.js App Router routes, layouts, and API route handlers (`app/api/*`)
-- `components/` — shared React UI components
-- `lib/` — server-side clients and integrations (Supabase, Clerk, etc.)
-- `schemas/` — Zod validation schemas
-- `types/` — shared TypeScript types
-- `supabase/` — Supabase project config and migrations
-- `tests/` — Jest and Playwright tests
+```sql
+REVOKE UPDATE, DELETE ON TABLE audit_logs FROM authenticated, anon;
 ```
 
-Only document dirs that actually exist (all listed above do). Do not invent
-subfolders or describe files that don't exist.
+Guard the `authenticated, anon` revoke so the migration does not fail if those
+roles are absent in a bare local Postgres (they exist in Supabase). Use a
+`DO $$ ... $$` block that checks `pg_roles` for each role, or wrap in
+`IF EXISTS`-style role checks. Keep the `FROM PUBLIC` revoke unconditional.
+
+Do NOT revoke SELECT or INSERT.
+
+### 3.4 Suggested indexes (add these)
+
+- Index on `audit_logs(church_group_id, created_at DESC)` — supports the
+  audit read endpoint (#29) and RLS scoping.
+- `user_id` on `google_calendar_tokens` is already UNIQUE (implicit index).
 
 ---
 
-## 4. Out of scope (do NOT do)
+## 4. Rollback migration — exact contents (`.down.sql`)
 
-- Do NOT edit `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`, or
-  `.prettierrc` config values.
-- Do NOT add/remove/bump dependencies.
-- Do NOT edit `.github/workflows/ci.yml` (CI wiring is issue #12).
-- Do NOT touch auth, or add any UI/pages beyond what exists.
-- Do NOT change route structure or any `app/api/*` logic.
+Must fully reverse §3, in dependency-safe order, wrapped in `BEGIN; ... COMMIT;`:
+
+```sql
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS google_calendar_tokens;
+```
+
+Dropping the tables removes their grants/indexes automatically; no separate
+`GRANT` restore is needed. Do not drop any enum or the `pgcrypto` extension.
 
 ---
 
-## 5. Verification (all must pass on a clean checkout after changes)
+## 5. Edge cases the implementation MUST handle
 
-Run from repo root:
+1. **Reversibility.** The `.down.sql` must cleanly drop both tables with no
+   leftover objects. Use `DROP TABLE IF EXISTS`.
+2. **BR-13 append-only.** After the migration, an UPDATE or DELETE against
+   `audit_logs` by an application role (`authenticated`/`anon`/PUBLIC) must be
+   denied by Postgres privileges. INSERT and SELECT must still work.
+3. **Nullable `user_id` on `audit_logs`.** System-triggered rows insert with
+   `user_id = NULL`; the FK must permit this and use `ON DELETE SET NULL`.
+4. **`gen_random_uuid()` availability.** It requires the `pgcrypto` extension.
+   Add `CREATE EXTENSION IF NOT EXISTS pgcrypto;` at the top of the forward
+   migration (idempotent; harmless if an earlier cluster already created it).
+5. **Missing Supabase roles locally.** The `authenticated`/`anon` revoke must
+   not hard-fail on a plain Postgres instance that lacks those roles (see §3.3).
+6. **Re-run safety is NOT required** for `CREATE TABLE` (a migration runs once),
+   but keep `CREATE EXTENSION IF NOT EXISTS` and the role-guarded revokes so a
+   partial local run can be cleaned up and retried.
 
-1. `bun run format:check` — must pass with zero warnings (was failing before).
-2. `bun run lint` — must still pass (already passes today).
-3. `bun run typecheck` — must still pass (already passes today).
-4. `bun run dev` — must start with no errors; `curl http://localhost:3000/`
-   returns HTTP 200.
+---
 
-If `format:check` reports files outside real source (e.g. `documentation/`,
-`.pipeline/`, node vendor dirs), the `.prettierignore` in 3.1 is incomplete —
-fix the ignore file rather than reformatting those files.
+## 6. Patterns to follow
+
+- **Column types / nullability / defaults:** copy exactly from
+  `documentation/prd/graceful_requirements_v10.md` §20.8 (lines 1025–1050).
+  All PKs are `uuid`, all timestamps `timestamptz` (PRD §20 intro, line 700).
+- **`church_group_id` FK convention:** every table except `church_groups`
+  carries it (PRD §20 intro / §14 line 622). `audit_logs` follows this.
+- **BR-13 immutability:** PRD line 190 and §20.8 line 1040.
+- **Minimal OAuth scope / ciphertext-only columns:** PRD §25.5 (line 1422) and
+  the issue's Implementation Notes — do not add encryption logic here.
+
+There is no existing migration file to copy structural style from (directory is
+empty). Use standard Postgres DDL as described above.
+
+---
+
+## 7. Acceptance-criteria mapping
+
+- AC1 `google_calendar_tokens` created → §3.1.
+- AC2 `audit_logs` created → §3.2.
+- AC3 No UPDATE/DELETE grant on `audit_logs` (BR-13) → §3.3.
+- AC4 Migration is reversible → §2 (companion `.down.sql`) + §4.
