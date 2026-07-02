@@ -1,49 +1,48 @@
-# Review: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Review — Issue #14: Integrate Clerk authentication (Sprint 0)
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-## What was verified (independently, not trusted from prior summaries)
+## Basis
+Reviewed spec, changes.md, test-results.md, and independently ran `git diff main...HEAD`,
+re-ran `bun run typecheck` and `bun run lint` (both clean), and grep-verified the
+supporting facts rather than trusting the summaries.
 
-Ran `git diff e4acd21..HEAD` firsthand. The change set is exactly the seven files
-the spec calls for and nothing else:
+## Spec conformance (all 4 gaps closed, exactly)
+1. `middleware.ts` — no-op `clerkMiddleware()` replaced with the prescribed callback
+   `if (!isPublicRoute(req)) await auth.protect();`. `isPublicRoute` list and
+   `config.matcher` are byte-for-byte unchanged (confirmed in diff). Stale
+   "deferred to #5/#6" comment replaced with the one-line note about #6 role checks.
+2. `.env.example` — exactly the 4 public URL vars, correct values, placed after
+   `CLERK_WEBHOOK_SECRET=`. No secrets added.
+3. `app/(app)/profile/page.tsx` — async server component using `currentUser()`
+   (not `getAuthContext`). Fallback chain `fullName || firstName || lastName || "—"`
+   and `primaryEmailAddress?.emailAddress ?? "—"` — handles the email-only-signup
+   edge case without crashing. Inline `<main style={{ padding: "3rem 1.5rem" }}>`
+   markup matches `app/(marketing)/page.tsx`.
+4. `app/api/profile/route.ts` — GET uses `auth()`, returns
+   `fail("Not authenticated", ErrorCode.UNAUTHENTICATED, 401)` on null userId
+   (arg order matches `fail(error, code, status)`), else `ok({ userId })`.
+   `UNAUTHENTICATED` confirmed present in `lib/api/errors.ts`. PUT untouched
+   (`notImplemented`). `NextRequest` import retained and still used by PUT — no
+   unused imports (lint passes under strict config).
 
-- `.prettierignore` (new) — matches spec 3.1 byte-for-byte.
-- `package.json` — only a clean 2-line insertion of `format` / `format:check`
-  after `typecheck`. Grepped for dependency lines: none changed. All existing
-  scripts (dev/build/start/lint/typecheck/test/test:e2e) intact.
-- `app/(auth)/layout.tsx`, `app/globals.css`, `components/ui/Button.tsx`,
-  `lib/api/webhook-verify.ts` — pure formatting. Confirmed each diff is only
-  JSX-wrapping parens / line-wrapping / whitespace. No identifier, string,
-  error message, TODO, or return type changed. Semantically inert.
-- `README.md` — added Getting Started, Scripts, and Project Structure sections.
-  Verified all 7 documented directories (app, components, lib, schemas, types,
-  supabase, tests) actually exist on disk. No invented subfolders.
+## Out-of-scope respected
+`lib/clerk/server.ts`, `lib/api/auth.ts`, `app/api/webhooks/clerk/route.ts`,
+`app/layout.tsx`, and `app/(auth)/**` are all untouched (empty diff stat).
+No dependency, route-structure, or config changes.
 
-## Checks re-run by the reviewer
+## Correctness notes
+- Defense-in-depth is correct: middleware `auth.protect()` fronts the route, and the
+  handler's own `userId` null-check is a deterministic second-layer 401. The tester
+  verified the 401 layer directly in keyless mode (does not depend on Clerk handshake).
+- The one behavior not black-box verifiable in-sandbox — that browser requests redirect
+  specifically to the app's own `/sign-in` — is a live-credential/deploy concern (#10),
+  not a code defect. The code (`auth.protect()` gated by `isPublicRoute`, plus the
+  `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in` env var) is correct per Clerk's documented API.
 
-- `bun run format:check` — PASS ("All matched files use Prettier code style!")
-- `bun run lint` — PASS (no errors)
-- `bun run typecheck` — PASS (no errors)
-- `.prettierignore` is a real filter, not a no-op: temporarily removed it and
-  `prettier --check .` reported 7 violations, all in ignored dirs
-  (.claude, .pipeline, documentation). Restored; check passes again.
+## Hygiene
+Working tree clean except the expected `.pipeline/` artifacts. No stray code changes,
+no leftover `.clerk/` or `.env.local` from testing (tester cleaned up). Single commit
+on the issue branch.
 
-## Out-of-scope confirmation
-
-`git diff` on eslint.config.mjs, tsconfig.json, next.config.ts, .prettierrc,
-and .github/workflows/ci.yml produced zero output — none touched. No dependency
-bumps. No route/auth/UI logic changes. No scope creep into other issues.
-
-## Critical assessment
-
-The prior chain (planner/coder/tester) was accurate; spot-checks reproduced
-every material claim. The one substantive judgment worth flagging — that the
-4 reformatted files are behavior-preserving — I re-derived from the raw diff
-rather than taking it on faith, and it holds: wrapping JSX in grouping parens
-and spreading a function signature across lines are non-semantic. The tester
-correctly wrote no new tests (there is no new behavior to test) and instead
-re-ran the existing Jest suite and re-verified the tooling claims — the right
-call for a formatting/docs change.
-
-All four acceptance criteria for issue #11 are now met on a clean checkout.
-No security, performance, or correctness concerns. Ship it.
+No blocking or must-fix issues. Ready to ship.
