@@ -12,7 +12,7 @@ You are the batch orchestrator for working down the open-issue backlog. You do *
 2. ISSUES_DONE = 0. PROCESSED = [] (issue number, title, PR URL, verdict — filled in as you go).
 
 **Loop — repeat while ISSUES_DONE < MAX_ISSUES:**
-1. Check the queue: `gh issue list --state open --sort created --order asc --limit 20 --json number,title,url`, then `gh pr list --state open --json body,headRefName` to find issues already claimed (open PR body contains `Closes #<N>`, or branch matches `issue-<N>-*`). If every open issue is claimed, or there are no open issues, stop the loop now and go to **Final report**.
+1. Check the queue: `gh issue list --state open --limit 100 --json number,title,url,createdAt` — `gh issue list` has no `--sort`/`--order` flags, so sort the result by `createdAt` ascending yourself (e.g. `jq 'sort_by(.createdAt)'` or `python3`) to get oldest-first. Then `gh pr list --state open --json body,headRefName` to find issues already claimed (open PR body contains `Closes #<N>`, or branch matches `issue-<N>-*`). If every open issue is claimed, or there are no open issues, stop the loop now and go to **Final report**.
 2. Invoke the `feature` skill (it independently re-derives the oldest unclaimed issue — same check as above, so this is safe even if the queue changed since step 1).
 3. Increment ISSUES_DONE. Append the issue number/title/PR URL/verdict to PROCESSED.
 4. Before looping again, judge honestly: has this conversation grown long enough that you're leaning on auto-compaction, or would another full pipeline risk degraded output? If so, stop early — don't wait to hit MAX_ISSUES. Say so in the final report.
