@@ -7,9 +7,10 @@ You are the orchestrator for a four-stage feature pipeline that solves the oldes
 
 **Stage 0 — Setup.**
 1. Fetch open issues oldest-first: `gh issue list --state open --sort created --order asc --limit 20 --json number,title,body,url`. Then fetch in-flight PRs: `gh pr list --state open --json body,headRefName`. An issue is already claimed if any open PR's body contains `Closes #<number>` or its branch matches `issue-<number>-*` — skip those (this pipeline may already be running against them). Pick the oldest issue that isn't claimed. If there are no open issues, or every open issue is already claimed, stop and report that to the user — do not proceed.
-2. Create a fresh branch off `main` for this issue: `git checkout main && git pull origin main && git checkout -b issue-<number>-<kebab-case-slug-of-title>`. Every pipeline run gets its own new branch from `main` — never reuse or build on top of a previous run's branch.
-3. The fetched issue's title + body is the feature request for the Planner (replaces any free-text argument).
-4. Ensure the `.pipeline/` directory exists (create it if needed).
+2. Claim it: `gh issue edit <number> --add-assignee @me` (assigns the issue to the currently authenticated `gh` user).
+3. Create a fresh branch off `main` for this issue: `git checkout main && git pull origin main && git checkout -b issue-<number>-<kebab-case-slug-of-title>`. Every pipeline run gets its own new branch from `main` — never reuse or build on top of a previous run's branch.
+4. The fetched issue's title + body is the feature request for the Planner (replaces any free-text argument).
+5. Ensure the `.pipeline/` directory exists (create it if needed).
 
 **Stage 1 — Planner.** Invoke the `planner` agent with the issue title/body/url from Stage 0. It writes `.pipeline/spec.md`.
 - After it returns, read `.pipeline/spec.md`. If it contains any **OPEN QUESTION**, STOP the pipeline and surface those questions to the user. Do not proceed until they are answered.
