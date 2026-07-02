@@ -1,66 +1,78 @@
-# Test Results: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Test Results — Issue #13 [Sprint 0] Set up staging environment
 
 ## Nature of this change
 
-This is a tooling/formatting/docs change with no new application logic (per
-spec and coder's changes.md). There is nothing new to unit-test. Judgment
-call: re-ran the existing Jest suite to confirm the reformatting didn't break
-anything, and independently re-verified every claim in changes.md rather than
-trusting it — including the two specific claims the coder flagged for the
-Tester to focus on (the `.prettierignore` is a real filter, not a no-op; the
-4 reformatted files are logic-identical).
+Documentation/comment-only change (per spec's scoping decision — the only
+in-repo-actionable acceptance criterion is "staging config documented in
+README or /docs"). No new application logic, so no new unit tests were
+written; instead this stage independently re-verified every claim in the
+coder's `.pipeline/changes.md` and re-ran all repo-level checks.
 
 ## Verification performed (independently re-run, not just trusted from changes.md)
 
 | # | Check | Result |
 |---|-------|--------|
-| 1 | `bun run format:check` | PASS — "All matched files use Prettier code style!" |
-| 2 | `bun run lint` | PASS — no output/errors |
-| 3 | `bun run typecheck` | PASS — no output/errors |
-| 4 | `bun run dev` + `curl http://localhost:3000/` | PASS — server started cleanly, `GET / 200` in dev log, curl returned `HTTP_STATUS:200` |
-| 5 | `bun test` (Jest, pre-existing suite: `tests/unit/lib/api/response.test.ts`) | PASS — 3/3 tests passed, unaffected by the reformatting |
+| 1 | `bun run lint` (eslint) | PASS — no errors/warnings |
+| 2 | `bun run typecheck` (`tsc --noEmit`) | PASS — no errors |
+| 3 | `bun run test` (repo's actual test script, `jest`) | PASS — 1 suite, 3/3 tests passed (`tests/unit/lib/api/response.test.ts`), unaffected by this docs-only change |
+| 4 | `git diff HEAD~1 -- .env.example` | PASS — confirmed only an 8-line additive comment block was inserted above `# App`; no existing variable added, renamed, removed, or value-changed |
+| 5 | `git diff HEAD~1 -- README.md` | PASS — original 2-line stub preserved; new 5-line "Environments" section added, links correctly to `documentation/staging-environment.md` |
+| 6 | `git diff HEAD~1 --stat` (full change footprint) | PASS — only `.env.example`, `README.md`, `documentation/staging-environment.md` (plus `.pipeline/*` bookkeeping) changed; no `vercel.json`, no IaC files, no `.github/workflows/ci.yml` changes |
+| 7 | Secrets/placeholder scan (grep for `sk_live`, `pk_live`, Supabase URLs, AWS key patterns) across the three changed files | PASS — zero matches, no real secrets/URLs/project IDs introduced |
 
-## Targeted checks from the coder's "what to focus on" list
+Note: the bare `bun test` command (bun's built-in runner) errors on this repo
+because it also picks up `tests/e2e/health.spec.ts` (a Playwright spec) and a
+`server-only` import test that aren't compatible with bun's native runner.
+This is a pre-existing repo/tooling characteristic unrelated to this change —
+the repo's `package.json` `test` script is `jest`, not bun's native runner —
+so `bun run test` (the correct invocation) is what was used above and it
+passes cleanly.
 
-1. **`.prettierignore` is a real filter, not a no-op.**
-   Temporarily removed `.prettierignore` and ran `prettier --check .`:
-   found 6 real violations —
-   `.claude/commands/feature.md`, `.claude/commands/handle-issues.md`,
-   `.pipeline/README.md`, `.pipeline/spec.md`,
-   `documentation/phase-1/graceful_phase1_sprint_backlog.md`,
-   `documentation/prd/graceful_requirements_v10.md`.
-   Restored `.prettierignore` and confirmed `format:check` passes again
-   (0 violations). This proves the ignore file is doing real, necessary work
-   and `format:check` is a genuine check, not a false-pass.
+## Content verification of `documentation/staging-environment.md` against spec §2a
 
-2. **No logic change in the 4 reformatted source files.**
-   Diffed each against the pre-change commit (`e4acd21`) with whitespace
-   collapsed. `app/globals.css`'s font-family list is byte-identical
-   modulo whitespace. `app/(auth)/layout.tsx`, `components/ui/Button.tsx`,
-   and `lib/api/webhook-verify.ts` differ only by JSX-wrapping parentheses
-   and multi-line vs single-line function signatures — both are inert,
-   non-semantic constructs (grouping parens around JSX don't change the
-   AST's meaning; wrapping a function signature across lines doesn't change
-   its parameters or return type). Confirmed: same identifiers, same
-   strings, same throw/error messages, same TODO comments, same logic.
+All six required sections are present and complete:
 
-3. **Out-of-scope files untouched.**
-   `git diff e4acd21..HEAD -- eslint.config.mjs tsconfig.json next.config.ts
-   .prettierrc .github/workflows/ci.yml` produced no output — confirmed none
-   of these were touched.
+1. **Purpose** — cites PRD §26.2 (E2E target), §26.5/#83 (production deploy
+   gate), §25.7/§26.5 (environment isolation) — matches the spec's required
+   citations in substance.
+2. **Environments overview** — table with development/staging/production rows
+   and the required columns (purpose, host, branch, Supabase project,
+   API-key mode); production correctly marked "set up later — same pattern
+   (issue out of scope here)" per spec instruction.
+3. **Vercel setup** — step-by-step for a human operator; explicitly states
+   `main` triggers the staging deploy; states the required unambiguous
+   env-var convention (Vercel's native per-Environment scoping, identical
+   variable names across environments, only values differ, explicit
+   rejection of prefixed names like `STAGING_SUPABASE_URL`) — this directly
+   satisfies the spec's §4 Edge Case, which was called out as something the
+   doc "must nail." Table mirrors `.env.example` sections with
+   distinct-vs-shared annotations matching the exact list in the spec
+   (Supabase, Clerk, Pingram, Resend, R2, `NEXT_PUBLIC_APP_URL`,
+   `TOKEN_ENCRYPTION_KEY`, Upstash/QStash, Modal, Google OAuth).
+4. **Test/sandbox keys** — Clerk, Pingram, Resend each addressed using the
+   spec-mandated "test mode if available, otherwise dedicated staging key"
+   phrasing rather than asserting unconfirmed sandbox tiers (spec explicitly
+   forbade fabricating sandbox claims).
+5. **Supabase** — separate project, schema parity via `supabase/migrations/`,
+   references `supabase/README.md`, staging-before-production migration
+   order per §26.5.
+6. **Verification checklist** — 4 checkbox items; confirmed 1:1 mapping to
+   the GitHub issue's four acceptance criteria (separate Supabase project,
+   test keys in use, `main` push triggers staging deploy, doc exists and is
+   linked from README).
 
-4. **`package.json` scripts preserved.**
-   `git diff e4acd21..HEAD -- package.json` shows only a clean 2-line
-   insertion of `format` / `format:check` after `typecheck`; `dev`, `build`,
-   `start`, `lint`, `typecheck`, `test`, `test:e2e` are untouched, same
-   commands, same order relative to each other.
+## Out-of-scope check
+
+Confirmed no `vercel.json`, no Terraform/Pulumi/IaC files, no changes to
+`.github/workflows/ci.yml`, no new deploy workflow, no Playwright/E2E setup,
+no production environment setup, and no new/renamed environment variables.
 
 ## Summary
 
-All verification commands pass. No new tests were written because this
-issue introduced no new application behavior — the existing Jest suite
-(3 tests) was re-run and still passes, confirming the Prettier reformatting
-didn't alter runtime behavior. All specific claims in the coder's
-changes.md were independently reproduced rather than taken on faith.
+All spec requirements (§2a's six documentation sections, §2b README link,
+§2c `.env.example` header block, §5 Definition of Done) are met. Lint,
+typecheck, and the project's actual test suite (`bun run test`) all pass. No
+secrets or out-of-scope changes were introduced. All claims in the coder's
+`changes.md` were independently reproduced rather than taken on faith.
 
 **Result: PASS. No blocking issues found. Ready for Reviewer.**
