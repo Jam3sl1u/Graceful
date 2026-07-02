@@ -1,130 +1,78 @@
-# Changes: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Changes — Issue #16: Migrate schema, Cluster 1 (Organization)
 
-## Summary
+## File added
 
-Closed the remaining gap on an otherwise-complete Next.js + TypeScript setup:
-Prettier now actually passes on a clean checkout, and the README documents the
-top-level folder structure. No dependencies, config strictness, routes, or
-auth were touched.
+- `supabase/migrations/20260702000001_cluster_1_organization.sql` (new)
 
-## Files changed
+## What it does
 
-- **`.prettierignore`** (new) — scopes Prettier to real developer source.
-  Mirrors `eslint.config.mjs`'s ignore list (`song2score/`, `.pipeline/`,
-  `documentation/`, `.next/`) plus `node_modules`, `out`, `coverage`,
-  `.claude`, and generated/lockfiles (`bun.lock`, `package-lock.json`,
-  `next-env.d.ts`). This was the root cause of the failing Prettier
-  acceptance criterion — without it, `prettier --check .` was scanning docs
-  and pipeline markdown that were never meant to be formatted.
+First-ever migration in the project (previously `supabase/migrations/`
+contained only `.gitkeep`). Establishes the pattern for later cluster
+migrations.
 
-- **`package.json`** — added two bun scripts, inserted right after
-  `typecheck` (no reordering/removal of existing scripts, no dependency
-  changes):
-  - `"format": "prettier --write ."`
-  - `"format:check": "prettier --check ."`
+UP section:
+- `create extension if not exists "pgcrypto"` for `gen_random_uuid()`.
+- `user_role` enum: `admin`, `set_leader`, `member`, `guest`.
+- `vocal_capability` enum: `none`, `lead`, `harmony`, `both` — created here
+  (owned by Cluster 1) per the spec's enum-ownership decision, with a code
+  comment noting Cluster 5 must NOT redefine it.
+- Tables in FK-dependency order: `church_groups` → `users` →
+  `member_profiles`, matching the exact column/type/constraint spec (uuid
+  PKs via `gen_random_uuid()`, `users.email` nullable+unique, `role`
+  default `'member'`, `vocal_capability` default `'none'`,
+  `timezone` default `'America/Chicago'`, both FKs `on delete cascade`,
+  `member_profiles` has no `updated_at`).
+- B-tree index `idx_users_church_group_id` on `users.church_group_id`.
 
-- **`app/(auth)/layout.tsx`**, **`components/ui/Button.tsx`**,
-  **`lib/api/webhook-verify.ts`**, **`app/globals.css`** — reformatted via
-  `bunx prettier --write .` to fix real `printWidth: 100` violations (long
-  single-line JSX/function signatures got wrapped; the CSS `font-family`
-  list got collapsed to fit under 100 chars). All four diffs are pure
-  whitespace/line-wrapping — verified via `git diff` that no logic, strings,
-  or identifiers changed. See diffs below for exact deltas.
+DOWN section (commented block, per spec's decision on reversibility given
+Supabase CLI has no native up/down pair): drops `member_profiles`, `users`,
+`church_groups`, then `vocal_capability`, then `user_role` — reverse
+dependency order, enums last.
 
-- **`README.md`** — expanded from a 2-line title/tagline into: Getting
-  Started (bun install / bun run dev), a Scripts list (dev/build/lint/
-  typecheck/format/format:check), and a new "Project Structure" section
-  listing `app/`, `components/`, `lib/`, `schemas/`, `types/`, `supabase/`,
-  `tests/` with one line each. Kept intentionally minimal per the issue's
-  "don't over-engineer" instruction — no deep architecture doc. This file
-  was itself reformatted by Prettier after being written (blank line added
-  after the `# Graceful` title).
+## Scope adherence
 
-## Exact diffs for the four reformatted source files
+Only the three Organization tables and the two enums Cluster 1 needs. No
+RLS policies, seed data, PostgREST lockdown, other clusters' tables, or
+TypeScript type generation. `supabase/config.toml`, `supabase/seed.sql`,
+`lib/supabase/types.ts`, `lib/supabase/client.ts` untouched.
 
-```diff
---- a/app/(auth)/layout.tsx
-+++ b/app/(auth)/layout.tsx
-@@ -1,3 +1,7 @@
- export default function AuthLayout({ children }: { children: React.ReactNode }) {
--  return <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>{children}</div>;
-+  return (
-+    <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>
-+      {children}
-+    </div>
-+  );
- }
+## Verification performed
 
---- a/app/globals.css
-+++ b/app/globals.css
-@@ -15,12 +15,7 @@ body {
-   margin: 0;
-   background: var(--color-bg);
-   color: var(--color-fg);
--  font-family:
--    -apple-system,
--    BlinkMacSystemFont,
--    "Segoe UI",
--    Roboto,
--    sans-serif;
-+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
- }
+No `psql`/`supabase` CLI locally, so validated with a throwaway
+`postgres:16` Docker container (started, tested, then removed —
+no persistent infra changes):
 
---- a/components/ui/Button.tsx
-+++ b/components/ui/Button.tsx
-@@ -6,7 +6,5 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
- };
+1. Ran the UP block against a fresh database — all statements succeeded
+   with zero errors (`CREATE EXTENSION`, `CREATE TYPE` x2, `CREATE TABLE`
+   x3, `CREATE INDEX`).
+2. Inserted a `church_groups` row with no explicit `timezone` — confirmed
+   default `'America/Chicago'`.
+3. Inserted two `users` rows with no `email` and no `role` — confirmed both
+   inserts succeed (nullable-unique constraint allows multiple NULLs) and
+   `role` defaults to `'member'`; inserted matching `member_profiles` rows
+   with no `vocal_capability` — confirmed default `'none'`.
+4. Deleted the `church_groups` row and confirmed cascade removed all
+   `users` and `member_profiles` rows (0 remaining in both).
+5. Ran the DOWN block — all drops succeeded; confirmed via
+   `information_schema.tables` and `pg_type` that no Cluster 1 tables or
+   enum types remain (0 rows each).
 
- export function Button({ variant = "primary", className, ...props }: ButtonProps) {
--  return (
--    <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />
--  );
-+  return <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />;
- }
+## Focus for Tester
 
---- a/lib/api/webhook-verify.ts
-+++ b/lib/api/webhook-verify.ts
-@@ -10,10 +10,7 @@ export async function verifyClerkWebhook(_rawBody: string, _headers: Headers): P
- }
+- Confirm the migration file timestamp (`20260702000001`) sorts correctly
+  ahead of any other migrations that may exist by review time.
+- No app code (TS) was touched, so `bun run lint` / `bun run typecheck` /
+  `bun test` should be unaffected by this change — worth a sanity run to
+  confirm no regressions were introduced elsewhere.
+- If the team has a real Supabase project/CLI available, running
+  `supabase db reset` (or equivalent) against this migration is the
+  strongest additional check beyond the manual Docker Postgres validation
+  done here.
 
- // TODO(Sprint 4 #58): verify using PINGRAM_WEBHOOK_SECRET.
--export async function verifyPingramWebhook(
--  _rawBody: string,
--  _headers: Headers,
--): Promise<boolean> {
-+export async function verifyPingramWebhook(_rawBody: string, _headers: Headers): Promise<boolean> {
-   throw new Error("verifyPingramWebhook not implemented — see Sprint 4 #58");
- }
-```
+## Commit
 
-## Verification performed (all passed)
-
-1. `bun run format:check` — "All matched files use Prettier code style!"
-2. `bun run lint` — passes, no output/errors.
-3. `bun run typecheck` — passes, no output/errors.
-4. `bun run dev` — started cleanly; `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/` returned `200`. Dev server stopped afterward.
-
-## What the Tester should focus on
-
-- Confirm `bun run format:check` fails if any of the 4 reformatted files (or
-  README.md) is reverted to its old formatting — i.e. the check is real, not
-  a no-op.
-- Confirm `.prettierignore` actually excludes `.pipeline/`, `documentation/`,
-  and `song2score/` from `prettier --check .` (these directories contain
-  markdown/config that would otherwise false-fail).
-- Confirm no logic changed in the 4 reformatted files — behavior of
-  `AuthLayout`, `Button`, and the four `verify*Webhook` functions should be
-  byte-identical modulo whitespace (diffs above are the full deltas).
-- Confirm `eslint.config.mjs`, `tsconfig.json`, `next.config.ts`,
-  `.prettierrc`, and `.github/workflows/ci.yml` were NOT touched (out of
-  scope per spec section 4).
-- `package.json` scripts: verify `format` and `format:check` were inserted
-  without disturbing existing scripts (`dev`, `build`, `start`, `lint`,
-  `typecheck`, `test`, `test:e2e` all still present, same commands).
-
-## Out of scope (confirmed not touched)
-
-- No dependency changes (prettier@^3.4.0 was already present).
-- No changes to `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`,
-  `.prettierrc`, `.github/workflows/ci.yml`.
-- No route/auth/UI logic changes beyond formatting.
+Committed only the new migration file on the current branch
+(`issue-16-sprint-0-migrate-schema-cluster-1-organization`), commit
+`fe3a6b6`. Not pushed. Note: `.pipeline/spec.md` had pre-existing local
+modifications not made by this stage and were intentionally left
+uncommitted/untouched.
