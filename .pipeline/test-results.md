@@ -1,68 +1,63 @@
-# Test Results — Issue #15: JWT verification + role-check middleware
+# Test Results — Issue #16: Migrate schema, Cluster 1 (Organization)
 
-Branch: `issue-15-jwt-verification-role-check-middleware`
+## Overall: PASS
 
-## Verification performed (independently re-run, not trusted from changes.md)
+All checks below were independently re-run (not taken on the coder's word).
 
-- `bun run typecheck` (`tsc --noEmit`) — **PASS**, no errors.
-- `bun run lint` (`eslint .`) — **PASS**, clean.
-- `bun run test` (`jest`) — **PASS**, 3 suites / 13 tests, 0 failures:
-  - `tests/unit/lib/api/auth.test.ts`
-  - `tests/unit/app/api/admin-only-route.test.ts`
-  - `tests/unit/lib/api/response.test.ts` (pre-existing, unaffected)
-- `git diff a60f52b..660fff0 --stat` — confirmed scope: only `lib/api/auth.ts` (modified),
-  `app/api/_examples/admin-only/route.ts` (new), the two new test files, and
-  `.pipeline/spec.md`. No changes to `middleware.ts`, `lib/supabase/*`,
-  `lib/clerk/server.ts`, or any existing route handler, matching the spec's "Files to
-  modify" / "Definition of done" constraints.
-- Manually read `lib/api/auth.ts`, `app/api/_examples/admin-only/route.ts`, both test
-  files, `lib/api/errors.ts`, and `types/domain.ts` line-by-line against the spec.
+## 1. App-code regression checks
 
-## Findings against spec/acceptance criteria
+- `bun run lint` (`eslint .`) — PASS, no output/errors.
+- `bun run typecheck` (`tsc --noEmit`) — PASS, no output/errors.
+- `bun run test` (`jest`, the actual test script defined in `package.json`) — PASS:
+  `tests/unit/lib/api/response.test.ts` — 3/3 tests passed. No regressions.
+  - Note: raw `bun test` (bun's own runner, not the repo's `test` script) throws
+    on this repo regardless of this change — it tries to execute
+    `tests/e2e/health.spec.ts` (a Playwright spec) and a Jest test that imports
+    `server-only` outside a Next.js server context, both of which are pre-existing
+    test-runner-selection issues unrelated to the migration. Using the correct
+    script (`bun run test` → `jest`) is clean. Confirms coder's claim that no app
+    code was touched and nothing else regressed.
 
-- **401 vs 403 ordering**: `requireAuth` throws `UNAUTHENTICATED`/401 when Clerk
-  `auth()` returns no `userId`, and the test at
-  `tests/unit/lib/api/auth.test.ts:24-33` asserts `lookup` is **never called** in that
-  case — confirms the JWT check strictly precedes the DB lookup as required.
-- **No-`users`-row case is 401, not 403**: when `lookup(clerkId)` resolves `null`,
-  `requireAuth` throws `UNAUTHENTICATED`/401 (`lib/api/auth.ts:36-38`), matching the
-  spec's explicit rationale ("no user record ⇒ cannot authorize ⇒ treat as
-  unauthenticated, not 403"). Verified by test at `auth.test.ts:35-43`.
-- **`requireRole`**: void/no-throw when role is in the allow-list array (multi-role
-  case tested with `["admin", "set_leader"]`); throws `ApiException` FORBIDDEN/403
-  otherwise. Matches spec exactly.
-- **All four `UserRole` values** (`admin`, `set_leader`, `member`, `guest`) are
-  table-driven tested against the admin-only fixture route in
-  `tests/unit/app/api/admin-only-route.test.ts`, satisfying the named acceptance
-  criterion. `admin` → 200 `{ data: { ok: true } }`; the other three → 403
-  `FORBIDDEN`. Confirmed `types/domain.ts` declares exactly these four roles, so the
-  table is exhaustive.
-- **Fixture route error mapping**: `app/api/_examples/admin-only/route.ts`'s `catch`
-  maps `ApiException` to `fail(err.message, err.code, err.status)` and any other
-  error to `fail("Internal error", ErrorCode.INTERNAL, 500)` — no raw error/stack can
-  leak. Matches spec's edge case requirement.
-- **`lookup` param not part of Next's route contract**: correctly noted as an optional
-  test seam; production callers get `undefined` and fall back to the real
-  `lookupUserByClerkId` default, which still throws the "blocked on #16" error as
-  intended (untested here since it requires real Clerk/DB context, and the spec does
-  not require testing the stub's throw path).
-- **Deviation noted in changes.md** (`auth as unknown as jest.Mock` instead of spec's
-  `auth as jest.Mock`): confirmed necessary — this is a pure TypeScript cast-syntax
-  fix required to satisfy `tsc --noEmit` (verified passing above), with no behavioral
-  or test-coverage change. Both test files use the same pattern consistently.
-  Acceptable as a typecheck-driven fix, not a spec violation.
+## 2. Migration file review
 
-## Failure case coverage
+Read `supabase/migrations/20260702000001_cluster_1_organization.sql` in full and
+diffed column-by-column against spec's exact schema tables. Matches exactly:
+tables (`church_groups`, `users`, `member_profiles`), columns, types, defaults,
+constraints, FK cascade behavior, index, and enum definitions/order. Scope is
+clean — `git show --stat fe3a6b6` confirms only this one file was committed; no
+edits to `config.toml`, `seed.sql`, `types.ts`, `client.ts`.
 
-- Unauthenticated request (`userId: null`) — covered in both test files, asserts
-  401/UNAUTHENTICATED and (in the fixture route test) that `lookup` is never
-  consulted.
-- Authenticated-but-unauthorized (role not in allow-list) — covered for all three
-  non-admin roles, asserts 403/FORBIDDEN.
-- Authenticated-but-no-DB-user (`lookup` resolves `null`) — covered directly against
-  `requireAuth` in `auth.test.ts`.
+Migration timestamp `20260702000001` is the only file in `supabase/migrations/`
+(sorts correctly as first/only migration).
 
-## Overall result: PASS
+## 3. Live Postgres verification (independent, via fresh throwaway Docker container `postgres:16`, removed after)
 
-No code changes needed from the coder. All claims in `.pipeline/changes.md` were
-independently verified and hold up. Ready for Reviewer.
+- UP block ran top-to-bottom with zero errors: `CREATE EXTENSION`, `CREATE TYPE` x2,
+  `CREATE TABLE` x3, `CREATE INDEX` — PASS.
+- **Happy path**: inserted a `church_groups` row with only `name`/`invite_code` —
+  `timezone` defaulted to `'America/Chicago'` — PASS.
+- Inserted two `users` rows with no `role`/`email` — both succeeded (nullable-unique
+  email allows multiple NULLs — **edge case from spec** #2), `role` defaulted to
+  `'member'` — PASS.
+- Inserted matching `member_profiles` rows with no `vocal_capability` — defaulted
+  to `'none'` — PASS (spec edge case #3).
+- **Cascade edge case** (spec #5): deleted the `church_groups` row — confirmed 0
+  `users` and 0 `member_profiles` rows remained (transitive cascade through
+  users→member_profiles) — PASS.
+- **Failure case**: attempted to insert a second `church_groups` row reusing an
+  existing `invite_code` — correctly rejected with
+  `duplicate key value violates unique constraint "church_groups_invite_code_key"`
+  — PASS (uniqueness constraint enforced as specified).
+- **Reversibility** (spec edge case #6): ran the commented DOWN block (all 5
+  statements) on the now-fresh DB — all drops succeeded; verified via
+  `information_schema.tables` and `pg_type` that 0 Cluster 1 tables and 0 Cluster 1
+  enum types remain — PASS.
+
+## Conclusion
+
+Independently verified UP migration runs clean on a fresh DB, all constraints/
+defaults/cascades match spec exactly, a representative failure case (duplicate
+invite_code) is correctly rejected, DOWN block fully reverses with no orphaned
+objects, scope is untouched outside the one new migration file, and existing
+lint/typecheck/test suite (via the repo's actual `bun run test` script) shows no
+regressions. No issues found. Ready for Reviewer.

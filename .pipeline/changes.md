@@ -1,80 +1,78 @@
-# Changes — Issue #15: JWT verification + role-check middleware
+# Changes — Issue #16: Migrate schema, Cluster 1 (Organization)
 
-## Files changed
+## File added
 
-- `lib/api/auth.ts` (rewrite of the two stubs)
-  - Implemented `requireAuth(req, lookup = lookupUserByClerkId)`:
-    1. Calls Clerk's `auth()` to get `clerkId`. Throws `ApiException("Authentication
-       required", ErrorCode.UNAUTHENTICATED, 401)` if null/undefined — this check
-       strictly precedes any DB lookup.
-    2. Calls the injected `lookup(clerkId)`. Throws the same 401 UNAUTHENTICATED
-       (not 403) if it resolves to `null` (Clerk-authenticated user with no matching
-       `users` row).
-    3. Returns the resolved `AuthContext`.
-  - Implemented `requireRole(ctx, roles)`: returns void if `roles.includes(ctx.role)`,
-    otherwise throws `ApiException("Insufficient permissions", ErrorCode.FORBIDDEN, 403)`.
-  - Added the `UserLookup` type (`(clerkId: string) => Promise<AuthContext | null>`) as
-    the lookup seam called out in the spec's open question — real `users` table query
-    is blocked on #16, so `lookupUserByClerkId` (kept internal/unexported) throws
-    `"user lookup not implemented — blocked on #16 ..."` and carries a
-    `// TODO(#16): SELECT id, church_group_id, role FROM users WHERE clerk_id = $1`
-    comment. It is the default `lookup` argument; tests inject a fake instead.
-  - `AuthContext` shape (`{ userId, churchGroupId, role }`) unchanged.
+- `supabase/migrations/20260702000001_cluster_1_organization.sql` (new)
 
-## Files created
+## What it does
 
-- `app/api/_examples/admin-only/route.ts` — minimal example admin-only `GET` route
-  (per spec verbatim) that calls `requireAuth` then `requireRole(ctx, ["admin"])`,
-  wrapping `ApiException` into `fail()` and any other error into a 500 `INTERNAL`.
-  Takes an optional `lookup` test seam parameter (unused by Next's route contract in
-  production, where it's `undefined` and the real default lookup applies). Exists only
-  to support #15's unit tests, not a product endpoint (`_examples` prefix).
+First-ever migration in the project (previously `supabase/migrations/`
+contained only `.gitkeep`). Establishes the pattern for later cluster
+migrations.
 
-- `tests/unit/lib/api/auth.test.ts` — unit tests for `requireAuth`/`requireRole`
-  directly, mocking `@clerk/nextjs/server`'s `auth`:
-  - 401 UNAUTHENTICATED when Clerk `userId` is null (lookup never called).
-  - 401 UNAUTHENTICATED when Clerk `userId` is set but injected lookup returns null.
-  - Returns the injected lookup's `AuthContext` when Clerk `userId` is set.
-  - `requireRole` no-op when role is in the allow-list.
-  - `requireRole` throws `ApiException` (`FORBIDDEN`, 403) when role is not allowed.
+UP section:
+- `create extension if not exists "pgcrypto"` for `gen_random_uuid()`.
+- `user_role` enum: `admin`, `set_leader`, `member`, `guest`.
+- `vocal_capability` enum: `none`, `lead`, `harmony`, `both` — created here
+  (owned by Cluster 1) per the spec's enum-ownership decision, with a code
+  comment noting Cluster 5 must NOT redefine it.
+- Tables in FK-dependency order: `church_groups` → `users` →
+  `member_profiles`, matching the exact column/type/constraint spec (uuid
+  PKs via `gen_random_uuid()`, `users.email` nullable+unique, `role`
+  default `'member'`, `vocal_capability` default `'none'`,
+  `timezone` default `'America/Chicago'`, both FKs `on delete cascade`,
+  `member_profiles` has no `updated_at`).
+- B-tree index `idx_users_church_group_id` on `users.church_group_id`.
 
-- `tests/unit/app/api/admin-only-route.test.ts` — table-driven test importing `GET`
-  from the fixture route, covering all four `UserRole` values (`admin` → 200,
-  `set_leader`/`member`/`guest` → 403 `FORBIDDEN`), plus the `auth()` returning
-  `{ userId: null }` case → 401 `UNAUTHENTICATED` (lookup never consulted). This
-  satisfies the "unit tests cover all four roles against an admin-only route"
-  acceptance criterion.
+DOWN section (commented block, per spec's decision on reversibility given
+Supabase CLI has no native up/down pair): drops `member_profiles`, `users`,
+`church_groups`, then `vocal_capability`, then `user_role` — reverse
+dependency order, enums last.
 
-## Deviation from spec (typecheck-driven, non-functional)
+## Scope adherence
 
-The spec's test snippet used `const mockAuth = auth as jest.Mock;`. `tsc --noEmit`
-rejected this direct cast (Clerk's `auth` export type doesn't sufficiently overlap
-with `jest.Mock`). Used `auth as unknown as jest.Mock` instead in both test files —
-purely a cast-syntax fix to satisfy `npm run typecheck`; no behavioral change and no
-scope added.
+Only the three Organization tables and the two enums Cluster 1 needs. No
+RLS policies, seed data, PostgREST lockdown, other clusters' tables, or
+TypeScript type generation. `supabase/config.toml`, `supabase/seed.sql`,
+`lib/supabase/types.ts`, `lib/supabase/client.ts` untouched.
 
 ## Verification performed
 
-- `bun run typecheck` — passes.
-- `bun run test` — all 3 suites / 13 tests pass, including the two new files and the
-  pre-existing `tests/unit/lib/api/response.test.ts`.
-- `bun run lint` — clean.
+No `psql`/`supabase` CLI locally, so validated with a throwaway
+`postgres:16` Docker container (started, tested, then removed —
+no persistent infra changes):
 
-## Out of scope / untouched (per spec)
+1. Ran the UP block against a fresh database — all statements succeeded
+   with zero errors (`CREATE EXTENSION`, `CREATE TYPE` x2, `CREATE TABLE`
+   x3, `CREATE INDEX`).
+2. Inserted a `church_groups` row with no explicit `timezone` — confirmed
+   default `'America/Chicago'`.
+3. Inserted two `users` rows with no `email` and no `role` — confirmed both
+   inserts succeed (nullable-unique constraint allows multiple NULLs) and
+   `role` defaults to `'member'`; inserted matching `member_profiles` rows
+   with no `vocal_capability` — confirmed default `'none'`.
+4. Deleted the `church_groups` row and confirmed cascade removed all
+   `users` and `member_profiles` rows (0 remaining in both).
+5. Ran the DOWN block — all drops succeeded; confirmed via
+   `information_schema.tables` and `pg_type` that no Cluster 1 tables or
+   enum types remain (0 rows each).
 
-- `middleware.ts`, `lib/supabase/*`, `lib/clerk/server.ts` — not modified.
-- No existing route handlers converted to use `requireAuth`/`requireRole`.
-- No `users` table / migration work (#16) — `lookupUserByClerkId` remains an
-  intentional stub pending that issue.
+## Focus for Tester
 
-## What the Tester should focus on
+- Confirm the migration file timestamp (`20260702000001`) sorts correctly
+  ahead of any other migrations that may exist by review time.
+- No app code (TS) was touched, so `bun run lint` / `bun run typecheck` /
+  `bun test` should be unaffected by this change — worth a sanity run to
+  confirm no regressions were introduced elsewhere.
+- If the team has a real Supabase project/CLI available, running
+  `supabase db reset` (or equivalent) against this migration is the
+  strongest additional check beyond the manual Docker Postgres validation
+  done here.
 
-- Confirm the 401-vs-403 distinction: authenticated-but-no-`users`-row is 401
-  (`UNAUTHENTICATED`), only a resolved user with a disallowed role is 403
-  (`FORBIDDEN`).
-- Confirm `requireAuth` never invokes `lookup` when Clerk `auth()` returns no
-  `userId` (ordering: JWT check strictly before DB lookup).
-- Confirm the `app/api/_examples/admin-only/route.ts` fixture's `catch` maps any
-  non-`ApiException` to a 500 `INTERNAL` response rather than leaking a raw error.
-- The `auth as unknown as jest.Mock` cast deviation above — confirm it's acceptable
-  as a typecheck fix rather than a spec violation.
+## Commit
+
+Committed only the new migration file on the current branch
+(`issue-16-sprint-0-migrate-schema-cluster-1-organization`), commit
+`fe3a6b6`. Not pushed. Note: `.pipeline/spec.md` had pre-existing local
+modifications not made by this stage and were intentionally left
+uncommitted/untouched.

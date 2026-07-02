@@ -1,167 +1,125 @@
-# Spec — Issue #15: JWT verification + role-check middleware
+# Spec — Issue #16: Migrate schema, Cluster 1 (Organization)
 
-## OPEN QUESTIONS (non-blocking — decisions made below, flag if you disagree)
+## OPEN QUESTIONS
 
-1. **The `users` table (#16) does not exist yet.** `supabase/migrations/` contains only
-   `.gitkeep`, and `lib/supabase/client.ts` is a stub that throws. The acceptance criteria
-   say role must be read from the `users` table "not just the JWT claim." We cannot query a
-   table that isn't built, and creating it is issue #16's job (out of scope here).
-   **Decision:** introduce a thin, injectable lookup seam (`UserLookup`) so the middleware's
-   contract and unit tests land now, and the real DB query is dropped in when #16 lands. The
-   real query is stubbed to throw a clear "pending #16" error; unit tests inject a fake
-   lookup. This is the same stub-and-seam pattern already used across `lib/` in this repo.
-   If the pipeline owner would rather block this issue until #16 merges, stop here.
+None that block implementation. Two decisions are made explicit below (both low-risk, chosen to match repo conventions and the PRD). Flag if you disagree:
 
-2. Everything else is unambiguous. No invented requirements below.
-
----
+1. **Down migration format.** Supabase CLI migrations are forward-only `.sql` files with no native up/down file pair. To satisfy the "reversible / down migration written" acceptance criterion without inventing tooling the repo doesn't have, include the down SQL in the same migration file inside a commented `-- DOWN` block. Lowest-friction, keeps one CLI-applicable file.
+2. **`vocal_capability` enum ownership.** `member_profiles.vocal_capability` (Cluster 1) needs the `vocal_capability` enum, which the backlog nominally assigns to a later cluster (#11/Cluster 5). Cluster 1 cannot compile without it, so create it here. See "Enum ownership decision".
 
 ## Scope
 
-Implement the two existing stubs in `lib/api/auth.ts` (`requireAuth`, `requireRole`) plus a
-lookup seam, and unit-test all four roles against an admin-only route. API-layer only. NOT in
-scope: RLS (#22), rate limiting (#76), wiring middleware.ts enforcement, the `users` migration
-(#16), or converting existing stub routes.
+ONLY the three Organization tables (`church_groups`, `users`, `member_profiles`) and the enums they require (`user_role`, `vocal_capability`). Do NOT add RLS policies (#22), seed data, PostgREST lockdown (#14), other clusters' tables, or TypeScript type generation.
 
-## Existing patterns to follow (do not deviate)
+## Current repo state (verified)
 
-- Error type: `ApiException(message, code, status)` from `lib/api/errors.ts`. `ErrorCode.UNAUTHENTICATED` and `ErrorCode.FORBIDDEN` already exist.
-- Response envelope + `fail()`: `lib/api/response.ts`.
-- Role type: `UserRole = "admin" | "set_leader" | "member" | "guest"` from `types/domain.ts`. Use this; do not redefine.
-- `AuthContext` type already declared in `lib/api/auth.ts` — keep its shape: `{ userId, churchGroupId, role }`.
-- Every server file starts with `import "server-only";`.
-- Unit test style: copy `tests/unit/lib/api/response.test.ts` (Jest `describe`/`it`, `@/` path alias). Tests live under `tests/unit/**/*.test.ts` (see `jest.config.ts` `testMatch`). `server-only` is auto-mocked via `tests/mocks/server-only.js`.
+- `supabase/migrations/` contains only `.gitkeep` — this is the FIRST migration in the project; there is no prior SQL to copy from. This file becomes the reference pattern for all later cluster migrations.
+- `supabase/config.toml` is a placeholder (`project_id = "graceful"` only). Do not edit it for this issue.
+- `supabase/seed.sql`, `lib/supabase/types.ts`, `lib/supabase/client.ts` are all placeholders for later issues — leave untouched.
+- PRD source of truth for the schema: `documentation/prd/graceful_requirements_v10.md` §20.2 (enums) and §20.3 (Cluster 1). Column definitions below are transcribed from there.
 
----
+## File to create
 
-## Files to modify
+### `supabase/migrations/20260702000001_cluster_1_organization.sql` (NEW)
 
-### 1. `lib/api/auth.ts` (rewrite the two stub bodies + add lookup seam)
+Timestamp prefix `20260702000001` — Supabase orders migrations lexicographically by the `YYYYMMDDHHMMSS_` prefix, so this must sort before any future cluster migration. Structure:
 
-Keep the existing `AuthContext` type. Implement:
+```
+-- Migration: Cluster 1 — Organization
+-- Tables: church_groups, users, member_profiles
+-- Enums: user_role, vocal_capability (vocal_capability is created here and reused by Cluster 5)
 
-```ts
-import "server-only";
-import type { NextRequest } from "next/server";
-import { auth } from "@clerk/nextjs/server";
-import { ApiException, ErrorCode } from "@/lib/api/errors";
-import type { UserRole } from "@/types/domain";
+-- ============ UP ============
+create extension if not exists "pgcrypto";  -- gen_random_uuid()
 
-export type AuthContext = {
-  userId: string;        // internal users.id (uuid), NOT the Clerk id
-  churchGroupId: string;
-  role: UserRole;
-};
+-- enums (user_role, vocal_capability)
+-- tables in FK dependency order: church_groups -> users -> member_profiles
+-- index on users.church_group_id
 
-// Lookup seam — real impl added when #16 (users table) lands. Injected in tests.
-export type UserLookup = (clerkId: string) => Promise<AuthContext | null>;
-
-// requireAuth: verify the Clerk JWT, then resolve the DB-backed AuthContext.
-// `lookup` defaults to the real (currently pending) DB lookup; tests pass a fake.
-export async function requireAuth(
-  _req: NextRequest,
-  lookup: UserLookup = lookupUserByClerkId,
-): Promise<AuthContext>;
-
-export function requireRole(ctx: AuthContext, roles: UserRole[]): void;
+-- ============ DOWN ============
+-- (commented; run to reverse — drop in reverse dependency order)
+-- drop table if exists member_profiles;
+-- drop table if exists users;
+-- drop table if exists church_groups;
+-- drop type if exists vocal_capability;
+-- drop type if exists user_role;
 ```
 
-Behaviour:
+## Enum ownership decision
 
-- `requireAuth`:
-  1. Call Clerk `const { userId: clerkId } = await auth();` (App Router server helper). If `clerkId` is null/undefined → `throw new ApiException("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`.
-  2. `const ctx = await lookup(clerkId);`. If `null` (authenticated Clerk user with no matching `users` row) → `throw new ApiException("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`. (No user record ⇒ cannot authorize ⇒ treat as unauthenticated, not 403.)
-  3. Return `ctx`.
-  - Note the `req` arg is retained for signature stability / future use even though Clerk `auth()` reads request context ambiently. Do not remove it.
+Create BOTH enums in this migration:
+- `user_role` — values in order: `admin`, `set_leader`, `member`, `guest`.
+- `vocal_capability` — values in order: `none`, `lead`, `harmony`, `both`.
 
-- `requireRole(ctx, roles)`:
-  - If `roles.includes(ctx.role)` → return (void).
-  - Else → `throw new ApiException("Insufficient permissions", ErrorCode.FORBIDDEN, 403)`.
-  - `roles` is an array so callers can allow multiple (e.g. `["admin", "set_leader"]`).
+Add a comment noting `vocal_capability` is created here and must NOT be redefined by the later Cluster 5 migration.
 
-- `lookupUserByClerkId` (the default real lookup): a `UserLookup` that currently throws `new Error("user lookup not implemented — blocked on #16 (users table) / #7-14 (supabase client)")`. Keep it internal (not exported) or export it — either is fine, but it must be the default arg. Add a `// TODO(#16): SELECT id, church_group_id, role FROM users WHERE clerk_id = $1` comment describing the real query (maps clerk_id → AuthContext per PRD §20.3 `users` table).
+## Exact schema (from PRD §20.2 / §20.3)
 
-Import note: import `ApiException` and `ErrorCode` from `@/lib/api/errors` (both are exported there).
+### Table `church_groups` (root — has NO church_group_id FK)
+| Column | Type | Constraints |
+| --- | --- | --- |
+| id | uuid | PK, default `gen_random_uuid()` |
+| name | varchar(100) | not null |
+| denomination | varchar(100) | null |
+| timezone | varchar(50) | not null, default `'America/Chicago'` |
+| logo_url | text | null (R2 object key, never a public URL) |
+| invite_code | varchar(20) | not null, **unique** |
+| created_at | timestamptz | not null, default `now()` |
+| updated_at | timestamptz | not null, default `now()` |
 
-### 2. `lib/clerk/server.ts` — LEAVE AS-IS.
+### Table `users`
+| Column | Type | Constraints |
+| --- | --- | --- |
+| id | uuid | PK, default `gen_random_uuid()` |
+| clerk_id | varchar(50) | not null, **unique** |
+| church_group_id | uuid | not null, FK → `church_groups(id)` on delete cascade |
+| role | user_role | not null, default `'member'` |
+| name | varchar(100) | not null |
+| email | varchar(255) | **null**, **unique** (nullable-unique: Postgres allows multiple NULLs) |
+| phone | varchar(20) | null |
+| sms_opted_in | boolean | not null, default `false` |
+| created_at | timestamptz | not null, default `now()` |
+| updated_at | timestamptz | not null, default `now()` |
 
-Do not implement `getAuthContext` here; it is a separate concern (session-claim reader, #5/#6) and not required by this issue. Touching it risks scope creep.
+### Table `member_profiles`
+| Column | Type | Constraints |
+| --- | --- | --- |
+| id | uuid | PK, default `gen_random_uuid()` |
+| user_id | uuid | not null, **unique**, FK → `users(id)` on delete cascade |
+| vocal_capability | vocal_capability | not null, default `'none'` |
+| bio | text | null |
+| created_at | timestamptz | not null, default `now()` |
 
----
+Note: `member_profiles` per PRD has NO `updated_at` — do not add one.
 
-## Files to create
+## Requirements the implementation must satisfy
 
-### 3. `app/api/_examples/admin-only/route.ts` (test fixture route)
-
-An admin-only route used only to exercise the middleware end-to-end in unit tests. Keep it
-minimal and clearly marked as an example.
-
-```ts
-import { NextRequest } from "next/server";
-import { requireAuth, requireRole, type UserLookup } from "@/lib/api/auth";
-import { ok, fail } from "@/lib/api/response";
-import { ApiException, ErrorCode } from "@/lib/api/errors";
-
-// Example admin-only route — demonstrates the requireAuth + requireRole pattern
-// every Sprint 1–4 endpoint will copy. Exists primarily for #15 unit tests.
-export async function GET(req: NextRequest, lookup?: UserLookup) {
-  try {
-    const ctx = await requireAuth(req, lookup);
-    requireRole(ctx, ["admin"]);
-    return ok({ ok: true });
-  } catch (err) {
-    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
-    return fail("Internal error", ErrorCode.INTERNAL, 500);
-  }
-}
-```
-
-- The optional `lookup` param is a test seam mirroring `requireAuth`. It is NOT part of the Next.js route contract (Next passes only `(req, { params })`); in production `lookup` is `undefined` and the real default is used. This keeps the fixture testable without a real DB.
-- `_examples` prefix (underscore) keeps it out of any future route-convention sweeps and signals it is not a product endpoint.
-
----
-
-## Tests to create
-
-### 4. `tests/unit/lib/api/auth.test.ts`
-
-Cover `requireAuth` + `requireRole` directly:
-
-- Mock Clerk: at top of file, `jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }));` then import `auth` and cast, e.g. `const mockAuth = auth as jest.Mock;`. Reset in `beforeEach`.
-- `requireAuth` throws `ApiException` with `code === "UNAUTHENTICATED"` and `status === 401` when `auth()` returns `{ userId: null }`.
-- `requireAuth` throws 401 UNAUTHENTICATED when Clerk `userId` is set but the injected `lookup` returns `null`.
-- `requireAuth` returns the `AuthContext` from the injected `lookup` when Clerk `userId` is set and lookup resolves a user.
-- `requireRole` returns void (does not throw) when `ctx.role` is in the allowed list.
-- `requireRole` throws `ApiException` with `code === "FORBIDDEN"` and `status === 403` when `ctx.role` is not allowed.
-- Assert on thrown error via `await expect(...).rejects.toMatchObject({ code, status })` or a try/catch with `instanceof ApiException`.
-
-### 5. `tests/unit/app/api/admin-only-route.test.ts`
-
-This satisfies the acceptance criterion "Unit tests cover all four roles against an admin-only route." Import the `GET` from `app/api/_examples/admin-only/route.ts`.
-
-- Mock `@clerk/nextjs/server` `auth` to return a fixed authenticated `{ userId: "clerk_test" }`.
-- Build a fake `UserLookup` factory that returns an `AuthContext` with a given `role`.
-- Table-driven test over all four roles:
-  - `admin` → response `status === 200`, body `{ data: { ok: true } }`.
-  - `set_leader` → `status === 403`, body `code === "FORBIDDEN"`.
-  - `member` → `status === 403`, `code === "FORBIDDEN"`.
-  - `guest` → `status === 403`, `code === "FORBIDDEN"`.
-- One additional case: `auth()` returns `{ userId: null }` → `status === 401`, `code === "UNAUTHENTICATED"` (lookup never consulted).
-- Read the response via `res.status` and `await res.json()` exactly like `tests/unit/lib/api/response.test.ts`.
-
----
+- UUID v4 PKs everywhere via `gen_random_uuid()` (pgcrypto). Do NOT depend on `uuid-ossp`.
+- Create tables in FK-dependency order (church_groups, then users, then member_profiles) so the UP migration runs top-to-bottom on a fresh DB.
+- Add a b-tree index on `users.church_group_id` (queried on nearly every request per the issue's Implementation Notes). `clerk_id` and `email` uniqueness already provide their own indexes; no extra index needed for those.
+- `users.email` must be nullable AND unique — a plain `unique` constraint is correct (Postgres treats NULLs as distinct, so multiple phone-only guest users insert fine). Do NOT mark it `not null`.
+- FKs use `on delete cascade`: deleting a church group removes its users; deleting a user removes their profile. Matches PRD §20 relationships ("One-to-many: church_groups → users"; "One-to-one: users → member_profiles").
+- DOWN block drops in reverse dependency order: member_profiles, users, church_groups, then enum types last.
 
 ## Edge cases the implementation must handle
 
-- Clerk `auth()` returns `userId: null` (unauthenticated) → 401, before any lookup.
-- Authenticated Clerk user with no `users` row → 401 (not 403). Documented rationale above.
-- `requireRole` called with a multi-role allow-list → any match passes.
-- Non-`ApiException` errors bubbling out of a handler → the route's `catch` maps to 500 `INTERNAL` (see fixture). Do not let a raw error escape as an unhandled 500 with a stack.
-- `requireAuth` must not perform the DB lookup before confirming the JWT is valid (auth check strictly precedes lookup — avoids unauthenticated DB hits).
+1. **Fresh-instance idempotency** of the extension: `create extension if not exists "pgcrypto"`.
+2. **Nullable-unique email**: two guest users with no email must both insert successfully — verify the constraint is `unique`, not a `not null` variant.
+3. **Enum defaults declared explicitly**: `role` default `'member'` (3rd value), `vocal_capability` default `'none'` (1st value). Do not rely on enum ordinal.
+4. **Timezone default** must be exactly the IANA string `'America/Chicago'`.
+5. **Cascade paths**: deleting a `church_groups` row must cascade to `users` and transitively (via the users→member_profiles FK cascade) to `member_profiles`. Confirm both FKs declare `on delete cascade`.
+6. **Reversibility with no orphans**: running the DOWN block after the UP block on a fresh DB must remove every Cluster 1 object, including both enum types. Enums must be dropped AFTER all referencing tables.
+7. **Clean run on fresh Supabase**: the whole UP block must execute with zero errors against an empty database (acceptance criterion). No forward references, no reliance on objects from other clusters.
 
-## Definition of done
+## Pattern to follow
 
-- `npm run typecheck` passes.
-- `npm test` passes, including the two new test files.
-- No changes to `middleware.ts`, `lib/supabase/*`, `lib/clerk/server.ts`, or any existing route.
-- `lib/api/auth.ts` no longer throws "not implemented"; `lookupUserByClerkId` remains the single point that is intentionally deferred to #16.
+No prior migration exists — this file establishes the pattern for later clusters (#8–#12 in the backlog). Keep it clean:
+- lowercase SQL keywords, snake_case identifiers (matches PRD naming).
+- `-- ============ UP ============` / `-- ============ DOWN ============` section banners.
+- One migration file per cluster (per `supabase/README.md`).
+
+## Out of scope (do not touch)
+
+- `supabase/seed.sql`, `supabase/config.toml`, `lib/supabase/types.ts`, `lib/supabase/client.ts`.
+- RLS policies (#22), PostgREST lockdown (#14), any Cluster 2–6 tables/enums beyond the two enums Cluster 1 needs.
+- Regenerating TypeScript types.
