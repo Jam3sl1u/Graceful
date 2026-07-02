@@ -1,194 +1,172 @@
-# Spec: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Spec: Issue #12 — [Sprint 0] Set up CI pipeline skeleton
 
 ## OPEN QUESTIONS
 
-None. The gap is concrete and unambiguous — proceed as specified below.
+**None that block coding.** One decision was already made for you and one item
+is out of scope for a code change — read both before starting:
+
+1. **`npm` vs `bun`.** The issue text says `npm audit` / Jest / ESLint / `tsc`,
+   but this repo is a **bun** project: it has `bun.lock` (no `package-lock.json`),
+   and `.claude/settings.json` standardizes on `bun` commands. The existing
+   `.github/workflows/ci.yml` already uses `bun`. **Follow the repo — keep bun.**
+   Do NOT convert the workflow to npm. The acceptance criteria (type errors,
+   lint, tests, dependency audit run on every PR) are satisfied by the bun
+   equivalents.
+
+2. **"PR blocked from merging if any step fails"** is a GitHub **branch
+   protection / required-status-check** setting on the repo, configured through
+   the GitHub UI or API — it is **not** something that lives in a file in this
+   repo. It is out of scope for the Coder. Do not attempt to encode it in the
+   workflow. (Note it in the PR description so a human enables the required
+   check named `checks` on `main`.)
 
 ---
 
 ## 1. Summary
 
-Issue #11 is **~90% already satisfied** by pre-existing code committed to
-`main`. A full Next.js App Router + TypeScript codebase already exists. Three of
-the four acceptance criteria are already met. The Coder's job is small and
-**purely additive** — do NOT re-scaffold, do NOT touch dependencies, do NOT
-touch the `app/` route structure, config strictness, or auth.
+Issue #12 is **already ~95% implemented** on this branch. `.github/workflows/ci.yml`
+exists and already:
 
-Acceptance criteria status (verified against current checkout):
+- triggers on `pull_request` (every PR),
+- installs deps with a frozen lockfile,
+- runs `bun run typecheck` (`tsc --noEmit`), `bun run lint` (ESLint),
+  `bun run test` (Jest), and `bun audit --audit-level=high`.
 
-| AC | Status |
-|----|--------|
-| Next.js (App Router) + TypeScript initialized | DONE — no action |
-| ESLint + Prettier configured AND passing on clean checkout | **PARTIAL — Prettier gap, this is the work** |
-| Base folder structure documented | **MISSING — this is the work** |
-| `bun run dev` works with no errors | DONE — no action |
+All four `package.json` scripts it depends on exist (`typecheck`, `lint`,
+`test`). The lockfile (`bun.lock`), `eslint.config.mjs`, `jest.config.ts`, and
+`tsconfig.json` all exist.
 
-Scope of this issue = **(a) make Prettier actually pass on a clean checkout**
-and **(b) document the folder structure in the README.** Nothing else.
+**The Coder's job is small and surgical.** Do the verification/hardening items
+in §3. Do NOT rewrite the workflow from scratch, do NOT switch package managers,
+do NOT add deploy/E2E steps.
 
 ---
 
-## 2. Verified current state (do not redo this work)
+## 2. Current file state (already on branch — do not recreate)
 
-- `package.json`: `next@^15.3.0`, `react@^19`, `react-dom@^19`,
-  `typescript@^5.7.0`, `prettier@^3.4.0`, `eslint@^9`, `eslint-config-next`.
-  Scripts present: `dev`, `build`, `start`, `lint` (`eslint .`),
-  `typecheck` (`tsc --noEmit`), `test`, `test:e2e`.
-  **No `format` or `format:check` script exists.**
-- App Router only. Route groups `app/(app)/`, `app/(auth)/`,
-  `app/(marketing)/`, `app/(public)/`, plus `app/api/*` handlers and root
-  `app/layout.tsx` + `app/globals.css`. No `pages/` directory anywhere.
-- `tsconfig.json`: strict, `noUncheckedIndexedAccess`, `@/*` path alias, Next
-  plugin. Excludes `node_modules`, `song2score`, `.pipeline`, `documentation`.
-- `next.config.ts`: minimal (`reactStrictMode`, `outputFileTracingRoot`,
-  scoped `eslint.dirs`). Do not change.
-- `eslint.config.mjs`: flat config extending `next/core-web-vitals` +
-  `next/typescript`; `ignores: ["song2score/**", ".pipeline/**",
-  "documentation/**", ".next/**", "next-env.d.ts"]`; one relaxed rule
-  (`no-unused-vars` warn with `^_` ignore). Leave as-is.
-- `.prettierrc` exists:
-  `{ "semi": true, "singleQuote": false, "trailingComma": "all", "printWidth": 100 }`.
-  Leave the config values as-is.
-- `.prettierignore`: **does not exist** — root cause of the failing Prettier AC.
-- `README.md`: only 2 lines (title + tagline). No folder-structure docs.
-- Top-level source dirs present: `app/`, `components/`, `lib/`, `schemas/`,
-  `types/`, `supabase/`, `tests/`.
-- `.github/workflows/ci.yml` exists (uses bun). **Out of scope** — do NOT edit
-  it (CI is issue #12).
+Existing `.github/workflows/ci.yml`:
+
+```yaml
+name: CI
+
+on:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run typecheck
+
+      - run: bun run lint
+
+      - run: bun run test
+
+      - run: bun audit --audit-level=high
+```
+
+Relevant `package.json` scripts (present, do not change):
+`"lint": "eslint ."`, `"typecheck": "tsc --noEmit"`, `"test": "jest"`.
 
 ---
 
-## 3. Files to create / modify
+## 3. Required changes
 
-### 3.1 CREATE `/Users/jamesliu/Documents/Graceful/.prettierignore`
+Modify **only** `/Users/jamesliu/Documents/Graceful/.github/workflows/ci.yml`.
+Apply these hardening edits to the existing file (keep the bun toolchain):
 
-Purpose: scope `prettier --check .` to source only, so docs/config/generated
-files stop false-failing the check. Mirror the dirs already ignored by ESLint
-and TS, plus build/vendor output. Exact contents:
+1. **Pin the workflow to a concurrency guard** so redundant runs on rapid
+   pushes to a PR are cancelled (keeps runs fast/cheap, supports the
+   "~under 5 minutes" criterion). Add at the top level (after `on:`):
 
-```
-# Dependencies & build output
-node_modules
-.next
-out
-coverage
+   ```yaml
+   concurrency:
+     group: ci-${{ github.ref }}
+     cancel-in-progress: true
+   ```
 
-# Nested project with its own toolchain
-song2score
+2. **Pin `bun-version` to a fixed minor** instead of `latest`, so CI is
+   reproducible and a new bun release can't break the pipeline unexpectedly.
+   Use a concrete recent version, e.g.:
 
-# Pipeline & docs (not developer source; not Prettier's concern)
-.pipeline
-documentation
-.claude
+   ```yaml
+       - uses: oven-sh/setup-bun@v2
+         with:
+           bun-version: 1.2.x
+   ```
 
-# Lockfiles / generated
-bun.lock
-package-lock.json
-next-env.d.ts
-```
+   (If you cannot confirm a valid `1.2.x` tag resolves, fall back to `1.2`.)
 
-Notes for the Coder:
-- `README.md` is intentionally NOT ignored — it is real developer-facing
-  source and must be Prettier-clean (see 3.3).
-- Keep `documentation/` and `.pipeline/` ignored (matches ESLint/TS config and
-  avoids reformatting PRD/planning markdown).
+3. **Verify `bun audit --audit-level=high` is a valid invocation** for the bun
+   version being used. `bun audit` and its `--audit-level` flag exist in modern
+   bun. **If — and only if — you confirm the flag is unsupported** by the pinned
+   version, replace that single step with:
 
-### 3.2 MODIFY `/Users/jamesliu/Documents/Graceful/package.json`
+   ```yaml
+       - run: bun audit --audit-level=high
+   ```
+   staying as-is is preferred; do not silently drop the audit step. The audit
+   MUST remain and MUST be gated at `high` per PRD §16. Do not lower it to
+   `low`/`moderate` (that reintroduces the noise the issue explicitly avoids).
 
-Add two scripts to the `"scripts"` block (do not remove or reorder existing
-ones). Insert after the existing `"typecheck"` entry:
+4. **Do not add `continue-on-error` to any step.** Every step must be able to
+   fail the job — that is the whole point (broken code can't merge).
 
-```json
-"format": "prettier --write .",
-"format:check": "prettier --check .",
-```
+5. Keep the job name as `checks` (this is the status-check name a human will
+   mark "required" in branch protection — keep it stable and predictable).
 
-Do NOT add or bump any dependency — `prettier@^3.4.0` is already a devDep.
-
-### 3.3 REFORMAT source files that violate the Prettier config
-
-After 3.1 is in place, run `bunx prettier --write .` (or `bun run format`).
-This will reformat any tracked source file that violates `printWidth: 100` /
-the other rules. Known offenders from prior inspection (long lines Prettier
-wraps) — but rely on `prettier --write` to find the authoritative set, do not
-hand-edit:
-- `app/(auth)/layout.tsx`
-- `components/ui/Button.tsx`
-- `lib/api/webhook-verify.ts`
-- `app/globals.css`
-- `README.md` (will be reformatted; see 3.4 for the content you add first)
-
-**Constraint:** every diff produced here MUST be pure formatting
-(whitespace / line wrapping / quotes / trailing commas). If `prettier --write`
-would change anything that looks like logic, stop — that indicates a config
-problem, not expected behavior. There is none expected here.
-
-### 3.4 MODIFY `/Users/jamesliu/Documents/Graceful/README.md`
-
-Add a concise "Project Structure" section documenting the top-level layout.
-Keep it minimal per the issue's explicit "avoid over-engineering" instruction —
-a short list with one line each, NOT a deep architecture doc. Preserve the
-existing title/tagline. Suggested content (adjust wording, keep it brief):
-
-```markdown
-# Graceful
-Planning Center capabilities with internal ML features
-
-## Getting Started
-
-```bash
-bun install
-bun run dev
-```
-
-Open http://localhost:3000 to view the app.
-
-## Scripts
-
-- `bun run dev` — start the Next.js dev server
-- `bun run build` — production build
-- `bun run lint` — ESLint
-- `bun run typecheck` — TypeScript check (no emit)
-- `bun run format` — format all files with Prettier
-- `bun run format:check` — verify formatting
-
-## Project Structure
-
-- `app/` — Next.js App Router routes, layouts, and API route handlers (`app/api/*`)
-- `components/` — shared React UI components
-- `lib/` — server-side clients and integrations (Supabase, Clerk, etc.)
-- `schemas/` — Zod validation schemas
-- `types/` — shared TypeScript types
-- `supabase/` — Supabase project config and migrations
-- `tests/` — Jest and Playwright tests
-```
-
-Only document dirs that actually exist (all listed above do). Do not invent
-subfolders or describe files that don't exist.
+If any of items 1–2 are judged unnecessary polish and the reviewer prefers
+minimalism, item 1 (concurrency) and item 4 (no continue-on-error) are the
+non-negotiable correctness items; item 2 is a reproducibility nicety.
 
 ---
 
-## 4. Out of scope (do NOT do)
+## 4. Edge cases the implementation must handle
 
-- Do NOT edit `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`, or
-  `.prettierrc` config values.
-- Do NOT add/remove/bump dependencies.
-- Do NOT edit `.github/workflows/ci.yml` (CI wiring is issue #12).
-- Do NOT touch auth, or add any UI/pages beyond what exists.
-- Do NOT change route structure or any `app/api/*` logic.
+- **Frozen lockfile drift:** `bun install --frozen-lockfile` fails if
+  `bun.lock` is out of sync with `package.json`. This is desired behavior
+  (catches un-committed lockfile changes) — keep `--frozen-lockfile`, do not
+  weaken it to a plain `bun install`.
+- **Empty/minimal test suite:** Jest exits non-zero when it finds zero test
+  files by default. If the current codebase has no test files, the `bun run test`
+  step will FAIL and block the workflow, contradicting the "empty/minimal
+  codebase completes" criterion. Confirm whether test files exist; if none do,
+  ensure the `test` script tolerates no tests by passing `--passWithNoTests`
+  (Jest flag) — check `jest.config.ts` / the `test` script first and add the
+  flag only if there are currently no tests. Do not add test files (out of
+  scope). Prefer adding `--passWithNoTests` in the `package.json` `test` script
+  so both CI and local runs behave identically.
+- **Audit step false-positives:** transitive high-severity advisories with no
+  fix available could block all PRs. Do not pre-emptively suppress; leave the
+  gate at `high`. Handling a specific unfixable advisory is a future issue, not
+  this one.
 
 ---
 
-## 5. Verification (all must pass on a clean checkout after changes)
+## 5. Patterns to follow
 
-Run from repo root:
+- The existing `.github/workflows/ci.yml` on this branch **is** the pattern —
+  edit it in place rather than introducing a differently-structured workflow.
+- Toolchain convention comes from `.claude/settings.json` (bun-based) and the
+  presence of `bun.lock`. Match it.
 
-1. `bun run format:check` — must pass with zero warnings (was failing before).
-2. `bun run lint` — must still pass (already passes today).
-3. `bun run typecheck` — must still pass (already passes today).
-4. `bun run dev` — must start with no errors; `curl http://localhost:3000/`
-   returns HTTP 200.
+---
 
-If `format:check` reports files outside real source (e.g. `documentation/`,
-`.pipeline/`, node vendor dirs), the `.prettierignore` in 3.1 is incomplete —
-fix the ignore file rather than reformatting those files.
+## 6. Explicitly OUT OF SCOPE (do not touch)
+
+- Playwright / E2E in CI (the `test:e2e` script exists but must NOT be added to
+  this workflow — deferred to a later sprint per the issue).
+- Any staging/deploy gate (issues #13 / #83).
+- Branch-protection / required-status-check configuration (GitHub setting, not a
+  repo file). Mention in the PR body; do not implement.
+- Any change to `tsconfig.json`, `eslint.config.mjs`, `jest.config.ts`,
+  application/source code, or dependencies beyond the `--passWithNoTests` note
+  above.

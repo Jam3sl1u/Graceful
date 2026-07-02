@@ -1,130 +1,61 @@
-# Changes: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Changes for Issue #12 — CI pipeline skeleton hardening
 
-## Summary
+## File changed
 
-Closed the remaining gap on an otherwise-complete Next.js + TypeScript setup:
-Prettier now actually passes on a clean checkout, and the README documents the
-top-level folder structure. No dependencies, config strictness, routes, or
-auth were touched.
+- `.github/workflows/ci.yml` (only file touched, per spec §3/§6)
 
-## Files changed
+## What changed
 
-- **`.prettierignore`** (new) — scopes Prettier to real developer source.
-  Mirrors `eslint.config.mjs`'s ignore list (`song2score/`, `.pipeline/`,
-  `documentation/`, `.next/`) plus `node_modules`, `out`, `coverage`,
-  `.claude`, and generated/lockfiles (`bun.lock`, `package-lock.json`,
-  `next-env.d.ts`). This was the root cause of the failing Prettier
-  acceptance criterion — without it, `prettier --check .` was scanning docs
-  and pipeline markdown that were never meant to be formatted.
+1. Added a top-level `concurrency` block right after `on:`:
+   ```yaml
+   concurrency:
+     group: ci-${{ github.ref }}
+     cancel-in-progress: true
+   ```
+   Cancels redundant in-flight runs when new commits land on the same PR/ref,
+   keeping CI fast/cheap.
 
-- **`package.json`** — added two bun scripts, inserted right after
-  `typecheck` (no reordering/removal of existing scripts, no dependency
-  changes):
-  - `"format": "prettier --write ."`
-  - `"format:check": "prettier --check ."`
+2. Pinned `bun-version` in the `oven-sh/setup-bun@v2` step from `latest` to
+   `1.2.x` for reproducibility (confirmed `1.2.x` tags exist upstream, e.g.
+   `bun-v1.2.23`, so the range resolves).
 
-- **`app/(auth)/layout.tsx`**, **`components/ui/Button.tsx`**,
-  **`lib/api/webhook-verify.ts`**, **`app/globals.css`** — reformatted via
-  `bunx prettier --write .` to fix real `printWidth: 100` violations (long
-  single-line JSX/function signatures got wrapped; the CSS `font-family`
-  list got collapsed to fit under 100 chars). All four diffs are pure
-  whitespace/line-wrapping — verified via `git diff` that no logic, strings,
-  or identifiers changed. See diffs below for exact deltas.
+## What was verified but left unchanged (per spec)
 
-- **`README.md`** — expanded from a 2-line title/tagline into: Getting
-  Started (bun install / bun run dev), a Scripts list (dev/build/lint/
-  typecheck/format/format:check), and a new "Project Structure" section
-  listing `app/`, `components/`, `lib/`, `schemas/`, `types/`, `supabase/`,
-  `tests/` with one line each. Kept intentionally minimal per the issue's
-  "don't over-engineer" instruction — no deep architecture doc. This file
-  was itself reformatted by Prettier after being written (blank line added
-  after the `# Graceful` title).
+- `bun audit --audit-level=high` — confirmed valid/supported on bun 1.3.4
+  (locally installed); left as-is, gate stays at `high`.
+- `package.json` `test` script (`jest`, no `--passWithNoTests`) — left
+  unchanged because real test files already exist
+  (`tests/unit/lib/api/response.test.ts`), so Jest does not need the
+  no-tests fallback flag.
+- Job name kept as `checks` (stable name for future branch-protection
+  required-status-check setup — out of scope, a human must enable it in
+  GitHub settings on `main`).
+- No `continue-on-error` added to any step — every step can still fail the
+  job.
+- No changes to `tsconfig.json`, `eslint.config.mjs`, `jest.config.ts`,
+  `package.json`, or application/source code.
 
-## Exact diffs for the four reformatted source files
+## Local verification performed (mirrors the workflow steps)
 
-```diff
---- a/app/(auth)/layout.tsx
-+++ b/app/(auth)/layout.tsx
-@@ -1,3 +1,7 @@
- export default function AuthLayout({ children }: { children: React.ReactNode }) {
--  return <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>{children}</div>;
-+  return (
-+    <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>
-+      {children}
-+    </div>
-+  );
- }
-
---- a/app/globals.css
-+++ b/app/globals.css
-@@ -15,12 +15,7 @@ body {
-   margin: 0;
-   background: var(--color-bg);
-   color: var(--color-fg);
--  font-family:
--    -apple-system,
--    BlinkMacSystemFont,
--    "Segoe UI",
--    Roboto,
--    sans-serif;
-+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
- }
-
---- a/components/ui/Button.tsx
-+++ b/components/ui/Button.tsx
-@@ -6,7 +6,5 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
- };
-
- export function Button({ variant = "primary", className, ...props }: ButtonProps) {
--  return (
--    <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />
--  );
-+  return <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />;
- }
-
---- a/lib/api/webhook-verify.ts
-+++ b/lib/api/webhook-verify.ts
-@@ -10,10 +10,7 @@ export async function verifyClerkWebhook(_rawBody: string, _headers: Headers): P
- }
-
- // TODO(Sprint 4 #58): verify using PINGRAM_WEBHOOK_SECRET.
--export async function verifyPingramWebhook(
--  _rawBody: string,
--  _headers: Headers,
--): Promise<boolean> {
-+export async function verifyPingramWebhook(_rawBody: string, _headers: Headers): Promise<boolean> {
-   throw new Error("verifyPingramWebhook not implemented — see Sprint 4 #58");
- }
-```
-
-## Verification performed (all passed)
-
-1. `bun run format:check` — "All matched files use Prettier code style!"
-2. `bun run lint` — passes, no output/errors.
-3. `bun run typecheck` — passes, no output/errors.
-4. `bun run dev` — started cleanly; `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/` returned `200`. Dev server stopped afterward.
+- `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"` — YAML parses.
+- `bun install --frozen-lockfile` — passes, no lockfile drift.
+- `bun run typecheck` (`tsc --noEmit`) — passes, no errors.
+- `bun run lint` (`eslint .`) — passes, no errors.
+- `bun run test` (`jest`) — passes, 1 suite / 3 tests green.
+- `bun audit --audit-level=high` — runs cleanly, exit 0, no high/critical advisories.
 
 ## What the Tester should focus on
 
-- Confirm `bun run format:check` fails if any of the 4 reformatted files (or
-  README.md) is reverted to its old formatting — i.e. the check is real, not
-  a no-op.
-- Confirm `.prettierignore` actually excludes `.pipeline/`, `documentation/`,
-  and `song2score/` from `prettier --check .` (these directories contain
-  markdown/config that would otherwise false-fail).
-- Confirm no logic changed in the 4 reformatted files — behavior of
-  `AuthLayout`, `Button`, and the four `verify*Webhook` functions should be
-  byte-identical modulo whitespace (diffs above are the full deltas).
-- Confirm `eslint.config.mjs`, `tsconfig.json`, `next.config.ts`,
-  `.prettierrc`, and `.github/workflows/ci.yml` were NOT touched (out of
-  scope per spec section 4).
-- `package.json` scripts: verify `format` and `format:check` were inserted
-  without disturbing existing scripts (`dev`, `build`, `start`, `lint`,
-  `typecheck`, `test`, `test:e2e` all still present, same commands).
+- Confirm the workflow YAML is syntactically valid and the diff matches the
+  spec's §3 requirements exactly (concurrency block, pinned bun-version,
+  audit step untouched, no `continue-on-error`, job name `checks` preserved).
+- Confirm no other files were modified (spec explicitly restricts scope to
+  `.github/workflows/ci.yml`).
+- Note for PR description (not implemented, per spec §OPEN QUESTIONS #2 and
+  §6): a human must configure branch protection on `main` to require the
+  `checks` status check before merge.
 
-## Out of scope (confirmed not touched)
+## Commit
 
-- No dependency changes (prettier@^3.4.0 was already present).
-- No changes to `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`,
-  `.prettierrc`, `.github/workflows/ci.yml`.
-- No route/auth/UI logic changes beyond formatting.
+- `c8539d4` — "Harden CI workflow for issue #12" on branch
+  `issue-12-sprint-0-set-up-ci-pipeline-skeleton`.
