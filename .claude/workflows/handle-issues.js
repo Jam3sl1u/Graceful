@@ -15,6 +15,15 @@ export const meta = {
 // returning. No loop, no parallel()/pipeline() -- to process another issue, invoke this
 // workflow again. That keeps exactly one agent active at a time and makes each run trivial
 // to reason about and resume (Workflow({name: 'handle-issues', resumeFromRunId: ...})).
+//
+// INVOCATION CONTRACT: if launching this from inside an EnterWorktree-created worktree for
+// isolation, the caller must stay cwd-pinned to that worktree for the entire run -- do not
+// call ExitWorktree (or otherwise change the session's current directory) until this run
+// completes. Only the FIRST agent() call below reliably inherits the worktree's cwd; every
+// later agent() call re-resolves against the caller's *live* current directory at the moment
+// it fires. Exiting the worktree right after launch causes every stage past the first to
+// silently execute against whatever directory the caller moved to instead -- verified via
+// live testing, not a theoretical concern.
 
 phase('Setup')
 
@@ -79,8 +88,13 @@ if (args && args.issueNumber) {
     { phase: 'Setup', schema: PRS_SCHEMA }
   )
 
-  const openIssues = (issuesResult && issuesResult.issues) || []
-  const openPrs = (prsResult && prsResult.prs) || []
+  if (!issuesResult || !prsResult) {
+    log('Fetching open issues/PRs failed (agent-level failure, e.g. a session/usage limit or transient API error) -- NOT the same as an empty queue. Stopping here so this is not silently misreported as "no open issues." Re-invoke this workflow once whatever caused the failure has cleared.')
+    return { status: 'fetch-failed', reason: !issuesResult ? 'issues fetch failed' : 'PR fetch failed' }
+  }
+
+  const openIssues = issuesResult.issues || []
+  const openPrs = prsResult.prs || []
 
   const claimed = new Set()
   for (const pr of openPrs) {
