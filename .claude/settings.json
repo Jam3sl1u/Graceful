@@ -42,6 +42,7 @@
       "Bash(git push -f *)",
       "Bash(git push origin main*)",
       "Bash(git push -u origin main*)",
+      "Bash(git push --set-upstream origin main*)",
       "Bash(git push origin HEAD:main*)",
       "Bash(git push)",
       "Bash(git push origin)",
