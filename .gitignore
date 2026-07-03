@@ -19,6 +19,3 @@ next-env.d.ts
 
 # misc
 .DS_Store
-
-# git worktrees (EnterWorktree isolation)
-.claude/worktrees/
