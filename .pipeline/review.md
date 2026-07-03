@@ -1,49 +1,33 @@
-# Review: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Review — Issue #16: Migrate schema, Cluster 1 (Organization)
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-## What was verified (independently, not trusted from prior summaries)
+## What was reviewed
+- `git diff main...HEAD` (one new file: `supabase/migrations/20260702000001_cluster_1_organization.sql`, 57 lines).
+- Cross-checked the migration column-by-column against the spec's exact schema AND the PRD source of truth (`documentation/prd/graceful_requirements_v10.md` §20.2 enums / §20.3 Cluster 1) — not just the written summaries.
+- Confirmed git status: only the migration file is committed on the branch; `.pipeline/*` edits are the pipeline's own artifacts, no stray source changes.
 
-Ran `git diff e4acd21..HEAD` firsthand. The change set is exactly the seven files
-the spec calls for and nothing else:
+## Correctness findings (all pass)
+- Enums: `user_role` = admin, set_leader, member, guest; `vocal_capability` = none, lead, harmony, both — exact value order per PRD §20.2.
+- FK-dependency order correct: church_groups -> users -> member_profiles; UP runs top-to-bottom on a fresh DB with no forward references.
+- `users.email` is `varchar(255) unique` (nullable-unique) — NOT `not null`. Allows multiple phone-only guests. Correct.
+- Both FKs declare `on delete cascade` (users.church_group_id, member_profiles.user_id) — transitive cascade works.
+- `member_profiles` has NO `updated_at` — correctly omitted per spec/PRD.
+- Defaults declared literally: role `'member'`, vocal_capability `'none'`, timezone `'America/Chicago'`, sms_opted_in false — no reliance on enum ordinal.
+- `create extension if not exists "pgcrypto"` for `gen_random_uuid()`; no uuid-ossp dependency.
+- B-tree index `idx_users_church_group_id` present.
+- DOWN block (commented) drops in reverse order: member_profiles, users, church_groups, then vocal_capability, then user_role — enums last. Correct.
+- Enum-ownership comment present noting Cluster 5 must not redefine vocal_capability.
+- Timestamp prefix `20260702000001` sorts first; it is the only real migration in the dir (only `.gitkeep` besides it).
 
-- `.prettierignore` (new) — matches spec 3.1 byte-for-byte.
-- `package.json` — only a clean 2-line insertion of `format` / `format:check`
-  after `typecheck`. Grepped for dependency lines: none changed. All existing
-  scripts (dev/build/start/lint/typecheck/test/test:e2e) intact.
-- `app/(auth)/layout.tsx`, `app/globals.css`, `components/ui/Button.tsx`,
-  `lib/api/webhook-verify.ts` — pure formatting. Confirmed each diff is only
-  JSX-wrapping parens / line-wrapping / whitespace. No identifier, string,
-  error message, TODO, or return type changed. Semantically inert.
-- `README.md` — added Getting Started, Scripts, and Project Structure sections.
-  Verified all 7 documented directories (app, components, lib, schemas, types,
-  supabase, tests) actually exist on disk. No invented subfolders.
+## Scope
+Clean. No RLS, seed data, PostgREST lockdown, other-cluster tables, or TS type generation. config.toml / seed.sql / types.ts / client.ts untouched.
 
-## Checks re-run by the reviewer
+## Tests
+Meaningful, not superficial: live Postgres (throwaway Docker postgres:16) exercised UP, default-application, multi-NULL email inserts, cascade delete, a duplicate invite_code rejection (real failure case), and full DOWN reversibility verified via information_schema/pg_type. App-code lint/typecheck/jest re-run green with the correct repo script. Green tests here genuinely reflect correct behavior.
 
-- `bun run format:check` — PASS ("All matched files use Prettier code style!")
-- `bun run lint` — PASS (no errors)
-- `bun run typecheck` — PASS (no errors)
-- `.prettierignore` is a real filter, not a no-op: temporarily removed it and
-  `prettier --check .` reported 7 violations, all in ignored dirs
-  (.claude, .pipeline, documentation). Restored; check passes again.
+## Notes (non-blocking)
+- DOWN lives in a commented block by design (Supabase CLI is forward-only) — a documented spec decision, acceptable.
+- This file becomes the reference pattern for later cluster migrations; it is clean and consistent.
 
-## Out-of-scope confirmation
-
-`git diff` on eslint.config.mjs, tsconfig.json, next.config.ts, .prettierrc,
-and .github/workflows/ci.yml produced zero output — none touched. No dependency
-bumps. No route/auth/UI logic changes. No scope creep into other issues.
-
-## Critical assessment
-
-The prior chain (planner/coder/tester) was accurate; spot-checks reproduced
-every material claim. The one substantive judgment worth flagging — that the
-4 reformatted files are behavior-preserving — I re-derived from the raw diff
-rather than taking it on faith, and it holds: wrapping JSX in grouping parens
-and spreading a function signature across lines are non-semantic. The tester
-correctly wrote no new tests (there is no new behavior to test) and instead
-re-ran the existing Jest suite and re-verified the tooling claims — the right
-call for a formatting/docs change.
-
-All four acceptance criteria for issue #11 are now met on a clean checkout.
-No security, performance, or correctness concerns. Ship it.
+No defects found. Ship.

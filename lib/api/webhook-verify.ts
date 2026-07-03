@@ -10,10 +10,7 @@ export async function verifyClerkWebhook(_rawBody: string, _headers: Headers): P
 }
 
 // TODO(Sprint 4 #58): verify using PINGRAM_WEBHOOK_SECRET.
-export async function verifyPingramWebhook(
-  _rawBody: string,
-  _headers: Headers,
-): Promise<boolean> {
+export async function verifyPingramWebhook(_rawBody: string, _headers: Headers): Promise<boolean> {
   throw new Error("verifyPingramWebhook not implemented — see Sprint 4 #58");
 }
 

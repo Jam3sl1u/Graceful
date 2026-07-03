@@ -1,130 +1,42 @@
-# Changes: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Changes — #15 auth DB lookup (post-#16)
 
-## Summary
+## Files created
 
-Closed the remaining gap on an otherwise-complete Next.js + TypeScript setup:
-Prettier now actually passes on a clean checkout, and the README documents the
-top-level folder structure. No dependencies, config strictness, routes, or
-auth were touched.
+| File | What it does |
+| ---- | ------------ |
+| `supabase/migrations/20260703000001_users_self_read_rls.sql` | Bootstrap RLS slice (#22): enables RLS on `users`, adds `users_select_own` SELECT policy so auth lookup is safe before full #22 lands. Commented DOWN block follows #16 pattern. |
+| `tests/unit/lib/api/lookup-user.test.ts` | Unit tests for `lookupUserByClerkId`: happy path, no row, Supabase error → 500, missing JWT → null. Mocks `@clerk/nextjs/server` `auth` + `@/lib/supabase/client` `getSupabaseClient`. |
 
-## Files changed
+## Files modified
 
-- **`.prettierignore`** (new) — scopes Prettier to real developer source.
-  Mirrors `eslint.config.mjs`'s ignore list (`song2score/`, `.pipeline/`,
-  `documentation/`, `.next/`) plus `node_modules`, `out`, `coverage`,
-  `.claude`, and generated/lockfiles (`bun.lock`, `package-lock.json`,
-  `next-env.d.ts`). This was the root cause of the failing Prettier
-  acceptance criterion — without it, `prettier --check .` was scanning docs
-  and pipeline markdown that were never meant to be formatted.
+| File | What changed |
+| ---- | ------------ |
+| `lib/supabase/types.ts` | Replaced `Record<string, never>` placeholder with hand-written `Database` type covering `users` table (`id`, `clerk_id`, `church_group_id`, `role`) and `user_role` enum. Shape satisfies supabase-js v2 `GenericSchema`/`GenericTable` so `from().select().maybeSingle()` returns typed data. |
+| `lib/supabase/client.ts` | Replaced stub with server-only `getSupabaseClient(jwt)`: reads `NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_ANON_KEY`, throws clear error if missing, passes JWT as `Authorization: Bearer` header. Anon key only — no service role key. |
+| `lib/api/auth.ts` | Replaced `lookupUserByClerkId` stub: calls `auth().getToken({ template: "supabase" })` → queries `users` by `clerk_id` via `getSupabaseClient` → maps row to `AuthContext`. Returns null on missing JWT or no row; throws `ApiException` 500 on DB error. Removed `TODO(#16)`. Added `TODO(#22)` noting RLS bootstrap slice. Exported the function for unit testing. `UserLookup` injection seam unchanged. |
+| `supabase/README.md` | Updated to reflect that migrations directory is no longer empty; documents both migration files and their purpose. |
 
-- **`package.json`** — added two bun scripts, inserted right after
-  `typecheck` (no reordering/removal of existing scripts, no dependency
-  changes):
-  - `"format": "prettier --write ."`
-  - `"format:check": "prettier --check ."`
+## Test results
 
-- **`app/(auth)/layout.tsx`**, **`components/ui/Button.tsx`**,
-  **`lib/api/webhook-verify.ts`**, **`app/globals.css`** — reformatted via
-  `bunx prettier --write .` to fix real `printWidth: 100` violations (long
-  single-line JSX/function signatures got wrapped; the CSS `font-family`
-  list got collapsed to fit under 100 chars). All four diffs are pure
-  whitespace/line-wrapping — verified via `git diff` that no logic, strings,
-  or identifiers changed. See diffs below for exact deltas.
-
-- **`README.md`** — expanded from a 2-line title/tagline into: Getting
-  Started (bun install / bun run dev), a Scripts list (dev/build/lint/
-  typecheck/format/format:check), and a new "Project Structure" section
-  listing `app/`, `components/`, `lib/`, `schemas/`, `types/`, `supabase/`,
-  `tests/` with one line each. Kept intentionally minimal per the issue's
-  "don't over-engineer" instruction — no deep architecture doc. This file
-  was itself reformatted by Prettier after being written (blank line added
-  after the `# Graceful` title).
-
-## Exact diffs for the four reformatted source files
-
-```diff
---- a/app/(auth)/layout.tsx
-+++ b/app/(auth)/layout.tsx
-@@ -1,3 +1,7 @@
- export default function AuthLayout({ children }: { children: React.ReactNode }) {
--  return <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>{children}</div>;
-+  return (
-+    <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>
-+      {children}
-+    </div>
-+  );
- }
-
---- a/app/globals.css
-+++ b/app/globals.css
-@@ -15,12 +15,7 @@ body {
-   margin: 0;
-   background: var(--color-bg);
-   color: var(--color-fg);
--  font-family:
--    -apple-system,
--    BlinkMacSystemFont,
--    "Segoe UI",
--    Roboto,
--    sans-serif;
-+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
- }
-
---- a/components/ui/Button.tsx
-+++ b/components/ui/Button.tsx
-@@ -6,7 +6,5 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
- };
-
- export function Button({ variant = "primary", className, ...props }: ButtonProps) {
--  return (
--    <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />
--  );
-+  return <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />;
- }
-
---- a/lib/api/webhook-verify.ts
-+++ b/lib/api/webhook-verify.ts
-@@ -10,10 +10,7 @@ export async function verifyClerkWebhook(_rawBody: string, _headers: Headers): P
- }
-
- // TODO(Sprint 4 #58): verify using PINGRAM_WEBHOOK_SECRET.
--export async function verifyPingramWebhook(
--  _rawBody: string,
--  _headers: Headers,
--): Promise<boolean> {
-+export async function verifyPingramWebhook(_rawBody: string, _headers: Headers): Promise<boolean> {
-   throw new Error("verifyPingramWebhook not implemented — see Sprint 4 #58");
- }
+```
+Test Suites: 4 passed, 4 total
+Tests:       17 passed, 17 total
 ```
 
-## Verification performed (all passed)
+All pre-existing tests (`auth.test.ts`, `admin-only-route.test.ts`, `response.test.ts`) continue to pass. 4 new tests added in `lookup-user.test.ts`.
 
-1. `bun run format:check` — "All matched files use Prettier code style!"
-2. `bun run lint` — passes, no output/errors.
-3. `bun run typecheck` — passes, no output/errors.
-4. `bun run dev` — started cleanly; `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/` returned `200`. Dev server stopped afterward.
+## Manual setup steps required (for PR description)
 
-## What the Tester should focus on
+These are one-time dashboard actions — not code changes:
 
-- Confirm `bun run format:check` fails if any of the 4 reformatted files (or
-  README.md) is reverted to its old formatting — i.e. the check is real, not
-  a no-op.
-- Confirm `.prettierignore` actually excludes `.pipeline/`, `documentation/`,
-  and `song2score/` from `prettier --check .` (these directories contain
-  markdown/config that would otherwise false-fail).
-- Confirm no logic changed in the 4 reformatted files — behavior of
-  `AuthLayout`, `Button`, and the four `verify*Webhook` functions should be
-  byte-identical modulo whitespace (diffs above are the full deltas).
-- Confirm `eslint.config.mjs`, `tsconfig.json`, `next.config.ts`,
-  `.prettierrc`, and `.github/workflows/ci.yml` were NOT touched (out of
-  scope per spec section 4).
-- `package.json` scripts: verify `format` and `format:check` were inserted
-  without disturbing existing scripts (`dev`, `build`, `start`, `lint`,
-  `typecheck`, `test`, `test:e2e` all still present, same commands).
+1. **Clerk JWT Template** — Clerk Dashboard → JWT Templates → New template → select *Supabase* preset → name it exactly `supabase` → Save. This wires `auth().getToken({ template: "supabase" })` to produce a JWT Supabase can verify.
+2. **Supabase Third-Party Auth** — Supabase Dashboard → Authentication → Third-party auth → enable Clerk → paste your Clerk Frontend API domain (e.g. `https://<your-slug>.clerk.accounts.dev`). This makes `auth.jwt()` inside RLS policies resolve against Clerk's JWKS.
+3. **Apply migrations** — `supabase db push` (or paste SQL into Supabase Dashboard SQL editor) to apply `20260703000001_users_self_read_rls.sql` on staging/prod.
+4. **Smoke test** — seed a `church_groups` + `users` row with a real `clerk_id` matching a Clerk test user. Hit a route using default lookup; expect 401 with no row, 200/403 with row depending on role.
 
-## Out of scope (confirmed not touched)
+## Tester focus areas
 
-- No dependency changes (prettier@^3.4.0 was already present).
-- No changes to `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`,
-  `.prettierrc`, `.github/workflows/ci.yml`.
-- No route/auth/UI logic changes beyond formatting.
+- `lookupUserByClerkId` edge cases: no row, Supabase error, null JWT
+- Verify injection seam still works (existing tests cover this)
+- RLS policy correctness: `clerk_id = (auth.jwt() ->> 'sub')` — requires Clerk JWT template in place; test with `supabase db push` + seeded row
+- Env var guard in `getSupabaseClient`: if `NEXT_PUBLIC_SUPABASE_URL` is unset, should throw clear error at call time (not silently)

@@ -1,0 +1,18 @@
+# Dependencies & build output
+node_modules
+.next
+out
+coverage
+
+# Nested project with its own toolchain
+song2score
+
+# Pipeline & docs (not developer source; not Prettier's concern)
+.pipeline
+documentation
+.claude
+
+# Lockfiles / generated
+bun.lock
+package-lock.json
+next-env.d.ts
