@@ -1,49 +1,44 @@
-# Review: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Review — Issue #23 (Disable PostgREST auto-API & lock down service role key)
 
-VERDICT: SHIP
+VERDICT: NEEDS WORK
 
-## What was verified (independently, not trusted from prior summaries)
+## Summary
+The four in-repo deliverables match the spec: `supabase/config.toml` [api]/enabled=false
+block, README "Architecture rules (standing)" section, `scripts/check-service-role.mjs`
+guard, and the `check:service-role` package.json script. All edits are additive (only
+deletion is the package.json trailing-comma line). PRD refs (§19.3, §25.1) verified to
+exist. Commit contains only the four code files; `.pipeline/*` correctly left uncommitted
+per prior incident history. OQ-1 dashboard/secret actions correctly deferred.
 
-Ran `git diff e4acd21..HEAD` firsthand. The change set is exactly the seven files
-the spec calls for and nothing else:
+I independently re-ran the guard and confirmed: passes clean repo (exit 0), the
+`lib/supabase/client.ts` comment is correctly allowlisted, real non-comment violations in
+both `app/` and `lib/` are flagged with `path:line - matched` and exit 1, trailing comments
+after real code correctly FAIL, and the extension filter skips `.json`/no-extension files.
 
-- `.prettierignore` (new) — matches spec 3.1 byte-for-byte.
-- `package.json` — only a clean 2-line insertion of `format` / `format:check`
-  after `typecheck`. Grepped for dependency lines: none changed. All existing
-  scripts (dev/build/start/lint/typecheck/test/test:e2e) intact.
-- `app/(auth)/layout.tsx`, `app/globals.css`, `components/ui/Button.tsx`,
-  `lib/api/webhook-verify.ts` — pure formatting. Confirmed each diff is only
-  JSX-wrapping parens / line-wrapping / whitespace. No identifier, string,
-  error message, TODO, or return type changed. Semantically inert.
-- `README.md` — added Getting Started, Scripts, and Project Structure sections.
-  Verified all 7 documented directories (app, components, lib, schemas, types,
-  supabase, tests) actually exist on disk. No invented subfolders.
+## Must fix
 
-## Checks re-run by the reviewer
+1. **Guard silently passes (exit 0) when run from any cwd other than the repo root.**
+   `scripts/check-service-role.mjs:11` uses relative `SCAN_DIRS = ["app", "lib"]` resolved
+   against `process.cwd()`. `walk()` (lines 21-25) swallows the ENOENT in a bare `try/catch`
+   and returns zero files, so from a non-root cwd the script prints the OK message and
+   exits 0 while scanning NOTHING. Reproduced:
+     - `cd /repo && node scripts/check-service-role.mjs` with an injected violation → exit 1 (correct)
+     - `cd / && node /repo/scripts/check-service-role.mjs` same violation → exit 0 "OK" (WRONG)
+   This is a false-negative in a security guard whose only job is to fail loudly. The
+   `bun run check:service-role` path is safe today (npm/bun set cwd to package root), but
+   the spec's stated contract is `node scripts/check-service-role.mjs`, and any future
+   direct call, git hook, or CI step that runs from a different directory would get a
+   silent green while enforcing nothing.
+   Fix: resolve SCAN_DIRS against the script/repo root, e.g. anchor to
+   `import.meta.url` (`fileURLToPath` + `join(dirname, "..", dir)`), OR make a missing
+   scan dir an explicit condition (only tolerate absent dirs, still fail on read errors) —
+   do not let a missing `app/`+`lib/` resolve to a silent pass. Then verify the guard
+   flags a violation regardless of invocation cwd.
 
-- `bun run format:check` — PASS ("All matched files use Prettier code style!")
-- `bun run lint` — PASS (no errors)
-- `bun run typecheck` — PASS (no errors)
-- `.prettierignore` is a real filter, not a no-op: temporarily removed it and
-  `prettier --check .` reported 7 violations, all in ignored dirs
-  (.claude, .pipeline, documentation). Restored; check passes again.
-
-## Out-of-scope confirmation
-
-`git diff` on eslint.config.mjs, tsconfig.json, next.config.ts, .prettierrc,
-and .github/workflows/ci.yml produced zero output — none touched. No dependency
-bumps. No route/auth/UI logic changes. No scope creep into other issues.
-
-## Critical assessment
-
-The prior chain (planner/coder/tester) was accurate; spot-checks reproduced
-every material claim. The one substantive judgment worth flagging — that the
-4 reformatted files are behavior-preserving — I re-derived from the raw diff
-rather than taking it on faith, and it holds: wrapping JSX in grouping parens
-and spreading a function signature across lines are non-semantic. The tester
-correctly wrote no new tests (there is no new behavior to test) and instead
-re-ran the existing Jest suite and re-verified the tooling claims — the right
-call for a formatting/docs change.
-
-All four acceptance criteria for issue #11 are now met on a clean checkout.
-No security, performance, or correctness concerns. Ship it.
+## Non-blocking notes (do not need to fix for ship)
+- Block comments whose content lines lack a leading `*` (e.g. a bare line inside `/* ... */`)
+  are treated as code and would FALSE-POSITIVE fail. This errs toward strictness, which is
+  the safe direction for a security guard, and does not affect the current allowlisted file
+  (which uses `//` and `*`-prefixed lines). Acceptable as-is; worth a comment if revisited.
+- No regression test for the guard itself (tester noted this). Acceptable for this issue's
+  scope; consider a fixture-based test if #79/CI wiring lands.

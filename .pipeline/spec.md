@@ -1,194 +1,149 @@
-# Spec: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Spec: Issue #23 — Disable PostgREST auto-API & lock down service role key
 
-## OPEN QUESTIONS
+## OPEN QUESTIONS (read first)
 
-None. The gap is concrete and unambiguous — proceed as specified below.
+**OQ-1 (NON-BLOCKING — dashboard action lives outside the repo).**
+Two of the four acceptance criteria are Supabase-dashboard / secrets-management
+actions that no code in this repo can perform:
+- "PostgREST auto-API confirmed disabled in the Supabase project settings"
+- "Service role key exists only in trusted migration scripts / CI secrets"
 
----
+There is no linked/real Supabase project in this repo yet — `supabase/config.toml`
+holds only `project_id = "graceful"` and `supabase/migrations/` is `.gitkeep`
+(scaffolding stage). The coder CANNOT toggle a dashboard setting or provision a CI
+secret. **This spec scopes the coder to the in-repo, verifiable deliverables:
+documenting the standing rule and adding a repo-wide guard.** The dashboard toggle
+and secret placement remain human/ops follow-ups tracked by this issue and re-checked
+in #79. Do NOT invent a fake Supabase project or dashboard automation.
 
-## 1. Summary
-
-Issue #11 is **~90% already satisfied** by pre-existing code committed to
-`main`. A full Next.js App Router + TypeScript codebase already exists. Three of
-the four acceptance criteria are already met. The Coder's job is small and
-**purely additive** — do NOT re-scaffold, do NOT touch dependencies, do NOT
-touch the `app/` route structure, config strictness, or auth.
-
-Acceptance criteria status (verified against current checkout):
-
-| AC | Status |
-|----|--------|
-| Next.js (App Router) + TypeScript initialized | DONE — no action |
-| ESLint + Prettier configured AND passing on clean checkout | **PARTIAL — Prettier gap, this is the work** |
-| Base folder structure documented | **MISSING — this is the work** |
-| `bun run dev` works with no errors | DONE — no action |
-
-Scope of this issue = **(a) make Prettier actually pass on a clean checkout**
-and **(b) document the folder structure in the README.** Nothing else.
+This is not a hard blocker: proceed with the in-repo work below.
 
 ---
 
-## 2. Verified current state (do not redo this work)
+## Current state (verified — do not redo this analysis)
 
-- `package.json`: `next@^15.3.0`, `react@^19`, `react-dom@^19`,
-  `typescript@^5.7.0`, `prettier@^3.4.0`, `eslint@^9`, `eslint-config-next`.
-  Scripts present: `dev`, `build`, `start`, `lint` (`eslint .`),
-  `typecheck` (`tsc --noEmit`), `test`, `test:e2e`.
-  **No `format` or `format:check` script exists.**
-- App Router only. Route groups `app/(app)/`, `app/(auth)/`,
-  `app/(marketing)/`, `app/(public)/`, plus `app/api/*` handlers and root
-  `app/layout.tsx` + `app/globals.css`. No `pages/` directory anywhere.
-- `tsconfig.json`: strict, `noUncheckedIndexedAccess`, `@/*` path alias, Next
-  plugin. Excludes `node_modules`, `song2score`, `.pipeline`, `documentation`.
-- `next.config.ts`: minimal (`reactStrictMode`, `outputFileTracingRoot`,
-  scoped `eslint.dirs`). Do not change.
-- `eslint.config.mjs`: flat config extending `next/core-web-vitals` +
-  `next/typescript`; `ignores: ["song2score/**", ".pipeline/**",
-  "documentation/**", ".next/**", "next-env.d.ts"]`; one relaxed rule
-  (`no-unused-vars` warn with `^_` ignore). Leave as-is.
-- `.prettierrc` exists:
-  `{ "semi": true, "singleQuote": false, "trailingComma": "all", "printWidth": 100 }`.
-  Leave the config values as-is.
-- `.prettierignore`: **does not exist** — root cause of the failing Prettier AC.
-- `README.md`: only 2 lines (title + tagline). No folder-structure docs.
-- Top-level source dirs present: `app/`, `components/`, `lib/`, `schemas/`,
-  `types/`, `supabase/`, `tests/`.
-- `.github/workflows/ci.yml` exists (uses bun). **Out of scope** — do NOT edit
-  it (CI is issue #12).
+- **Service-role key is already absent from user-callable code.** Repo-wide search
+  for `SUPABASE_SERVICE_ROLE_KEY` / `service_role` finds it ONLY in:
+  - `.env.example:7` (declaration, expected)
+  - `lib/supabase/client.ts:6` (a warning comment telling future devs never to use it here)
+  - docs/backlog/spec references
+  No `createClient(..., SERVICE_ROLE_KEY)` call exists anywhere in `/app` or `/lib`.
+  Acceptance criterion "does not appear in `/app` or any user-callable API route"
+  is **already satisfied**; the coder's job is to add a guard that keeps it that way.
+- **The architecture rules already exist in the PRD** — see
+  `documentation/prd/graceful_requirements_v10.md` §19.3 (lines 693–696) and §25.1
+  (lines 1383–1384). They are NOT yet surfaced as a contributor-facing standing rule.
+- **There is no `/docs` directory.** The issue says "`/docs` or README." Use the
+  README route (see Files below) — do not create a new top-level `/docs` tree.
+- `supabase/config.toml` is a 4-line placeholder with no `[api]` block.
 
 ---
 
-## 3. Files to create / modify
+## Files to create / modify
 
-### 3.1 CREATE `/Users/jamesliu/Documents/Graceful/.prettierignore`
+### 1. `supabase/config.toml` (MODIFY)
+Add an explicit `[api]` block that disables PostgREST for local `supabase start`,
+so the "PostgREST disabled" intent is codified where the project config lives (the
+production toggle is still a dashboard action per OQ-1). Append after the existing
+`project_id` line:
 
-Purpose: scope `prettier --check .` to source only, so docs/config/generated
-files stop false-failing the check. Mirror the dirs already ignored by ESLint
-and TS, plus build/vendor output. Exact contents:
-
-```
-# Dependencies & build output
-node_modules
-.next
-out
-coverage
-
-# Nested project with its own toolchain
-song2score
-
-# Pipeline & docs (not developer source; not Prettier's concern)
-.pipeline
-documentation
-.claude
-
-# Lockfiles / generated
-bun.lock
-package-lock.json
-next-env.d.ts
+```toml
+# PostgREST auto-API is disabled by architecture rule (PRD §19.3, §25.1 / issue #23).
+# All DB access goes through Next.js API routes, never Supabase's generated REST API.
+# NOTE: this governs the local `supabase start` stack only. The hosted project's
+# Data API must also be turned off in the Supabase dashboard (Settings > API) — see
+# issue #23 acceptance criteria and re-verified in the Sprint 4 audit (#79).
+[api]
+enabled = false
 ```
 
-Notes for the Coder:
-- `README.md` is intentionally NOT ignored — it is real developer-facing
-  source and must be Prettier-clean (see 3.3).
-- Keep `documentation/` and `.pipeline/` ignored (matches ESLint/TS config and
-  avoids reformatting PRD/planning markdown).
+Keep the existing header comments and `project_id` line intact.
 
-### 3.2 MODIFY `/Users/jamesliu/Documents/Graceful/package.json`
+### 2. `README.md` (MODIFY)
+The README is currently 2 lines. Append a `## Architecture rules (standing)` section
+documenting the two rules this issue is about, phrased for future contributors. Keep
+it tight — copy the wording intent from PRD §19.3 lines 693–695. Must state:
+- PostgREST (Supabase's auto-generated REST API) is disabled; all data access goes
+  through the app's own Next.js API routes.
+- The Supabase **service role key bypasses RLS** and must NEVER appear in any
+  user-callable API route (`app/**`) or client/lib code (`lib/**`). It belongs only
+  in trusted migration/seed scripts and CI secrets.
+- Reference: PRD §15.1 (§25.1 in v10 doc), §19.3.
+- Note that this rule is enforced by the check in `scripts/check-service-role.mjs`
+  (item 3) and re-verified in the Sprint 4 security audit (#79).
 
-Add two scripts to the `"scripts"` block (do not remove or reorder existing
-ones). Insert after the existing `"typecheck"` entry:
+### 3. `scripts/check-service-role.mjs` (CREATE)
+A repo-wide guard that fails (exit code 1) if the service-role key is referenced in
+user-callable code. This makes the "confirmed via repo-wide search" criterion
+executable and repeatable rather than a one-time manual pass.
 
+Behavior:
+- Recursively scan `app/` and `lib/` for the strings `SUPABASE_SERVICE_ROLE_KEY`
+  and `service_role` (case-insensitive on the latter).
+- **Allowlist:** `lib/supabase/client.ts` is permitted to mention the key **only
+  inside comments** (it currently warns against using it). Simplest correct rule:
+  allow the match on any line that is a comment (line trimmed starts with `//` or
+  `*`), fail on any non-comment occurrence anywhere in `app/`+`lib/`. Do not
+  hard-exclude the whole file, or the guard becomes toothless if real code is added.
+- On violation: print each offending `path:line` and the matched text, then
+  `process.exit(1)`.
+- On clean: print a one-line OK message and exit 0.
+- No external dependencies — use Node's built-in `fs`/`path` only (ESM `.mjs`,
+  matching repo convention; confirm by checking whether other `scripts/*.mjs` /
+  package.json `"type"` exist and follow it). Read files as UTF-8; skip non-source
+  extensions (only scan `.ts`, `.tsx`, `.js`, `.mjs`).
+
+Signature (no exports needed; it's a CLI script):
+```
+node scripts/check-service-role.mjs   # exit 0 = clean, exit 1 = violation
+```
+
+### 4. `package.json` (MODIFY)
+Add a script entry so the guard is discoverable and CI-runnable:
 ```json
-"format": "prettier --write .",
-"format:check": "prettier --check .",
+"check:service-role": "node scripts/check-service-role.mjs"
 ```
-
-Do NOT add or bump any dependency — `prettier@^3.4.0` is already a devDep.
-
-### 3.3 REFORMAT source files that violate the Prettier config
-
-After 3.1 is in place, run `bunx prettier --write .` (or `bun run format`).
-This will reformat any tracked source file that violates `printWidth: 100` /
-the other rules. Known offenders from prior inspection (long lines Prettier
-wraps) — but rely on `prettier --write` to find the authoritative set, do not
-hand-edit:
-- `app/(auth)/layout.tsx`
-- `components/ui/Button.tsx`
-- `lib/api/webhook-verify.ts`
-- `app/globals.css`
-- `README.md` (will be reformatted; see 3.4 for the content you add first)
-
-**Constraint:** every diff produced here MUST be pure formatting
-(whitespace / line wrapping / quotes / trailing commas). If `prettier --write`
-would change anything that looks like logic, stop — that indicates a config
-problem, not expected behavior. There is none expected here.
-
-### 3.4 MODIFY `/Users/jamesliu/Documents/Graceful/README.md`
-
-Add a concise "Project Structure" section documenting the top-level layout.
-Keep it minimal per the issue's explicit "avoid over-engineering" instruction —
-a short list with one line each, NOT a deep architecture doc. Preserve the
-existing title/tagline. Suggested content (adjust wording, keep it brief):
-
-```markdown
-# Graceful
-Planning Center capabilities with internal ML features
-
-## Getting Started
-
-```bash
-bun install
-bun run dev
-```
-
-Open http://localhost:3000 to view the app.
-
-## Scripts
-
-- `bun run dev` — start the Next.js dev server
-- `bun run build` — production build
-- `bun run lint` — ESLint
-- `bun run typecheck` — TypeScript check (no emit)
-- `bun run format` — format all files with Prettier
-- `bun run format:check` — verify formatting
-
-## Project Structure
-
-- `app/` — Next.js App Router routes, layouts, and API route handlers (`app/api/*`)
-- `components/` — shared React UI components
-- `lib/` — server-side clients and integrations (Supabase, Clerk, etc.)
-- `schemas/` — Zod validation schemas
-- `types/` — shared TypeScript types
-- `supabase/` — Supabase project config and migrations
-- `tests/` — Jest and Playwright tests
-```
-
-Only document dirs that actually exist (all listed above do). Do not invent
-subfolders or describe files that don't exist.
+Place it alongside existing scripts. Do NOT wire it into a git hook or CI workflow
+in this issue (out of scope — no CI config is asked for). If a `lint`/`check`
+aggregate script already exists, you MAY chain it in, but only if that does not
+change existing behavior; otherwise leave standalone.
 
 ---
 
-## 4. Out of scope (do NOT do)
+## Edge cases the implementation must handle
 
-- Do NOT edit `next.config.ts`, `tsconfig.json`, `eslint.config.mjs`, or
-  `.prettierrc` config values.
-- Do NOT add/remove/bump dependencies.
-- Do NOT edit `.github/workflows/ci.yml` (CI wiring is issue #12).
-- Do NOT touch auth, or add any UI/pages beyond what exists.
-- Do NOT change route structure or any `app/api/*` logic.
+- **`check-service-role.mjs` must pass against the current repo as-is.** The only
+  current match is the comment block in `lib/supabase/client.ts` — the comment
+  allowlist must let that through with exit 0. Verify this before finishing.
+- The scanner must not crash on directories with no matching files, on empty files,
+  or on binary/non-source files (skip by extension).
+- Case sensitivity: `SUPABASE_SERVICE_ROLE_KEY` is all-caps (env var);
+  `service_role` may appear lower/upper — match case-insensitively for the latter.
+- Do not match on substrings that are legitimately unrelated (there are none
+  currently; the two literal patterns above are specific enough — do not broaden to
+  bare `service` or `role`).
+- README/config edits must be additive; do not delete or reword existing content.
 
 ---
 
-## 5. Verification (all must pass on a clean checkout after changes)
+## Patterns to follow
 
-Run from repo root:
+- **Config style:** mirror the existing comment-first style already in
+  `supabase/config.toml` and `supabase/README.md` (leading `#` explanatory comments
+  citing PRD sections and issue numbers).
+- **Doc citation style:** the codebase consistently cites PRD sections inline
+  (e.g. `lib/supabase/client.ts:7` cites "PRD §19.3", `app/api/health/route.ts:5`
+  cites "PRD §19.2"). Match that convention.
+- **Script style:** if any `scripts/*.mjs` already exists, copy its shebang/ESM/
+  exit-code conventions. If `scripts/` does not yet exist, create it; keep the file
+  dependency-free (Node built-ins only), consistent with the repo having no test/
+  tooling deps wired for this.
 
-1. `bun run format:check` — must pass with zero warnings (was failing before).
-2. `bun run lint` — must still pass (already passes today).
-3. `bun run typecheck` — must still pass (already passes today).
-4. `bun run dev` — must start with no errors; `curl http://localhost:3000/`
-   returns HTTP 200.
+---
 
-If `format:check` reports files outside real source (e.g. `documentation/`,
-`.pipeline/`, node vendor dirs), the `.prettierignore` in 3.1 is incomplete —
-fix the ignore file rather than reformatting those files.
+## Out of scope (do NOT touch)
+
+- Rate limiting (#76), CSP/HTTPS (#78), CI pipeline wiring, git hooks.
+- Implementing `getSupabaseClient` or any RLS work (#22) — leave
+  `lib/supabase/client.ts` logic unchanged (the guard reads it, does not edit it).
+- Creating a real Supabase project, running migrations, or any dashboard automation.
