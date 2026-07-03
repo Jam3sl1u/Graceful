@@ -1,12 +1,7 @@
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 
-// Route matcher is defined now so it's ready to use, but NOT enforced yet —
-// auth.protect() depends on real Clerk keys + role claims that land in
-// Sprint 0 #5/#6. Wire it in then:
-//
-//   export default clerkMiddleware(async (auth, req) => {
-//     if (!isPublicRoute(req)) await auth.protect();
-//   });
+// Request-level auth is enforced here; role-level checks (requireRole) still
+// land in #6.
 export const isPublicRoute = createRouteMatcher([
   "/",
   "/sign-in(.*)",
@@ -17,7 +12,11 @@ export const isPublicRoute = createRouteMatcher([
   "/api/webhooks(.*)",
 ]);
 
-export default clerkMiddleware();
+export default clerkMiddleware(async (auth, req) => {
+  if (!isPublicRoute(req)) {
+    await auth.protect();
+  }
+});
 
 export const config = {
   matcher: ["/((?!_next|.*\\..*).*)", "/(api|trpc)(.*)"],

@@ -26,8 +26,10 @@
       "Bash(bun test*)",
       "Bash(bun run*)",
       "Bash(bun install*)",
+      "Bash(bun audit*)",
       "Bash(bunx vitest*)",
       "Bash(bunx jest*)",
+      "Bash(bunx prettier*)",
       "Bash(pytest*)",
       "Bash(python -m pytest*)",
       "Bash(python3 -m pytest*)",
@@ -52,7 +54,9 @@
       "Bash(gh pr merge*)",
       "Bash(gh pr close*)",
       "Bash(gh issue close*)",
-      "Bash(gh issue delete*)"
+      "Bash(gh issue delete*)",
+      "Bash(npm *)",
+      "Bash(npx *)"
     ]
   },
   "attribution": {

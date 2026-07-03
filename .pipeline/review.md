@@ -1,57 +1,33 @@
-# Review: Issue #21 — Cluster 6 (Auth & Audit) schema migration
+# Review — Issue #16: Migrate schema, Cluster 1 (Organization)
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
 ## What was reviewed
-- `git diff main...HEAD` firsthand (not just the summaries)
-- Both SQL files read in full
-- Cross-checked columns/types/FKs against PRD §20.8 and §20.9
-- Spec §3.1–§3.4, §4, §5 edge cases, §7 acceptance-criteria mapping
+- `git diff main...HEAD` (one new file: `supabase/migrations/20260702000001_cluster_1_organization.sql`, 57 lines).
+- Cross-checked the migration column-by-column against the spec's exact schema AND the PRD source of truth (`documentation/prd/graceful_requirements_v10.md` §20.2 enums / §20.3 Cluster 1) — not just the written summaries.
+- Confirmed git status: only the migration file is committed on the branch; `.pipeline/*` edits are the pipeline's own artifacts, no stray source changes.
 
-## Correctness assessment (matches spec + PRD)
-- `google_calendar_tokens`: uuid PK w/ `gen_random_uuid()`, UNIQUE `user_id`
-  FK → `users(id) ON DELETE CASCADE`, both ciphertext text columns NOT NULL,
-  `token_expiry` timestamptz, `calendar_id` varchar(200), `scope` text,
-  created/updated_at defaults. Matches §3.1 and PRD §20.8 exactly. 1:1
-  relationship enforced by UNIQUE (PRD §20.9). AC1 met.
-- `audit_logs`: uuid PK, `church_group_id` FK → `church_groups(id) ON DELETE
-  CASCADE`, nullable `user_id` FK → `users(id) ON DELETE SET NULL`,
-  action/entity_type/entity_id, `metadata jsonb DEFAULT '{}'::jsonb`,
-  created_at default. Matches §3.2 and PRD §20.8. AC2 met.
-- BR-13 append-only (§3.3): unconditional `REVOKE UPDATE, DELETE ... FROM
-  PUBLIC` plus a `DO $$` block that guards `authenticated`/`anon` revokes
-  behind `pg_roles` existence checks so a bare local Postgres won't hard-fail
-  (edge case #5). SELECT/INSERT untouched. AC3 met.
-- Index on `(church_group_id, created_at DESC)` present (§3.4).
-- Extension guard `CREATE EXTENSION IF NOT EXISTS pgcrypto` (edge case #4/#6).
-- Both migrations wrapped in `BEGIN; ... COMMIT;`.
-- `.down.sql` drops both tables in dependency-safe order via `DROP TABLE IF
-  EXISTS` (§4, edge case #1). AC4 met.
+## Correctness findings (all pass)
+- Enums: `user_role` = admin, set_leader, member, guest; `vocal_capability` = none, lead, harmony, both — exact value order per PRD §20.2.
+- FK-dependency order correct: church_groups -> users -> member_profiles; UP runs top-to-bottom on a fresh DB with no forward references.
+- `users.email` is `varchar(255) unique` (nullable-unique) — NOT `not null`. Allows multiple phone-only guests. Correct.
+- Both FKs declare `on delete cascade` (users.church_group_id, member_profiles.user_id) — transitive cascade works.
+- `member_profiles` has NO `updated_at` — correctly omitted per spec/PRD.
+- Defaults declared literally: role `'member'`, vocal_capability `'none'`, timezone `'America/Chicago'`, sms_opted_in false — no reliance on enum ordinal.
+- `create extension if not exists "pgcrypto"` for `gen_random_uuid()`; no uuid-ossp dependency.
+- B-tree index `idx_users_church_group_id` present.
+- DOWN block (commented) drops in reverse order: member_profiles, users, church_groups, then vocal_capability, then user_role — enums last. Correct.
+- Enum-ownership comment present noting Cluster 5 must not redefine vocal_capability.
+- Timestamp prefix `20260702000001` sorts first; it is the only real migration in the dir (only `.gitkeep` besides it).
 
-## Scope compliance
-- Only the two specified migration files were added under `supabase/migrations/`.
-- No RLS, no encryption logic, no TS types, no API routes, no seed data.
-- `users` / `church_groups` NOT created here (correctly left to #16).
+## Scope
+Clean. No RLS, seed data, PostgREST lockdown, other-cluster tables, or TS type generation. config.toml / seed.sql / types.ts / client.ts untouched.
 
-## Tests: meaningful, not superficial
-The tester did not merely trust changes.md. They ran the migration end-to-end
-against a real throwaway Postgres 16 container with stub FK targets, and
-independently verified: role-guarded revoke on bare Postgres, `\d` column
-introspection vs spec, BR-13 privilege denial for BOTH `authenticated` and
-`anon` (UPDATE/DELETE denied, INSERT/SELECT allowed), nullable user_id insert,
-ON DELETE SET NULL vs CASCADE behavior, UNIQUE rejection, clean rollback, and a
-full up→down→up cycle. This is real behavioral coverage of every AC and edge
-case, appropriate for a DDL-only change with no SQL test framework in the repo.
+## Tests
+Meaningful, not superficial: live Postgres (throwaway Docker postgres:16) exercised UP, default-application, multi-NULL email inserts, cascade delete, a duplicate invite_code rejection (real failure case), and full DOWN reversibility verified via information_schema/pg_type. App-code lint/typecheck/jest re-run green with the correct repo script. Green tests here genuinely reflect correct behavior.
 
 ## Notes (non-blocking)
-- The commit swept `.pipeline/spec.md` and `.pipeline/changes.md` into the code
-  commit. Unlike the prior "rogue spec" incident, this spec.md change IS this
-  issue's own spec (regenerated #11 → #21), i.e. legitimate pipeline state, not
-  an unrelated file. No action required, but future commits could keep
-  `.pipeline/` churn out of the code commit for a cleaner diff.
-- `REVOKE`-based enforcement relies on Supabase default privileges granting
-  authenticated/anon DML on new tables; the tester confirmed denial empirically,
-  so this is sound. (A future BEFORE UPDATE/DELETE trigger or RLS would be
-  belt-and-suspenders, but is explicitly out of scope for #21.)
+- DOWN lives in a commented block by design (Supabase CLI is forward-only) — a documented spec decision, acceptable.
+- This file becomes the reference pattern for later cluster migrations; it is clean and consistent.
 
-Nothing wrong with the code. Ship it.
+No defects found. Ship.

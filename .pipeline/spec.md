@@ -1,197 +1,124 @@
-# Spec: Issue #21 — [Sprint 0] Migrate schema — Cluster 6 (Auth & Audit)
+# Spec — Issue #16: Migrate schema, Cluster 1 (Organization)
 
 ## OPEN QUESTIONS
+None that block implementation. Two decisions are made explicit below (both low-risk, chosen to match repo conventions and the PRD). Flag if you disagree:
 
-None blocking. Two decisions were made for you (see notes inline); both are
-low-risk and reversible. Proceed as specified.
+1. **Down migration format.** Supabase CLI migrations are forward-only `.sql` files with no native up/down file pair. To satisfy the "reversible / down migration written" acceptance criterion without inventing tooling the repo doesn't have, include the down SQL in the same migration file inside a commented `-- DOWN` block. Lowest-friction, keeps one CLI-applicable file.
+2. **`vocal_capability` enum ownership.** `member_profiles.vocal_capability` (Cluster 1) needs the `vocal_capability` enum, which the backlog nominally assigns to a later cluster (#11/Cluster 5). Cluster 1 cannot compile without it, so create it here. See "Enum ownership decision".
 
-- **Migration filename timestamp.** The `supabase/migrations/` directory is
-  currently empty (only `.gitkeep`), so no prior-cluster migration files
-  (#7–#11 / #16) exist in this repo yet. Cluster 6 is the *last* cluster, so
-  its migration must sort after all others. Use the exact filename given in
-  §2. If a real Supabase CLI timestamp convention is later adopted, renaming
-  is trivial.
-- **FK targets `users` and `church_groups` may not exist in the repo yet.**
-  This issue is *blocked by #16* (Cluster 1), which creates those tables. Write
-  the FK references as specified; if the migration cannot run because Cluster 1
-  is absent, that is expected and out of scope for #21. Do not create `users`
-  or `church_groups` here.
+## Scope
 
----
+ONLY the three Organization tables (`church_groups`, `users`, `member_profiles`) and the enums they require (`user_role`, `vocal_capability`). Do NOT add RLS policies (#22), seed data, PostgREST lockdown (#14), other clusters' tables, or TypeScript type generation.
 
-## 1. Summary
+## Current repo state (verified)
 
-Create ONE new, reversible SQL migration adding two tables from PRD §20.8
-(Cluster 6 — Auth & Audit): `google_calendar_tokens` and `audit_logs`.
+- `supabase/migrations/` contains only `.gitkeep` — this is the FIRST migration in the project; there is no prior SQL to copy from. This file becomes the reference pattern for all later cluster migrations.
+- `supabase/config.toml` is a placeholder (`project_id = "graceful"` only). Do not edit it for this issue.
+- `supabase/seed.sql`, `lib/supabase/types.ts`, `lib/supabase/client.ts` are all placeholders for later issues — leave untouched.
+- PRD source of truth for the schema: `documentation/prd/graceful_requirements_v10.md` §20.2 (enums) and §20.3 (Cluster 1). Column definitions below are transcribed from there.
 
-Scope is **schema only**:
-- Tables, columns, PKs, FKs, unique constraints, defaults per PRD §20.8.
-- Append-only enforcement on `audit_logs` via `REVOKE UPDATE, DELETE` (BR-13).
-- A matching down/rollback migration.
+## File to create
 
-**Out of scope for this issue — do NOT add:**
-- RLS policies (that is issue #13; not this issue).
-- Encryption/decryption logic (columns store ciphertext only — #61 / audit writer).
-- Any TypeScript types, API routes, seed data, or PostgREST config.
-- The `users` / `church_groups` tables themselves (from #16).
+### `supabase/migrations/20260702000001_cluster_1_organization.sql` (NEW)
 
----
+Timestamp prefix `20260702000001` — Supabase orders migrations lexicographically by the `YYYYMMDDHHMMSS_` prefix, so this must sort before any future cluster migration. Structure:
 
-## 2. Files to create
+```
+-- Migration: Cluster 1 — Organization
+-- Tables: church_groups, users, member_profiles
+-- Enums: user_role, vocal_capability (vocal_capability is created here and reused by Cluster 5)
 
-The repo uses plain SQL migrations under `supabase/migrations/` (see
-`supabase/README.md`, which states "one migration file per schema cluster").
-There is no established up/down file convention yet because the directory is
-empty. Follow the Supabase CLI convention: a single `.sql` file whose leading
-`YYYYMMDDHHMMSS` timestamp orders it, containing the forward migration, with a
-rollback provided as a companion `.down.sql` file so the migration is
-demonstrably reversible.
+-- ============ UP ============
+create extension if not exists "pgcrypto";  -- gen_random_uuid()
 
-Create BOTH of these files:
+-- enums (user_role, vocal_capability)
+-- tables in FK dependency order: church_groups -> users -> member_profiles
+-- index on users.church_group_id
 
-1. **`supabase/migrations/20260702000006_cluster6_auth_audit.sql`** — forward migration.
-2. **`supabase/migrations/20260702000006_cluster6_auth_audit.down.sql`** — rollback.
-
-(The `000006` suffix reflects Cluster 6 and keeps it ordered last among the six
-cluster migrations.)
-
-Do not modify `supabase/config.toml`, `supabase/seed.sql`, or
-`supabase/README.md`.
-
----
-
-## 3. Forward migration — exact contents
-
-Wrap the whole forward migration in a single transaction (`BEGIN; ... COMMIT;`).
-
-### 3.1 `google_calendar_tokens` (PRD §20.8)
-
-One row per user; `user_id` is a UNIQUE FK. Columns store ciphertext produced by
-the application layer (AES-256) — the DB just stores text.
-
-| Column | Type | Null | Constraint / Default |
-| --- | --- | --- | --- |
-| id | uuid | NOT NULL | PK, default `gen_random_uuid()` |
-| user_id | uuid | NOT NULL | UNIQUE, FK → `users(id)` ON DELETE CASCADE |
-| access_token_encrypted | text | NOT NULL | ciphertext (never logged plaintext) |
-| refresh_token_encrypted | text | NOT NULL | ciphertext |
-| token_expiry | timestamptz | NOT NULL | |
-| calendar_id | varchar(200) | NOT NULL | specific calendar to write to |
-| scope | text | NOT NULL | always `calendar.events` (write-only) |
-| created_at | timestamptz | NOT NULL | default `now()` |
-| updated_at | timestamptz | NOT NULL | default `now()` |
-
-Notes:
-- `user_id` UNIQUE enforces the one-token-per-user (1:1) relationship from §20.9.
-- No CHECK on `scope` value — PRD documents the intended value but does not
-  require a DB constraint; keep it a plain `text` column.
-
-### 3.2 `audit_logs` (PRD §20.8) — append-only (BR-13)
-
-| Column | Type | Null | Constraint / Default |
-| --- | --- | --- | --- |
-| id | uuid | NOT NULL | PK, default `gen_random_uuid()` |
-| church_group_id | uuid | NOT NULL | FK → `church_groups(id)` ON DELETE CASCADE |
-| user_id | uuid | NULL | FK → `users(id)` ON DELETE SET NULL — NULL for system-triggered actions |
-| action | varchar(100) | NOT NULL | dot-notation, e.g. `invitation.sent`, `role.changed` |
-| entity_type | varchar(50) | NOT NULL | |
-| entity_id | uuid | NOT NULL | |
-| metadata | jsonb | NOT NULL | default `'{}'::jsonb` (e.g. old_value → new_value) |
-| created_at | timestamptz | NOT NULL | default `now()`, immutable |
-
-Notes:
-- `user_id` is nullable (per §20.8 "Null for system-triggered actions"); use
-  `ON DELETE SET NULL` so deleting a user preserves the immutable log row.
-- `church_group_id` FK matches the app-wide RLS pattern (every table except
-  `church_groups` carries it) but this issue adds NO RLS policy.
-
-### 3.3 Append-only enforcement (BR-13) — required
-
-Immediately after creating `audit_logs`, enforce append-only at the DB layer.
-No application role may UPDATE or DELETE audit rows. INSERT and SELECT remain
-allowed.
-
-Emit:
-
-```sql
-REVOKE UPDATE, DELETE ON TABLE audit_logs FROM PUBLIC;
+-- ============ DOWN ============
+-- (commented; run to reverse — drop in reverse dependency order)
+-- drop table if exists member_profiles;
+-- drop table if exists users;
+-- drop table if exists church_groups;
+-- drop type if exists vocal_capability;
+-- drop type if exists user_role;
 ```
 
-Then, defensively, also revoke from the Supabase-standard application roles so
-the grant cannot be inherited:
+## Enum ownership decision
 
-```sql
-REVOKE UPDATE, DELETE ON TABLE audit_logs FROM authenticated, anon;
-```
+Create BOTH enums in this migration:
+- `user_role` — values in order: `admin`, `set_leader`, `member`, `guest`.
+- `vocal_capability` — values in order: `none`, `lead`, `harmony`, `both`.
 
-Guard the `authenticated, anon` revoke so the migration does not fail if those
-roles are absent in a bare local Postgres (they exist in Supabase). Use a
-`DO $$ ... $$` block that checks `pg_roles` for each role, or wrap in
-`IF EXISTS`-style role checks. Keep the `FROM PUBLIC` revoke unconditional.
+Add a comment noting `vocal_capability` is created here and must NOT be redefined by the later Cluster 5 migration.
 
-Do NOT revoke SELECT or INSERT.
+## Exact schema (from PRD §20.2 / §20.3)
 
-### 3.4 Suggested indexes (add these)
+### Table `church_groups` (root — has NO church_group_id FK)
+| Column | Type | Constraints |
+| --- | --- | --- |
+| id | uuid | PK, default `gen_random_uuid()` |
+| name | varchar(100) | not null |
+| denomination | varchar(100) | null |
+| timezone | varchar(50) | not null, default `'America/Chicago'` |
+| logo_url | text | null (R2 object key, never a public URL) |
+| invite_code | varchar(20) | not null, **unique** |
+| created_at | timestamptz | not null, default `now()` |
+| updated_at | timestamptz | not null, default `now()` |
 
-- Index on `audit_logs(church_group_id, created_at DESC)` — supports the
-  audit read endpoint (#29) and RLS scoping.
-- `user_id` on `google_calendar_tokens` is already UNIQUE (implicit index).
+### Table `users`
+| Column | Type | Constraints |
+| --- | --- | --- |
+| id | uuid | PK, default `gen_random_uuid()` |
+| clerk_id | varchar(50) | not null, **unique** |
+| church_group_id | uuid | not null, FK → `church_groups(id)` on delete cascade |
+| role | user_role | not null, default `'member'` |
+| name | varchar(100) | not null |
+| email | varchar(255) | **null**, **unique** (nullable-unique: Postgres allows multiple NULLs) |
+| phone | varchar(20) | null |
+| sms_opted_in | boolean | not null, default `false` |
+| created_at | timestamptz | not null, default `now()` |
+| updated_at | timestamptz | not null, default `now()` |
 
----
+### Table `member_profiles`
+| Column | Type | Constraints |
+| --- | --- | --- |
+| id | uuid | PK, default `gen_random_uuid()` |
+| user_id | uuid | not null, **unique**, FK → `users(id)` on delete cascade |
+| vocal_capability | vocal_capability | not null, default `'none'` |
+| bio | text | null |
+| created_at | timestamptz | not null, default `now()` |
 
-## 4. Rollback migration — exact contents (`.down.sql`)
+Note: `member_profiles` per PRD has NO `updated_at` — do not add one.
 
-Must fully reverse §3, in dependency-safe order, wrapped in `BEGIN; ... COMMIT;`:
+## Requirements the implementation must satisfy
 
-```sql
-DROP TABLE IF EXISTS audit_logs;
-DROP TABLE IF EXISTS google_calendar_tokens;
-```
+- UUID v4 PKs everywhere via `gen_random_uuid()` (pgcrypto). Do NOT depend on `uuid-ossp`.
+- Create tables in FK-dependency order (church_groups, then users, then member_profiles) so the UP migration runs top-to-bottom on a fresh DB.
+- Add a b-tree index on `users.church_group_id` (queried on nearly every request per the issue's Implementation Notes). `clerk_id` and `email` uniqueness already provide their own indexes; no extra index needed for those.
+- `users.email` must be nullable AND unique — a plain `unique` constraint is correct (Postgres treats NULLs as distinct, so multiple phone-only guest users insert fine). Do NOT mark it `not null`.
+- FKs use `on delete cascade`: deleting a church group removes its users; deleting a user removes their profile. Matches PRD §20 relationships ("One-to-many: church_groups → users"; "One-to-one: users → member_profiles").
+- DOWN block drops in reverse dependency order: member_profiles, users, church_groups, then enum types last.
 
-Dropping the tables removes their grants/indexes automatically; no separate
-`GRANT` restore is needed. Do not drop any enum or the `pgcrypto` extension.
+## Edge cases the implementation must handle
 
----
+1. **Fresh-instance idempotency** of the extension: `create extension if not exists "pgcrypto"`.
+2. **Nullable-unique email**: two guest users with no email must both insert successfully — verify the constraint is `unique`, not a `not null` variant.
+3. **Enum defaults declared explicitly**: `role` default `'member'` (3rd value), `vocal_capability` default `'none'` (1st value). Do not rely on enum ordinal.
+4. **Timezone default** must be exactly the IANA string `'America/Chicago'`.
+5. **Cascade paths**: deleting a `church_groups` row must cascade to `users` and transitively (via the users→member_profiles FK cascade) to `member_profiles`. Confirm both FKs declare `on delete cascade`.
+6. **Reversibility with no orphans**: running the DOWN block after the UP block on a fresh DB must remove every Cluster 1 object, including both enum types. Enums must be dropped AFTER all referencing tables.
+7. **Clean run on fresh Supabase**: the whole UP block must execute with zero errors against an empty database (acceptance criterion). No forward references, no reliance on objects from other clusters.
 
-## 5. Edge cases the implementation MUST handle
+## Pattern to follow
 
-1. **Reversibility.** The `.down.sql` must cleanly drop both tables with no
-   leftover objects. Use `DROP TABLE IF EXISTS`.
-2. **BR-13 append-only.** After the migration, an UPDATE or DELETE against
-   `audit_logs` by an application role (`authenticated`/`anon`/PUBLIC) must be
-   denied by Postgres privileges. INSERT and SELECT must still work.
-3. **Nullable `user_id` on `audit_logs`.** System-triggered rows insert with
-   `user_id = NULL`; the FK must permit this and use `ON DELETE SET NULL`.
-4. **`gen_random_uuid()` availability.** It requires the `pgcrypto` extension.
-   Add `CREATE EXTENSION IF NOT EXISTS pgcrypto;` at the top of the forward
-   migration (idempotent; harmless if an earlier cluster already created it).
-5. **Missing Supabase roles locally.** The `authenticated`/`anon` revoke must
-   not hard-fail on a plain Postgres instance that lacks those roles (see §3.3).
-6. **Re-run safety is NOT required** for `CREATE TABLE` (a migration runs once),
-   but keep `CREATE EXTENSION IF NOT EXISTS` and the role-guarded revokes so a
-   partial local run can be cleaned up and retried.
+No prior migration exists — this file establishes the pattern for later clusters (#8–#12 in the backlog). Keep it clean:
+- lowercase SQL keywords, snake_case identifiers (matches PRD naming).
+- `-- ============ UP ============` / `-- ============ DOWN ============` section banners.
+- One migration file per cluster (per `supabase/README.md`).
 
----
+## Out of scope (do not touch)
 
-## 6. Patterns to follow
-
-- **Column types / nullability / defaults:** copy exactly from
-  `documentation/prd/graceful_requirements_v10.md` §20.8 (lines 1025–1050).
-  All PKs are `uuid`, all timestamps `timestamptz` (PRD §20 intro, line 700).
-- **`church_group_id` FK convention:** every table except `church_groups`
-  carries it (PRD §20 intro / §14 line 622). `audit_logs` follows this.
-- **BR-13 immutability:** PRD line 190 and §20.8 line 1040.
-- **Minimal OAuth scope / ciphertext-only columns:** PRD §25.5 (line 1422) and
-  the issue's Implementation Notes — do not add encryption logic here.
-
-There is no existing migration file to copy structural style from (directory is
-empty). Use standard Postgres DDL as described above.
-
----
-
-## 7. Acceptance-criteria mapping
-
-- AC1 `google_calendar_tokens` created → §3.1.
-- AC2 `audit_logs` created → §3.2.
-- AC3 No UPDATE/DELETE grant on `audit_logs` (BR-13) → §3.3.
-- AC4 Migration is reversible → §2 (companion `.down.sql`) + §4.
+- `supabase/seed.sql`, `supabase/config.toml`, `lib/supabase/types.ts`, `lib/supabase/client.ts`.
+- RLS policies (#22), PostgREST lockdown (#14), any Cluster 2–6 tables/enums beyond the two enums Cluster 1 needs.
+- Regenerating TypeScript types.

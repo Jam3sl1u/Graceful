@@ -1,79 +1,42 @@
-# Changes for Issue #21 — [Sprint 0] Migrate schema — Cluster 6 (Auth & Audit)
+# Changes — #15 auth DB lookup (post-#16)
 
-## Files changed
+## Files created
 
-- `supabase/migrations/20260702000006_cluster6_auth_audit.sql` (new)
-  Forward migration. Wrapped in `BEGIN; ... COMMIT;`.
-  - `CREATE EXTENSION IF NOT EXISTS pgcrypto;` for `gen_random_uuid()`.
-  - Creates `google_calendar_tokens`: uuid PK, UNIQUE `user_id` FK →
-    `users(id) ON DELETE CASCADE`, encrypted-ciphertext text columns
-    (`access_token_encrypted`, `refresh_token_encrypted`), `token_expiry`
-    timestamptz, `calendar_id` varchar(200), `scope` text, `created_at` /
-    `updated_at` timestamptz defaults.
-  - Creates `audit_logs`: uuid PK, `church_group_id` FK →
-    `church_groups(id) ON DELETE CASCADE`, nullable `user_id` FK →
-    `users(id) ON DELETE SET NULL`, `action` varchar(100), `entity_type`
-    varchar(50), `entity_id` uuid, `metadata` jsonb default `'{}'`,
-    `created_at` timestamptz default `now()`.
-  - BR-13 append-only enforcement: unconditional
-    `REVOKE UPDATE, DELETE ON TABLE audit_logs FROM PUBLIC;`, followed by a
-    `DO $$ ... $$` block that individually checks `pg_roles` for
-    `authenticated` and `anon` before revoking from each, so the migration
-    doesn't fail on a bare local Postgres missing those roles.
-  - Index: `audit_logs_church_group_id_created_at_idx` on
-    `(church_group_id, created_at DESC)`.
+| File | What it does |
+| ---- | ------------ |
+| `supabase/migrations/20260703000001_users_self_read_rls.sql` | Bootstrap RLS slice (#22): enables RLS on `users`, adds `users_select_own` SELECT policy so auth lookup is safe before full #22 lands. Commented DOWN block follows #16 pattern. |
+| `tests/unit/lib/api/lookup-user.test.ts` | Unit tests for `lookupUserByClerkId`: happy path, no row, Supabase error → 500, missing JWT → null. Mocks `@clerk/nextjs/server` `auth` + `@/lib/supabase/client` `getSupabaseClient`. |
 
-- `supabase/migrations/20260702000006_cluster6_auth_audit.down.sql` (new)
-  Rollback migration, wrapped in `BEGIN; ... COMMIT;`. Drops `audit_logs`
-  then `google_calendar_tokens` via `DROP TABLE IF EXISTS` (dependency-safe
-  order; dropping tables removes their grants/indexes automatically).
+## Files modified
 
-No other files were touched. `supabase/config.toml`, `supabase/seed.sql`,
-and `supabase/README.md` were left as-is per spec. Note: `.pipeline/spec.md`
-also shows as modified in `git status`, but that change predates this task
-(it's pipeline scaffolding reflecting the current spec, not part of this
-issue's code change) and was intentionally left out of the commit.
+| File | What changed |
+| ---- | ------------ |
+| `lib/supabase/types.ts` | Replaced `Record<string, never>` placeholder with hand-written `Database` type covering `users` table (`id`, `clerk_id`, `church_group_id`, `role`) and `user_role` enum. Shape satisfies supabase-js v2 `GenericSchema`/`GenericTable` so `from().select().maybeSingle()` returns typed data. |
+| `lib/supabase/client.ts` | Replaced stub with server-only `getSupabaseClient(jwt)`: reads `NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_ANON_KEY`, throws clear error if missing, passes JWT as `Authorization: Bearer` header. Anon key only — no service role key. |
+| `lib/api/auth.ts` | Replaced `lookupUserByClerkId` stub: calls `auth().getToken({ template: "supabase" })` → queries `users` by `clerk_id` via `getSupabaseClient` → maps row to `AuthContext`. Returns null on missing JWT or no row; throws `ApiException` 500 on DB error. Removed `TODO(#16)`. Added `TODO(#22)` noting RLS bootstrap slice. Exported the function for unit testing. `UserLookup` injection seam unchanged. |
+| `supabase/README.md` | Updated to reflect that migrations directory is no longer empty; documents both migration files and their purpose. |
 
-## Verification performed
+## Test results
 
-No SQL-specific test suite exists in the repo, so verification was done
-directly against a throwaway Postgres 16 instance (`docker run
-postgres:16-alpine`), with minimal stub `users` / `church_groups` tables
-(never committed) to satisfy the FK targets that Cluster 1 (#16) will
-eventually provide:
+```
+Test Suites: 4 passed, 4 total
+Tests:       17 passed, 17 total
+```
 
-1. Forward migration applies cleanly (with and without `authenticated`/`anon`
-   roles present) — confirms edge case #5 (role-guarded revoke doesn't
-   hard-fail on bare Postgres).
-2. `CREATE EXTENSION IF NOT EXISTS pgcrypto` is idempotent on re-run.
-3. BR-13: as role `authenticated`, `SELECT` and `INSERT` succeed; `UPDATE`
-   and `DELETE` are denied with `permission denied for table audit_logs`
-   (AC3 / edge case #2).
-4. `audit_logs.user_id` accepts `NULL` (system-triggered rows) — edge case #3.
-5. Deleting a referenced `users` row: `audit_logs.user_id` becomes `NULL`
-   (`ON DELETE SET NULL`, log row preserved) and the user's
-   `google_calendar_tokens` row is cascade-deleted (`ON DELETE CASCADE`,
-   1:1 relationship).
-6. `google_calendar_tokens.user_id` UNIQUE constraint rejects a second
-   token row for the same user.
-7. Down migration drops both tables cleanly, leaving `users` /
-   `church_groups` untouched; forward migration re-applies successfully
-   after rollback (full up/down/up cycle) — AC4.
+All pre-existing tests (`auth.test.ts`, `admin-only-route.test.ts`, `response.test.ts`) continue to pass. 4 new tests added in `lookup-user.test.ts`.
 
-Also ran the repo's existing checks, both clean (no findings, since only
-new `.sql` files were added):
-- `bun run typecheck`
-- `bun run lint`
+## Manual setup steps required (for PR description)
 
-## What the Tester should focus on
+These are one-time dashboard actions — not code changes:
 
-- Confirm the two new files exist under `supabase/migrations/` with exactly
-  the specified filenames and are the only new/changed files from this
-  issue (aside from the pre-existing `.pipeline/spec.md` diff noted above,
-  which predates this task).
-- Confirm no RLS policies, encryption logic, TS types, API routes, or seed
-  data were added (explicitly out of scope per the spec).
-- Confirm `users` / `church_groups` tables were NOT created here (blocked by
-  #16, intentionally out of scope).
-- If a real Postgres/Supabase instance is available in CI, consider running
-  the forward + down migration end-to-end there too.
+1. **Clerk JWT Template** — Clerk Dashboard → JWT Templates → New template → select *Supabase* preset → name it exactly `supabase` → Save. This wires `auth().getToken({ template: "supabase" })` to produce a JWT Supabase can verify.
+2. **Supabase Third-Party Auth** — Supabase Dashboard → Authentication → Third-party auth → enable Clerk → paste your Clerk Frontend API domain (e.g. `https://<your-slug>.clerk.accounts.dev`). This makes `auth.jwt()` inside RLS policies resolve against Clerk's JWKS.
+3. **Apply migrations** — `supabase db push` (or paste SQL into Supabase Dashboard SQL editor) to apply `20260703000001_users_self_read_rls.sql` on staging/prod.
+4. **Smoke test** — seed a `church_groups` + `users` row with a real `clerk_id` matching a Clerk test user. Hit a route using default lookup; expect 401 with no row, 200/403 with row depending on role.
+
+## Tester focus areas
+
+- `lookupUserByClerkId` edge cases: no row, Supabase error, null JWT
+- Verify injection seam still works (existing tests cover this)
+- RLS policy correctness: `clerk_id = (auth.jwt() ->> 'sub')` — requires Clerk JWT template in place; test with `supabase db push` + seeded row
+- Env var guard in `getSupabaseClient`: if `NEXT_PUBLIC_SUPABASE_URL` is unset, should throw clear error at call time (not silently)
