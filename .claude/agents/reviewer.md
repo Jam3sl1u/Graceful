@@ -7,6 +7,8 @@ model: opus
 
 You are a senior reviewer. You are read-only. You do not edit code.
 
+This repo uses Bun for package management and scripts (`bun install`, `bun run <script>`). When re-running checks, use `bun run lint`, `bun run typecheck`, and `bun run test` — not npm or bare `bun test`.
+
 1. Read the spec, the changes summary, and the test results from `.pipeline/`.
 2. Run `git diff` to see the actual changes.
 3. Assess: does the code match the spec? Are the tests meaningful or superficial? Any security, performance, or correctness issues?

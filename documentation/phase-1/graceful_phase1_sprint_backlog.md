@@ -35,7 +35,7 @@ Source: `graceful_phase1_core_prd.docx` only. Nothing from Phases 2–5 is inclu
 |---|---|---|---|
 | 1 | Provision third-party accounts & environment config | `type:infra` | Create Vercel, Supabase, Clerk, Pingram, Resend, Cloudflare R2 accounts and a Google Cloud Console project for the Calendar API. Document all env vars in `.env.example` with placeholder values only (PRD §15 — no secrets in source). |
 | 2 | Initialize Next.js project & tooling | `type:infra` | App Router project, TypeScript, ESLint, Prettier, base folder structure. |
-| 3 | CI pipeline skeleton | `type:infra` | GitHub Actions: TypeScript check, ESLint, Jest, npm audit on every PR (PRD §16). |
+| 3 | CI pipeline skeleton | `type:infra` | GitHub Actions: TypeScript check, ESLint, Jest, bun audit on every PR (PRD §16). |
 | 4 | Staging environment | `type:infra` | Separate Supabase project, test API keys, mirrors production config (PRD §16). |
 | 5 | Clerk auth integration | `type:infra` `area:auth` | Sign-up/sign-in flow, JWT issuance, session handling. |
 | 6 | JWT verification + role-check middleware | `type:security` `area:auth` | Every API route validates the Clerk JWT before any business logic; reusable role-check helper for Admin/Set Leader/Member/Guest gating (PRD §15). |

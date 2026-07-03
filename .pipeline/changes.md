@@ -7,7 +7,7 @@ placing the service role key in CI secrets). Per the spec, this pass covers only
 in-repo, verifiable deliverables. Those two dashboard/secrets actions remain human/ops
 follow-ups tracked by issue #23 and re-checked in #79.
 
-## Files changed
+## Files modified
 
 1. **`supabase/config.toml`** (modified) — appended an `[api]` block with
    `enabled = false` after the existing `project_id` line, plus a comment block

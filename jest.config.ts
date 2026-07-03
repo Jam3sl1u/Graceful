@@ -8,6 +8,7 @@ const config: Config = {
     "<rootDir>/song2score/",
     "<rootDir>/.pipeline/",
     "<rootDir>/tests/e2e/",
+    "<rootDir>/tests/integration/",
   ],
   testMatch: ["**/tests/unit/**/*.test.ts"],
   transform: {

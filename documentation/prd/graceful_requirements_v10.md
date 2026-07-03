@@ -1450,7 +1450,7 @@ Even for a single-church US deployment, GDPR-aligned data practices are worth bu
 | **HTTPS everywhere** | MVP | Enforced by Vercel on all routes. HTTP requests are automatically redirected to HTTPS. No exceptions, including API routes and webhooks. |
 | **Content Security Policy headers** | MVP | CSP headers configured on the Next.js app to prevent XSS. Strict CSP: script-src limited to self and Clerk, no inline scripts, no eval. Tested against OWASP CSP validator before launch. |
 | **Webhook signature verification** | MVP | All incoming webhooks (Pingram SMS status callbacks, Clerk user events) verify the request signature before processing. Unsigned or invalid webhook requests are rejected with 401. |
-| **Dependency scanning** | MVP | npm audit and pip-audit run in CI on every pull request. Any high-severity vulnerability blocks the merge. Dependabot is enabled on the repository for automated dependency update PRs. |
+| **Dependency scanning** | MVP | bun audit and pip-audit run in CI on every pull request. Any high-severity vulnerability blocks the merge. Dependabot is enabled on the repository for automated dependency update PRs. |
 | **Environment isolation** | MVP | Three environments: development (local), staging (mirrors production config, uses test API keys), and production. Production secrets are never used in development or staging. Staging uses separate Supabase project, R2 bucket, and Pingram test environment. |
 
 # 26. Testing & Quality Assurance
@@ -1501,7 +1501,7 @@ Run as a dedicated gate before the Phase 1 production launch and repeated before
 | **Input validation / injection** | MVP | Test all string input fields with: SQL injection payloads, XSS payloads, oversized strings, null bytes, and Unicode edge cases. All must be safely rejected or escaped. |
 | **Rate limit tests** | MVP | Verify rate limits fire correctly on: the login endpoint, the SMS trigger endpoint, and the job submission endpoint. Exceeding the limit returns 429 with a Retry-After header. |
 | **OWASP Top 10 checklist** | MVP | Manual review against OWASP Top 10 (2021) before Phase 1 launch: A01 Broken Access Control, A02 Cryptographic Failures, A03 Injection, A05 Security Misconfiguration, A07 Auth Failures. Document findings and resolutions. |
-| **Dependency vulnerability scan** | MVP | npm audit --audit-level=high and pip-audit must both return zero high-severity findings before Phase 1 launch. This scan also runs in CI on every PR. |
+| **Dependency vulnerability scan** | MVP | bun audit --audit-level=high and pip-audit must both return zero high-severity findings before Phase 1 launch. This scan also runs in CI on every PR. |
 
 ## 26.4 Pipeline Accuracy Regression Tests
 
@@ -1521,7 +1521,7 @@ All tests run automatically on every pull request via GitHub Actions. No code me
 
 | Feature | Phase | Description |
 | --- | --- | --- |
-| **Pull request checks** | MVP | On every PR: TypeScript type check, ESLint, Jest unit tests, Playwright E2E tests against staging, npm audit, RLS policy tests. All must pass before the PR can be reviewed and merged. |
+| **Pull request checks** | MVP | On every PR: TypeScript type check, ESLint, Jest unit tests, Playwright E2E tests against staging, bun audit, RLS policy tests. All must pass before the PR can be reviewed and merged. |
 | **Staging environment** | MVP | Staging mirrors production infrastructure exactly: same Vercel config, a separate Supabase project with identical schema, a separate R2 bucket, Pingram test environment, and Clerk test mode. Staging is always deployed from the main branch after merge. |
 | **Production deploy gate** | MVP | Production deployments require: (1) all CI checks passed on main, (2) staging smoke test suite passed (a subset of E2E tests run against staging post-deploy), (3) manual approval from the deploying developer. No automatic production deploys without the smoke test gate. |
 | **Migration safety** | MVP | Database migrations are run against staging before production. Migrations are written to be backward-compatible (add columns, never rename or drop without a deprecation period). A failed staging migration blocks the production deploy. |

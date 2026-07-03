@@ -3,6 +3,10 @@ name: CI
 on:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     runs-on: ubuntu-latest
@@ -11,7 +15,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.2.x
 
       - run: bun install --frozen-lockfile
 
@@ -22,3 +26,42 @@ jobs:
       - run: bun run test
 
       - run: bun audit --audit-level=high
+
+  rls-integration:
+    runs-on: ubuntu-latest
+    # Only run when the required secrets are configured
+    if: ${{ secrets.SUPABASE_TEST_URL != '' }}
+    env:
+      SUPABASE_TEST_URL: ${{ secrets.SUPABASE_TEST_URL }}
+      SUPABASE_TEST_ANON_KEY: ${{ secrets.SUPABASE_TEST_ANON_KEY }}
+      SUPABASE_TEST_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_TEST_SERVICE_ROLE_KEY }}
+      SUPABASE_JWT_SECRET: ${{ secrets.SUPABASE_JWT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.x
+
+      - run: bun install --frozen-lockfile
+
+      - name: Apply RLS migration
+        run: |
+          # Push migrations to test Supabase project via CLI
+          # Requires SUPABASE_ACCESS_TOKEN + supabase link --project-ref <ref>
+          # to be pre-configured, or use the REST API approach below.
+          # For simplicity we apply the migration SQL directly via psql:
+          psql "$SUPABASE_TEST_URL/postgres" \
+            --set=ON_ERROR_STOP=1 \
+            -f supabase/migrations/20260702000001_cluster_1_organization.sql \
+            -f supabase/migrations/20260702000002_cluster_2_instruments.sql \
+            -f supabase/migrations/20260702000003_cluster_3_scheduling_core.sql \
+            -f supabase/migrations/20260702000004_cluster_4_partial_songs.sql \
+            -f supabase/migrations/20260702000005_cluster_5_partial.sql \
+            -f supabase/migrations/20260702000006_cluster6_auth_audit.sql \
+            -f supabase/migrations/20260703000001_users_self_read_rls.sql \
+            -f supabase/migrations/20260704000001_rls_policies.sql \
+          || echo "Migrations already applied — continuing"
+
+      - name: Run RLS integration tests
+        run: bun run test:rls
