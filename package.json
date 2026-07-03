@@ -2,12 +2,15 @@
   "name": "graceful",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "bun@1.2.0",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "test": "jest",
     "test:e2e": "playwright test"
   },

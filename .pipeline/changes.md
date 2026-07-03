@@ -1,91 +1,42 @@
-# Changes — Issue #20: Migrate schema — Cluster 5 partial
+# Changes — #15 auth DB lookup (post-#16)
 
-## File created
+## Files created
 
-- `supabase/migrations/0005_cluster5_partial.sql`
+| File | What it does |
+| ---- | ------------ |
+| `supabase/migrations/20260703000001_users_self_read_rls.sql` | Bootstrap RLS slice (#22): enables RLS on `users`, adds `users_select_own` SELECT policy so auth lookup is safe before full #22 lands. Commented DOWN block follows #16 pattern. |
+| `tests/unit/lib/api/lookup-user.test.ts` | Unit tests for `lookupUserByClerkId`: happy path, no row, Supabase error → 500, missing JWT → null. Mocks `@clerk/nextjs/server` `auth` + `@/lib/supabase/client` `getSupabaseClient`. |
 
-## What it does
+## Files modified
 
-Single reversible SQL migration with `-- migrate:up` / `-- migrate:down` sections
-(no paired `_down.sql`, matching the spec's chosen convention since no prior
-migrations exist in the repo).
+| File | What changed |
+| ---- | ------------ |
+| `lib/supabase/types.ts` | Replaced `Record<string, never>` placeholder with hand-written `Database` type covering `users` table (`id`, `clerk_id`, `church_group_id`, `role`) and `user_role` enum. Shape satisfies supabase-js v2 `GenericSchema`/`GenericTable` so `from().select().maybeSingle()` returns typed data. |
+| `lib/supabase/client.ts` | Replaced stub with server-only `getSupabaseClient(jwt)`: reads `NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_ANON_KEY`, throws clear error if missing, passes JWT as `Authorization: Bearer` header. Anon key only — no service role key. |
+| `lib/api/auth.ts` | Replaced `lookupUserByClerkId` stub: calls `auth().getToken({ template: "supabase" })` → queries `users` by `clerk_id` via `getSupabaseClient` → maps row to `AuthContext`. Returns null on missing JWT or no row; throws `ApiException` 500 on DB error. Removed `TODO(#16)`. Added `TODO(#22)` noting RLS bootstrap slice. Exported the function for unit testing. `UserLookup` injection seam unchanged. |
+| `supabase/README.md` | Updated to reflect that migrations directory is no longer empty; documents both migration files and their purpose. |
 
-**Up section**, in order:
-1. Two enums, each guarded with `DO $$ ... EXCEPTION WHEN duplicate_object $$`:
-   - `chat_pref` — `('all', 'mentions')`
-   - `notification_type` — the 11-value catalog from PRD §14 (`set_invitation`,
-     `invitation_reminder`, `invitation_accepted`, `invitation_denied`,
-     `practice_reminder`, `setlist_released`, `scheduling_conflict`,
-     `chat_mention`, `devotion_shared`, `new_church_document`,
-     `google_calendar_event`). This enum is not in PRD §20.2's list but is
-     referenced by `notifications.type` in §20.7 — the spec resolves this gap
-     by having the migration define it here.
-2. `availability` table (uuid PK, FK to `users`/`church_groups` ON DELETE
-   CASCADE, `date`, `is_available` default true, nullable `note`,
-   `created_at`), with `UNIQUE (user_id, date)` and an index on
-   `(church_group_id, date)`.
-3. `notification_preferences` table (uuid PK, `user_id` UNIQUE FK, the 8
-   boolean/int preference columns with PRD-specified defaults — notably
-   `reminder_email` defaults `false` while the other booleans default `true`
-   — `chat_preference chat_pref` default `'mentions'`, `gcal_sync_enabled`
-   default `false`). No BR-14 CHECK constraint (intentionally left to the API
-   layer per spec).
-4. `notifications` table (uuid PK, FKs to `church_groups`/`users`, `type
-   notification_type`, `title varchar(200)`, nullable `body`, nullable
-   polymorphic `link_entity_type`/`link_entity_id` pair with no FK on the
-   latter, `is_read` default false, `created_at`), with indexes on
-   `(user_id, is_read)` and `(user_id, created_at DESC)`.
+## Test results
 
-**Down section** drops in reverse dependency order: `notifications` →
-`notification_preferences` → `availability` → `notification_type` →
-`chat_pref`. Does not touch `users` or `church_groups` (owned by issue #16).
+```
+Test Suites: 4 passed, 4 total
+Tests:       17 passed, 17 total
+```
 
-## Out of scope (confirmed not done)
+All pre-existing tests (`auth.test.ts`, `admin-only-route.test.ts`, `response.test.ts`) continue to pass. 4 new tests added in `lookup-user.test.ts`.
 
-- No `chat_rooms` / `chat_messages` / `chat_mentions` (Phase 2).
-- No RLS / `ENABLE ROW LEVEL SECURITY` (issue #13).
-- No `vocal_capability` enum (Cluster 1 / #16).
-- No BR-14 CHECK constraint.
-- No seed data, no API routes, no TS types/Zod schemas, no config.toml changes.
+## Manual setup steps required (for PR description)
 
-## Verification performed
+These are one-time dashboard actions — not code changes:
 
-No SQL lint/test tooling exists in this repo's `package.json` scripts
-(`lint`/`typecheck`/`test` are all JS/TS-oriented and don't touch `.sql`
-files), so verification was done directly against Postgres:
+1. **Clerk JWT Template** — Clerk Dashboard → JWT Templates → New template → select *Supabase* preset → name it exactly `supabase` → Save. This wires `auth().getToken({ template: "supabase" })` to produce a JWT Supabase can verify.
+2. **Supabase Third-Party Auth** — Supabase Dashboard → Authentication → Third-party auth → enable Clerk → paste your Clerk Frontend API domain (e.g. `https://<your-slug>.clerk.accounts.dev`). This makes `auth.jwt()` inside RLS policies resolve against Clerk's JWKS.
+3. **Apply migrations** — `supabase db push` (or paste SQL into Supabase Dashboard SQL editor) to apply `20260703000001_users_self_read_rls.sql` on staging/prod.
+4. **Smoke test** — seed a `church_groups` + `users` row with a real `clerk_id` matching a Clerk test user. Hit a route using default lookup; expect 401 with no row, 200/403 with row depending on role.
 
-- Spun up a throwaway `postgres:15-alpine` Docker container, created stub
-  `church_groups`/`users` tables (standing in for issue #16's not-yet-present
-  migration), then applied this migration's `migrate:up` block — it applied
-  cleanly.
-- Confirmed via `\d` that every column, type, default, nullability, unique
-  constraint, index, and FK on `availability`, `notification_preferences`,
-  and `notifications` matches the spec's tables exactly (§3.3–3.5), and that
-  `chat_pref` / `notification_type` enum values match exactly (§3.2).
-- Applied `migrate:down` and confirmed all 3 tables and both enums were
-  removed, leaving only the stub `users`/`church_groups` tables intact.
-- Re-ran `migrate:down` a second time and confirmed `DROP ... IF EXISTS`
-  guards make it a no-op (NOTICE: does not exist, skipping) rather than an
-  error.
-- Re-ran `migrate:up` again and separately re-ran the `chat_pref` enum
-  `CREATE TYPE` guard block to confirm the `duplicate_object` exception
-  handler prevents an error on re-creation.
-- Removed the Docker container after verification (no artifacts left behind
-  in the repo).
+## Tester focus areas
 
-## Focus for Tester
-
-- Confirm the migration is a no-op / correctly errors (missing relation) when
-  applied to a DB that does not yet have `church_groups`/`users` — this is
-  expected behavior per the spec, not a bug.
-- Confirm the migration applies cleanly and matches schema exactly once
-  issue #16's Cluster 1 migration is present ahead of it.
-- Confirm no RLS, no Phase-2 chat tables, and no `vocal_capability` enum were
-  introduced.
-
-## Git
-
-Committed on the current branch
-(`issue-20-sprint-0-migrate-schema-cluster-5-partial-availability-notification-prefs-notifications`)
-as commit `b42ad83`: "Add Cluster 5 partial migration (availability,
-notification_preferences, notifications)". Not pushed.
+- `lookupUserByClerkId` edge cases: no row, Supabase error, null JWT
+- Verify injection seam still works (existing tests cover this)
+- RLS policy correctness: `clerk_id = (auth.jwt() ->> 'sub')` — requires Clerk JWT template in place; test with `supabase db push` + seeded row
+- Env var guard in `getSupabaseClient`: if `NEXT_PUBLIC_SUPABASE_URL` is unset, should throw clear error at call time (not silently)
