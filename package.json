@@ -13,7 +13,8 @@
     "format:check": "prettier --check .",
     "test": "jest",
     "test:rls": "jest --config jest.config.integration.ts",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "check:service-role": "node scripts/check-service-role.mjs"
   },
   "dependencies": {
     "next": "^15.3.0",

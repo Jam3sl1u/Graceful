@@ -1,33 +1,44 @@
-# Review — Issue #16: Migrate schema, Cluster 1 (Organization)
+# Review — Issue #23 (Disable PostgREST auto-API & lock down service role key)
 
-## VERDICT: SHIP
+VERDICT: NEEDS WORK
 
-## What was reviewed
-- `git diff main...HEAD` (one new file: `supabase/migrations/20260702000001_cluster_1_organization.sql`, 57 lines).
-- Cross-checked the migration column-by-column against the spec's exact schema AND the PRD source of truth (`documentation/prd/graceful_requirements_v10.md` §20.2 enums / §20.3 Cluster 1) — not just the written summaries.
-- Confirmed git status: only the migration file is committed on the branch; `.pipeline/*` edits are the pipeline's own artifacts, no stray source changes.
+## Summary
+The four in-repo deliverables match the spec: `supabase/config.toml` [api]/enabled=false
+block, README "Architecture rules (standing)" section, `scripts/check-service-role.mjs`
+guard, and the `check:service-role` package.json script. All edits are additive (only
+deletion is the package.json trailing-comma line). PRD refs (§19.3, §25.1) verified to
+exist. Commit contains only the four code files; `.pipeline/*` correctly left uncommitted
+per prior incident history. OQ-1 dashboard/secret actions correctly deferred.
 
-## Correctness findings (all pass)
-- Enums: `user_role` = admin, set_leader, member, guest; `vocal_capability` = none, lead, harmony, both — exact value order per PRD §20.2.
-- FK-dependency order correct: church_groups -> users -> member_profiles; UP runs top-to-bottom on a fresh DB with no forward references.
-- `users.email` is `varchar(255) unique` (nullable-unique) — NOT `not null`. Allows multiple phone-only guests. Correct.
-- Both FKs declare `on delete cascade` (users.church_group_id, member_profiles.user_id) — transitive cascade works.
-- `member_profiles` has NO `updated_at` — correctly omitted per spec/PRD.
-- Defaults declared literally: role `'member'`, vocal_capability `'none'`, timezone `'America/Chicago'`, sms_opted_in false — no reliance on enum ordinal.
-- `create extension if not exists "pgcrypto"` for `gen_random_uuid()`; no uuid-ossp dependency.
-- B-tree index `idx_users_church_group_id` present.
-- DOWN block (commented) drops in reverse order: member_profiles, users, church_groups, then vocal_capability, then user_role — enums last. Correct.
-- Enum-ownership comment present noting Cluster 5 must not redefine vocal_capability.
-- Timestamp prefix `20260702000001` sorts first; it is the only real migration in the dir (only `.gitkeep` besides it).
+I independently re-ran the guard and confirmed: passes clean repo (exit 0), the
+`lib/supabase/client.ts` comment is correctly allowlisted, real non-comment violations in
+both `app/` and `lib/` are flagged with `path:line - matched` and exit 1, trailing comments
+after real code correctly FAIL, and the extension filter skips `.json`/no-extension files.
 
-## Scope
-Clean. No RLS, seed data, PostgREST lockdown, other-cluster tables, or TS type generation. config.toml / seed.sql / types.ts / client.ts untouched.
+## Must fix
 
-## Tests
-Meaningful, not superficial: live Postgres (throwaway Docker postgres:16) exercised UP, default-application, multi-NULL email inserts, cascade delete, a duplicate invite_code rejection (real failure case), and full DOWN reversibility verified via information_schema/pg_type. App-code lint/typecheck/jest re-run green with the correct repo script. Green tests here genuinely reflect correct behavior.
+1. **Guard silently passes (exit 0) when run from any cwd other than the repo root.**
+   `scripts/check-service-role.mjs:11` uses relative `SCAN_DIRS = ["app", "lib"]` resolved
+   against `process.cwd()`. `walk()` (lines 21-25) swallows the ENOENT in a bare `try/catch`
+   and returns zero files, so from a non-root cwd the script prints the OK message and
+   exits 0 while scanning NOTHING. Reproduced:
+     - `cd /repo && node scripts/check-service-role.mjs` with an injected violation → exit 1 (correct)
+     - `cd / && node /repo/scripts/check-service-role.mjs` same violation → exit 0 "OK" (WRONG)
+   This is a false-negative in a security guard whose only job is to fail loudly. The
+   `bun run check:service-role` path is safe today (npm/bun set cwd to package root), but
+   the spec's stated contract is `node scripts/check-service-role.mjs`, and any future
+   direct call, git hook, or CI step that runs from a different directory would get a
+   silent green while enforcing nothing.
+   Fix: resolve SCAN_DIRS against the script/repo root, e.g. anchor to
+   `import.meta.url` (`fileURLToPath` + `join(dirname, "..", dir)`), OR make a missing
+   scan dir an explicit condition (only tolerate absent dirs, still fail on read errors) —
+   do not let a missing `app/`+`lib/` resolve to a silent pass. Then verify the guard
+   flags a violation regardless of invocation cwd.
 
-## Notes (non-blocking)
-- DOWN lives in a commented block by design (Supabase CLI is forward-only) — a documented spec decision, acceptable.
-- This file becomes the reference pattern for later cluster migrations; it is clean and consistent.
-
-No defects found. Ship.
+## Non-blocking notes (do not need to fix for ship)
+- Block comments whose content lines lack a leading `*` (e.g. a bare line inside `/* ... */`)
+  are treated as code and would FALSE-POSITIVE fail. This errs toward strictness, which is
+  the safe direction for a security guard, and does not affect the current allowlisted file
+  (which uses `//` and `*`-prefixed lines). Acceptable as-is; worth a comment if revisited.
+- No regression test for the guard itself (tester noted this). Acceptable for this issue's
+  scope; consider a fixture-based test if #79/CI wiring lands.

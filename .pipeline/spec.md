@@ -1,124 +1,149 @@
-# Spec — Issue #16: Migrate schema, Cluster 1 (Organization)
+# Spec: Issue #23 — Disable PostgREST auto-API & lock down service role key
 
-## OPEN QUESTIONS
-None that block implementation. Two decisions are made explicit below (both low-risk, chosen to match repo conventions and the PRD). Flag if you disagree:
+## OPEN QUESTIONS (read first)
 
-1. **Down migration format.** Supabase CLI migrations are forward-only `.sql` files with no native up/down file pair. To satisfy the "reversible / down migration written" acceptance criterion without inventing tooling the repo doesn't have, include the down SQL in the same migration file inside a commented `-- DOWN` block. Lowest-friction, keeps one CLI-applicable file.
-2. **`vocal_capability` enum ownership.** `member_profiles.vocal_capability` (Cluster 1) needs the `vocal_capability` enum, which the backlog nominally assigns to a later cluster (#11/Cluster 5). Cluster 1 cannot compile without it, so create it here. See "Enum ownership decision".
+**OQ-1 (NON-BLOCKING — dashboard action lives outside the repo).**
+Two of the four acceptance criteria are Supabase-dashboard / secrets-management
+actions that no code in this repo can perform:
+- "PostgREST auto-API confirmed disabled in the Supabase project settings"
+- "Service role key exists only in trusted migration scripts / CI secrets"
 
-## Scope
+There is no linked/real Supabase project in this repo yet — `supabase/config.toml`
+holds only `project_id = "graceful"` and `supabase/migrations/` is `.gitkeep`
+(scaffolding stage). The coder CANNOT toggle a dashboard setting or provision a CI
+secret. **This spec scopes the coder to the in-repo, verifiable deliverables:
+documenting the standing rule and adding a repo-wide guard.** The dashboard toggle
+and secret placement remain human/ops follow-ups tracked by this issue and re-checked
+in #79. Do NOT invent a fake Supabase project or dashboard automation.
 
-ONLY the three Organization tables (`church_groups`, `users`, `member_profiles`) and the enums they require (`user_role`, `vocal_capability`). Do NOT add RLS policies (#22), seed data, PostgREST lockdown (#14), other clusters' tables, or TypeScript type generation.
+This is not a hard blocker: proceed with the in-repo work below.
 
-## Current repo state (verified)
+---
 
-- `supabase/migrations/` contains only `.gitkeep` — this is the FIRST migration in the project; there is no prior SQL to copy from. This file becomes the reference pattern for all later cluster migrations.
-- `supabase/config.toml` is a placeholder (`project_id = "graceful"` only). Do not edit it for this issue.
-- `supabase/seed.sql`, `lib/supabase/types.ts`, `lib/supabase/client.ts` are all placeholders for later issues — leave untouched.
-- PRD source of truth for the schema: `documentation/prd/graceful_requirements_v10.md` §20.2 (enums) and §20.3 (Cluster 1). Column definitions below are transcribed from there.
+## Current state (verified — do not redo this analysis)
 
-## File to create
+- **Service-role key is already absent from user-callable code.** Repo-wide search
+  for `SUPABASE_SERVICE_ROLE_KEY` / `service_role` finds it ONLY in:
+  - `.env.example:7` (declaration, expected)
+  - `lib/supabase/client.ts:6` (a warning comment telling future devs never to use it here)
+  - docs/backlog/spec references
+  No `createClient(..., SERVICE_ROLE_KEY)` call exists anywhere in `/app` or `/lib`.
+  Acceptance criterion "does not appear in `/app` or any user-callable API route"
+  is **already satisfied**; the coder's job is to add a guard that keeps it that way.
+- **The architecture rules already exist in the PRD** — see
+  `documentation/prd/graceful_requirements_v10.md` §19.3 (lines 693–696) and §25.1
+  (lines 1383–1384). They are NOT yet surfaced as a contributor-facing standing rule.
+- **There is no `/docs` directory.** The issue says "`/docs` or README." Use the
+  README route (see Files below) — do not create a new top-level `/docs` tree.
+- `supabase/config.toml` is a 4-line placeholder with no `[api]` block.
 
-### `supabase/migrations/20260702000001_cluster_1_organization.sql` (NEW)
+---
 
-Timestamp prefix `20260702000001` — Supabase orders migrations lexicographically by the `YYYYMMDDHHMMSS_` prefix, so this must sort before any future cluster migration. Structure:
+## Files to create / modify
 
+### 1. `supabase/config.toml` (MODIFY)
+Add an explicit `[api]` block that disables PostgREST for local `supabase start`,
+so the "PostgREST disabled" intent is codified where the project config lives (the
+production toggle is still a dashboard action per OQ-1). Append after the existing
+`project_id` line:
+
+```toml
+# PostgREST auto-API is disabled by architecture rule (PRD §19.3, §25.1 / issue #23).
+# All DB access goes through Next.js API routes, never Supabase's generated REST API.
+# NOTE: this governs the local `supabase start` stack only. The hosted project's
+# Data API must also be turned off in the Supabase dashboard (Settings > API) — see
+# issue #23 acceptance criteria and re-verified in the Sprint 4 audit (#79).
+[api]
+enabled = false
 ```
--- Migration: Cluster 1 — Organization
--- Tables: church_groups, users, member_profiles
--- Enums: user_role, vocal_capability (vocal_capability is created here and reused by Cluster 5)
 
--- ============ UP ============
-create extension if not exists "pgcrypto";  -- gen_random_uuid()
+Keep the existing header comments and `project_id` line intact.
 
--- enums (user_role, vocal_capability)
--- tables in FK dependency order: church_groups -> users -> member_profiles
--- index on users.church_group_id
+### 2. `README.md` (MODIFY)
+The README is currently 2 lines. Append a `## Architecture rules (standing)` section
+documenting the two rules this issue is about, phrased for future contributors. Keep
+it tight — copy the wording intent from PRD §19.3 lines 693–695. Must state:
+- PostgREST (Supabase's auto-generated REST API) is disabled; all data access goes
+  through the app's own Next.js API routes.
+- The Supabase **service role key bypasses RLS** and must NEVER appear in any
+  user-callable API route (`app/**`) or client/lib code (`lib/**`). It belongs only
+  in trusted migration/seed scripts and CI secrets.
+- Reference: PRD §15.1 (§25.1 in v10 doc), §19.3.
+- Note that this rule is enforced by the check in `scripts/check-service-role.mjs`
+  (item 3) and re-verified in the Sprint 4 security audit (#79).
 
--- ============ DOWN ============
--- (commented; run to reverse — drop in reverse dependency order)
--- drop table if exists member_profiles;
--- drop table if exists users;
--- drop table if exists church_groups;
--- drop type if exists vocal_capability;
--- drop type if exists user_role;
+### 3. `scripts/check-service-role.mjs` (CREATE)
+A repo-wide guard that fails (exit code 1) if the service-role key is referenced in
+user-callable code. This makes the "confirmed via repo-wide search" criterion
+executable and repeatable rather than a one-time manual pass.
+
+Behavior:
+- Recursively scan `app/` and `lib/` for the strings `SUPABASE_SERVICE_ROLE_KEY`
+  and `service_role` (case-insensitive on the latter).
+- **Allowlist:** `lib/supabase/client.ts` is permitted to mention the key **only
+  inside comments** (it currently warns against using it). Simplest correct rule:
+  allow the match on any line that is a comment (line trimmed starts with `//` or
+  `*`), fail on any non-comment occurrence anywhere in `app/`+`lib/`. Do not
+  hard-exclude the whole file, or the guard becomes toothless if real code is added.
+- On violation: print each offending `path:line` and the matched text, then
+  `process.exit(1)`.
+- On clean: print a one-line OK message and exit 0.
+- No external dependencies — use Node's built-in `fs`/`path` only (ESM `.mjs`,
+  matching repo convention; confirm by checking whether other `scripts/*.mjs` /
+  package.json `"type"` exist and follow it). Read files as UTF-8; skip non-source
+  extensions (only scan `.ts`, `.tsx`, `.js`, `.mjs`).
+
+Signature (no exports needed; it's a CLI script):
+```
+node scripts/check-service-role.mjs   # exit 0 = clean, exit 1 = violation
 ```
 
-## Enum ownership decision
+### 4. `package.json` (MODIFY)
+Add a script entry so the guard is discoverable and CI-runnable:
+```json
+"check:service-role": "node scripts/check-service-role.mjs"
+```
+Place it alongside existing scripts. Do NOT wire it into a git hook or CI workflow
+in this issue (out of scope — no CI config is asked for). If a `lint`/`check`
+aggregate script already exists, you MAY chain it in, but only if that does not
+change existing behavior; otherwise leave standalone.
 
-Create BOTH enums in this migration:
-- `user_role` — values in order: `admin`, `set_leader`, `member`, `guest`.
-- `vocal_capability` — values in order: `none`, `lead`, `harmony`, `both`.
-
-Add a comment noting `vocal_capability` is created here and must NOT be redefined by the later Cluster 5 migration.
-
-## Exact schema (from PRD §20.2 / §20.3)
-
-### Table `church_groups` (root — has NO church_group_id FK)
-| Column | Type | Constraints |
-| --- | --- | --- |
-| id | uuid | PK, default `gen_random_uuid()` |
-| name | varchar(100) | not null |
-| denomination | varchar(100) | null |
-| timezone | varchar(50) | not null, default `'America/Chicago'` |
-| logo_url | text | null (R2 object key, never a public URL) |
-| invite_code | varchar(20) | not null, **unique** |
-| created_at | timestamptz | not null, default `now()` |
-| updated_at | timestamptz | not null, default `now()` |
-
-### Table `users`
-| Column | Type | Constraints |
-| --- | --- | --- |
-| id | uuid | PK, default `gen_random_uuid()` |
-| clerk_id | varchar(50) | not null, **unique** |
-| church_group_id | uuid | not null, FK → `church_groups(id)` on delete cascade |
-| role | user_role | not null, default `'member'` |
-| name | varchar(100) | not null |
-| email | varchar(255) | **null**, **unique** (nullable-unique: Postgres allows multiple NULLs) |
-| phone | varchar(20) | null |
-| sms_opted_in | boolean | not null, default `false` |
-| created_at | timestamptz | not null, default `now()` |
-| updated_at | timestamptz | not null, default `now()` |
-
-### Table `member_profiles`
-| Column | Type | Constraints |
-| --- | --- | --- |
-| id | uuid | PK, default `gen_random_uuid()` |
-| user_id | uuid | not null, **unique**, FK → `users(id)` on delete cascade |
-| vocal_capability | vocal_capability | not null, default `'none'` |
-| bio | text | null |
-| created_at | timestamptz | not null, default `now()` |
-
-Note: `member_profiles` per PRD has NO `updated_at` — do not add one.
-
-## Requirements the implementation must satisfy
-
-- UUID v4 PKs everywhere via `gen_random_uuid()` (pgcrypto). Do NOT depend on `uuid-ossp`.
-- Create tables in FK-dependency order (church_groups, then users, then member_profiles) so the UP migration runs top-to-bottom on a fresh DB.
-- Add a b-tree index on `users.church_group_id` (queried on nearly every request per the issue's Implementation Notes). `clerk_id` and `email` uniqueness already provide their own indexes; no extra index needed for those.
-- `users.email` must be nullable AND unique — a plain `unique` constraint is correct (Postgres treats NULLs as distinct, so multiple phone-only guest users insert fine). Do NOT mark it `not null`.
-- FKs use `on delete cascade`: deleting a church group removes its users; deleting a user removes their profile. Matches PRD §20 relationships ("One-to-many: church_groups → users"; "One-to-one: users → member_profiles").
-- DOWN block drops in reverse dependency order: member_profiles, users, church_groups, then enum types last.
+---
 
 ## Edge cases the implementation must handle
 
-1. **Fresh-instance idempotency** of the extension: `create extension if not exists "pgcrypto"`.
-2. **Nullable-unique email**: two guest users with no email must both insert successfully — verify the constraint is `unique`, not a `not null` variant.
-3. **Enum defaults declared explicitly**: `role` default `'member'` (3rd value), `vocal_capability` default `'none'` (1st value). Do not rely on enum ordinal.
-4. **Timezone default** must be exactly the IANA string `'America/Chicago'`.
-5. **Cascade paths**: deleting a `church_groups` row must cascade to `users` and transitively (via the users→member_profiles FK cascade) to `member_profiles`. Confirm both FKs declare `on delete cascade`.
-6. **Reversibility with no orphans**: running the DOWN block after the UP block on a fresh DB must remove every Cluster 1 object, including both enum types. Enums must be dropped AFTER all referencing tables.
-7. **Clean run on fresh Supabase**: the whole UP block must execute with zero errors against an empty database (acceptance criterion). No forward references, no reliance on objects from other clusters.
+- **`check-service-role.mjs` must pass against the current repo as-is.** The only
+  current match is the comment block in `lib/supabase/client.ts` — the comment
+  allowlist must let that through with exit 0. Verify this before finishing.
+- The scanner must not crash on directories with no matching files, on empty files,
+  or on binary/non-source files (skip by extension).
+- Case sensitivity: `SUPABASE_SERVICE_ROLE_KEY` is all-caps (env var);
+  `service_role` may appear lower/upper — match case-insensitively for the latter.
+- Do not match on substrings that are legitimately unrelated (there are none
+  currently; the two literal patterns above are specific enough — do not broaden to
+  bare `service` or `role`).
+- README/config edits must be additive; do not delete or reword existing content.
 
-## Pattern to follow
+---
 
-No prior migration exists — this file establishes the pattern for later clusters (#8–#12 in the backlog). Keep it clean:
-- lowercase SQL keywords, snake_case identifiers (matches PRD naming).
-- `-- ============ UP ============` / `-- ============ DOWN ============` section banners.
-- One migration file per cluster (per `supabase/README.md`).
+## Patterns to follow
 
-## Out of scope (do not touch)
+- **Config style:** mirror the existing comment-first style already in
+  `supabase/config.toml` and `supabase/README.md` (leading `#` explanatory comments
+  citing PRD sections and issue numbers).
+- **Doc citation style:** the codebase consistently cites PRD sections inline
+  (e.g. `lib/supabase/client.ts:7` cites "PRD §19.3", `app/api/health/route.ts:5`
+  cites "PRD §19.2"). Match that convention.
+- **Script style:** if any `scripts/*.mjs` already exists, copy its shebang/ESM/
+  exit-code conventions. If `scripts/` does not yet exist, create it; keep the file
+  dependency-free (Node built-ins only), consistent with the repo having no test/
+  tooling deps wired for this.
 
-- `supabase/seed.sql`, `supabase/config.toml`, `lib/supabase/types.ts`, `lib/supabase/client.ts`.
-- RLS policies (#22), PostgREST lockdown (#14), any Cluster 2–6 tables/enums beyond the two enums Cluster 1 needs.
-- Regenerating TypeScript types.
+---
+
+## Out of scope (do NOT touch)
+
+- Rate limiting (#76), CSP/HTTPS (#78), CI pipeline wiring, git hooks.
+- Implementing `getSupabaseClient` or any RLS work (#22) — leave
+  `lib/supabase/client.ts` logic unchanged (the guard reads it, does not edit it).
+- Creating a real Supabase project, running migrations, or any dashboard automation.
