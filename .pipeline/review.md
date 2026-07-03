@@ -1,49 +1,57 @@
-# Review: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Review: Issue #21 — Cluster 6 (Auth & Audit) schema migration
 
 VERDICT: SHIP
 
-## What was verified (independently, not trusted from prior summaries)
+## What was reviewed
+- `git diff main...HEAD` firsthand (not just the summaries)
+- Both SQL files read in full
+- Cross-checked columns/types/FKs against PRD §20.8 and §20.9
+- Spec §3.1–§3.4, §4, §5 edge cases, §7 acceptance-criteria mapping
 
-Ran `git diff e4acd21..HEAD` firsthand. The change set is exactly the seven files
-the spec calls for and nothing else:
+## Correctness assessment (matches spec + PRD)
+- `google_calendar_tokens`: uuid PK w/ `gen_random_uuid()`, UNIQUE `user_id`
+  FK → `users(id) ON DELETE CASCADE`, both ciphertext text columns NOT NULL,
+  `token_expiry` timestamptz, `calendar_id` varchar(200), `scope` text,
+  created/updated_at defaults. Matches §3.1 and PRD §20.8 exactly. 1:1
+  relationship enforced by UNIQUE (PRD §20.9). AC1 met.
+- `audit_logs`: uuid PK, `church_group_id` FK → `church_groups(id) ON DELETE
+  CASCADE`, nullable `user_id` FK → `users(id) ON DELETE SET NULL`,
+  action/entity_type/entity_id, `metadata jsonb DEFAULT '{}'::jsonb`,
+  created_at default. Matches §3.2 and PRD §20.8. AC2 met.
+- BR-13 append-only (§3.3): unconditional `REVOKE UPDATE, DELETE ... FROM
+  PUBLIC` plus a `DO $$` block that guards `authenticated`/`anon` revokes
+  behind `pg_roles` existence checks so a bare local Postgres won't hard-fail
+  (edge case #5). SELECT/INSERT untouched. AC3 met.
+- Index on `(church_group_id, created_at DESC)` present (§3.4).
+- Extension guard `CREATE EXTENSION IF NOT EXISTS pgcrypto` (edge case #4/#6).
+- Both migrations wrapped in `BEGIN; ... COMMIT;`.
+- `.down.sql` drops both tables in dependency-safe order via `DROP TABLE IF
+  EXISTS` (§4, edge case #1). AC4 met.
 
-- `.prettierignore` (new) — matches spec 3.1 byte-for-byte.
-- `package.json` — only a clean 2-line insertion of `format` / `format:check`
-  after `typecheck`. Grepped for dependency lines: none changed. All existing
-  scripts (dev/build/start/lint/typecheck/test/test:e2e) intact.
-- `app/(auth)/layout.tsx`, `app/globals.css`, `components/ui/Button.tsx`,
-  `lib/api/webhook-verify.ts` — pure formatting. Confirmed each diff is only
-  JSX-wrapping parens / line-wrapping / whitespace. No identifier, string,
-  error message, TODO, or return type changed. Semantically inert.
-- `README.md` — added Getting Started, Scripts, and Project Structure sections.
-  Verified all 7 documented directories (app, components, lib, schemas, types,
-  supabase, tests) actually exist on disk. No invented subfolders.
+## Scope compliance
+- Only the two specified migration files were added under `supabase/migrations/`.
+- No RLS, no encryption logic, no TS types, no API routes, no seed data.
+- `users` / `church_groups` NOT created here (correctly left to #16).
 
-## Checks re-run by the reviewer
+## Tests: meaningful, not superficial
+The tester did not merely trust changes.md. They ran the migration end-to-end
+against a real throwaway Postgres 16 container with stub FK targets, and
+independently verified: role-guarded revoke on bare Postgres, `\d` column
+introspection vs spec, BR-13 privilege denial for BOTH `authenticated` and
+`anon` (UPDATE/DELETE denied, INSERT/SELECT allowed), nullable user_id insert,
+ON DELETE SET NULL vs CASCADE behavior, UNIQUE rejection, clean rollback, and a
+full up→down→up cycle. This is real behavioral coverage of every AC and edge
+case, appropriate for a DDL-only change with no SQL test framework in the repo.
 
-- `bun run format:check` — PASS ("All matched files use Prettier code style!")
-- `bun run lint` — PASS (no errors)
-- `bun run typecheck` — PASS (no errors)
-- `.prettierignore` is a real filter, not a no-op: temporarily removed it and
-  `prettier --check .` reported 7 violations, all in ignored dirs
-  (.claude, .pipeline, documentation). Restored; check passes again.
+## Notes (non-blocking)
+- The commit swept `.pipeline/spec.md` and `.pipeline/changes.md` into the code
+  commit. Unlike the prior "rogue spec" incident, this spec.md change IS this
+  issue's own spec (regenerated #11 → #21), i.e. legitimate pipeline state, not
+  an unrelated file. No action required, but future commits could keep
+  `.pipeline/` churn out of the code commit for a cleaner diff.
+- `REVOKE`-based enforcement relies on Supabase default privileges granting
+  authenticated/anon DML on new tables; the tester confirmed denial empirically,
+  so this is sound. (A future BEFORE UPDATE/DELETE trigger or RLS would be
+  belt-and-suspenders, but is explicitly out of scope for #21.)
 
-## Out-of-scope confirmation
-
-`git diff` on eslint.config.mjs, tsconfig.json, next.config.ts, .prettierrc,
-and .github/workflows/ci.yml produced zero output — none touched. No dependency
-bumps. No route/auth/UI logic changes. No scope creep into other issues.
-
-## Critical assessment
-
-The prior chain (planner/coder/tester) was accurate; spot-checks reproduced
-every material claim. The one substantive judgment worth flagging — that the
-4 reformatted files are behavior-preserving — I re-derived from the raw diff
-rather than taking it on faith, and it holds: wrapping JSX in grouping parens
-and spreading a function signature across lines are non-semantic. The tester
-correctly wrote no new tests (there is no new behavior to test) and instead
-re-ran the existing Jest suite and re-verified the tooling claims — the right
-call for a formatting/docs change.
-
-All four acceptance criteria for issue #11 are now met on a clean checkout.
-No security, performance, or correctness concerns. Ship it.
+Nothing wrong with the code. Ship it.
