@@ -6,7 +6,5 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
 };
 
 export function Button({ variant = "primary", className, ...props }: ButtonProps) {
-  return (
-    <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />
-  );
+  return <button className={`${styles.button} ${styles[variant]} ${className ?? ""}`} {...props} />;
 }
