@@ -7,9 +7,11 @@
 // Usage: node scripts/check-service-role.mjs   (exit 0 = clean, exit 1 = violation)
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const SCAN_DIRS = ["app", "lib"];
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const SCAN_DIRS = ["app", "lib"].map((d) => join(REPO_ROOT, d));
 const SCAN_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".mjs"]);
 const PATTERNS = [
   { name: "SUPABASE_SERVICE_ROLE_KEY", regex: /SUPABASE_SERVICE_ROLE_KEY/ },
@@ -65,6 +67,12 @@ function scanFile(filePath) {
 
 function main() {
   const files = SCAN_DIRS.flatMap((dir) => walk(dir));
+
+  if (files.length === 0) {
+    console.error("ERROR: no files found to scan — check SCAN_DIRS paths.");
+    process.exit(1);
+  }
+
   const allViolations = files.flatMap((file) => scanFile(file));
 
   if (allViolations.length > 0) {

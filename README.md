@@ -48,7 +48,8 @@ Open http://localhost:3000 to view the app.
 
 - **PostgREST is disabled.** Supabase's auto-generated REST API is turned off;
   all data access goes through the app's own Next.js API routes, which enforce
-  business logic before touching the database.
+  business logic before touching the database. The `church_groups` table has no
+  RLS by design — PostgREST being disabled is its only database-layer guard.
 - **The Supabase service role key bypasses RLS** and must NEVER appear in any
   user-callable API route (`app/**`) or client/lib code (`lib/**`). It belongs
   only in trusted migration/seed scripts and CI secrets.
