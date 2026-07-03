@@ -62,7 +62,7 @@ export default async function ProfilePage() {
 }
 ```
 
-- Use `currentUser()` from `@clerk/nextjs/server`. Do **NOT** use `lib/clerk/server.ts`’s `getAuthContext` — it intentionally throws until #5/#6.
+- Use `currentUser()` from `@clerk/nextjs/server`. Do **NOT** use `lib/clerk/server.ts`'s `getAuthContext` — it intentionally throws until #5/#6.
 - Minimal markup only. Follow the inline-style `<main>` pattern in `app/(marketing)/page.tsx`. No new UI components, no CSS module. Polish is out of scope.
 
 ### 4. Prove the session reaches API routes
@@ -102,7 +102,7 @@ export async function GET() {
 
 ## Explicitly OUT OF SCOPE (do not implement)
 - Any change to `lib/clerk/server.ts` (`getAuthContext`) or `lib/api/auth.ts` (`requireAuth`/`requireRole`) — that is #5/#6.
-- JWT signature verification / claim extraction beyond `auth()`’s built-in resolution — that is #15.
+- JWT signature verification / claim extraction beyond `auth()`'s built-in resolution — that is #15.
 - Clerk webhook (`app/api/webhooks/clerk/route.ts`) user-sync — leave as `notImplemented`.
 - Custom-branded auth UI, social providers, password reset (Clerk defaults only).
 - `PUT /api/profile` implementation.

@@ -1,6 +1,6 @@
 # Changes — Issue #14: Integrate Clerk authentication (Sprint 0)
 
-## Files changed
+## What changed
 
 1. **`middleware.ts`**
    - Replaced the no-op `export default clerkMiddleware();` with a callback that calls `await auth.protect()` for any request that doesn't match `isPublicRoute`.
