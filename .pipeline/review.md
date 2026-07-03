@@ -1,49 +1,25 @@
-# Review: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Review — Issue #12 CI pipeline skeleton hardening
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-## What was verified (independently, not trusted from prior summaries)
+## What I verified independently (not just from summaries)
+- `git diff main...HEAD` — one commit (`c8539d4`), one file: `.github/workflows/ci.yml`, 5 insertions / 1 deletion. No scope creep.
+- The diff is exactly the two required §3 edits:
+  1. Top-level `concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }` added after `on:`.
+  2. `bun-version` pinned from `latest` to `1.2.x`.
+- Read the final `ci.yml`: job name is still `checks`; `bun install --frozen-lockfile` retained; audit step still `bun audit --audit-level=high` (gate at high, not weakened); no `continue-on-error` anywhere. Every step can fail the job.
+- `package.json` test script is `jest` (no `--passWithNoTests`). Confirmed real tests exist and pass: `tests/unit/lib/api/response.test.ts` (1 suite / 3 tests). So the "Jest exits non-zero on zero tests" edge case from spec §4 does not apply — flag correctly omitted.
+- Read `jest.config.ts`: `testMatch` is scoped to `**/tests/unit/**/*.test.ts` and `tests/e2e/` is in `testPathIgnorePatterns`, so the Playwright spec (`tests/e2e/health.spec.ts`) is correctly NOT run by the unit `test` step. Out-of-scope E2E stays out of CI as required by §6.
+- No changes to `tsconfig.json`, `eslint.config.mjs`, `jest.config.ts`, `package.json`, or source — matches §6 scope restriction.
 
-Ran `git diff e4acd21..HEAD` firsthand. The change set is exactly the seven files
-the spec calls for and nothing else:
+## Correctness / security / performance assessment
+- Correctness: the workflow triggers on `pull_request`, runs typecheck/lint/test/audit, all fail-closed. Matches acceptance criteria.
+- Security: dependency audit gated at `high` per PRD §16, not lowered. Frozen lockfile prevents lockfile-drift smuggling. Good.
+- Performance: `concurrency` with `cancel-in-progress` addresses the ~under-5-min criterion for rapid PR pushes.
+- Reproducibility: `bun-version: 1.2.x` is a valid resolvable range (1.2.x tags exist upstream), removes the `latest` drift risk.
 
-- `.prettierignore` (new) — matches spec 3.1 byte-for-byte.
-- `package.json` — only a clean 2-line insertion of `format` / `format:check`
-  after `typecheck`. Grepped for dependency lines: none changed. All existing
-  scripts (dev/build/start/lint/typecheck/test/test:e2e) intact.
-- `app/(auth)/layout.tsx`, `app/globals.css`, `components/ui/Button.tsx`,
-  `lib/api/webhook-verify.ts` — pure formatting. Confirmed each diff is only
-  JSX-wrapping parens / line-wrapping / whitespace. No identifier, string,
-  error message, TODO, or return type changed. Semantically inert.
-- `README.md` — added Getting Started, Scripts, and Project Structure sections.
-  Verified all 7 documented directories (app, components, lib, schemas, types,
-  supabase, tests) actually exist on disk. No invented subfolders.
+## Non-blocking notes (not defects, for the human / PR body)
+- Branch protection requiring the `checks` status check on `main` is a GitHub setting, correctly left out of the repo per §OPEN QUESTIONS #2. Must be enabled manually — call this out in the PR description.
+- The workflow's audit/frozen-lockfile behavior is fail-closed by design; a future unfixable transitive `high` advisory could block all PRs. Per spec §4 that is intentionally deferred, not a defect here.
 
-## Checks re-run by the reviewer
-
-- `bun run format:check` — PASS ("All matched files use Prettier code style!")
-- `bun run lint` — PASS (no errors)
-- `bun run typecheck` — PASS (no errors)
-- `.prettierignore` is a real filter, not a no-op: temporarily removed it and
-  `prettier --check .` reported 7 violations, all in ignored dirs
-  (.claude, .pipeline, documentation). Restored; check passes again.
-
-## Out-of-scope confirmation
-
-`git diff` on eslint.config.mjs, tsconfig.json, next.config.ts, .prettierrc,
-and .github/workflows/ci.yml produced zero output — none touched. No dependency
-bumps. No route/auth/UI logic changes. No scope creep into other issues.
-
-## Critical assessment
-
-The prior chain (planner/coder/tester) was accurate; spot-checks reproduced
-every material claim. The one substantive judgment worth flagging — that the
-4 reformatted files are behavior-preserving — I re-derived from the raw diff
-rather than taking it on faith, and it holds: wrapping JSX in grouping parens
-and spreading a function signature across lines are non-semantic. The tester
-correctly wrote no new tests (there is no new behavior to test) and instead
-re-ran the existing Jest suite and re-verified the tooling claims — the right
-call for a formatting/docs change.
-
-All four acceptance criteria for issue #11 are now met on a clean checkout.
-No security, performance, or correctness concerns. Ship it.
+Green tests here reflect genuinely correct behavior. The change is minimal, surgical, and matches the spec item-for-item. Ship it.

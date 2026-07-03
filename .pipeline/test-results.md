@@ -1,66 +1,76 @@
-# Test Results: Issue #11 — [Sprint 0] Initialize Next.js project & tooling
+# Test Results — Issue #12 CI pipeline skeleton hardening
 
-## Nature of this change
+## Verdict: PASS
 
-This is a tooling/formatting/docs change with no new application logic (per
-spec and coder's changes.md). There is nothing new to unit-test. Judgment
-call: re-ran the existing Jest suite to confirm the reformatting didn't break
-anything, and independently re-verified every claim in changes.md rather than
-trusting it — including the two specific claims the coder flagged for the
-Tester to focus on (the `.prettierignore` is a real filter, not a no-op; the
-4 reformatted files are logic-identical).
+Independently re-verified the Coder's claims (did not just trust `.pipeline/changes.md`).
 
-## Verification performed (independently re-run, not just trusted from changes.md)
+## Scope check
 
-| # | Check | Result |
-|---|-------|--------|
-| 1 | `bun run format:check` | PASS — "All matched files use Prettier code style!" |
-| 2 | `bun run lint` | PASS — no output/errors |
-| 3 | `bun run typecheck` | PASS — no output/errors |
-| 4 | `bun run dev` + `curl http://localhost:3000/` | PASS — server started cleanly, `GET / 200` in dev log, curl returned `HTTP_STATUS:200` |
-| 5 | `bun test` (Jest, pre-existing suite: `tests/unit/lib/api/response.test.ts`) | PASS — 3/3 tests passed, unaffected by the reformatting |
+- `git show c8539d4 --stat` confirms the commit touches **only**
+  `.github/workflows/ci.yml` (5 insertions, 1 deletion), matching spec §3/§6
+  scope restriction.
+- `git diff c8539d4^ c8539d4 -- .github/workflows/ci.yml` shows exactly the two
+  hardening edits required by spec §3:
+  1. Added top-level `concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }`.
+  2. Pinned `bun-version` from `latest` to `1.2.x`.
+- Confirmed no `continue-on-error` anywhere in the file, job name still
+  `checks`, audit step still gated at `--audit-level=high` (unchanged).
+- `tsconfig.json`, `eslint.config.mjs`, `jest.config.ts`, `package.json` are
+  untouched by this commit (only `ci.yml` appears in the diff).
+- Note: the working tree has unrelated, pre-existing uncommitted changes to
+  `.claude/agents/*`, `.claude/commands/*`, `.claude/settings.json`,
+  `.claude/workflows/handle-issues.js`, `.gitignore`, and `.pipeline/*` —
+  these are pipeline/tooling files unrelated to issue #12 and are not part
+  of the `c8539d4` commit, so they do not affect this verdict.
 
-## Targeted checks from the coder's "what to focus on" list
+## Independent verification performed
 
-1. **`.prettierignore` is a real filter, not a no-op.**
-   Temporarily removed `.prettierignore` and ran `prettier --check .`:
-   found 6 real violations —
-   `.claude/commands/feature.md`, `.claude/commands/handle-issues.md`,
-   `.pipeline/README.md`, `.pipeline/spec.md`,
-   `documentation/phase-1/graceful_phase1_sprint_backlog.md`,
-   `documentation/prd/graceful_requirements_v10.md`.
-   Restored `.prettierignore` and confirmed `format:check` passes again
-   (0 violations). This proves the ignore file is doing real, necessary work
-   and `format:check` is a genuine check, not a false-pass.
+| Check | Command | Result |
+|---|---|---|
+| YAML validity | `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"` | OK, parses cleanly |
+| `1.2.x` tag exists upstream | `curl -I https://github.com/oven-sh/bun/releases/tag/bun-v1.2.23` | `HTTP/2 200` — confirmed real tag exists, `1.2.x` range resolves on the `oven-sh/setup-bun@v2` action |
+| Lockfile sync | `bun install --frozen-lockfile` | Passes, no drift ("no changes") |
+| Typecheck | `bun run typecheck` (`tsc --noEmit`) | Passes, no errors |
+| Lint | `bun run lint` (`eslint .`) | Passes, no errors |
+| Test | `bun run test` (`jest`) | Passes — 1 suite / 3 tests green (`tests/unit/lib/api/response.test.ts`) |
+| Audit | `bun audit --audit-level=high` | Exit 0, no high/critical advisories, locally installed bun 1.3.4 |
 
-2. **No logic change in the 4 reformatted source files.**
-   Diffed each against the pre-change commit (`e4acd21`) with whitespace
-   collapsed. `app/globals.css`'s font-family list is byte-identical
-   modulo whitespace. `app/(auth)/layout.tsx`, `components/ui/Button.tsx`,
-   and `lib/api/webhook-verify.ts` differ only by JSX-wrapping parentheses
-   and multi-line vs single-line function signatures — both are inert,
-   non-semantic constructs (grouping parens around JSX don't change the
-   AST's meaning; wrapping a function signature across lines doesn't change
-   its parameters or return type). Confirmed: same identifiers, same
-   strings, same throw/error messages, same TODO comments, same logic.
+## Edge cases from spec §4
 
-3. **Out-of-scope files untouched.**
-   `git diff e4acd21..HEAD -- eslint.config.mjs tsconfig.json next.config.ts
-   .prettierrc .github/workflows/ci.yml` produced no output — confirmed none
-   of these were touched.
+- **Frozen lockfile drift**: `--frozen-lockfile` retained and verified working
+  (no drift currently). Correctly left as strict per spec — this is desired
+  fail-closed behavior, not weakened.
+- **Empty/minimal test suite**: real test files exist
+  (`tests/unit/lib/api/response.test.ts`, 3 passing tests), so Jest does not
+  hit the "zero test files" failure mode. `--passWithNoTests` correctly
+  omitted per spec (spec says only add it if no tests currently exist).
+- **Audit false positives**: gate correctly left at `high`, not weakened to
+  `low`/`moderate`.
 
-4. **`package.json` scripts preserved.**
-   `git diff e4acd21..HEAD -- package.json` shows only a clean 2-line
-   insertion of `format` / `format:check` after `typecheck`; `dev`, `build`,
-   `start`, `lint`, `typecheck`, `test`, `test:e2e` are untouched, same
-   commands, same order relative to each other.
+## Out-of-scope items correctly not implemented
 
-## Summary
+- Branch protection / required status check on `main` — correctly left as a
+  human follow-up, noted in changes.md for the PR description.
+- No Playwright/E2E step added to the workflow.
+- No deploy/staging gate added.
 
-All verification commands pass. No new tests were written because this
-issue introduced no new application behavior — the existing Jest suite
-(3 tests) was re-run and still passes, confirming the Prettier reformatting
-didn't alter runtime behavior. All specific claims in the coder's
-changes.md were independently reproduced rather than taken on faith.
+## Failure case considered
+
+- Deliberately re-checked whether `bun install --frozen-lockfile` would mask
+  lockfile drift (a way this could silently pass when it shouldn't) — it did
+  not; the command genuinely validates `bun.lock` against `package.json` and
+  would exit non-zero on drift. No masking/false-pass behavior found in any
+  of the five CI steps.
+
+## Notes for Reviewer
+
+- No failures found. The diff is minimal and surgical, matching spec §3
+  items 1, 2, 4, 5 exactly; item 3 (audit invocation) was correctly left
+  unchanged after verification since `bun audit --audit-level=high` is valid
+  on the installed bun 1.3.4.
+- Flag to a human (per spec §OPEN QUESTIONS #2): branch protection requiring
+  the `checks` status check must be enabled manually on `main` in GitHub
+  settings — this is not verifiable by local/CI checks and is out of scope
+  for code changes.
 
 **Result: PASS. No blocking issues found. Ready for Reviewer.**
