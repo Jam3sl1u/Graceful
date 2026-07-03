@@ -207,7 +207,7 @@ if (plan.hasOpenQuestion) {
 }
 
 const coded = await agent(
-  `You are the coder stage. Read .pipeline/spec.md in full and implement exactly what it specifies for issue #${issue.number} -- no scope creep. Verify your changes (lint/typecheck/tests/whatever the spec calls for) before finishing. Commit your changes on the current branch with a clear message referencing issue #${issue.number} (do not push). Write a summary of what changed and where to .pipeline/changes.md.`,
+  `You are the coder stage. Read .pipeline/spec.md in full and implement exactly what it specifies for issue #${issue.number} -- no scope creep. Verify your changes with Bun (bun run lint, bun run typecheck, bun run test, or whatever the spec calls for) before finishing. Commit your changes on the current branch with a clear message referencing issue #${issue.number} (do not push). Write a summary of what changed and where to .pipeline/changes.md.`,
   { agentType: 'coder', label: `code:${issue.number}`, phase: 'Code', schema: { type: 'object', properties: { done: { type: 'boolean' } }, required: ['done'] } }
 )
 
@@ -218,7 +218,7 @@ if (!coded) {
 }
 
 const tested = await agent(
-  `You are the tester stage. Read .pipeline/changes.md and .pipeline/spec.md. Independently verify the coder's claims rather than trusting them -- re-run whatever checks are relevant (lint, typecheck, existing test suite, manual verification of the feature) and write pass/fail findings to .pipeline/test-results.md for the reviewer.`,
+  `You are the tester stage. Read .pipeline/changes.md and .pipeline/spec.md. Independently verify the coder's claims rather than trusting them -- re-run whatever checks are relevant with Bun (bun run lint, bun run typecheck, bun run test, manual verification of the feature) and write pass/fail findings to .pipeline/test-results.md for the reviewer.`,
   { agentType: 'tester', label: `test:${issue.number}`, phase: 'Test', schema: { type: 'object', properties: { done: { type: 'boolean' } }, required: ['done'] } }
 )
 
