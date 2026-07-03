@@ -1,25 +1,33 @@
-# Review — Issue #12 CI pipeline skeleton hardening
+# Review — Issue #16: Migrate schema, Cluster 1 (Organization)
 
 ## VERDICT: SHIP
 
-## What I verified independently (not just from summaries)
-- `git diff main...HEAD` — one commit (`c8539d4`), one file: `.github/workflows/ci.yml`, 5 insertions / 1 deletion. No scope creep.
-- The diff is exactly the two required §3 edits:
-  1. Top-level `concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }` added after `on:`.
-  2. `bun-version` pinned from `latest` to `1.2.x`.
-- Read the final `ci.yml`: job name is still `checks`; `bun install --frozen-lockfile` retained; audit step still `bun audit --audit-level=high` (gate at high, not weakened); no `continue-on-error` anywhere. Every step can fail the job.
-- `package.json` test script is `jest` (no `--passWithNoTests`). Confirmed real tests exist and pass: `tests/unit/lib/api/response.test.ts` (1 suite / 3 tests). So the "Jest exits non-zero on zero tests" edge case from spec §4 does not apply — flag correctly omitted.
-- Read `jest.config.ts`: `testMatch` is scoped to `**/tests/unit/**/*.test.ts` and `tests/e2e/` is in `testPathIgnorePatterns`, so the Playwright spec (`tests/e2e/health.spec.ts`) is correctly NOT run by the unit `test` step. Out-of-scope E2E stays out of CI as required by §6.
-- No changes to `tsconfig.json`, `eslint.config.mjs`, `jest.config.ts`, `package.json`, or source — matches §6 scope restriction.
+## What was reviewed
+- `git diff main...HEAD` (one new file: `supabase/migrations/20260702000001_cluster_1_organization.sql`, 57 lines).
+- Cross-checked the migration column-by-column against the spec's exact schema AND the PRD source of truth (`documentation/prd/graceful_requirements_v10.md` §20.2 enums / §20.3 Cluster 1) — not just the written summaries.
+- Confirmed git status: only the migration file is committed on the branch; `.pipeline/*` edits are the pipeline's own artifacts, no stray source changes.
 
-## Correctness / security / performance assessment
-- Correctness: the workflow triggers on `pull_request`, runs typecheck/lint/test/audit, all fail-closed. Matches acceptance criteria.
-- Security: dependency audit gated at `high` per PRD §16, not lowered. Frozen lockfile prevents lockfile-drift smuggling. Good.
-- Performance: `concurrency` with `cancel-in-progress` addresses the ~under-5-min criterion for rapid PR pushes.
-- Reproducibility: `bun-version: 1.2.x` is a valid resolvable range (1.2.x tags exist upstream), removes the `latest` drift risk.
+## Correctness findings (all pass)
+- Enums: `user_role` = admin, set_leader, member, guest; `vocal_capability` = none, lead, harmony, both — exact value order per PRD §20.2.
+- FK-dependency order correct: church_groups -> users -> member_profiles; UP runs top-to-bottom on a fresh DB with no forward references.
+- `users.email` is `varchar(255) unique` (nullable-unique) — NOT `not null`. Allows multiple phone-only guests. Correct.
+- Both FKs declare `on delete cascade` (users.church_group_id, member_profiles.user_id) — transitive cascade works.
+- `member_profiles` has NO `updated_at` — correctly omitted per spec/PRD.
+- Defaults declared literally: role `'member'`, vocal_capability `'none'`, timezone `'America/Chicago'`, sms_opted_in false — no reliance on enum ordinal.
+- `create extension if not exists "pgcrypto"` for `gen_random_uuid()`; no uuid-ossp dependency.
+- B-tree index `idx_users_church_group_id` present.
+- DOWN block (commented) drops in reverse order: member_profiles, users, church_groups, then vocal_capability, then user_role — enums last. Correct.
+- Enum-ownership comment present noting Cluster 5 must not redefine vocal_capability.
+- Timestamp prefix `20260702000001` sorts first; it is the only real migration in the dir (only `.gitkeep` besides it).
 
-## Non-blocking notes (not defects, for the human / PR body)
-- Branch protection requiring the `checks` status check on `main` is a GitHub setting, correctly left out of the repo per §OPEN QUESTIONS #2. Must be enabled manually — call this out in the PR description.
-- The workflow's audit/frozen-lockfile behavior is fail-closed by design; a future unfixable transitive `high` advisory could block all PRs. Per spec §4 that is intentionally deferred, not a defect here.
+## Scope
+Clean. No RLS, seed data, PostgREST lockdown, other-cluster tables, or TS type generation. config.toml / seed.sql / types.ts / client.ts untouched.
 
-Green tests here reflect genuinely correct behavior. The change is minimal, surgical, and matches the spec item-for-item. Ship it.
+## Tests
+Meaningful, not superficial: live Postgres (throwaway Docker postgres:16) exercised UP, default-application, multi-NULL email inserts, cascade delete, a duplicate invite_code rejection (real failure case), and full DOWN reversibility verified via information_schema/pg_type. App-code lint/typecheck/jest re-run green with the correct repo script. Green tests here genuinely reflect correct behavior.
+
+## Notes (non-blocking)
+- DOWN lives in a commented block by design (Supabase CLI is forward-only) — a documented spec decision, acceptable.
+- This file becomes the reference pattern for later cluster migrations; it is clean and consistent.
+
+No defects found. Ship.

@@ -1,76 +1,63 @@
-# Test Results — Issue #12 CI pipeline skeleton hardening
+# Test Results — Issue #16: Migrate schema, Cluster 1 (Organization)
 
-## Verdict: PASS
+## Overall: PASS
 
-Independently re-verified the Coder's claims (did not just trust `.pipeline/changes.md`).
+All checks below were independently re-run (not taken on the coder's word).
 
-## Scope check
+## 1. App-code regression checks
 
-- `git show c8539d4 --stat` confirms the commit touches **only**
-  `.github/workflows/ci.yml` (5 insertions, 1 deletion), matching spec §3/§6
-  scope restriction.
-- `git diff c8539d4^ c8539d4 -- .github/workflows/ci.yml` shows exactly the two
-  hardening edits required by spec §3:
-  1. Added top-level `concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }`.
-  2. Pinned `bun-version` from `latest` to `1.2.x`.
-- Confirmed no `continue-on-error` anywhere in the file, job name still
-  `checks`, audit step still gated at `--audit-level=high` (unchanged).
-- `tsconfig.json`, `eslint.config.mjs`, `jest.config.ts`, `package.json` are
-  untouched by this commit (only `ci.yml` appears in the diff).
-- Note: the working tree has unrelated, pre-existing uncommitted changes to
-  `.claude/agents/*`, `.claude/commands/*`, `.claude/settings.json`,
-  `.claude/workflows/handle-issues.js`, `.gitignore`, and `.pipeline/*` —
-  these are pipeline/tooling files unrelated to issue #12 and are not part
-  of the `c8539d4` commit, so they do not affect this verdict.
+- `bun run lint` (`eslint .`) — PASS, no output/errors.
+- `bun run typecheck` (`tsc --noEmit`) — PASS, no output/errors.
+- `bun run test` (`jest`, the actual test script defined in `package.json`) — PASS:
+  `tests/unit/lib/api/response.test.ts` — 3/3 tests passed. No regressions.
+  - Note: raw `bun test` (bun's own runner, not the repo's `test` script) throws
+    on this repo regardless of this change — it tries to execute
+    `tests/e2e/health.spec.ts` (a Playwright spec) and a Jest test that imports
+    `server-only` outside a Next.js server context, both of which are pre-existing
+    test-runner-selection issues unrelated to the migration. Using the correct
+    script (`bun run test` → `jest`) is clean. Confirms coder's claim that no app
+    code was touched and nothing else regressed.
 
-## Independent verification performed
+## 2. Migration file review
 
-| Check | Command | Result |
-|---|---|---|
-| YAML validity | `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"` | OK, parses cleanly |
-| `1.2.x` tag exists upstream | `curl -I https://github.com/oven-sh/bun/releases/tag/bun-v1.2.23` | `HTTP/2 200` — confirmed real tag exists, `1.2.x` range resolves on the `oven-sh/setup-bun@v2` action |
-| Lockfile sync | `bun install --frozen-lockfile` | Passes, no drift ("no changes") |
-| Typecheck | `bun run typecheck` (`tsc --noEmit`) | Passes, no errors |
-| Lint | `bun run lint` (`eslint .`) | Passes, no errors |
-| Test | `bun run test` (`jest`) | Passes — 1 suite / 3 tests green (`tests/unit/lib/api/response.test.ts`) |
-| Audit | `bun audit --audit-level=high` | Exit 0, no high/critical advisories, locally installed bun 1.3.4 |
+Read `supabase/migrations/20260702000001_cluster_1_organization.sql` in full and
+diffed column-by-column against spec's exact schema tables. Matches exactly:
+tables (`church_groups`, `users`, `member_profiles`), columns, types, defaults,
+constraints, FK cascade behavior, index, and enum definitions/order. Scope is
+clean — `git show --stat fe3a6b6` confirms only this one file was committed; no
+edits to `config.toml`, `seed.sql`, `types.ts`, `client.ts`.
 
-## Edge cases from spec §4
+Migration timestamp `20260702000001` is the only file in `supabase/migrations/`
+(sorts correctly as first/only migration).
 
-- **Frozen lockfile drift**: `--frozen-lockfile` retained and verified working
-  (no drift currently). Correctly left as strict per spec — this is desired
-  fail-closed behavior, not weakened.
-- **Empty/minimal test suite**: real test files exist
-  (`tests/unit/lib/api/response.test.ts`, 3 passing tests), so Jest does not
-  hit the "zero test files" failure mode. `--passWithNoTests` correctly
-  omitted per spec (spec says only add it if no tests currently exist).
-- **Audit false positives**: gate correctly left at `high`, not weakened to
-  `low`/`moderate`.
+## 3. Live Postgres verification (independent, via fresh throwaway Docker container `postgres:16`, removed after)
 
-## Out-of-scope items correctly not implemented
+- UP block ran top-to-bottom with zero errors: `CREATE EXTENSION`, `CREATE TYPE` x2,
+  `CREATE TABLE` x3, `CREATE INDEX` — PASS.
+- **Happy path**: inserted a `church_groups` row with only `name`/`invite_code` —
+  `timezone` defaulted to `'America/Chicago'` — PASS.
+- Inserted two `users` rows with no `role`/`email` — both succeeded (nullable-unique
+  email allows multiple NULLs — **edge case from spec** #2), `role` defaulted to
+  `'member'` — PASS.
+- Inserted matching `member_profiles` rows with no `vocal_capability` — defaulted
+  to `'none'` — PASS (spec edge case #3).
+- **Cascade edge case** (spec #5): deleted the `church_groups` row — confirmed 0
+  `users` and 0 `member_profiles` rows remained (transitive cascade through
+  users→member_profiles) — PASS.
+- **Failure case**: attempted to insert a second `church_groups` row reusing an
+  existing `invite_code` — correctly rejected with
+  `duplicate key value violates unique constraint "church_groups_invite_code_key"`
+  — PASS (uniqueness constraint enforced as specified).
+- **Reversibility** (spec edge case #6): ran the commented DOWN block (all 5
+  statements) on the now-fresh DB — all drops succeeded; verified via
+  `information_schema.tables` and `pg_type` that 0 Cluster 1 tables and 0 Cluster 1
+  enum types remain — PASS.
 
-- Branch protection / required status check on `main` — correctly left as a
-  human follow-up, noted in changes.md for the PR description.
-- No Playwright/E2E step added to the workflow.
-- No deploy/staging gate added.
+## Conclusion
 
-## Failure case considered
-
-- Deliberately re-checked whether `bun install --frozen-lockfile` would mask
-  lockfile drift (a way this could silently pass when it shouldn't) — it did
-  not; the command genuinely validates `bun.lock` against `package.json` and
-  would exit non-zero on drift. No masking/false-pass behavior found in any
-  of the five CI steps.
-
-## Notes for Reviewer
-
-- No failures found. The diff is minimal and surgical, matching spec §3
-  items 1, 2, 4, 5 exactly; item 3 (audit invocation) was correctly left
-  unchanged after verification since `bun audit --audit-level=high` is valid
-  on the installed bun 1.3.4.
-- Flag to a human (per spec §OPEN QUESTIONS #2): branch protection requiring
-  the `checks` status check must be enabled manually on `main` in GitHub
-  settings — this is not verifiable by local/CI checks and is out of scope
-  for code changes.
-
-**Result: PASS. No blocking issues found. Ready for Reviewer.**
+Independently verified UP migration runs clean on a fresh DB, all constraints/
+defaults/cascades match spec exactly, a representative failure case (duplicate
+invite_code) is correctly rejected, DOWN block fully reverses with no orphaned
+objects, scope is untouched outside the one new migration file, and existing
+lint/typecheck/test suite (via the repo's actual `bun run test` script) shows no
+regressions. No issues found. Ready for Reviewer.
