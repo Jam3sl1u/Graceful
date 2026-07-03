@@ -1,66 +1,39 @@
-# Changes for Issue #13 — [Sprint 0] Set up staging environment
-
-## Scope
-
-Per the spec's OPEN QUESTIONS note, three of the four acceptance criteria
-(separate Supabase project, test/sandbox API keys, automatic Vercel deploy
-from `main`) are external dashboard provisioning actions and out of scope for
-the Coder. Only the "staging config documented in README or /docs" criterion
-produces a repo artifact — that documentation is what was implemented here.
+# Changes — Issue #14: Integrate Clerk authentication (Sprint 0)
 
 ## What changed
 
-- **`documentation/staging-environment.md`** (new) — single source of truth
-  for the staging setup. Covers all six required sections: Purpose,
-  Environments overview (dev/staging/production table), Vercel setup
-  (step-by-step + the explicit environment-variable naming convention —
-  Vercel's native per-Environment scoping with identical variable names
-  across environments, values only differ; no `STAGING_`-prefixed names),
-  Test/sandbox keys (Clerk/Pingram/Resend, with "test mode if available,
-  otherwise dedicated staging key" phrasing where a sandbox tier isn't
-  confirmed), Supabase (separate project, schema parity via
-  `supabase/migrations/`, migrate staging before production), and a
-  Verification checklist that maps 1:1 to the issue's four acceptance
-  criteria. Cites PRD §25.7 (Environment isolation), §26.2 (E2E tests target
-  staging), and §26.5 (CI/CD Pipeline / staging deploy gate); references
-  issue #83 (production deploy gate) as a forward pointer only. (Note: the
-  spec suggested citing "§16/§25/§26.5"; verified against the actual PRD text
-  and used the precise subsections that contain the relevant content —
-  §25.7, not a bare §16 which is the unrelated Audio-to-Sheet-Music pipeline
-  section.)
-- **`README.md`** — added a short "Environments" section (4 lines) linking to
-  `documentation/staging-environment.md`. No other content changed.
-- **`.env.example`** — added a top-of-file comment block (above `# App`)
-  stating these are environment-agnostic placeholders, that staging/production
-  need distinct values set per-environment in Vercel (never committed here),
-  and pointing to the new doc. No variables were added, renamed, or had
-  values changed.
+1. **`middleware.ts`**
+   - Replaced the no-op `export default clerkMiddleware();` with a callback that calls `await auth.protect()` for any request that doesn't match `isPublicRoute`.
+   - Removed the stale "enforcement deferred" comment block and replaced it with a one-line note that request-level auth is enforced here while role-level checks (`requireRole`) still land in #6.
+   - `isPublicRoute` matcher and `config.matcher` left untouched.
 
-## Explicitly not touched
+2. **`.env.example`**
+   - Added four new public Clerk env vars under the existing `# Clerk (Auth)` block: `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in`, `NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up`, `NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/dashboard`, `NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/dashboard`, so Clerk routes to the app's own sign-in/up pages instead of the hosted account portal.
 
-- No `vercel.json`, Terraform/Pulumi, or other IaC files.
-- No changes to `.github/workflows/ci.yml` or any new deploy workflow.
-- No Playwright/E2E setup.
-- No production environment setup.
-- No new/renamed env vars, no real secrets or URLs (placeholders only).
+3. **`app/(app)/profile/page.tsx`**
+   - Converted the static `<h1>Profile — coming soon</h1>` stub into an async server component that calls `currentUser()` from `@clerk/nextjs/server` and renders the user's name (falls back through `fullName` -> `firstName` -> `lastName` -> `"—"`) and primary email (`primaryEmailAddress?.emailAddress ?? "—"`).
+   - Follows the inline-style `<main>` markup pattern from `app/(marketing)/page.tsx`. No new components/CSS.
+   - Does not use `lib/clerk/server.ts`'s `getAuthContext` (left untouched, out of scope).
 
-## Verification
+4. **`app/api/profile/route.ts`**
+   - Implemented `GET` to call `auth()` from `@clerk/nextjs/server`, returning `fail("Not authenticated", ErrorCode.UNAUTHENTICATED, 401)` when `userId` is null, otherwise `ok({ userId })`.
+   - `PUT` left exactly as-is (`notImplemented("PUT /api/profile")`).
+   - Removed the now-unused `_req: NextRequest` param from `GET` (kept the `NextRequest` import since `PUT` still uses it).
 
-- `bun run lint` — passes (no errors).
-- `bun run typecheck` — passes (no errors).
-- Changes are documentation/comment-only; no application code touched, so
-  `bun test` behavior is unaffected.
+## Out of scope (untouched, per spec)
+- `lib/clerk/server.ts` (`getAuthContext`) and `lib/api/auth.ts` (`requireAuth`/`requireRole`) — unchanged.
+- `app/api/webhooks/clerk/route.ts` — unchanged, still `notImplemented`.
+- `app/(auth)/sign-in`, `app/(auth)/sign-up` pages, `app/layout.tsx` `<ClerkProvider>` — unchanged, already correct.
+- No dependency, route-structure, or other config changes.
 
-## What the Tester should focus on
+## Verification performed
+- `bun run lint` — passes (no warnings/errors).
+- `bun run typecheck` — passes.
+- `bun run test` (jest unit tests) — all 3 existing tests pass (`tests/unit/lib/api/response.test.ts`).
+- Did not run `bun run test:e2e` (Playwright) — requires a running dev server / Clerk env keys; left for the tester stage per the spec's "Suggested verification" section.
 
-- Confirm `documentation/staging-environment.md` covers all six §2a sections
-  from the spec and that the Verification checklist's four items map 1:1 to
-  the GitHub issue's four acceptance criteria.
-- Confirm the Vercel environment-variable naming convention is stated
-  unambiguously (identical names, per-Environment values, no prefixing) since
-  this was called out as an edge case the doc must nail.
-- Confirm no secrets/real values were introduced anywhere, and that
-  `.env.example`'s existing variable list is untouched other than the new
-  header comment.
-- Confirm `README.md`'s new section links correctly and doesn't bloat the
-  stub.
+## Focus for the tester
+- Confirm unauthenticated `GET /api/profile` returns 401 with `ErrorCode.UNAUTHENTICATED` (or that middleware's `auth.protect()` intercepts it first with a redirect/404, per Clerk's behavior for API vs. browser requests).
+- Confirm unauthenticated browser GET to a protected page (e.g. `/dashboard`, `/profile`) redirects toward `/sign-in`.
+- Confirm public routes (`/`, `/sign-in(.*)`, `/sign-up(.*)`, `/join(.*)`, `/invite(.*)`, `/api/health`, `/api/webhooks(.*)`) remain reachable while signed out.
+- Confirm the profile page renders gracefully with `"—"` fallbacks when Clerk user has no name (email-only signup) — cannot be fully exercised without live Clerk test data, so reasoning-based review of the fallback logic in `app/(app)/profile/page.tsx` may be needed.

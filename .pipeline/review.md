@@ -1,59 +1,48 @@
-# Review — Issue #13 [Sprint 0] Set up staging environment
+# Review — Issue #14: Integrate Clerk authentication (Sprint 0)
 
 ## VERDICT: SHIP
 
-## What was reviewed
-Read spec.md, changes.md, test-results.md, and inspected the actual diff
-(`git diff main...HEAD`) plus independently verified every load-bearing claim
-against the repo and PRD — not just the written summaries.
+## Basis
+Reviewed spec, changes.md, test-results.md, and independently ran `git diff main...HEAD`,
+re-ran `bun run typecheck` and `bun run lint` (both clean), and grep-verified the
+supporting facts rather than trusting the summaries.
 
-## Findings
+## Spec conformance (all 4 gaps closed, exactly)
+1. `middleware.ts` — no-op `clerkMiddleware()` replaced with the prescribed callback
+   `if (!isPublicRoute(req)) await auth.protect();`. `isPublicRoute` list and
+   `config.matcher` are byte-for-byte unchanged (confirmed in diff). Stale
+   "deferred to #5/#6" comment replaced with the one-line note about #6 role checks.
+2. `.env.example` — exactly the 4 public URL vars, correct values, placed after
+   `CLERK_WEBHOOK_SECRET=`. No secrets added.
+3. `app/(app)/profile/page.tsx` — async server component using `currentUser()`
+   (not `getAuthContext`). Fallback chain `fullName || firstName || lastName || "—"`
+   and `primaryEmailAddress?.emailAddress ?? "—"` — handles the email-only-signup
+   edge case without crashing. Inline `<main style={{ padding: "3rem 1.5rem" }}>`
+   markup matches `app/(marketing)/page.tsx`.
+4. `app/api/profile/route.ts` — GET uses `auth()`, returns
+   `fail("Not authenticated", ErrorCode.UNAUTHENTICATED, 401)` on null userId
+   (arg order matches `fail(error, code, status)`), else `ok({ userId })`.
+   `UNAUTHENTICATED` confirmed present in `lib/api/errors.ts`. PUT untouched
+   (`notImplemented`). `NextRequest` import retained and still used by PUT — no
+   unused imports (lint passes under strict config).
 
-**Scope is correct.** Three of four acceptance criteria are external dashboard
-provisioning actions (Supabase project, sandbox keys, Vercel deploy) that
-cannot be done in-repo. The only repo artifact — "staging config documented in
-README or /docs" — is exactly what was produced. No scope creep.
+## Out-of-scope respected
+`lib/clerk/server.ts`, `lib/api/auth.ts`, `app/api/webhooks/clerk/route.ts`,
+`app/layout.tsx`, and `app/(auth)/**` are all untouched (empty diff stat).
+No dependency, route-structure, or config changes.
 
-**Content is accurate and complete.**
-- All six §2a sections present in `documentation/staging-environment.md`:
-  Purpose, Environments overview table, Vercel setup, Test/sandbox keys,
-  Supabase, Verification checklist.
-- The `.env.example` section groupings/variable names in the doc's table match
-  the actual file 1:1 (verified against the real file). All service groups
-  covered.
-- PRD citations verified against `documentation/prd/graceful_requirements_v10.md`:
-  §25.7 (Environment isolation — verbatim mentions separate Supabase project,
-  R2 bucket, Pingram test environment), §26.2 (E2E), §26.5 (Production deploy
-  gate, Migration safety). Citations are correct, not fabricated.
-- The namespacing edge case (§4) is nailed: doc states the ONE convention
-  (Vercel per-Environment scoping, identical var names, no `STAGING_` prefix)
-  with correct reasoning that app code reads plain names, so a prefix would be
-  `undefined` at runtime.
-- Test/sandbox keys use the mandated "test mode if available, otherwise a
-  dedicated staging key" phrasing — no fabricated sandbox tiers.
-- Verification checklist maps 1:1 to the issue's four acceptance criteria
-  (confirmed against `gh issue view 13`).
+## Correctness notes
+- Defense-in-depth is correct: middleware `auth.protect()` fronts the route, and the
+  handler's own `userId` null-check is a deterministic second-layer 401. The tester
+  verified the 401 layer directly in keyless mode (does not depend on Clerk handshake).
+- The one behavior not black-box verifiable in-sandbox — that browser requests redirect
+  specifically to the app's own `/sign-in` — is a live-credential/deploy concern (#10),
+  not a code defect. The code (`auth.protect()` gated by `isPublicRoute`, plus the
+  `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in` env var) is correct per Clerk's documented API.
 
-**Out-of-scope respected.** No `vercel.json`, no Terraform/IaC, no
-`.github/workflows/ci.yml` change, no new/renamed env vars, no E2E setup.
-Confirmed via diff stat and filesystem checks.
+## Hygiene
+Working tree clean except the expected `.pipeline/` artifacts. No stray code changes,
+no leftover `.clerk/` or `.env.local` from testing (tester cleaned up). Single commit
+on the issue branch.
 
-**Security.** Grep for secret patterns (sk_live/pk_live/JWT/AWS keys/Supabase
-URLs) across all three changed files: zero matches. Placeholders only.
-
-## Judgment-call deviation (acceptable, not blocking)
-The issue cites "Phase 1 PRD §16"; the doc cites §25.7/§26.2/§26.5 of the main
-requirements doc. changes.md explains §16 of the main PRD is an unrelated
-Audio-to-Sheet-Music section, so the coder mapped to the substantively correct
-subsections. The "Phase 1 PRD" appears to be a separate document. This is a
-reasonable, well-documented mapping rather than a citation error.
-
-## Tests
-This is a docs/comment-only change; no application logic touched. Tester re-ran
-lint (pass), typecheck (pass), and `bun run test` (jest, 3/3 pass). Green tests
-here are not the correctness signal — the correctness signal is the doc
-matching the spec and PRD, which I verified directly. It does.
-
-## Verdict
-Ships. Matches spec §5 Definition of Done exactly, no secrets, no side effects,
-no out-of-scope changes.
+No blocking or must-fix issues. Ready to ship.

@@ -1,158 +1,113 @@
-# Spec: Issue #13 — [Sprint 0] Set up staging environment
+# Spec — Issue #14: Integrate Clerk authentication (Sprint 0)
 
 ## OPEN QUESTIONS
+None blocking. Two clarifying notes (proceed with the stated default):
 
-None that block the in-repo work. **But read this first — it defines scope:**
+1. **Scope boundary with #15 / #5 / #6.** This issue is *base authentication only*: Clerk sign-up/sign-in flows, session availability, redirect of signed-out users, and reading basic profile (email/name) from the Clerk session. JWT verification middleware for API routes (#15), and church-group/role resolution (#5/#6) are explicitly downstream and MUST NOT be implemented here. Do **not** touch the role/church-group TODOs in `lib/api/auth.ts` or `lib/clerk/server.ts`.
+2. **Acceptance criterion "session/JWT usable by API routes."** For this issue, "usable" means the Clerk session reaches API route handlers (i.e. `auth()` from `@clerk/nextjs/server` resolves a `userId` inside a route). Full signature-verified middleware enforcement is #15. Deliver the minimal proof: one API route that returns the caller's `userId` (or 401 if signed out).
 
-Three of the four acceptance criteria (separate Supabase project, test/sandbox
-API keys, automatic Vercel deploy from `main`) are **provisioning actions
-performed in external dashboards** (Supabase, Vercel, Clerk, Pingram, Resend).
-They cannot be done by editing files in this repo and are **out of scope for the
-Coder**. The one criterion that produces a repo artifact is:
+## Current state (already done — do NOT recreate)
+- `@clerk/nextjs@^6.12.0` is installed (`package.json`). No dependency changes needed.
+- `<ClerkProvider>` already wraps the app in `app/layout.tsx`.
+- `app/(auth)/sign-in/[[...sign-in]]/page.tsx` renders `<SignIn />`; `app/(auth)/sign-up/[[...sign-up]]/page.tsx` renders `<SignUp />`. These are the Clerk-default flows the issue asks for — leave as-is.
+- `middleware.ts` runs `clerkMiddleware()` with a correct `config.matcher` and an `isPublicRoute` matcher — but does **not** enforce auth yet (it calls `clerkMiddleware()` with no callback).
+- Clerk env placeholders exist in `.env.example` (`NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET`).
 
-> Staging config documented in README or `/docs`
+## Gaps to close (the actual work — 4 changes)
 
-**The Coder's entire job for this issue is to write that documentation** (plus a
-small, matching addition to `.env.example` header comment — see §3). The doc
-must describe the setup precisely enough that a human can execute the dashboard
-steps and verify them. Do NOT invent scripts, CI jobs, or Terraform — none were
-requested and there is no IaC pattern in this repo.
+### 1. Enforce authentication in middleware (redirect signed-out users)
+**File:** `middleware.ts` (modify)
 
-Do NOT commit any real secrets, keys, project IDs, or URLs. Placeholders only
-(the repo convention in `.env.example`).
+Replace the no-op `export default clerkMiddleware();` (line 20) with a callback that protects every non-public route:
 
----
+```ts
+export default clerkMiddleware(async (auth, req) => {
+  if (!isPublicRoute(req)) {
+    await auth.protect();
+  }
+});
+```
 
-## 1. Current repo state (verified)
+- Keep the existing `isPublicRoute` matcher (lines 10–18) and `config.matcher` (lines 22–24) exactly as-is.
+- Remove the now-stale comment block (lines 3–9) that says enforcement is deferred to #5/#6 — we are enabling it now. Replace it with a one-line comment noting that request-level auth is enforced here while role-level checks (`requireRole`) still land in #6.
+- Effect: `auth.protect()` redirects unauthenticated browser requests to the Clerk sign-in and returns 404 for unauthenticated API requests. Satisfies "signed-out users are redirected away from authenticated routes."
 
-- No `/docs` directory exists. Documentation lives under `documentation/`
-  (`documentation/phase-1/`, `documentation/prd/`).
-- `README.md` is a 2-line stub (title + one sentence).
-- `.env.example` exists at repo root with all service env vars as empty
-  placeholders, grouped by section header comments (App, Supabase, Clerk,
-  Pingram, Resend, Google, R2, Upstash, QStash, Modal, Spotify). It is currently
-  **environment-agnostic** — no dev/staging/prod namespacing.
-- `.github/workflows/ci.yml` runs on `pull_request` only (typecheck, lint, test,
-  audit). It does **not** deploy — Vercel handles deploys via its Git
-  integration, not GitHub Actions. Do NOT add a deploy job to CI.
-- No `vercel.json` exists. Vercel config is dashboard-managed. Do NOT create one
-  unless the doc step below genuinely requires it — it does not.
-- PRD §25 (Environment isolation) and §26.5 (CI/CD Pipeline) are the governing
-  requirements. Key facts to mirror in the doc:
-  - Three environments: development (local), staging, production.
-  - Staging mirrors production: same Vercel config, **separate** Supabase
-    project (identical schema), **separate** R2 bucket, Pingram test
-    environment, Clerk test mode.
-  - Staging always deploys from `main` after merge.
-  - Production secrets are never used in dev or staging.
+### 2. Point Clerk at the app's own sign-in/up routes
+**File:** `.env.example` (modify)
 
----
+Under the existing `# Clerk (Auth)` block (after line 12, `CLERK_WEBHOOK_SECRET=`), add these public env vars so Clerk uses the in-app `/sign-in` and `/sign-up` routes rather than the hosted account portal. Give the URL vars concrete route values (they are paths, not secrets):
 
-## 2. Files to create / modify
+```
+NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
+NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
+NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/dashboard
+NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/dashboard
+```
 
-### 2a. CREATE: `documentation/staging-environment.md`
+`/dashboard` exists at `app/(app)/dashboard/page.tsx` and is a protected route, so a freshly-authenticated user lands there. Match the file's placeholder style (`# fill in later`-type comments not required for these path values).
 
-This is the single source of truth for the staging setup. Follow the tone and
-Markdown structure of existing docs in `documentation/` (heading levels, tables
-where enumerating config). Sections required:
+### 3. Expose basic profile data from the Clerk session (email + name)
+**File:** `app/(app)/profile/page.tsx` (modify — currently the static stub `<h1>Profile — coming soon</h1>`)
 
-1. **Purpose** — one paragraph: staging mirrors production so Phase 1 changes are
-   validated end-to-end before shipping; it is the future target for Playwright
-   E2E (§26.2) and the production deploy gate (#83). Cite PRD §16 / §25 / §26.5.
+Convert to an async server component that reads the current user from Clerk and renders their name and primary email, proving profile data is available from the session:
 
-2. **Environments overview** — a table of the three environments
-   (development / staging / production) with columns: purpose, host, branch,
-   Supabase project, API-key mode. Fill development and staging concretely;
-   mark production as "set up later — same pattern (issue out of scope here)".
+```tsx
+import { currentUser } from "@clerk/nextjs/server";
 
-3. **Vercel setup** — step-by-step for a human operator:
-   - Staging is a Vercel deployment target that auto-deploys from the `main`
-     branch. (Production, when set up, will map to git tags / a `production`
-     branch or promotion — note as future, do not specify.)
-   - Environment variables must be namespaced per environment using Vercel's
-     built-in **Environment** scoping (Production / Preview / Development), OR an
-     explicit naming convention if the operator prefers. State the chosen
-     convention explicitly so it is unambiguous — see §4 Edge Cases.
-   - List every env var group from `.env.example` and note which need a
-     **distinct staging value** vs. which can be shared. Distinct-per-env
-     (staging-specific): Supabase (URL, anon key, service role), Clerk keys +
-     webhook secret, Pingram key + webhook secret, Resend key + webhook secret,
-     R2 bucket/credentials, `NEXT_PUBLIC_APP_URL`, `TOKEN_ENCRYPTION_KEY`,
-     Upstash/QStash, Modal, Google OAuth redirect URI + client. Keep this a
-     table mirroring the `.env.example` sections.
+export default async function ProfilePage() {
+  const user = await currentUser();
+  // Guaranteed non-null because middleware protects this route; guard anyway.
+  // Render: name (user.fullName, falling back to firstName/lastName, then "—")
+  //         and email (user.primaryEmailAddress?.emailAddress ?? "—").
+}
+```
 
-4. **Test / sandbox keys** — for each of Clerk, Pingram, Resend: state to use
-   test/sandbox mode where the provider offers it (Clerk test instance, Pingram
-   test environment, Resend test API key / sandbox domain). Where a provider has
-   no sandbox tier, note "use a dedicated staging key on the same account, never
-   the production key." Do not assert a provider has a sandbox you cannot
-   confirm — phrase as "use test mode if available, otherwise a separate key."
+- Use `currentUser()` from `@clerk/nextjs/server`. Do **NOT** use `lib/clerk/server.ts`'s `getAuthContext` — it intentionally throws until #5/#6.
+- Minimal markup only. Follow the inline-style `<main>` pattern in `app/(marketing)/page.tsx`. No new UI components, no CSS module. Polish is out of scope.
 
-5. **Supabase** — separate Supabase project for staging, schema kept identical to
-   production via the migrations under `supabase/migrations/` (currently empty —
-   reference `supabase/README.md`). Note migrations run against staging before
-   production (§26.5 Migration safety).
+### 4. Prove the session reaches API routes
+**File:** `app/api/profile/route.ts` (modify — currently returns `notImplemented` for GET and PUT)
 
-6. **Verification checklist** — a checkbox list a human can walk to confirm all
-   four acceptance criteria are met (staging Supabase project exists and is
-   distinct; test keys in use; push to `main` triggers a staging deploy; this doc
-   exists and is linked from README).
+Implement **only** the `GET` handler to return the authenticated caller's `userId` from the Clerk session. Leave `PUT` exactly as-is (`notImplemented` — profile mutation is out of scope for #14).
 
-### 2b. MODIFY: `README.md`
+```ts
+import { auth } from "@clerk/nextjs/server";
+import { ok, fail } from "@/lib/api/response";
+import { ErrorCode } from "@/lib/api/errors";
 
-Add a short "Environments" section (2–4 lines) that links to
-`documentation/staging-environment.md`. This satisfies the "documented in README
-**or** /docs" criterion via README linkage. Do not bloat the README stub with the
-full content — link only.
+export async function GET() {
+  const { userId } = await auth();
+  if (!userId) return fail("Not authenticated", ErrorCode.UNAUTHENTICATED, 401);
+  return ok({ userId });
+}
+```
 
-### 2c. MODIFY: `.env.example`
+- Use `ErrorCode.UNAUTHENTICATED` (confirmed to exist in `lib/api/errors.ts`). Do NOT invent new codes.
+- Use the existing helpers from `lib/api/response.ts`: `ok(data, status?)` and `fail(error, code, status)`.
+- Keep the `import { NextRequest }` line only if `PUT` still needs it; `GET` here takes no args. Ensure no unused imports remain (lint is strict).
+- Do NOT call `requireAuth` from `lib/api/auth.ts` — it throws until #6. Reading `auth()` directly is the #14-scoped proof.
 
-Add a top-of-file comment block (above the existing `# App` section) explaining
-that these are environment-agnostic placeholders and that **staging and
-production must each get their own distinct values**, set per-environment in
-Vercel (never committed here). Reference `documentation/staging-environment.md`.
-Do NOT add new variables, do NOT duplicate the var list per-environment, do NOT
-change any existing variable names or values.
+## Edge cases the implementation must handle
+- Signed-out browser request to a protected route (`/dashboard`, `/profile`, etc.) -> redirected to `/sign-in` by middleware.
+- Signed-out request to `GET /api/profile` -> middleware `auth.protect()` handles it; the handler's own `userId` null-check returns a clean 401 as a second layer.
+- Public routes stay reachable while signed out — verify `isPublicRoute` list is unchanged: `/`, `/sign-in(.*)`, `/sign-up(.*)`, `/join(.*)`, `/invite(.*)`, `/api/health`, `/api/webhooks(.*)`.
+- `currentUser()` returning a user with no name (Clerk allows email-only signup): the profile page must not crash — fall back gracefully (show email only / `—`) when `fullName`/`firstName`/`lastName` are null.
+- Missing Clerk env keys at runtime is a deploy/config concern (#10), not a code concern — do not add runtime key-presence guards.
 
----
+## Patterns to follow
+- API route + response helpers: `lib/api/response.ts` (signatures) and `lib/api/errors.ts` (codes). Any existing `app/api/*` route using `ok`/`fail` shows the shape.
+- Server component reading Clerk: `@clerk/nextjs/server` (`auth`, `currentUser`) — same package already imported in `middleware.ts`.
+- Minimal inline-style markup: `app/(marketing)/page.tsx`.
+- Env placeholder style: existing `# Clerk (Auth)` block in `.env.example`.
 
-## 3. Explicitly OUT OF SCOPE (do not do)
+## Explicitly OUT OF SCOPE (do not implement)
+- Any change to `lib/clerk/server.ts` (`getAuthContext`) or `lib/api/auth.ts` (`requireAuth`/`requireRole`) — that is #5/#6.
+- JWT signature verification / claim extraction beyond `auth()`'s built-in resolution — that is #15.
+- Clerk webhook (`app/api/webhooks/clerk/route.ts`) user-sync — leave as `notImplemented`.
+- Custom-branded auth UI, social providers, password reset (Clerk defaults only).
+- `PUT /api/profile` implementation.
+- Any change to route structure, dependencies, or config files.
 
-- Creating the actual Supabase/Vercel/Clerk/etc. projects or keys (external).
-- Any `vercel.json`, Terraform, Pulumi, or other IaC file.
-- Any change to `.github/workflows/ci.yml` or a new deploy workflow.
-- Staging smoke tests / Playwright E2E setup (explicitly Sprint 4, #83, #82).
-- Production environment setup (issue's Out of Scope).
-- Adding or renaming environment variables.
-
----
-
-## 4. Edge cases / decisions the Coder must nail
-
-- **Namespacing convention (issue Implementation Note: "clearly namespaced in
-  Vercel").** The doc must state ONE unambiguous convention. Recommended: use
-  Vercel's native per-Environment scoping (Preview→staging via `main`,
-  Production→prod later) with identical variable *names* across environments and
-  different *values* — do NOT prefix var names like `STAGING_SUPABASE_URL`,
-  because the app code reads plain names (e.g. `NEXT_PUBLIC_SUPABASE_URL`).
-  Document this reasoning so no one later prefixes names.
-- **README says "or /docs" — this repo uses `documentation/`, not `/docs`.**
-  Put the doc under `documentation/` (existing convention) and link from README.
-  Do not create a new top-level `/docs` directory.
-- **No secrets in source (PRD §15).** Every value in the doc and `.env.example`
-  must be a placeholder or a `<describe-what-goes-here>` token.
-- **Providers without sandbox tiers.** Do not fabricate a sandbox mode; use the
-  "test mode if available, otherwise a separate dedicated staging key" phrasing.
-- The `main` branch is the staging deploy trigger — be explicit that merging to
-  `main` deploys staging (matches §26.5 and current repo's single-branch flow).
-
----
-
-## 5. Definition of done
-
-- `documentation/staging-environment.md` exists and covers all six sections in §2a.
-- `README.md` links to it under an Environments heading.
-- `.env.example` has the top comment block; no vars added/renamed.
-- No secrets, no external side effects, no CI or IaC changes.
-- Verification checklist in the doc maps 1:1 to the issue's four acceptance
-  criteria.
+## Suggested verification (for the tester stage)
+- `bun run lint` and `bun run typecheck` must pass.
+- Playwright (fixture style in `tests/e2e/health.spec.ts`): unauthenticated `GET /api/profile` returns 401 (or a redirect/404 from middleware); unauthenticated GET of a protected page redirects toward `/sign-in`.
