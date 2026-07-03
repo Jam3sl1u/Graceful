@@ -3,6 +3,7 @@ import type { NextRequest } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { ApiException, ErrorCode } from "@/lib/api/errors";
 import type { UserRole } from "@/types/domain";
+import { getSupabaseClient } from "@/lib/supabase/client";
 
 export type AuthContext = {
   userId: string; // internal users.id (uuid), NOT the Clerk id
@@ -10,19 +11,34 @@ export type AuthContext = {
   role: UserRole;
 };
 
-// Lookup seam — real impl added when #16 (users table) lands. Injected in tests.
+// Lookup seam — injected in tests to avoid hitting Supabase.
 export type UserLookup = (clerkId: string) => Promise<AuthContext | null>;
 
-// TODO(#16): SELECT id, church_group_id, role FROM users WHERE clerk_id = $1
-// Maps clerk_id -> AuthContext per PRD §20.3 `users` table.
-async function lookupUserByClerkId(_clerkId: string): Promise<AuthContext | null> {
-  throw new Error(
-    "user lookup not implemented — blocked on #16 (users table) / #7-14 (supabase client)",
-  );
+// Queries the users table via an RLS-scoped Supabase client.
+// Returns null when the Clerk user has no matching row (not yet provisioned).
+// Throws ApiException 500 on DB error; JWT missing → null (treated as 401 by caller).
+// TODO(#22): RLS migration 20260703000001_users_self_read_rls.sql is a
+// bootstrap slice — full column- and row-level policies land in #22.
+export async function lookupUserByClerkId(clerkId: string): Promise<AuthContext | null> {
+  const { getToken } = await auth();
+  const jwt = await getToken({ template: "supabase" });
+  if (!jwt) return null;
+
+  const supabase = getSupabaseClient(jwt);
+  const { data, error } = await supabase
+    .from("users")
+    .select("id, church_group_id, role")
+    .eq("clerk_id", clerkId)
+    .maybeSingle();
+
+  if (error) throw new ApiException("Internal error", ErrorCode.INTERNAL, 500);
+  if (!data) return null;
+
+  return { userId: data.id, churchGroupId: data.church_group_id, role: data.role };
 }
 
 // requireAuth: verify the Clerk JWT, then resolve the DB-backed AuthContext.
-// `lookup` defaults to the real (currently pending) DB lookup; tests pass a fake.
+// `lookup` defaults to the real DB lookup; tests pass a fake.
 export async function requireAuth(
   _req: NextRequest,
   lookup: UserLookup = lookupUserByClerkId,

@@ -1,78 +1,42 @@
-# Changes — Issue #16: Migrate schema, Cluster 1 (Organization)
+# Changes — #15 auth DB lookup (post-#16)
 
-## File added
+## Files created
 
-- `supabase/migrations/20260702000001_cluster_1_organization.sql` (new)
+| File | What it does |
+| ---- | ------------ |
+| `supabase/migrations/20260703000001_users_self_read_rls.sql` | Bootstrap RLS slice (#22): enables RLS on `users`, adds `users_select_own` SELECT policy so auth lookup is safe before full #22 lands. Commented DOWN block follows #16 pattern. |
+| `tests/unit/lib/api/lookup-user.test.ts` | Unit tests for `lookupUserByClerkId`: happy path, no row, Supabase error → 500, missing JWT → null. Mocks `@clerk/nextjs/server` `auth` + `@/lib/supabase/client` `getSupabaseClient`. |
 
-## What it does
+## Files modified
 
-First-ever migration in the project (previously `supabase/migrations/`
-contained only `.gitkeep`). Establishes the pattern for later cluster
-migrations.
+| File | What changed |
+| ---- | ------------ |
+| `lib/supabase/types.ts` | Replaced `Record<string, never>` placeholder with hand-written `Database` type covering `users` table (`id`, `clerk_id`, `church_group_id`, `role`) and `user_role` enum. Shape satisfies supabase-js v2 `GenericSchema`/`GenericTable` so `from().select().maybeSingle()` returns typed data. |
+| `lib/supabase/client.ts` | Replaced stub with server-only `getSupabaseClient(jwt)`: reads `NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_ANON_KEY`, throws clear error if missing, passes JWT as `Authorization: Bearer` header. Anon key only — no service role key. |
+| `lib/api/auth.ts` | Replaced `lookupUserByClerkId` stub: calls `auth().getToken({ template: "supabase" })` → queries `users` by `clerk_id` via `getSupabaseClient` → maps row to `AuthContext`. Returns null on missing JWT or no row; throws `ApiException` 500 on DB error. Removed `TODO(#16)`. Added `TODO(#22)` noting RLS bootstrap slice. Exported the function for unit testing. `UserLookup` injection seam unchanged. |
+| `supabase/README.md` | Updated to reflect that migrations directory is no longer empty; documents both migration files and their purpose. |
 
-UP section:
-- `create extension if not exists "pgcrypto"` for `gen_random_uuid()`.
-- `user_role` enum: `admin`, `set_leader`, `member`, `guest`.
-- `vocal_capability` enum: `none`, `lead`, `harmony`, `both` — created here
-  (owned by Cluster 1) per the spec's enum-ownership decision, with a code
-  comment noting Cluster 5 must NOT redefine it.
-- Tables in FK-dependency order: `church_groups` → `users` →
-  `member_profiles`, matching the exact column/type/constraint spec (uuid
-  PKs via `gen_random_uuid()`, `users.email` nullable+unique, `role`
-  default `'member'`, `vocal_capability` default `'none'`,
-  `timezone` default `'America/Chicago'`, both FKs `on delete cascade`,
-  `member_profiles` has no `updated_at`).
-- B-tree index `idx_users_church_group_id` on `users.church_group_id`.
+## Test results
 
-DOWN section (commented block, per spec's decision on reversibility given
-Supabase CLI has no native up/down pair): drops `member_profiles`, `users`,
-`church_groups`, then `vocal_capability`, then `user_role` — reverse
-dependency order, enums last.
+```
+Test Suites: 4 passed, 4 total
+Tests:       17 passed, 17 total
+```
 
-## Scope adherence
+All pre-existing tests (`auth.test.ts`, `admin-only-route.test.ts`, `response.test.ts`) continue to pass. 4 new tests added in `lookup-user.test.ts`.
 
-Only the three Organization tables and the two enums Cluster 1 needs. No
-RLS policies, seed data, PostgREST lockdown, other clusters' tables, or
-TypeScript type generation. `supabase/config.toml`, `supabase/seed.sql`,
-`lib/supabase/types.ts`, `lib/supabase/client.ts` untouched.
+## Manual setup steps required (for PR description)
 
-## Verification performed
+These are one-time dashboard actions — not code changes:
 
-No `psql`/`supabase` CLI locally, so validated with a throwaway
-`postgres:16` Docker container (started, tested, then removed —
-no persistent infra changes):
+1. **Clerk JWT Template** — Clerk Dashboard → JWT Templates → New template → select *Supabase* preset → name it exactly `supabase` → Save. This wires `auth().getToken({ template: "supabase" })` to produce a JWT Supabase can verify.
+2. **Supabase Third-Party Auth** — Supabase Dashboard → Authentication → Third-party auth → enable Clerk → paste your Clerk Frontend API domain (e.g. `https://<your-slug>.clerk.accounts.dev`). This makes `auth.jwt()` inside RLS policies resolve against Clerk's JWKS.
+3. **Apply migrations** — `supabase db push` (or paste SQL into Supabase Dashboard SQL editor) to apply `20260703000001_users_self_read_rls.sql` on staging/prod.
+4. **Smoke test** — seed a `church_groups` + `users` row with a real `clerk_id` matching a Clerk test user. Hit a route using default lookup; expect 401 with no row, 200/403 with row depending on role.
 
-1. Ran the UP block against a fresh database — all statements succeeded
-   with zero errors (`CREATE EXTENSION`, `CREATE TYPE` x2, `CREATE TABLE`
-   x3, `CREATE INDEX`).
-2. Inserted a `church_groups` row with no explicit `timezone` — confirmed
-   default `'America/Chicago'`.
-3. Inserted two `users` rows with no `email` and no `role` — confirmed both
-   inserts succeed (nullable-unique constraint allows multiple NULLs) and
-   `role` defaults to `'member'`; inserted matching `member_profiles` rows
-   with no `vocal_capability` — confirmed default `'none'`.
-4. Deleted the `church_groups` row and confirmed cascade removed all
-   `users` and `member_profiles` rows (0 remaining in both).
-5. Ran the DOWN block — all drops succeeded; confirmed via
-   `information_schema.tables` and `pg_type` that no Cluster 1 tables or
-   enum types remain (0 rows each).
+## Tester focus areas
 
-## Focus for Tester
-
-- Confirm the migration file timestamp (`20260702000001`) sorts correctly
-  ahead of any other migrations that may exist by review time.
-- No app code (TS) was touched, so `bun run lint` / `bun run typecheck` /
-  `bun test` should be unaffected by this change — worth a sanity run to
-  confirm no regressions were introduced elsewhere.
-- If the team has a real Supabase project/CLI available, running
-  `supabase db reset` (or equivalent) against this migration is the
-  strongest additional check beyond the manual Docker Postgres validation
-  done here.
-
-## Commit
-
-Committed only the new migration file on the current branch
-(`issue-16-sprint-0-migrate-schema-cluster-1-organization`), commit
-`fe3a6b6`. Not pushed. Note: `.pipeline/spec.md` had pre-existing local
-modifications not made by this stage and were intentionally left
-uncommitted/untouched.
+- `lookupUserByClerkId` edge cases: no row, Supabase error, null JWT
+- Verify injection seam still works (existing tests cover this)
+- RLS policy correctness: `clerk_id = (auth.jwt() ->> 'sub')` — requires Clerk JWT template in place; test with `supabase db push` + seeded row
+- Env var guard in `getSupabaseClient`: if `NEXT_PUBLIC_SUPABASE_URL` is unset, should throw clear error at call time (not silently)
