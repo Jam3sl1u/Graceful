@@ -8,23 +8,29 @@ Graceful runs in three environments: development, staging, and production.
 See [`documentation/staging-environment.md`](documentation/staging-environment.md)
 for how the staging environment is configured and verified.
 
+## Prerequisites
+
+Requires [Bun](https://bun.sh) (CI pins `1.2.x` via `oven-sh/setup-bun`).
+
 ## Getting Started
 
 ```bash
-npm install
-npm run dev
+bun install
+bun run dev
 ```
 
 Open http://localhost:3000 to view the app.
 
 ## Scripts
 
-- `npm run dev` — start the Next.js dev server
-- `npm run build` — production build
-- `npm run lint` — ESLint
-- `npm run typecheck` — TypeScript check (no emit)
-- `npm run format` — format all files with Prettier
-- `npm run format:check` — verify formatting
+- `bun run dev` — start the Next.js dev server
+- `bun run build` — production build
+- `bun run lint` — ESLint
+- `bun run typecheck` — TypeScript check (no emit)
+- `bun run format` — format all files with Prettier
+- `bun run format:check` — verify formatting
+- `bun run test` — Jest unit tests
+- `bun run test:e2e` — Playwright E2E tests
 
 ## Project Structure
 
