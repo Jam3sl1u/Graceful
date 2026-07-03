@@ -2,3 +2,11 @@
 # Run `bunx supabase init` to populate this fully once Sprint 0 #7-14
 # (schema migrations + RLS policies) begin.
 project_id = "graceful"
+
+# PostgREST auto-API is disabled by architecture rule (PRD §19.3, §25.1 / issue #23).
+# All DB access goes through Next.js API routes, never Supabase's generated REST API.
+# NOTE: this governs the local `supabase start` stack only. The hosted project's
+# Data API must also be turned off in the Supabase dashboard (Settings > API) — see
+# issue #23 acceptance criteria and re-verified in the Sprint 4 audit (#79).
+[api]
+enabled = false

@@ -9,7 +9,8 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "jest",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "check:service-role": "node scripts/check-service-role.mjs"
   },
   "dependencies": {
     "next": "^15.3.0",
