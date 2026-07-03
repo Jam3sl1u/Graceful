@@ -1,61 +1,66 @@
-# Changes for Issue #12 — CI pipeline skeleton hardening
+# Changes for Issue #13 — [Sprint 0] Set up staging environment
 
-## File changed
+## Scope
 
-- `.github/workflows/ci.yml` (only file touched, per spec §3/§6)
+Per the spec's OPEN QUESTIONS note, three of the four acceptance criteria
+(separate Supabase project, test/sandbox API keys, automatic Vercel deploy
+from `main`) are external dashboard provisioning actions and out of scope for
+the Coder. Only the "staging config documented in README or /docs" criterion
+produces a repo artifact — that documentation is what was implemented here.
 
 ## What changed
 
-1. Added a top-level `concurrency` block right after `on:`:
-   ```yaml
-   concurrency:
-     group: ci-${{ github.ref }}
-     cancel-in-progress: true
-   ```
-   Cancels redundant in-flight runs when new commits land on the same PR/ref,
-   keeping CI fast/cheap.
+- **`documentation/staging-environment.md`** (new) — single source of truth
+  for the staging setup. Covers all six required sections: Purpose,
+  Environments overview (dev/staging/production table), Vercel setup
+  (step-by-step + the explicit environment-variable naming convention —
+  Vercel's native per-Environment scoping with identical variable names
+  across environments, values only differ; no `STAGING_`-prefixed names),
+  Test/sandbox keys (Clerk/Pingram/Resend, with "test mode if available,
+  otherwise dedicated staging key" phrasing where a sandbox tier isn't
+  confirmed), Supabase (separate project, schema parity via
+  `supabase/migrations/`, migrate staging before production), and a
+  Verification checklist that maps 1:1 to the issue's four acceptance
+  criteria. Cites PRD §25.7 (Environment isolation), §26.2 (E2E tests target
+  staging), and §26.5 (CI/CD Pipeline / staging deploy gate); references
+  issue #83 (production deploy gate) as a forward pointer only. (Note: the
+  spec suggested citing "§16/§25/§26.5"; verified against the actual PRD text
+  and used the precise subsections that contain the relevant content —
+  §25.7, not a bare §16 which is the unrelated Audio-to-Sheet-Music pipeline
+  section.)
+- **`README.md`** — added a short "Environments" section (4 lines) linking to
+  `documentation/staging-environment.md`. No other content changed.
+- **`.env.example`** — added a top-of-file comment block (above `# App`)
+  stating these are environment-agnostic placeholders, that staging/production
+  need distinct values set per-environment in Vercel (never committed here),
+  and pointing to the new doc. No variables were added, renamed, or had
+  values changed.
 
-2. Pinned `bun-version` in the `oven-sh/setup-bun@v2` step from `latest` to
-   `1.2.x` for reproducibility (confirmed `1.2.x` tags exist upstream, e.g.
-   `bun-v1.2.23`, so the range resolves).
+## Explicitly not touched
 
-## What was verified but left unchanged (per spec)
+- No `vercel.json`, Terraform/Pulumi, or other IaC files.
+- No changes to `.github/workflows/ci.yml` or any new deploy workflow.
+- No Playwright/E2E setup.
+- No production environment setup.
+- No new/renamed env vars, no real secrets or URLs (placeholders only).
 
-- `bun audit --audit-level=high` — confirmed valid/supported on bun 1.3.4
-  (locally installed); left as-is, gate stays at `high`.
-- `package.json` `test` script (`jest`, no `--passWithNoTests`) — left
-  unchanged because real test files already exist
-  (`tests/unit/lib/api/response.test.ts`), so Jest does not need the
-  no-tests fallback flag.
-- Job name kept as `checks` (stable name for future branch-protection
-  required-status-check setup — out of scope, a human must enable it in
-  GitHub settings on `main`).
-- No `continue-on-error` added to any step — every step can still fail the
-  job.
-- No changes to `tsconfig.json`, `eslint.config.mjs`, `jest.config.ts`,
-  `package.json`, or application/source code.
+## Verification
 
-## Local verification performed (mirrors the workflow steps)
-
-- `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"` — YAML parses.
-- `bun install --frozen-lockfile` — passes, no lockfile drift.
-- `bun run typecheck` (`tsc --noEmit`) — passes, no errors.
-- `bun run lint` (`eslint .`) — passes, no errors.
-- `bun run test` (`jest`) — passes, 1 suite / 3 tests green.
-- `bun audit --audit-level=high` — runs cleanly, exit 0, no high/critical advisories.
+- `bun run lint` — passes (no errors).
+- `bun run typecheck` — passes (no errors).
+- Changes are documentation/comment-only; no application code touched, so
+  `bun test` behavior is unaffected.
 
 ## What the Tester should focus on
 
-- Confirm the workflow YAML is syntactically valid and the diff matches the
-  spec's §3 requirements exactly (concurrency block, pinned bun-version,
-  audit step untouched, no `continue-on-error`, job name `checks` preserved).
-- Confirm no other files were modified (spec explicitly restricts scope to
-  `.github/workflows/ci.yml`).
-- Note for PR description (not implemented, per spec §OPEN QUESTIONS #2 and
-  §6): a human must configure branch protection on `main` to require the
-  `checks` status check before merge.
-
-## Commit
-
-- `c8539d4` — "Harden CI workflow for issue #12" on branch
-  `issue-12-sprint-0-set-up-ci-pipeline-skeleton`.
+- Confirm `documentation/staging-environment.md` covers all six §2a sections
+  from the spec and that the Verification checklist's four items map 1:1 to
+  the GitHub issue's four acceptance criteria.
+- Confirm the Vercel environment-variable naming convention is stated
+  unambiguously (identical names, per-Environment values, no prefixing) since
+  this was called out as an edge case the doc must nail.
+- Confirm no secrets/real values were introduced anywhere, and that
+  `.env.example`'s existing variable list is untouched other than the new
+  header comment.
+- Confirm `README.md`'s new section links correctly and doesn't bloat the
+  stub.
