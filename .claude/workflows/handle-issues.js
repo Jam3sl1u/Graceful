@@ -27,8 +27,40 @@ export const meta = {
 
 phase('Setup')
 
+// The Workflow runtime delivers `args` JSON-stringified rather than as the real
+// object/array that was passed in -- confirmed via a minimal repro. Without this,
+// `args.issueNumber` is always undefined (since `args` is a truthy string), so a
+// specific issueNumber request silently fell through to the "scan everything, pick
+// oldest unclaimed" branch below every single time.
+const issueArgs = typeof args === 'string' ? JSON.parse(args) : args
+
+async function abandonStaleBranchIfEmpty(issueNumber, reasonLabel) {
+  const result = await agent(
+    `A previous stage for issue #${issueNumber} did not complete normally (${reasonLabel} -- most likely a token/usage limit or transient failure, not a real blocker). Before this issue can be retried cleanly, in this repo's working directory:\n1. Find the local branch matching \`issue-${issueNumber}-*\` exactly (there should be at most one -- if none exists, there's nothing to clean up, report that and stop).\n2. Check how many commits it has beyond \`origin/main\`: \`git rev-list --count origin/main..<branch>\`.\n3. If that count is 0 (no real work committed yet -- e.g. only the empty branch-creation checkout happened before the stoppage): switch off the branch WITHOUT checking out local \`main\` (this working directory may be an isolated worktree where \`main\` is already checked out elsewhere) -- use \`git checkout --detach origin/main\`, then delete the stale branch: \`git branch -D <branch-name>\`. This lets the next run start completely fresh instead of resuming a half-done branch.\n4. If that count is greater than 0, DO NOT delete anything -- there is real committed work on the branch. Just report the branch name and commit count so a human can decide what to do with it.\n5. NEVER touch origin or any remote branch (no push, no remote delete, no force-push) -- only ever operate on the local branch.\nReport what you found and whether you deleted the branch.`,
+    {
+      phase: 'Setup',
+      label: `abandon:${issueNumber}`,
+      schema: {
+        type: 'object',
+        properties: {
+          branchFound: { type: 'boolean' },
+          deleted: { type: 'boolean' },
+          commitsAheadOfMain: { type: 'number' },
+        },
+        required: ['branchFound', 'deleted'],
+      },
+    }
+  )
+  if (result) {
+    log(`Cleanup for issue #${issueNumber}: branchFound=${result.branchFound}, deleted=${result.deleted}${result.commitsAheadOfMain != null ? `, commitsAheadOfMain=${result.commitsAheadOfMain}` : ''}`)
+  } else {
+    log(`Cleanup agent for issue #${issueNumber} itself failed to complete -- branch state unknown, leaving as-is.`)
+  }
+  return result
+}
+
 let issue
-if (args && args.issueNumber) {
+if (issueArgs && issueArgs.issueNumber) {
   const ISSUE_SCHEMA = {
     type: 'object',
     properties: {
@@ -40,7 +72,7 @@ if (args && args.issueNumber) {
     required: ['number', 'title', 'body', 'url'],
   }
   issue = await agent(
-    `Fetch GitHub issue #${args.issueNumber} in this repo's working directory: \`gh issue view ${args.issueNumber} --json number,title,body,url\`. Return its number, title, body, and url exactly as given.`,
+    `Fetch GitHub issue #${issueArgs.issueNumber} in this repo's working directory: \`gh issue view ${issueArgs.issueNumber} --json number,title,body,url\`. Return its number, title, body, and url exactly as given.`,
     { phase: 'Setup', schema: ISSUE_SCHEMA }
   )
 } else {
@@ -165,6 +197,7 @@ const plan = await agent(
 
 if (!plan) {
   log(`Planner for issue #${issue.number} did not complete (agent-level failure, e.g. a session/usage limit -- NOT a real open question). Stopping here so this isn't silently mislabeled. Re-invoke this workflow with the same issueNumber to retry once whatever caused the failure has cleared.`)
+  await abandonStaleBranchIfEmpty(issue.number, 'planner did not complete')
   return { status: 'planner-failed', issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
@@ -174,22 +207,24 @@ if (plan.hasOpenQuestion) {
 }
 
 const coded = await agent(
-  `You are the coder stage. Read .pipeline/spec.md in full and implement exactly what it specifies for issue #${issue.number} -- no scope creep. Verify your changes (lint/typecheck/tests/whatever the spec calls for) before finishing. Commit your changes on the current branch with a clear message referencing issue #${issue.number} (do not push). Write a summary of what changed and where to .pipeline/changes.md.`,
+  `You are the coder stage. Read .pipeline/spec.md in full and implement exactly what it specifies for issue #${issue.number} -- no scope creep. Verify your changes with Bun (bun run lint, bun run typecheck, bun run test, or whatever the spec calls for) before finishing. Commit your changes on the current branch with a clear message referencing issue #${issue.number} (do not push). Write a summary of what changed and where to .pipeline/changes.md.`,
   { agentType: 'coder', label: `code:${issue.number}`, phase: 'Code', schema: { type: 'object', properties: { done: { type: 'boolean' } }, required: ['done'] } }
 )
 
 if (!coded) {
   log(`Coder for issue #${issue.number} did not complete (agent-level failure, e.g. a session/usage limit or transient API error). Stopping here rather than letting the pipeline silently proceed against a half-finished change. Re-invoke this workflow with the same issueNumber to retry.`)
+  await abandonStaleBranchIfEmpty(issue.number, 'coder did not complete')
   return { status: 'coder-failed', issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
 const tested = await agent(
-  `You are the tester stage. Read .pipeline/changes.md and .pipeline/spec.md. Independently verify the coder's claims rather than trusting them -- re-run whatever checks are relevant (lint, typecheck, existing test suite, manual verification of the feature) and write pass/fail findings to .pipeline/test-results.md for the reviewer.`,
+  `You are the tester stage. Read .pipeline/changes.md and .pipeline/spec.md. Independently verify the coder's claims rather than trusting them -- re-run whatever checks are relevant with Bun (bun run lint, bun run typecheck, bun run test, manual verification of the feature) and write pass/fail findings to .pipeline/test-results.md for the reviewer.`,
   { agentType: 'tester', label: `test:${issue.number}`, phase: 'Test', schema: { type: 'object', properties: { done: { type: 'boolean' } }, required: ['done'] } }
 )
 
 if (!tested) {
   log(`Tester for issue #${issue.number} did not complete (agent-level failure). Stopping here rather than letting the pipeline silently proceed to Review without real test results. Re-invoke this workflow with the same issueNumber to retry.`)
+  await abandonStaleBranchIfEmpty(issue.number, 'tester did not complete')
   return { status: 'tester-failed', issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
