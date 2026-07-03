@@ -27,13 +27,29 @@ jobs:
 
       - run: bun audit --audit-level=high
 
+  check-secrets:
+    runs-on: ubuntu-latest
+    outputs:
+      has-secrets: ${{ steps.check.outputs.has-secrets }}
+    steps:
+      - id: check
+        env:
+          URL: ${{ secrets.SUPABASE_TEST_URL }}
+        run: |
+          if [ -n "$URL" ]; then
+            echo "has-secrets=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-secrets=false" >> $GITHUB_OUTPUT
+          fi
+
   rls-integration:
+    needs: check-secrets
     runs-on: ubuntu-latest
     # Only run when the required secrets are configured.
     # SUPABASE_TEST_URL  — HTTPS project URL used by the Supabase JS SDK in tests.
     # SUPABASE_TEST_DB_URL — postgres connection string used by psql to apply
     #   migrations, e.g. postgresql://postgres:[password]@db.xxxx.supabase.co:5432/postgres
-    if: ${{ secrets.SUPABASE_TEST_URL != '' }}
+    if: needs.check-secrets.outputs.has-secrets == 'true'
     env:
       SUPABASE_TEST_URL: ${{ secrets.SUPABASE_TEST_URL }}
       SUPABASE_TEST_DB_URL: ${{ secrets.SUPABASE_TEST_DB_URL }}
