@@ -17,8 +17,7 @@ export type UserLookup = (clerkId: string) => Promise<AuthContext | null>;
 // Queries the users table via an RLS-scoped Supabase client.
 // Returns null when the Clerk user has no matching row (not yet provisioned).
 // Throws ApiException 500 on DB error; JWT missing → null (treated as 401 by caller).
-// TODO(#22): RLS migration 20260703000001_users_self_read_rls.sql is a
-// bootstrap slice — full column- and row-level policies land in #22.
+// Full group-scoped RLS policies are in 20260704000001_rls_policies.sql (#22).
 export async function lookupUserByClerkId(clerkId: string): Promise<AuthContext | null> {
   const { getToken } = await auth();
   const jwt = await getToken({ template: "supabase" });
