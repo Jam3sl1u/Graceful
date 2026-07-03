@@ -1,6 +1,6 @@
 # Test Results — Issue #13 [Sprint 0] Set up staging environment
 
-## Nature of this change
+## Verdict: PASS
 
 Documentation/comment-only change (per spec's scoping decision — the only
 in-repo-actionable acceptance criterion is "staging config documented in
@@ -8,7 +8,7 @@ README or /docs"). No new application logic, so no new unit tests were
 written; instead this stage independently re-verified every claim in the
 coder's `.pipeline/changes.md` and re-ran all repo-level checks.
 
-## Verification performed (independently re-run, not just trusted from changes.md)
+## Scope check
 
 | # | Check | Result |
 |---|-------|--------|
@@ -67,7 +67,10 @@ Confirmed no `vercel.json`, no Terraform/Pulumi/IaC files, no changes to
 `.github/workflows/ci.yml`, no new deploy workflow, no Playwright/E2E setup,
 no production environment setup, and no new/renamed environment variables.
 
-## Summary
+- Branch protection / required status check on `main` — correctly left as a
+  human follow-up, noted in changes.md for the PR description.
+- No Playwright/E2E step added to the workflow.
+- No deploy/staging gate added.
 
 All spec requirements (§2a's six documentation sections, §2b README link,
 §2c `.env.example` header block, §5 Definition of Done) are met. Lint,

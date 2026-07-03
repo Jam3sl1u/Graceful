@@ -8,7 +8,7 @@ from `main`) are external dashboard provisioning actions and out of scope for
 the Coder. Only the "staging config documented in README or /docs" criterion
 produces a repo artifact — that documentation is what was implemented here.
 
-## Files changed
+## What changed
 
 - **`documentation/staging-environment.md`** (new) — single source of truth
   for the staging setup. Covers all six required sections: Purpose,

@@ -1,6 +1,6 @@
 # Review — Issue #13 [Sprint 0] Set up staging environment
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
 ## What was reviewed
 Read spec.md, changes.md, test-results.md, and inspected the actual diff
