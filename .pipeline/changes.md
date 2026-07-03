@@ -1,42 +1,66 @@
-# Changes — #15 auth DB lookup (post-#16)
+# Changes — #22 RLS Policies on Every Phase 1 Table
 
 ## Files created
 
 | File | What it does |
 | ---- | ------------ |
-| `supabase/migrations/20260703000001_users_self_read_rls.sql` | Bootstrap RLS slice (#22): enables RLS on `users`, adds `users_select_own` SELECT policy so auth lookup is safe before full #22 lands. Commented DOWN block follows #16 pattern. |
-| `tests/unit/lib/api/lookup-user.test.ts` | Unit tests for `lookupUserByClerkId`: happy path, no row, Supabase error → 500, missing JWT → null. Mocks `@clerk/nextjs/server` `auth` + `@/lib/supabase/client` `getSupabaseClient`. |
+| `supabase/migrations/20260704000001_rls_policies.sql` | Defines 4 SECURITY DEFINER helper functions (`auth_user_id`, `auth_church_group_id`, `auth_user_role`, `auth_is_leader_or_admin`); drops the bootstrap `users_select_own` policy; enables RLS on all 17 remaining tables; creates ~70 policies across all 18 tables using tiered rules (tenant isolation, published-only setlists, own-row availability, role-gated invitations/conflicts/audit_logs, user-scoped tier-3 tables). Full commented DOWN block. |
+| `supabase/seed-rls-test.sql` | Deterministic-UUID seed for 2 isolated test tenants (Church A + B): 7 users, instruments, service weeks, draft + published setlists, songs, setlist songs, events, invitations, conflicts, availability, notifications, notification prefs, audit logs, gcal tokens, song documents. TRUNCATE cascade + re-insert = idempotent. |
+| `tests/integration/rls/jwt.ts` | Mints HS256 Supabase-compatible JWTs signed with `SUPABASE_JWT_SECRET`. Sets `sub` = `clerk_id` so helpers resolve identity via DB fallback (no Clerk required in tests). Optionally injects `church_group_id` or app-role claim to test JWT fast path. |
+| `tests/integration/rls/client.ts` | `getServiceClient()` (bypasses RLS, for seed/teardown) and `getUserClient(claims)` (anon-key + minted JWT, subject to RLS). |
+| `tests/integration/rls/setup.ts` | Exports `IDS` constants (all deterministic UUIDs), env-guard flag `rlsTestsEnabled`, `globalSetup()`, and `seedViaServiceClient()` for programmatic seeding. |
+| `tests/integration/rls/tables/cross-tenant.test.ts` | Parameterized cross-tenant isolation: Church B member cannot SELECT/INSERT Church A rows across all Tier 1/2 tables. |
+| `tests/integration/rls/tables/setlists.test.ts` | Published/draft visibility: member/guest cannot see drafts; leader/admin can; setlist_songs inherits parent visibility. |
+| `tests/integration/rls/tables/role-gated.test.ts` | Invitations (member sees own only; leader inserts), conflicts (leader/admin only), audit_logs (admin only). |
+| `tests/integration/rls/tables/availability.test.ts` | Own-row writes: member can only INSERT/UPDATE own rows; leader/admin any row in group. |
+| `tests/integration/rls/tables/users.test.ts` | Member directory SELECT; INSERT denied for authenticated; UPDATE own row vs. leader/admin update others; admin DELETE. |
+| `tests/integration/rls/tables/tier3-user-scoped.test.ts` | notification_preferences and google_calendar_tokens: strict user_id = auth_user_id() for all ops. |
+| `jest.config.integration.ts` | Standalone Jest config for `bun run test:rls` — targets `tests/integration/rls/**/*.test.ts`, `testTimeout: 30s`, `maxWorkers: 1`. |
 
 ## Files modified
 
 | File | What changed |
 | ---- | ------------ |
-| `lib/supabase/types.ts` | Replaced `Record<string, never>` placeholder with hand-written `Database` type covering `users` table (`id`, `clerk_id`, `church_group_id`, `role`) and `user_role` enum. Shape satisfies supabase-js v2 `GenericSchema`/`GenericTable` so `from().select().maybeSingle()` returns typed data. |
-| `lib/supabase/client.ts` | Replaced stub with server-only `getSupabaseClient(jwt)`: reads `NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_ANON_KEY`, throws clear error if missing, passes JWT as `Authorization: Bearer` header. Anon key only — no service role key. |
-| `lib/api/auth.ts` | Replaced `lookupUserByClerkId` stub: calls `auth().getToken({ template: "supabase" })` → queries `users` by `clerk_id` via `getSupabaseClient` → maps row to `AuthContext`. Returns null on missing JWT or no row; throws `ApiException` 500 on DB error. Removed `TODO(#16)`. Added `TODO(#22)` noting RLS bootstrap slice. Exported the function for unit testing. `UserLookup` injection seam unchanged. |
-| `supabase/README.md` | Updated to reflect that migrations directory is no longer empty; documents both migration files and their purpose. |
+| `jest.config.ts` | Reverted to single-project unit-test config (no integration project); `testPathIgnorePatterns` now explicitly excludes `tests/integration/`. This keeps `bun run test` fast and DB-free. |
+| `package.json` | `test:rls` script updated to `jest --config jest.config.integration.ts`; `jsonwebtoken` + `@types/jsonwebtoken` installed as devDeps. |
+| `.github/workflows/ci.yml` | Added `rls-integration` job (conditional on `SUPABASE_TEST_URL` secret) that applies all migrations via psql then runs `bun run test:rls`. |
+| `supabase/README.md` | Added `20260704000001_rls_policies.sql` migration row; added "RLS Integration Tests" section with local dev + CI workflow; removed #22 from roadmap. |
+| `lib/api/auth.ts` | Removed `TODO(#22)` comment; replaced with note that full policies are live. |
 
 ## Test results
 
 ```
-Test Suites: 4 passed, 4 total
-Tests:       17 passed, 17 total
+# Unit tests (no DB required)
+bun run test
+→ Test Suites: 4 passed, 4 total
+→ Tests:       17 passed, 17 total
+
+# Integration tests (skipped without Supabase env)
+bun run test:rls
+→ Test Suites: 7 skipped, 0 of 7 total
+→ Tests:       136 skipped, 136 total
 ```
 
-All pre-existing tests (`auth.test.ts`, `admin-only-route.test.ts`, `response.test.ts`) continue to pass. 4 new tests added in `lookup-user.test.ts`.
-
-## Manual setup steps required (for PR description)
-
-These are one-time dashboard actions — not code changes:
-
-1. **Clerk JWT Template** — Clerk Dashboard → JWT Templates → New template → select *Supabase* preset → name it exactly `supabase` → Save. This wires `auth().getToken({ template: "supabase" })` to produce a JWT Supabase can verify.
-2. **Supabase Third-Party Auth** — Supabase Dashboard → Authentication → Third-party auth → enable Clerk → paste your Clerk Frontend API domain (e.g. `https://<your-slug>.clerk.accounts.dev`). This makes `auth.jwt()` inside RLS policies resolve against Clerk's JWKS.
-3. **Apply migrations** — `supabase db push` (or paste SQL into Supabase Dashboard SQL editor) to apply `20260703000001_users_self_read_rls.sql` on staging/prod.
-4. **Smoke test** — seed a `church_groups` + `users` row with a real `clerk_id` matching a Clerk test user. Hit a route using default lookup; expect 401 with no row, 200/403 with row depending on role.
+TypeScript: `bun run typecheck` → 0 errors.
 
 ## Tester focus areas
 
-- `lookupUserByClerkId` edge cases: no row, Supabase error, null JWT
-- Verify injection seam still works (existing tests cover this)
-- RLS policy correctness: `clerk_id = (auth.jwt() ->> 'sub')` — requires Clerk JWT template in place; test with `supabase db push` + seeded row
-- Env var guard in `getSupabaseClient`: if `NEXT_PUBLIC_SUPABASE_URL` is unset, should throw clear error at call time (not silently)
+- **Migration syntax**: Apply `20260704000001_rls_policies.sql` on a fresh Supabase instance with `supabase db push` and verify no SQL errors.
+- **SECURITY DEFINER helpers**: Verify no infinite recursion when `auth_church_group_id()` is called in policies on the `users` table.
+- **Cross-tenant isolation**: Set `SUPABASE_TEST_URL` + secrets, run `bun run test:rls` — every `cross-tenant.test.ts` assertion must pass.
+- **Published/draft setlists**: `setlists.test.ts` — member must NOT see draft; leader/admin must see draft.
+- **audit_logs**: Admin SELECT; leader cannot; member cannot.
+- **availability own-row**: Member can only write own rows; leader can write any.
+- **JWT fast path**: `rls.test.ts` "JWT claims fast path" describe block — client with explicit `churchGroupId` claim routes through `COALESCE` fast path instead of DB lookup.
+
+## Local dev workflow
+
+```bash
+supabase start
+supabase db push
+export SUPABASE_TEST_URL=$(supabase status --output json | jq -r '.api.url')
+export SUPABASE_TEST_ANON_KEY=$(supabase status --output json | jq -r '.anon_key')
+export SUPABASE_TEST_SERVICE_ROLE_KEY=$(supabase status --output json | jq -r '.service_role_key')
+export SUPABASE_JWT_SECRET=$(supabase status --output json | jq -r '.jwt_secret')
+bun run test:rls
+```

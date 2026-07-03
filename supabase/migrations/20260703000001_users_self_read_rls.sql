@@ -1,7 +1,8 @@
 -- Migration: users self-read RLS (bootstrap slice of #22)
--- TODO(#22): This is a bootstrap slice — full column- and row-level policies
--- land in #22. Only users SELECT self-read is added here so auth lookup is safe
--- before the full RLS pass.
+-- Bootstrap slice superseded by 20260704000001_rls_policies.sql (#22).
+-- This migration only added users SELECT self-read so auth lookup was safe
+-- before the full RLS pass. The new migration drops users_select_own and
+-- replaces it with full group-scoped policies.
 
 -- ============ UP ============
 
