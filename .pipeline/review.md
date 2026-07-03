@@ -1,6 +1,6 @@
 # Review — Issue #16: Migrate schema, Cluster 1 (Organization)
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
 ## What was reviewed
 - `git diff main...HEAD` (one new file: `supabase/migrations/20260702000001_cluster_1_organization.sql`, 57 lines).
