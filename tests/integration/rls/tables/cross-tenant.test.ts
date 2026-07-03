@@ -24,6 +24,34 @@ describeRls("Cross-tenant isolation", () => {
     serviceClient = getServiceClient();
   }, 60_000);
 
+  // ── church_groups — self-access only ─────────────────────────────────────
+
+  it("church_groups: member can SELECT own group", async () => {
+    const memberA = getUserClient({ clerkId: IDS.clerkIds.memberA });
+    const { data, error } = await memberA
+      .from("church_groups")
+      .select("id")
+      .eq("id", IDS.churches.A);
+    expect(error).toBeNull();
+    expect(data).toHaveLength(1);
+  });
+
+  it("church_groups: Church B member cannot see Church A row", async () => {
+    const { data, error } = await memberBClient
+      .from("church_groups")
+      .select("id")
+      .eq("id", IDS.churches.A);
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+  });
+
+  it("church_groups: unfiltered SELECT returns only own group", async () => {
+    const memberA = getUserClient({ clerkId: IDS.clerkIds.memberA });
+    const { data, error } = await memberA.from("church_groups").select("id");
+    expect(error).toBeNull();
+    expect(data?.every((r) => r.id === IDS.churches.A)).toBe(true);
+  });
+
   // ── Tier 1: direct church_group_id tables ────────────────────────────────
 
   it("instruments: Church B cannot see Church A rows", async () => {
