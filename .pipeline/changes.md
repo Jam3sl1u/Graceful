@@ -1,39 +1,78 @@
-# Changes — Issue #14: Integrate Clerk authentication (Sprint 0)
+# Changes — Issue #16: Migrate schema, Cluster 1 (Organization)
 
-## What changed
+## File added
 
-1. **`middleware.ts`**
-   - Replaced the no-op `export default clerkMiddleware();` with a callback that calls `await auth.protect()` for any request that doesn't match `isPublicRoute`.
-   - Removed the stale "enforcement deferred" comment block and replaced it with a one-line note that request-level auth is enforced here while role-level checks (`requireRole`) still land in #6.
-   - `isPublicRoute` matcher and `config.matcher` left untouched.
+- `supabase/migrations/20260702000001_cluster_1_organization.sql` (new)
 
-2. **`.env.example`**
-   - Added four new public Clerk env vars under the existing `# Clerk (Auth)` block: `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in`, `NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up`, `NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/dashboard`, `NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/dashboard`, so Clerk routes to the app's own sign-in/up pages instead of the hosted account portal.
+## What it does
 
-3. **`app/(app)/profile/page.tsx`**
-   - Converted the static `<h1>Profile — coming soon</h1>` stub into an async server component that calls `currentUser()` from `@clerk/nextjs/server` and renders the user's name (falls back through `fullName` -> `firstName` -> `lastName` -> `"—"`) and primary email (`primaryEmailAddress?.emailAddress ?? "—"`).
-   - Follows the inline-style `<main>` markup pattern from `app/(marketing)/page.tsx`. No new components/CSS.
-   - Does not use `lib/clerk/server.ts`'s `getAuthContext` (left untouched, out of scope).
+First-ever migration in the project (previously `supabase/migrations/`
+contained only `.gitkeep`). Establishes the pattern for later cluster
+migrations.
 
-4. **`app/api/profile/route.ts`**
-   - Implemented `GET` to call `auth()` from `@clerk/nextjs/server`, returning `fail("Not authenticated", ErrorCode.UNAUTHENTICATED, 401)` when `userId` is null, otherwise `ok({ userId })`.
-   - `PUT` left exactly as-is (`notImplemented("PUT /api/profile")`).
-   - Removed the now-unused `_req: NextRequest` param from `GET` (kept the `NextRequest` import since `PUT` still uses it).
+UP section:
+- `create extension if not exists "pgcrypto"` for `gen_random_uuid()`.
+- `user_role` enum: `admin`, `set_leader`, `member`, `guest`.
+- `vocal_capability` enum: `none`, `lead`, `harmony`, `both` — created here
+  (owned by Cluster 1) per the spec's enum-ownership decision, with a code
+  comment noting Cluster 5 must NOT redefine it.
+- Tables in FK-dependency order: `church_groups` → `users` →
+  `member_profiles`, matching the exact column/type/constraint spec (uuid
+  PKs via `gen_random_uuid()`, `users.email` nullable+unique, `role`
+  default `'member'`, `vocal_capability` default `'none'`,
+  `timezone` default `'America/Chicago'`, both FKs `on delete cascade`,
+  `member_profiles` has no `updated_at`).
+- B-tree index `idx_users_church_group_id` on `users.church_group_id`.
 
-## Out of scope (untouched, per spec)
-- `lib/clerk/server.ts` (`getAuthContext`) and `lib/api/auth.ts` (`requireAuth`/`requireRole`) — unchanged.
-- `app/api/webhooks/clerk/route.ts` — unchanged, still `notImplemented`.
-- `app/(auth)/sign-in`, `app/(auth)/sign-up` pages, `app/layout.tsx` `<ClerkProvider>` — unchanged, already correct.
-- No dependency, route-structure, or other config changes.
+DOWN section (commented block, per spec's decision on reversibility given
+Supabase CLI has no native up/down pair): drops `member_profiles`, `users`,
+`church_groups`, then `vocal_capability`, then `user_role` — reverse
+dependency order, enums last.
+
+## Scope adherence
+
+Only the three Organization tables and the two enums Cluster 1 needs. No
+RLS policies, seed data, PostgREST lockdown, other clusters' tables, or
+TypeScript type generation. `supabase/config.toml`, `supabase/seed.sql`,
+`lib/supabase/types.ts`, `lib/supabase/client.ts` untouched.
 
 ## Verification performed
-- `bun run lint` — passes (no warnings/errors).
-- `bun run typecheck` — passes.
-- `bun run test` (jest unit tests) — all 3 existing tests pass (`tests/unit/lib/api/response.test.ts`).
-- Did not run `bun run test:e2e` (Playwright) — requires a running dev server / Clerk env keys; left for the tester stage per the spec's "Suggested verification" section.
 
-## Focus for the tester
-- Confirm unauthenticated `GET /api/profile` returns 401 with `ErrorCode.UNAUTHENTICATED` (or that middleware's `auth.protect()` intercepts it first with a redirect/404, per Clerk's behavior for API vs. browser requests).
-- Confirm unauthenticated browser GET to a protected page (e.g. `/dashboard`, `/profile`) redirects toward `/sign-in`.
-- Confirm public routes (`/`, `/sign-in(.*)`, `/sign-up(.*)`, `/join(.*)`, `/invite(.*)`, `/api/health`, `/api/webhooks(.*)`) remain reachable while signed out.
-- Confirm the profile page renders gracefully with `"—"` fallbacks when Clerk user has no name (email-only signup) — cannot be fully exercised without live Clerk test data, so reasoning-based review of the fallback logic in `app/(app)/profile/page.tsx` may be needed.
+No `psql`/`supabase` CLI locally, so validated with a throwaway
+`postgres:16` Docker container (started, tested, then removed —
+no persistent infra changes):
+
+1. Ran the UP block against a fresh database — all statements succeeded
+   with zero errors (`CREATE EXTENSION`, `CREATE TYPE` x2, `CREATE TABLE`
+   x3, `CREATE INDEX`).
+2. Inserted a `church_groups` row with no explicit `timezone` — confirmed
+   default `'America/Chicago'`.
+3. Inserted two `users` rows with no `email` and no `role` — confirmed both
+   inserts succeed (nullable-unique constraint allows multiple NULLs) and
+   `role` defaults to `'member'`; inserted matching `member_profiles` rows
+   with no `vocal_capability` — confirmed default `'none'`.
+4. Deleted the `church_groups` row and confirmed cascade removed all
+   `users` and `member_profiles` rows (0 remaining in both).
+5. Ran the DOWN block — all drops succeeded; confirmed via
+   `information_schema.tables` and `pg_type` that no Cluster 1 tables or
+   enum types remain (0 rows each).
+
+## Focus for Tester
+
+- Confirm the migration file timestamp (`20260702000001`) sorts correctly
+  ahead of any other migrations that may exist by review time.
+- No app code (TS) was touched, so `bun run lint` / `bun run typecheck` /
+  `bun test` should be unaffected by this change — worth a sanity run to
+  confirm no regressions were introduced elsewhere.
+- If the team has a real Supabase project/CLI available, running
+  `supabase db reset` (or equivalent) against this migration is the
+  strongest additional check beyond the manual Docker Postgres validation
+  done here.
+
+## Commit
+
+Committed only the new migration file on the current branch
+(`issue-16-sprint-0-migrate-schema-cluster-1-organization`), commit
+`fe3a6b6`. Not pushed. Note: `.pipeline/spec.md` had pre-existing local
+modifications not made by this stage and were intentionally left
+uncommitted/untouched.

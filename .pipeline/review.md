@@ -1,48 +1,33 @@
-# Review — Issue #14: Integrate Clerk authentication (Sprint 0)
+# Review — Issue #16: Migrate schema, Cluster 1 (Organization)
 
 ## VERDICT: SHIP
 
-## Basis
-Reviewed spec, changes.md, test-results.md, and independently ran `git diff main...HEAD`,
-re-ran `bun run typecheck` and `bun run lint` (both clean), and grep-verified the
-supporting facts rather than trusting the summaries.
+## What was reviewed
+- `git diff main...HEAD` (one new file: `supabase/migrations/20260702000001_cluster_1_organization.sql`, 57 lines).
+- Cross-checked the migration column-by-column against the spec's exact schema AND the PRD source of truth (`documentation/prd/graceful_requirements_v10.md` §20.2 enums / §20.3 Cluster 1) — not just the written summaries.
+- Confirmed git status: only the migration file is committed on the branch; `.pipeline/*` edits are the pipeline's own artifacts, no stray source changes.
 
-## Spec conformance (all 4 gaps closed, exactly)
-1. `middleware.ts` — no-op `clerkMiddleware()` replaced with the prescribed callback
-   `if (!isPublicRoute(req)) await auth.protect();`. `isPublicRoute` list and
-   `config.matcher` are byte-for-byte unchanged (confirmed in diff). Stale
-   "deferred to #5/#6" comment replaced with the one-line note about #6 role checks.
-2. `.env.example` — exactly the 4 public URL vars, correct values, placed after
-   `CLERK_WEBHOOK_SECRET=`. No secrets added.
-3. `app/(app)/profile/page.tsx` — async server component using `currentUser()`
-   (not `getAuthContext`). Fallback chain `fullName || firstName || lastName || "—"`
-   and `primaryEmailAddress?.emailAddress ?? "—"` — handles the email-only-signup
-   edge case without crashing. Inline `<main style={{ padding: "3rem 1.5rem" }}>`
-   markup matches `app/(marketing)/page.tsx`.
-4. `app/api/profile/route.ts` — GET uses `auth()`, returns
-   `fail("Not authenticated", ErrorCode.UNAUTHENTICATED, 401)` on null userId
-   (arg order matches `fail(error, code, status)`), else `ok({ userId })`.
-   `UNAUTHENTICATED` confirmed present in `lib/api/errors.ts`. PUT untouched
-   (`notImplemented`). `NextRequest` import retained and still used by PUT — no
-   unused imports (lint passes under strict config).
+## Correctness findings (all pass)
+- Enums: `user_role` = admin, set_leader, member, guest; `vocal_capability` = none, lead, harmony, both — exact value order per PRD §20.2.
+- FK-dependency order correct: church_groups -> users -> member_profiles; UP runs top-to-bottom on a fresh DB with no forward references.
+- `users.email` is `varchar(255) unique` (nullable-unique) — NOT `not null`. Allows multiple phone-only guests. Correct.
+- Both FKs declare `on delete cascade` (users.church_group_id, member_profiles.user_id) — transitive cascade works.
+- `member_profiles` has NO `updated_at` — correctly omitted per spec/PRD.
+- Defaults declared literally: role `'member'`, vocal_capability `'none'`, timezone `'America/Chicago'`, sms_opted_in false — no reliance on enum ordinal.
+- `create extension if not exists "pgcrypto"` for `gen_random_uuid()`; no uuid-ossp dependency.
+- B-tree index `idx_users_church_group_id` present.
+- DOWN block (commented) drops in reverse order: member_profiles, users, church_groups, then vocal_capability, then user_role — enums last. Correct.
+- Enum-ownership comment present noting Cluster 5 must not redefine vocal_capability.
+- Timestamp prefix `20260702000001` sorts first; it is the only real migration in the dir (only `.gitkeep` besides it).
 
-## Out-of-scope respected
-`lib/clerk/server.ts`, `lib/api/auth.ts`, `app/api/webhooks/clerk/route.ts`,
-`app/layout.tsx`, and `app/(auth)/**` are all untouched (empty diff stat).
-No dependency, route-structure, or config changes.
+## Scope
+Clean. No RLS, seed data, PostgREST lockdown, other-cluster tables, or TS type generation. config.toml / seed.sql / types.ts / client.ts untouched.
 
-## Correctness notes
-- Defense-in-depth is correct: middleware `auth.protect()` fronts the route, and the
-  handler's own `userId` null-check is a deterministic second-layer 401. The tester
-  verified the 401 layer directly in keyless mode (does not depend on Clerk handshake).
-- The one behavior not black-box verifiable in-sandbox — that browser requests redirect
-  specifically to the app's own `/sign-in` — is a live-credential/deploy concern (#10),
-  not a code defect. The code (`auth.protect()` gated by `isPublicRoute`, plus the
-  `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in` env var) is correct per Clerk's documented API.
+## Tests
+Meaningful, not superficial: live Postgres (throwaway Docker postgres:16) exercised UP, default-application, multi-NULL email inserts, cascade delete, a duplicate invite_code rejection (real failure case), and full DOWN reversibility verified via information_schema/pg_type. App-code lint/typecheck/jest re-run green with the correct repo script. Green tests here genuinely reflect correct behavior.
 
-## Hygiene
-Working tree clean except the expected `.pipeline/` artifacts. No stray code changes,
-no leftover `.clerk/` or `.env.local` from testing (tester cleaned up). Single commit
-on the issue branch.
+## Notes (non-blocking)
+- DOWN lives in a commented block by design (Supabase CLI is forward-only) — a documented spec decision, acceptable.
+- This file becomes the reference pattern for later cluster migrations; it is clean and consistent.
 
-No blocking or must-fix issues. Ready to ship.
+No defects found. Ship.
