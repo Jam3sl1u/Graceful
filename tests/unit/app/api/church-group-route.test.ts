@@ -158,6 +158,76 @@ describe("PUT /api/church-group", () => {
     expect(body.code).toBe("INTERNAL");
   });
 
+  it("defaults timezone to America/Chicago when omitted", async () => {
+    const mockGetToken = jest.fn().mockResolvedValue(JWT);
+    mockAuth.mockResolvedValue({ userId: CLERK_ID, getToken: mockGetToken });
+    mockCurrentUser.mockResolvedValue(null);
+    const { rpc } = makeSupabaseRpc({ data: groupRow, error: null });
+    mockGetSupabaseClient.mockReturnValue({ rpc });
+
+    const req = makeReq({ name: "Grace Church" });
+    const res = await PUT(req);
+
+    expect(res.status).toBe(201);
+    expect(rpc).toHaveBeenCalledWith(
+      "create_church_group",
+      expect.objectContaining({ p_timezone: "America/Chicago" }),
+    );
+  });
+
+  it("passes through provided denomination and logoUrl", async () => {
+    const mockGetToken = jest.fn().mockResolvedValue(JWT);
+    mockAuth.mockResolvedValue({ userId: CLERK_ID, getToken: mockGetToken });
+    mockCurrentUser.mockResolvedValue(null);
+    const { rpc } = makeSupabaseRpc({ data: groupRow, error: null });
+    mockGetSupabaseClient.mockReturnValue({ rpc });
+
+    const req = makeReq({
+      name: "Grace Church",
+      denomination: "Baptist",
+      logoUrl: "logos/grace-church.png",
+    });
+    const res = await PUT(req);
+
+    expect(res.status).toBe(201);
+    expect(rpc).toHaveBeenCalledWith(
+      "create_church_group",
+      expect.objectContaining({
+        p_denomination: "Baptist",
+        p_logo_url: "logos/grace-church.png",
+      }),
+    );
+  });
+
+  it("400 on non-JSON / empty body", async () => {
+    const mockGetToken = jest.fn().mockResolvedValue(JWT);
+    mockAuth.mockResolvedValue({ userId: CLERK_ID, getToken: mockGetToken });
+
+    const req = {
+      json: jest.fn().mockRejectedValue(new SyntaxError("Unexpected end of JSON input")),
+    } as unknown as NextRequest;
+    const res = await PUT(req);
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe("VALIDATION_FAILED");
+    expect(mockGetSupabaseClient).not.toHaveBeenCalled();
+  });
+
+  it("500 when an unexpected error is thrown (e.g. currentUser rejects)", async () => {
+    const mockGetToken = jest.fn().mockResolvedValue(JWT);
+    mockAuth.mockResolvedValue({ userId: CLERK_ID, getToken: mockGetToken });
+    mockCurrentUser.mockRejectedValue(new Error("Clerk API unavailable"));
+
+    const req = makeReq({ name: "Grace Church" });
+    const res = await PUT(req);
+
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.code).toBe("INTERNAL");
+    expect(mockGetSupabaseClient).not.toHaveBeenCalled();
+  });
+
   it("falls back to 'Admin' when no name is available from Clerk", async () => {
     const mockGetToken = jest.fn().mockResolvedValue(JWT);
     mockAuth.mockResolvedValue({ userId: CLERK_ID, getToken: mockGetToken });

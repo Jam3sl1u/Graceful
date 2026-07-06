@@ -34,6 +34,14 @@ phase('Setup')
 // oldest unclaimed" branch below every single time.
 const issueArgs = typeof args === 'string' ? JSON.parse(args) : args
 
+// Optional: when re-invoking after a prior run returned status 'blocked-on-question',
+// pass args.humanDecision with the human's resolution so the planner incorporates it
+// instead of re-raising the same question. This changes the planner agent's prompt,
+// so a resumeFromRunId call will NOT replay the stale cached (blocked) planner result.
+const humanDecision = issueArgs && issueArgs.humanDecision
+  ? `\n\nHUMAN DECISION ON A PRIOR OPEN QUESTION (this was already escalated to a human -- apply it directly, do not re-ask, and set hasOpenQuestion based on any OTHER genuinely blocking ambiguity, not this one): ${issueArgs.humanDecision}`
+  : ''
+
 async function abandonStaleBranchIfEmpty(issueNumber, reasonLabel) {
   const result = await agent(
     `A previous stage for issue #${issueNumber} did not complete normally (${reasonLabel} -- most likely a token/usage limit or transient failure, not a real blocker). Before this issue can be retried cleanly, in this repo's working directory:\n1. Find the local branch matching \`issue-${issueNumber}-*\` exactly (there should be at most one -- if none exists, there's nothing to clean up, report that and stop).\n2. Check how many commits it has beyond \`origin/main\`: \`git rev-list --count origin/main..<branch>\`.\n3. If that count is 0 (no real work committed yet -- e.g. only the empty branch-creation checkout happened before the stoppage): switch off the branch WITHOUT checking out local \`main\` (this working directory may be an isolated worktree where \`main\` is already checked out elsewhere) -- use \`git checkout --detach origin/main\`, then delete the stale branch: \`git branch -D <branch-name>\`. This lets the next run start completely fresh instead of resuming a half-done branch.\n4. If that count is greater than 0, DO NOT delete anything -- there is real committed work on the branch. Just report the branch name and commit count so a human can decide what to do with it.\n5. NEVER touch origin or any remote branch (no push, no remote delete, no force-push) -- only ever operate on the local branch.\nReport what you found and whether you deleted the branch.`,
@@ -96,7 +104,7 @@ await agent(
 )
 
 const plan = await agent(
-  `You are the planner stage of a 4-stage feature pipeline (planner -> coder -> tester -> reviewer). Working directory is the repo root, on the branch just created/checked-out for issue #${issue.number}. Turn this GitHub issue into an implementation spec written to .pipeline/spec.md (overwrite anything already there, including any stale spec from a different issue):\n\nIssue #${issue.number}: ${issue.title}\nURL: ${issue.url}\n\n${issue.body}\n\nInspect the actual current repo state yourself rather than assuming -- much of this repo may already satisfy parts of the issue. Write a concrete, actionable spec scoped only to this issue. If there's a genuine blocking ambiguity that requires a human decision, say so clearly.`,
+  `You are the planner stage of a 4-stage feature pipeline (planner -> coder -> tester -> reviewer). Working directory is the repo root, on the branch just created/checked-out for issue #${issue.number}. Turn this GitHub issue into an implementation spec written to .pipeline/spec.md (overwrite anything already there, including any stale spec from a different issue):\n\nIssue #${issue.number}: ${issue.title}\nURL: ${issue.url}\n\n${issue.body}\n\nInspect the actual current repo state yourself rather than assuming -- much of this repo may already satisfy parts of the issue. Write a concrete, actionable spec scoped only to this issue. If there's a genuine blocking ambiguity that requires a human decision, say so clearly.${humanDecision}`,
   {
     agentType: 'planner',
     label: `plan:${issue.number}`,

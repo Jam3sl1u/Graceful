@@ -1,67 +1,113 @@
-# Changes for Issue #23 — Disable PostgREST auto-API & lock down service role key
+# Changes — Issue #24: Church group creation (`PUT /api/church-group`)
 
-## Scope note (OQ-1, non-blocking)
-Two of the issue's four acceptance criteria are Supabase-dashboard / secrets-management
-actions outside this repo's reach (toggling the hosted project's Data API off, and
-placing the service role key in CI secrets). Per the spec, this pass covers only the
-in-repo, verifiable deliverables. Those two dashboard/secrets actions remain human/ops
-follow-ups tracked by issue #23 and re-checked in #79.
+## Files changed
 
-## Files modified
+### `supabase/migrations/20260706000001_church_group_create_rpc.sql` (new)
+- `public.generate_invite_code()` — `SECURITY DEFINER` plpgsql function that
+  generates an 8-char code from the unambiguous URL-safe alphabet
+  (`ABCDEFGHJKMNPQRSTUVWXYZ23456789`), looping until it finds a value not
+  already present in `church_groups.invite_code`. Not granted to
+  `authenticated` (only called internally).
+- `public.create_church_group(p_name, p_timezone, p_denomination, p_logo_url,
+  p_creator_name, p_creator_email)` — `SECURITY DEFINER` plpgsql function,
+  `GRANT EXECUTE ... TO authenticated`. In one transaction:
+  1. Resolves `auth.jwt() ->> 'sub'`; raises `UNAUTHENTICATED` (`ERRCODE
+     'P0001'`) if null.
+  2. Raises `USER_ALREADY_IN_GROUP` (`ERRCODE 'P0001'`) if a `users` row
+     already exists for that Clerk id.
+  3. Inserts the `church_groups` row (using the generated invite code),
+     inserts the creator as an `admin` `users` row, then seeds exactly the 8
+     named default instruments (`is_default = true`, `created_by = NULL`) —
+     no "Other" row.
+  4. Returns the new `church_groups` row.
+  - Commented-out DOWN section drops both functions.
+  - This exists because `church_groups`/`users` have no authenticated INSERT
+    policy and the service-role key is forbidden in `app/`/`lib/` — see the
+    spec's Background section for the full rationale.
 
-1. **`supabase/config.toml`** (modified) — appended an `[api]` block with
-   `enabled = false` after the existing `project_id` line, plus a comment block
-   citing PRD §19.3/§25.1 and noting this only governs the local `supabase start`
-   stack (the hosted dashboard toggle is a separate ops action). Existing header
-   comments and `project_id` line are untouched.
+### `schemas/church-group.ts` (rewritten)
+- Removed the unused `churchGroupSchema` / `ChurchGroupInput` stub.
+- Added `createChurchGroupSchema` (zod): `name` (required, trimmed, 1–100
+  chars), `timezone` (optional but defaults to `"America/Chicago"`, validated
+  via a local `isValidIanaTimezone` helper using
+  `Intl.DateTimeFormat`/try-catch — no hardcoded timezone list),
+  `denomination` (optional, ≤100 chars), `logoUrl` (optional, ≤2048 chars —
+  documented as an R2 object key, never a public URL).
+- Exported `CreateChurchGroupInput` type.
 
-2. **`README.md`** (modified) — appended a new `## Architecture rules (standing)`
-   section (README was previously 2 lines) documenting: PostgREST is disabled and
-   all data access goes through Next.js API routes; the service role key bypasses
-   RLS and must never appear in `app/**` or `lib/**`; PRD references (§15.1/§25.1,
-   §19.3); and a pointer to the new `scripts/check-service-role.mjs` guard
-   (`bun run check:service-role`), re-verified in the Sprint 4 audit (#79).
+### `app/api/church-group/route.ts` (rewritten)
+- `GET` unchanged (`notImplemented`).
+- `PUT` implemented per spec:
+  1. `auth()` → 401 `UNAUTHENTICATED` if no Clerk `userId`.
+  2. `getToken({ template: "supabase" })` → 401 if no JWT.
+  3. Parses/validates body with `createChurchGroupSchema.safeParse` → 400
+     `VALIDATION_FAILED` on failure (covers missing/blank name, invalid
+     timezone, and non-JSON/empty body).
+  4. `currentUser()` → derives `creatorName` (first non-empty of `fullName`,
+     `"firstName lastName"`, `username`, email local-part, else `"Admin"`,
+     truncated to 100 chars) and `creatorEmail` (primary email or `null`).
+  5. Calls `supabase.rpc("create_church_group", {...})` via
+     `getSupabaseClient(jwt)`.
+  6. Error mapping: `USER_ALREADY_IN_GROUP` → 409 `CONFLICT`;
+     `UNAUTHENTICATED` → 401; any other RPC error → 500 `INTERNAL`.
+  7. Success → `ok(data, 201)`.
+  - Whole handler wrapped in try/catch → 500 `INTERNAL` as a last resort,
+    matching the `app/api/_examples/admin-only/route.ts` pattern.
+  - Does not call `requireAuth` (creator has no `users` row yet).
 
-3. **`scripts/check-service-role.mjs`** (new file, new `scripts/` directory) —
-   dependency-free ESM CLI guard (Node built-in `fs`/`path` only). Recursively
-   scans `app/` and `lib/` (`.ts`, `.tsx`, `.js`, `.mjs` only) for the literal
-   `SUPABASE_SERVICE_ROLE_KEY` and case-insensitive `service_role`. Lines whose
-   trimmed content starts with `//` or `*` are treated as comments and allowed
-   (this is what lets the existing warning comment in `lib/supabase/client.ts`
-   pass). Any non-comment match prints `path:line - matchedText` for every
-   violation and exits 1; a clean scan prints one OK line and exits 0.
+### `lib/supabase/types.ts` (extended)
+- Added `ChurchGroupsRow` type and a `church_groups` table entry
+  (`Row`/`Insert`/`Update`/`Relationships: []`) mirroring the existing
+  `users` entry style.
+- Replaced `Functions: Record<string, never>` with a typed
+  `create_church_group` entry (`Args` matching the RPC's `p_*` params,
+  `Returns: ChurchGroupsRow`) so `supabase.rpc("create_church_group", ...)`
+  typechecks.
 
-4. **`package.json`** (modified) — added `"check:service-role": "node
-   scripts/check-service-role.mjs"` to the `scripts` block (placed after
-   `test:e2e`). No dependency changes; no other scripts touched or reordered
-   beyond the insertion.
+### `tests/unit/app/api/church-group-route.test.ts` (new)
+Mocks `@clerk/nextjs/server` (`auth`, `currentUser`) and
+`@/lib/supabase/client` (`getSupabaseClient`), following the style of
+`tests/unit/lib/api/lookup-user.test.ts`. Covers:
+- 201 happy path — asserts `rpc` called with the exact expected params and
+  the response body is `{ data: <group row incl. invite_code> }`.
+- 400 on missing `name`.
+- 400 on invalid IANA timezone (`"Mars/Phobos"`).
+- 401 when Clerk `userId` is null.
+- 401 when `getToken` resolves to null (extra case beyond the spec's minimum
+  list — covers the "no supabase JWT" edge case called out in the spec).
+- 409 when the RPC returns a `USER_ALREADY_IN_GROUP` error.
+- 500 on a generic RPC error.
+- Fallback to `"Admin"` as `p_creator_name` when Clerk has no usable name
+  (extra case beyond the spec's minimum list — covers the "creator has no
+  name" edge case called out in the spec).
 
-## Verification performed
-- `node scripts/check-service-role.mjs` and `bun run check:service-role` both
-  exit 0 against the current repo (only match is the comment block in
-  `lib/supabase/client.ts`, correctly allowlisted).
-- Manually introduced a temporary non-comment violation
-  (`lib/__test_violation.ts` referencing `SUPABASE_SERVICE_ROLE_KEY`) and
-  confirmed the script reports `path:line - matchedText` for both patterns and
-  exits 1; the temp file was removed afterward (not committed).
-- `bun run typecheck` — passes, no errors.
-- `bun run lint` — passes, no errors.
+## Verification run
+- `bun run typecheck` — passes.
+- `bun run lint` — passes.
+- `bun run test` — all 5 suites / 25 tests pass (including the 8 new
+  church-group route tests).
+- `bun run check:service-role` — passes (no service-role key references in
+  `app/`/`lib/`).
+- `bunx prettier --check` on all touched files — passes.
+
+## Not committed / out of scope
+- `.pipeline/spec.md` and `.claude/workflows/handle-issues.js` showed as
+  modified in the working tree before this pass started; per the incident
+  history documented in the prior `.pipeline/changes.md` (issue #23), those
+  are pipeline-orchestrator scratch content, not part of this code change —
+  left untouched/unstaged, not committed.
 
 ## What the Tester should focus on
-- Confirm `bun run check:service-role` exits 0 on a clean checkout of this
-  branch.
-- Confirm the guard would catch a real violation if one were introduced in
-  `app/` or `lib/` (non-comment reference to either pattern).
-- Confirm README and `supabase/config.toml` changes are purely additive (no
-  existing lines removed/reworded) — verified via `git diff`.
-- `.pipeline/spec.md` shows as modified in the working tree but was
-  deliberately **not** included in this commit — per prior incident history
-  (see commit `8b1915a`, "Revert unrelated .pipeline/spec.md change swept into
-  previous commit"), that file is pipeline scratch content managed by the
-  orchestrator, not part of the code change for this issue.
-
-## Out of scope (per spec, intentionally not touched)
-- No dashboard automation, no real Supabase project/migrations.
-- No CI workflow or git-hook wiring for the new script.
-- `lib/supabase/client.ts` logic left unchanged (guard reads it, doesn't edit
-  it) — that's issue #22's territory.
+- The DB-level behavior of the RPC (exactly 8 default instruments seeded in
+  the correct order/names, creator gets `admin` role, invite-code
+  uniqueness/collision retry, atomicity/rollback on failure) is **not**
+  covered by the unit test added here — per spec this belongs in
+  `tests/integration/rls/` and is explicitly out of scope for this pass.
+  Flagging so it isn't assumed covered.
+- The migration SQL has been reviewed against the existing migration style
+  but not executed — there is no local Supabase CLI/DB available in this
+  environment to run `supabase migration up` / `db reset`.
+- `error.message.includes(...)` string matching against real
+  PostgREST/postgres error payloads for `RAISE EXCEPTION ... USING ERRCODE =
+  'P0001'` is only verified against mocked `error.message` values in the
+  unit tests, not a live Supabase error shape.
