@@ -33,6 +33,21 @@
       "Bash(pytest*)",
       "Bash(python -m pytest*)",
       "Bash(python3 -m pytest*)",
+      "Bash(python3 *)",
+      "Bash(node *)",
+      "Bash(echo *)",
+      "Bash(docker *)",
+      "Bash(docker-compose *)",
+      "Bash(gh issue develop *)",
+      "Bash(gh api *)",
+      "Bash(curl *)",
+      "Bash(jq *)",
+      "Bash(cat *)",
+      "Bash(ls *)",
+      "Bash(mkdir *)",
+      "Bash(find *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
       "Workflow",
       "EnterWorktree",
       "ExitWorktree",
@@ -57,6 +72,20 @@
       "Bash(gh issue delete*)",
       "Bash(npm *)",
       "Bash(npx *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-main-branch.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   },
   "attribution": {

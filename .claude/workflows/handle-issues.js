@@ -1,6 +1,6 @@
 export const meta = {
   name: 'handle-issues',
-  description: 'Process exactly one GitHub issue (oldest unclaimed by default, or a specific issue number via args.issueNumber) through plan/code/test/review and open a PR for it.',
+  description: 'Process exactly one GitHub issue, given explicitly via args.issueNumber, through claim/branch-link/plan/code/test/review and open a PR for it.',
   phases: [
     { title: 'Setup' },
     { title: 'Plan' },
@@ -59,122 +59,39 @@ async function abandonStaleBranchIfEmpty(issueNumber, reasonLabel) {
   return result
 }
 
-let issue
-if (issueArgs && issueArgs.issueNumber) {
-  const ISSUE_SCHEMA = {
-    type: 'object',
-    properties: {
-      number: { type: 'number' },
-      title: { type: 'string' },
-      body: { type: 'string' },
-      url: { type: 'string' },
-    },
-    required: ['number', 'title', 'body', 'url'],
-  }
-  issue = await agent(
-    `Fetch GitHub issue #${issueArgs.issueNumber} in this repo's working directory: \`gh issue view ${issueArgs.issueNumber} --json number,title,body,url\`. Return its number, title, body, and url exactly as given.`,
-    { phase: 'Setup', schema: ISSUE_SCHEMA }
-  )
-} else {
-  // Deliberately excludes `body` here -- with a large open-issue backlog, fetching every
-  // issue's full body just to pick the oldest unclaimed one caused the subagent to blow past
-  // context limits (100k+ tokens) round-tripping the payload through scratch files. Only the
-  // winning issue's body is ever needed downstream, so it's fetched separately below, once,
-  // by number -- same cheap pattern as the args.issueNumber branch above.
-  const ISSUES_SCHEMA = {
-    type: 'object',
-    properties: {
-      issues: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            number: { type: 'number' },
-            title: { type: 'string' },
-            url: { type: 'string' },
-            createdAt: { type: 'string' },
-          },
-          required: ['number', 'title', 'url', 'createdAt'],
-        },
-      },
-    },
-    required: ['issues'],
-  }
-  const issuesResult = await agent(
-    `Fetch open GitHub issues in this repo's working directory and return them raw, unsorted, unfiltered: \`gh issue list --state open --limit 100 --json number,title,url,createdAt\`. Return the parsed JSON array as-is under "issues". Do not sort, filter, or interpret it -- note that \`gh issue list\` has no --sort/--order flags, so do not attempt to use them. Do NOT fetch issue bodies -- they are not needed here.`,
-    { phase: 'Setup', schema: ISSUES_SCHEMA }
-  )
-
-  const PRS_SCHEMA = {
-    type: 'object',
-    properties: {
-      prs: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: { body: { type: 'string' }, headRefName: { type: 'string' } },
-          required: ['body', 'headRefName'],
-        },
-      },
-    },
-    required: ['prs'],
-  }
-  const prsResult = await agent(
-    `List open GitHub PRs in this repo's working directory and return them raw: \`gh pr list --state open --json body,headRefName\`. Return the parsed JSON array as-is under "prs". Do not interpret it.`,
-    { phase: 'Setup', schema: PRS_SCHEMA }
-  )
-
-  if (!issuesResult || !prsResult) {
-    log('Fetching open issues/PRs failed (agent-level failure, e.g. a session/usage limit or transient API error) -- NOT the same as an empty queue. Stopping here so this is not silently misreported as "no open issues." Re-invoke this workflow once whatever caused the failure has cleared.')
-    return { status: 'fetch-failed', reason: !issuesResult ? 'issues fetch failed' : 'PR fetch failed' }
-  }
-
-  const openIssues = issuesResult.issues || []
-  const openPrs = prsResult.prs || []
-
-  const claimed = new Set()
-  for (const pr of openPrs) {
-    const closes = (pr.body || '').match(/Closes #(\d+)/i)
-    if (closes) claimed.add(Number(closes[1]))
-    const branch = (pr.headRefName || '').match(/^issue-(\d+)-/)
-    if (branch) claimed.add(Number(branch[1]))
-  }
-
-  const unclaimed = openIssues
-    .filter(i => !claimed.has(i.number))
-    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
-
-  const picked = unclaimed[0] || null
-
-  if (picked) {
-    const ISSUE_SCHEMA = {
-      type: 'object',
-      properties: {
-        number: { type: 'number' },
-        title: { type: 'string' },
-        body: { type: 'string' },
-        url: { type: 'string' },
-      },
-      required: ['number', 'title', 'body', 'url'],
-    }
-    issue = await agent(
-      `Fetch GitHub issue #${picked.number} in this repo's working directory: \`gh issue view ${picked.number} --json number,title,body,url\`. Return its number, title, body, and url exactly as given.`,
-      { phase: 'Setup', schema: ISSUE_SCHEMA }
-    )
-  } else {
-    issue = null
-  }
+if (!issueArgs || !issueArgs.issueNumber) {
+  log('No issueNumber provided in args -- this workflow always requires an explicit issue number now (no backlog scan). Invoke it as Workflow({..., args: {issueNumber: N}}).')
+  return { status: 'no-op', reason: 'issueNumber not provided in args' }
 }
 
+const ISSUE_SCHEMA = {
+  type: 'object',
+  properties: {
+    number: { type: 'number' },
+    title: { type: 'string' },
+    body: { type: 'string' },
+    url: { type: 'string' },
+  },
+  required: ['number', 'title', 'body', 'url'],
+}
+const issue = await agent(
+  `Fetch GitHub issue #${issueArgs.issueNumber} in this repo's working directory: \`gh issue view ${issueArgs.issueNumber} --json number,title,body,url\`. Return its number, title, body, and url exactly as given.`,
+  { phase: 'Setup', schema: ISSUE_SCHEMA }
+)
+
 if (!issue) {
-  log('No unclaimed open issue to process.')
-  return { status: 'no-op', reason: 'no unclaimed open issues found' }
+  log(`Fetching issue #${issueArgs.issueNumber} failed (agent-level failure, e.g. a session/usage limit or transient API error, or the issue number doesn't exist). Stopping here so this isn't silently misreported. Re-invoke this workflow with the same issueNumber to retry.`)
+  return { status: 'fetch-failed', reason: `could not fetch issue #${issueArgs.issueNumber}` }
 }
 
 log(`Processing issue #${issue.number}: ${issue.title}`)
 
+// Claim + branch-link happen FIRST, before any planning work -- this is the very first
+// thing done once the issue is resolved. Uses `gh issue develop` (not plain `git checkout -b`)
+// so the branch shows up as a linked branch in the issue's own GitHub "Development" sidebar,
+// not just associated by naming convention.
 await agent(
-  `Claim and set up GitHub issue #${issue.number} ("${issue.title}") for work, in this repo's working directory:\n1. Assign it to yourself: \`gh issue edit ${issue.number} --add-assignee @me\`.\n2. \`git fetch origin main\`.\n3. If a local branch named exactly \`issue-${issue.number}-<kebab-case-slug-of-title>\` already exists (e.g. from a prior interrupted run on this same issue), just check it out as-is to resume it -- don't create a duplicate. Otherwise create it fresh without ever checking out local \`main\` (this working directory may be an isolated worktree where \`main\` is already checked out elsewhere, and checking it out here would fail): \`git checkout -b issue-${issue.number}-<kebab-case-slug-of-title> --no-track origin/main\`.\n4. Ensure a \`.pipeline/\` directory exists (create if needed).\nDo not do any implementation work -- this is claiming and branch setup only.`,
+  `Claim and set up GitHub issue #${issue.number} ("${issue.title}") for work, in this repo's working directory. Do this BEFORE any planning or implementation work -- this step is claiming and branch setup only:\n1. Assign the issue to yourself: \`gh issue edit ${issue.number} --add-assignee @me\`.\n2. \`git fetch origin main\`.\n3. Check for an existing linked branch first: \`gh issue develop ${issue.number} --list\`. If one already exists (e.g. from a prior interrupted run on this same issue), check it out as-is to resume it -- don't create a duplicate: \`git checkout <existing-branch-name>\`.\n4. Otherwise create a new branch that is both created AND linked to this issue in GitHub's UI (not just named to imply a link), based off \`origin/main\`, and check it out in one step: \`gh issue develop ${issue.number} --name issue-${issue.number}-<kebab-case-slug-of-title> --base origin/main --checkout\`. Do NOT use plain \`git checkout -b\` for this -- it would create a branch but not link it to the issue.\n5. Ensure a \`.pipeline/\` directory exists (create if needed).`,
   { label: `setup:${issue.number}`, phase: 'Setup' }
 )
 

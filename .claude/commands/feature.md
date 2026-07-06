@@ -1,16 +1,17 @@
 ---
-description: Create a branch from main, pull the oldest open GitHub issue, and run the full 4-agent pipeline — plan, code, test, review — to solve it. Can be run in the background.
-argument-hint: (none — always pulls the oldest open issue; runs in the background when invoked via a backgrounded agent)
+description: Claim a specific GitHub issue, create and link its branch, and run the full 4-agent pipeline — plan, code, test, review — to solve it. Can be run in the background.
+argument-hint: "<issue-number> — the GitHub issue number to solve (required — this no longer picks the oldest open issue for you)"
 ---
 
-You are the orchestrator for a four-stage feature pipeline that solves the oldest open GitHub issue in this repo. Run the four specialist subagents in order, using the Agent/Task tool. Each stage hands off through files in `.pipeline/`. Do NOT do the work yourself — delegate each stage to its agent.
+You are the orchestrator for a four-stage feature pipeline that solves a specific GitHub issue in this repo, given as `$ARGUMENTS`. Run the four specialist subagents in order, using the Agent/Task tool. Each stage hands off through files in `.pipeline/`. Do NOT do the work yourself — delegate each stage to its agent.
 
 **Stage 0 — Setup.**
-1. Fetch open issues: `gh issue list --state open --limit 100 --json number,title,body,url,createdAt` — note `gh issue list` has no `--sort`/`--order` flags, so sort the JSON result by `createdAt` ascending yourself (e.g. pipe through `jq 'sort_by(.createdAt)'` or `python3`) to get oldest-first. Then fetch in-flight PRs: `gh pr list --state open --json body,headRefName`. An issue is already claimed if any open PR's body contains `Closes #<number>` or its branch matches `issue-<number>-*` — skip those (this pipeline may already be running against them). Pick the oldest issue that isn't claimed. If there are no open issues, or every open issue is already claimed, stop and report that to the user — do not proceed.
-2. Claim it: `gh issue edit <number> --add-assignee @me` (assigns the issue to the currently authenticated `gh` user).
-3. Create a fresh branch off `main` for this issue: `git checkout main && git pull origin main && git checkout -b issue-<number>-<kebab-case-slug-of-title>`. Every pipeline run gets its own new branch from `main` — never reuse or build on top of a previous run's branch.
-4. The fetched issue's title + body is the feature request for the Planner (replaces any free-text argument).
-5. Ensure the `.pipeline/` directory exists (create it if needed).
+1. Parse `$ARGUMENTS` as the issue number. If it's missing or not a positive integer, stop and ask the user for one — do not fall back to scanning the backlog for the oldest open issue.
+2. Fetch it: `gh issue view <number> --json number,title,body,url`.
+3. Claim it immediately, before any planning work: `gh issue edit <number> --add-assignee @me` (assigns the issue to the currently authenticated `gh` user).
+4. Create AND link a branch to the issue in one step, so it shows up in the issue's own GitHub "Development" sidebar (not just associated by naming convention): `git fetch origin main && gh issue develop <number> --name issue-<number>-<kebab-case-slug-of-title> --base origin/main --checkout`. If a linked branch already exists for this issue (`gh issue develop <number> --list`), check it out instead of creating a duplicate. Do NOT use plain `git checkout -b` for this.
+5. The fetched issue's title + body is the feature request for the Planner.
+6. Ensure the `.pipeline/` directory exists (create it if needed).
 
 **Stage 1 — Planner.** Invoke the `planner` agent with the issue title/body/url from Stage 0. It writes `.pipeline/spec.md`.
 - After it returns, read `.pipeline/spec.md`. If it contains any **OPEN QUESTION**, STOP the pipeline and surface those questions to the user. Do not proceed until they are answered.
