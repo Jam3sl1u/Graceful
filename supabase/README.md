@@ -14,6 +14,7 @@ PostgreSQL schema for Graceful Phase 1. Migrations are applied in **lexicographi
 | `20260702000006_cluster6_auth_audit.sql` | #12 | `google_calendar_tokens`, `audit_logs` (append-only; `REVOKE UPDATE, DELETE` on `audit_logs`) |
 | `20260703000001_users_self_read_rls.sql` | #15 (bootstrap slice of #22) | Enables RLS on `users`; `users_select_own` policy (`clerk_id = jwt sub`) — superseded by #22 |
 | `20260704000001_rls_policies.sql` | #22 | Auth helper functions (`auth_church_group_id`, `auth_user_role`, `auth_user_id`, `auth_is_leader_or_admin`); RLS enabled on all 18 tables (excl. `church_groups`); full tiered policies |
+| `20260705000001_church_group_create_fn.sql` | #24 | `create_church_group` SECURITY DEFINER bootstrap fn: group + admin user + 9 default instruments; invite-code generation |
 
 Each migration file (except Cluster 6's companion down file) contains an `-- ============ UP ============` block applied by `supabase db push` and a commented `-- ============ DOWN ============` block for manual reversals. `20260702000006_cluster6_auth_audit.down.sql` is a standalone rollback script for Cluster 6 only.
 
