@@ -1,234 +1,149 @@
-# Spec — Issue #24: Implement church group creation
+# Spec: Issue #23 — Disable PostgREST auto-API & lock down service role key
 
-`PUT /api/church-group` creates a church group, assigns the creator as `admin`,
-auto-generates a unique invite code, and seeds the 9 default instruments.
+## OPEN QUESTIONS (read first)
 
-## OPEN QUESTIONS
+**OQ-1 (NON-BLOCKING — dashboard action lives outside the repo).**
+Two of the four acceptance criteria are Supabase-dashboard / secrets-management
+actions that no code in this repo can perform:
+- "PostgREST auto-API confirmed disabled in the Supabase project settings"
+- "Service role key exists only in trusted migration scripts / CI secrets"
 
-None are blocking. Two decisions were made from repo/PRD evidence — implement as
-written below:
+There is no linked/real Supabase project in this repo yet — `supabase/config.toml`
+holds only `project_id = "graceful"` and `supabase/migrations/` is `.gitkeep`
+(scaffolding stage). The coder CANNOT toggle a dashboard setting or provision a CI
+secret. **This spec scopes the coder to the in-repo, verifiable deliverables:
+documenting the standing rule and adding a repo-wide guard.** The dashboard toggle
+and secret placement remain human/ops follow-ups tracked by this issue and re-checked
+in #79. Do NOT invent a fake Supabase project or dashboard automation.
 
-1. **PUT = create (not update).** PRD §22.1 lists `PUT /api/church-group` as
-   "update", but Issue #24 explicitly redefines it as the create endpoint. The
-   issue wins. Update-group is out of scope for this issue.
-2. **Creator's `name`/`email` come from Clerk, not the request body.**
-   `users.name` is `NOT NULL`; the onboarding flow (PRD §21.1 steps 1→2b) creates
-   the Clerk account first, then the `users` row. So the route reads `currentUser()`
-   from Clerk for name/email. The request body carries only group fields.
+This is not a hard blocker: proceed with the in-repo work below.
 
-## Key architectural constraint (read first)
+---
 
-The creator is a Clerk-authenticated user who has **no `users` row and no group yet**.
-Therefore:
+## Current state (verified — do not redo this analysis)
 
-- **Do NOT use `requireAuth`** — it looks up the `users` table by `clerk_id` and
-  would 401 a brand-new user. Use Clerk `auth()` directly for the `clerkId` + JWT.
-- Writes to `church_groups`, `users`, and `instruments` are all **denied by RLS**
-  for the `authenticated` role (church_groups has SELECT-only policy; users/instruments
-  INSERT require `auth_church_group_id()`, which is null for a new user).
-- **The service-role key is forbidden in `app/` and `lib/`** (guarded by
-  `scripts/check-service-role.mjs`; `bun run check:service-role`). Do not import or
-  reference it.
-- **Resolution:** perform the entire creation inside a Postgres `SECURITY DEFINER`
-  RPC (`public.create_church_group`), called via the RLS-scoped Supabase client with
-  the caller's JWT. `SECURITY DEFINER` bypasses RLS inside the function, exactly like
-  the existing `auth_*` helpers in `20260704000001_rls_policies.sql`. This keeps
-  `church_groups` writes locked while still allowing the atomic bootstrap.
+- **Service-role key is already absent from user-callable code.** Repo-wide search
+  for `SUPABASE_SERVICE_ROLE_KEY` / `service_role` finds it ONLY in:
+  - `.env.example:7` (declaration, expected)
+  - `lib/supabase/client.ts:6` (a warning comment telling future devs never to use it here)
+  - docs/backlog/spec references
+  No `createClient(..., SERVICE_ROLE_KEY)` call exists anywhere in `/app` or `/lib`.
+  Acceptance criterion "does not appear in `/app` or any user-callable API route"
+  is **already satisfied**; the coder's job is to add a guard that keeps it that way.
+- **The architecture rules already exist in the PRD** — see
+  `documentation/prd/graceful_requirements_v10.md` §19.3 (lines 693–696) and §25.1
+  (lines 1383–1384). They are NOT yet surfaced as a contributor-facing standing rule.
+- **There is no `/docs` directory.** The issue says "`/docs` or README." Use the
+  README route (see Files below) — do not create a new top-level `/docs` tree.
+- `supabase/config.toml` is a 4-line placeholder with no `[api]` block.
+
+---
 
 ## Files to create / modify
 
-### 1. CREATE `supabase/migrations/20260705000001_church_group_create_fn.sql`
+### 1. `supabase/config.toml` (MODIFY)
+Add an explicit `[api]` block that disables PostgREST for local `supabase start`,
+so the "PostgREST disabled" intent is codified where the project config lives (the
+production toggle is still a dashboard action per OQ-1). Append after the existing
+`project_id` line:
 
-New migration (timestamp is after the latest existing `20260704000002`). Follow the
-`-- ============ UP ============` / commented `-- ============ DOWN ============`
-convention used by every migration in `supabase/migrations/`. `pgcrypto` (for
-`gen_random_bytes`) is already enabled by cluster 1.
-
-Define `public.create_church_group` as
-`LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''` with signature (all `text`
-params; schema-qualify every table as `public.*`):
-
-```
-create or replace function public.create_church_group(
-  p_name         text,
-  p_timezone     text,
-  p_denomination text,
-  p_logo_url     text,
-  p_user_name    text,
-  p_user_email   text
-) returns public.church_groups
+```toml
+# PostgREST auto-API is disabled by architecture rule (PRD §19.3, §25.1 / issue #23).
+# All DB access goes through Next.js API routes, never Supabase's generated REST API.
+# NOTE: this governs the local `supabase start` stack only. The hosted project's
+# Data API must also be turned off in the Supabase dashboard (Settings > API) — see
+# issue #23 acceptance criteria and re-verified in the Sprint 4 audit (#79).
+[api]
+enabled = false
 ```
 
-Body requirements:
+Keep the existing header comments and `project_id` line intact.
 
-- `v_clerk_id := auth.jwt() ->> 'sub'`. If null →
-  `raise exception 'not authenticated' using errcode = 'GR000';`
-- **Already-a-member guard:** if a `public.users` row exists with
-  `clerk_id = v_clerk_id`,
-  `raise exception 'user already belongs to a church group' using errcode = 'GR001';`
-- **Invite code:** generate an 8-character, URL-safe, unambiguous code and insert the
-  `church_groups` row inside a `begin … exception when unique_violation then …` retry
-  loop so an `invite_code` collision (the only unique constraint on the table) retries
-  transparently. Alphabet must exclude ambiguous chars (`0/O/1/I/l`); use e.g.
-  `23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz`. Build the code from
-  `gen_random_bytes(1)` per character (crypto-random, not `random()`).
-  Insert `(name, timezone, denomination, logo_url, invite_code)` and `returning *`
-  into a `public.church_groups` variable.
-- **Creator user row:** insert into `public.users`
-  `(clerk_id, church_group_id, role, name, email)` with `role = 'admin'`,
-  `name = p_user_name`, `email = p_user_email` (may be null). Capture the new
-  `users.id` (via `returning id`) for `created_by` below.
-- **Seed 9 default instruments:** insert 9 rows into `public.instruments`
-  `(church_group_id, name, is_default, created_by)` with `is_default = true` and
-  `created_by =` the new user id. Names exactly (PRD §11 instrument list):
-  `Acoustic guitar`, `Electric guitar`, `Bass guitar`, `Piano / keyboard`, `Violin`,
-  `Vocalists`, `Drums`, `Cajon`, `Other`.
-- `return` the church_groups row variable.
+### 2. `README.md` (MODIFY)
+The README is currently 2 lines. Append a `## Architecture rules (standing)` section
+documenting the two rules this issue is about, phrased for future contributors. Keep
+it tight — copy the wording intent from PRD §19.3 lines 693–695. Must state:
+- PostgREST (Supabase's auto-generated REST API) is disabled; all data access goes
+  through the app's own Next.js API routes.
+- The Supabase **service role key bypasses RLS** and must NEVER appear in any
+  user-callable API route (`app/**`) or client/lib code (`lib/**`). It belongs only
+  in trusted migration/seed scripts and CI secrets.
+- Reference: PRD §15.1 (§25.1 in v10 doc), §19.3.
+- Note that this rule is enforced by the check in `scripts/check-service-role.mjs`
+  (item 3) and re-verified in the Sprint 4 security audit (#79).
 
-After the function:
-`grant execute on function public.create_church_group(text, text, text, text, text, text) to authenticated;`
+### 3. `scripts/check-service-role.mjs` (CREATE)
+A repo-wide guard that fails (exit code 1) if the service-role key is referenced in
+user-callable code. This makes the "confirmed via repo-wide search" criterion
+executable and repeatable rather than a one-time manual pass.
 
-Commented DOWN:
-`drop function if exists public.create_church_group(text, text, text, text, text, text);`
+Behavior:
+- Recursively scan `app/` and `lib/` for the strings `SUPABASE_SERVICE_ROLE_KEY`
+  and `service_role` (case-insensitive on the latter).
+- **Allowlist:** `lib/supabase/client.ts` is permitted to mention the key **only
+  inside comments** (it currently warns against using it). Simplest correct rule:
+  allow the match on any line that is a comment (line trimmed starts with `//` or
+  `*`), fail on any non-comment occurrence anywhere in `app/`+`lib/`. Do not
+  hard-exclude the whole file, or the guard becomes toothless if real code is added.
+- On violation: print each offending `path:line` and the matched text, then
+  `process.exit(1)`.
+- On clean: print a one-line OK message and exit 0.
+- No external dependencies — use Node's built-in `fs`/`path` only (ESM `.mjs`,
+  matching repo convention; confirm by checking whether other `scripts/*.mjs` /
+  package.json `"type"` exist and follow it). Read files as UTF-8; skip non-source
+  extensions (only scan `.ts`, `.tsx`, `.js`, `.mjs`).
 
-### 2. MODIFY `schemas/church-group.ts`
-
-Replace the empty `churchGroupSchema` stub. Add:
-
+Signature (no exports needed; it's a CLI script):
 ```
-export const createChurchGroupSchema = z.object({
-  name: z.string().trim().min(1).max(100),
-  timezone: z.string().trim().min(1).max(50).default("America/Chicago"),
-  denomination: z.string().trim().min(1).max(100).optional(),
-  logo_url: z.string().trim().url().optional(),
-});
-export type CreateChurchGroupInput = z.infer<typeof createChurchGroupSchema>;
+node scripts/check-service-role.mjs   # exit 0 = clean, exit 1 = violation
 ```
 
-- `timezone` must be IANA. Add a `.refine(...)` that accepts the value when it is in
-  `Intl.supportedValuesOf("timeZone")` (Node 22 supports this). Default is
-  `America/Chicago` per PRD schema notes. On failure → validation error.
-- Only `name`, `timezone`, `denomination?`, `logo_url?` are in scope. Do not invent
-  extra fields. You may leave the old `churchGroupSchema`/`ChurchGroupInput` exports
-  in place or remove them (nothing else imports them); the new create schema is what
-  the route uses.
-
-### 3. MODIFY `app/api/church-group/route.ts`
-
-Leave `GET` as the existing `notImplemented("GET /api/church-group")` stub (GET is a
-separate issue). Implement `PUT`:
-
-Imports: `auth`, `currentUser` from `@clerk/nextjs/server`; `getSupabaseClient` from
-`@/lib/supabase/client`; `ok`, `fail` from `@/lib/api/response`;
-`ApiException`, `ErrorCode` from `@/lib/api/errors`; `createChurchGroupSchema` from
-`@/schemas/church-group`.
-
-Handler logic (wrap in `try/catch` mirroring `app/api/_examples/admin-only/route.ts`;
-catch `ApiException` → `fail(err.message, err.code, err.status)`, else
-`fail("Internal error", ErrorCode.INTERNAL, 500)`):
-
-1. `const { userId: clerkId, getToken } = await auth();`
-   If `!clerkId` → throw `ApiException("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`.
-2. Parse body defensively: `const body = await req.json().catch(() => null);`
-   `const parsed = createChurchGroupSchema.safeParse(body);`
-   If `!parsed.success` → `return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)`.
-3. `const jwt = await getToken({ template: "supabase" });`
-   If `!jwt` → throw `ApiException("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`.
-4. `const user = await currentUser();` Derive:
-   - `name = [user?.firstName, user?.lastName].filter(Boolean).join(" ").trim() || user?.username || "Admin";`
-   - `email = user?.primaryEmailAddress?.emailAddress ?? user?.emailAddresses?.[0]?.emailAddress ?? null;`
-5. `const supabase = getSupabaseClient(jwt);`
-   Call the RPC with snake_case param names matching the SQL function:
-   ```
-   const { data, error } = await supabase.rpc("create_church_group", {
-     p_name: parsed.data.name,
-     p_timezone: parsed.data.timezone,
-     p_denomination: parsed.data.denomination ?? null,
-     p_logo_url: parsed.data.logo_url ?? null,
-     p_user_name: name,
-     p_user_email: email,
-   });
-   ```
-6. Error mapping:
-   - `error?.code === "GR001"` → `return fail("You already belong to a church group", ErrorCode.CONFLICT, 409)`.
-   - any other `error` → throw `ApiException("Internal error", ErrorCode.INTERNAL, 500)`.
-7. Success → `return ok(data, 201);`
-
-### 4. MODIFY `lib/supabase/types.ts`
-
-Extend the hand-written `Database` type so the typed client + `.rpc(...)` compile
-(keep `bun run typecheck` green). Add a `ChurchGroupsRow` type
-(`id, name, denomination: string | null, timezone, logo_url: string | null,
-invite_code, created_at, updated_at` — all `string` except the two nullables), add
-`church_groups` and `instruments` entries under `Tables`, and replace the empty
-`Functions: Record<string, never>` with:
-
+### 4. `package.json` (MODIFY)
+Add a script entry so the guard is discoverable and CI-runnable:
+```json
+"check:service-role": "node scripts/check-service-role.mjs"
 ```
-Functions: {
-  create_church_group: {
-    Args: {
-      p_name: string; p_timezone: string;
-      p_denomination: string | null; p_logo_url: string | null;
-      p_user_name: string; p_user_email: string | null;
-    };
-    Returns: ChurchGroupsRow;
-  };
-};
-```
+Place it alongside existing scripts. Do NOT wire it into a git hook or CI workflow
+in this issue (out of scope — no CI config is asked for). If a `lint`/`check`
+aggregate script already exists, you MAY chain it in, but only if that does not
+change existing behavior; otherwise leave standalone.
 
-Do not remove the existing `users` table entry. Keep the file's "hand-written minimal"
-intent — add only what these routes need.
-
-### 5. MODIFY `supabase/README.md`
-
-Add one row to the Migrations table for `20260705000001_church_group_create_fn.sql`
-(Issue #24, "`create_church_group` SECURITY DEFINER bootstrap fn: group + admin user
-+ 9 default instruments; invite-code generation"). Keeps docs in sync with the repo
-convention.
+---
 
 ## Edge cases the implementation must handle
 
-- Missing/blank `name` → 400 `VALIDATION_FAILED`.
-- Non-IANA `timezone` → 400 `VALIDATION_FAILED`. Omitted `timezone` → defaults to
-  `America/Chicago`.
-- `denomination` and `logo_url` omitted → group created with those columns null.
-- Malformed/empty request body → 400 (do not throw on `req.json()`).
-- No Clerk session (`clerkId` null) → 401 `UNAUTHENTICATED`.
-- Missing Supabase JWT template → 401 `UNAUTHENTICATED`.
-- Caller already has a `users` row (already in a group) → 409 `CONFLICT` (function
-  raises `GR001`).
-- `invite_code` collision → retried transparently inside the SQL function; never
-  surfaces to the client.
-- Any other DB/RPC error → 500 `INTERNAL`.
-- The whole group + user + instruments write is atomic (single RPC / transaction):
-  a failure leaves no partial group.
+- **`check-service-role.mjs` must pass against the current repo as-is.** The only
+  current match is the comment block in `lib/supabase/client.ts` — the comment
+  allowlist must let that through with exit 0. Verify this before finishing.
+- The scanner must not crash on directories with no matching files, on empty files,
+  or on binary/non-source files (skip by extension).
+- Case sensitivity: `SUPABASE_SERVICE_ROLE_KEY` is all-caps (env var);
+  `service_role` may appear lower/upper — match case-insensitively for the latter.
+- Do not match on substrings that are legitimately unrelated (there are none
+  currently; the two literal patterns above are specific enough — do not broaden to
+  bare `service` or `role`).
+- README/config edits must be additive; do not delete or reword existing content.
 
-## Patterns to copy
+---
 
-- **Route structure & error handling:** `app/api/_examples/admin-only/route.ts`
-  (try/catch → `ApiException` mapping via `fail`).
-- **Clerk `auth()` + `getToken({ template: "supabase" })` + `getSupabaseClient`:**
-  `lib/api/auth.ts` (`lookupUserByClerkId`).
-- **SECURITY DEFINER function conventions** (`SET search_path = ''`, schema-qualified
-  `public.*`, reading `auth.jwt() ->> 'sub'`): the `auth_*` helpers in
-  `supabase/migrations/20260704000001_rls_policies.sql`.
-- **Migration file format** (UP block + commented DOWN): any file in
-  `supabase/migrations/`.
-- **Response envelope:** `lib/api/response.ts` (`ok` / `fail`) and `lib/api/errors.ts`
-  (`ErrorCode`, `ApiException`).
+## Patterns to follow
 
-## Out of scope (do NOT build)
+- **Config style:** mirror the existing comment-first style already in
+  `supabase/config.toml` and `supabase/README.md` (leading `#` explanatory comments
+  citing PRD sections and issue numbers).
+- **Doc citation style:** the codebase consistently cites PRD sections inline
+  (e.g. `lib/supabase/client.ts:7` cites "PRD §19.3", `app/api/health/route.ts:5`
+  cites "PRD §19.2"). Match that convention.
+- **Script style:** if any `scripts/*.mjs` already exists, copy its shebang/ESM/
+  exit-code conventions. If `scripts/` does not yet exist, create it; keep the file
+  dependency-free (Node built-ins only), consistent with the repo having no test/
+  tooling deps wired for this.
 
-- `POST /api/church-group/join` (invite-code join flow — issue #25).
-- Group settings / creation UI screen (functionality only).
-- `GET /api/church-group` (leave as the `notImplemented` stub).
-- Clerk custom-claim sync of `church_group_id`/`role` into the JWT (#5/#6).
+---
 
-## Notes for the tester (not implementation)
+## Out of scope (do NOT touch)
 
-Unit tests will mock `@clerk/nextjs/server` (`auth`, `currentUser`) and
-`@/lib/supabase/client` (`getSupabaseClient` returning an object with a `rpc` mock),
-following `tests/unit/lib/api/lookup-user.test.ts` and
-`tests/unit/app/api/admin-only-route.test.ts`. The RPC itself is covered by the RLS
-integration suite against a live DB. `ErrorCode.CONFLICT` already exists in
-`lib/api/errors.ts`; no new error codes are needed.
+- Rate limiting (#76), CSP/HTTPS (#78), CI pipeline wiring, git hooks.
+- Implementing `getSupabaseClient` or any RLS work (#22) — leave
+  `lib/supabase/client.ts` logic unchanged (the guard reads it, does not edit it).
+- Creating a real Supabase project, running migrations, or any dashboard automation.
