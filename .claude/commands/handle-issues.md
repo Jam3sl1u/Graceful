@@ -1,27 +1,26 @@
 ---
-description: Work down the open-issue backlog oldest-first, running the feature pipeline on each issue via subagents, until the queue is empty or a safe per-run cap is hit. Meant to run unattended/in the background.
-argument-hint: "[max-issues] (optional, default 3 — hard cap on how many issues this run will process)"
+description: Process a specific list of GitHub issue numbers, each in its own isolated worktree, by delegating to the handle-issues Workflow. Meant to run unattended/in the background.
+argument-hint: "<issue-numbers> — one or more issue numbers, e.g. \"23 45 67\" (required — this no longer scans the backlog for you)"
 ---
 
-You are the batch orchestrator for working down the open-issue backlog. You do **not** do implementation work yourself — every issue's plan/code/test/review work happens inside the `feature` skill, which you invoke once per issue via the Skill tool. That skill already delegates to the planner/coder/tester/reviewer subagents and opens the PR; do not duplicate that logic here.
-
-**Why a cap, not a token counter.** There's no reliable API in a plain session for "tokens remaining until the limit." The harness auto-compacts context as it fills up, so this won't crash — but a long unattended chain of full pipelines (plan+code+test+review+PR, four subagent calls each) degrades quality well before that. Treat the cap below as the safety valve, and your own judgment as a second check.
+You are the batch orchestrator for a specific list of GitHub issue numbers. You do **not** do implementation work yourself — every issue's claim/branch-link/plan/code/test/review/PR work happens inside `.claude/workflows/handle-issues.js`, invoked once per issue via the `Workflow` tool. Do not duplicate that logic here.
 
 **Setup.**
-1. Read `$ARGUMENTS` as MAX_ISSUES if it's a positive integer; otherwise MAX_ISSUES = 3. Do not process more than 5 in a single run even if asked — if the user wants more, tell them to run `/handle-issues` again afterward (already-claimed issues are automatically skipped, see below).
-2. ISSUES_DONE = 0. PROCESSED = [] (issue number, title, PR URL, verdict — filled in as you go).
+1. Parse `$ARGUMENTS` as a whitespace/comma-separated list of issue numbers. If it's empty or contains anything that isn't a positive integer, stop and ask the user for explicit issue numbers — do NOT fall back to scanning the open-issue backlog for "oldest unclaimed" or anything similar. Issue numbers are always provided by the caller now.
+2. PROCESSED = [] (issue number, title, PR URL, verdict, or failure status — filled in as you go).
 
-**Loop — repeat while ISSUES_DONE < MAX_ISSUES:**
-1. Check the queue: `gh issue list --state open --limit 100 --json number,title,url,createdAt` — `gh issue list` has no `--sort`/`--order` flags, so sort the result by `createdAt` ascending yourself (e.g. `jq 'sort_by(.createdAt)'` or `python3`) to get oldest-first. Then `gh pr list --state open --json body,headRefName` to find issues already claimed (open PR body contains `Closes #<N>`, or branch matches `issue-<N>-*`). If every open issue is claimed, or there are no open issues, stop the loop now and go to **Final report**.
-2. Invoke the `feature` skill (it independently re-derives the oldest unclaimed issue — same check as above, so this is safe even if the queue changed since step 1).
-3. Increment ISSUES_DONE. Append the issue number/title/PR URL/verdict to PROCESSED.
-4. Before looping again, judge honestly: has this conversation grown long enough that you're leaning on auto-compaction, or would another full pipeline risk degraded output? If so, stop early — don't wait to hit MAX_ISSUES. Say so in the final report.
+**Loop — for each issue number, in the order given, one at a time (not in parallel — this avoids two orchestrators touching the same repo state concurrently):**
+1. `EnterWorktree` to get a fresh, isolated worktree for this issue. Each issue gets its own worktree, opened right before its run and closed right after — issues are never processed in a worktree left over from a previous issue in this same loop.
+2. Invoke `Workflow({scriptPath: '.claude/workflows/handle-issues.js', args: {issueNumber: <N>}})` — use `scriptPath` (not `name`) on every call in this loop, including the first: repeated `Workflow({name:...})` calls in one session can silently reuse a stale script snapshot from an earlier call, `scriptPath` forces a fresh read every time. The workflow itself claims the issue and creates/links its branch as its very first action, before any planning.
+3. Sanity-check the result: confirm the returned `issue.number` matches the `<N>` you requested (a silent mismatch is the signature of the stale-snapshot bug above — if it doesn't match, stop and report this explicitly rather than continuing the loop).
+4. `ExitWorktree` to close out this issue's isolated worktree before moving to the next one.
+5. Append the issue number/title/PR URL/verdict/status to PROCESSED.
+6. Before moving to the next issue, judge honestly: has this conversation grown long enough that you're leaning on auto-compaction, or would another full pipeline risk degraded output? If so, stop early and say so in the final report — don't push through the remaining issue numbers.
 
 **Final report.** Summarize:
-- Every issue processed this run: number, title, PR URL, verdict (SHIP/NEEDS WORK/BLOCK).
-- Whether you stopped because the cap was hit, the queue emptied, or a context-safety judgment call — and if the latter, say that explicitly so the user knows to just re-run `/handle-issues` rather than assuming the backlog is done.
-- Any open issues still unclaimed and how many.
+- Every issue number requested, whether it was processed, and its outcome (PR URL + verdict, or the failure/blocked status returned by the workflow).
+- Any issue numbers not reached because you stopped early for context-safety reasons.
 
-Never merge PRs, close issues, or push to `main` — same rules as `/feature`.
+Never merge PRs, close issues, or push to `main` — the workflow and the repo's `.claude/settings.json` permissions/hooks already enforce this; do not attempt to work around them.
 
-To run this fully unattended, invoke it as a backgrounded agent rather than in the foreground session, so it doesn't block your terminal while it works through the queue.
+To run this fully unattended, invoke it as a backgrounded agent rather than in the foreground session, so it doesn't block your terminal while it works through the list.
