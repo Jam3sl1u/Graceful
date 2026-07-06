@@ -1,81 +1,108 @@
-# Test Results — Issue #23 (Disable PostgREST auto-API & lock down service role key)
+# Test Results — Issue #24 (Implement church group creation)
 
 ## Overall: PASS
 
-All coder claims in `.pipeline/changes.md` were independently re-verified against
-a clean checkout of branch `issue-23-sprint-0-disable-postgrest-auto-api-lock-down-service-role-key`
-(HEAD `3bc3e6c`). No code changes were made by the tester.
+All coder claims in `.pipeline/changes.md` were independently re-verified. Two
+new unit test files were added by the Tester (not present before); all other
+checks were re-run from scratch rather than trusted from the changes.md report.
 
 ## Checks performed
 
-1. **Diff review vs. spec/changes.md claims** — PASS
-   - `git diff HEAD~1 HEAD -- README.md supabase/config.toml package.json` confirms
-     all three edits are purely additive: no existing lines removed or reworded.
-   - `supabase/config.toml`: `[api]` / `enabled = false` block appended after
-     `project_id`, with the exact comment text specified in the spec.
-   - `README.md`: new `## Architecture rules (standing)` section appended below
-     the original 2 lines; covers PostgREST-disabled rule, service-role-key/RLS
-     rule, PRD §15.1/§25.1/§19.3 references, and pointer to the guard script —
-     matches spec requirements verbatim.
-   - `package.json`: `"check:service-role": "node scripts/check-service-role.mjs"`
-     added after `test:e2e`, no other scripts touched/reordered.
-   - `scripts/check-service-role.mjs` is a new, dependency-free ESM script using
-     only `node:fs`/`node:path`, matching the spec's required behavior (recursive
-     scan of `app/`+`lib/`, `.ts/.tsx/.js/.mjs` only, comment-line allowlist,
-     case-sensitive `SUPABASE_SERVICE_ROLE_KEY` / case-insensitive `service_role`).
+1. **`bun install`** — clean, no changes needed.
 
-2. **Existing test/lint/typecheck suite** — PASS (re-run independently, not trusted from changes.md)
-   - `bun run typecheck` (`tsc --noEmit`) — exit 0, no errors.
-   - `bun run lint` (`eslint .`) — exit 0, no errors.
-   - `bun run test` (`jest`) — 1 suite / 3 tests passed
-     (`tests/unit/lib/api/response.test.ts`), exit 0. Unaffected by this change,
-     as expected (no existing test touches these files).
+2. **`bun run lint` (`eslint .`)** — PASS, exit 0, no errors. Re-run again after
+   adding the new test files — still clean.
 
-3. **Guard script — clean repo baseline** — PASS
-   - `node scripts/check-service-role.mjs` and `bun run check:service-role` both
-     exit 0 on the unmodified repo, printing the expected single OK line. Only
-     pre-existing match is the allowlisted comment block in
-     `lib/supabase/client.ts` (not flagged, as required).
+3. **`bun run typecheck` (`tsc --noEmit`)** — PASS, exit 0, no errors. Confirms
+   `lib/supabase/types.ts`'s new `ChurchGroupsRow`/`InstrumentsRow`/`Functions`
+   entries and the route's `.rpc("create_church_group", ...)` call type-check
+   correctly.
 
-4. **Guard script — manual violation injection (failure-case + edge-case coverage)** — PASS
-   Temporarily added (and removed after verification, confirmed via
-   `git status --porcelain` showing no leftover files):
-   - `lib/__tmp_test/violation1.ts` — non-comment `SUPABASE_SERVICE_ROLE_KEY`
-     reference in `lib/`. Correctly flagged (`path:line - matchedText`), and the
-     line also matched the case-insensitive `service_role` pattern (substring
-     `SERVICE_ROLE` inside the const name), which is correct per spec since both
-     patterns are independently checked.
-   - `app/api/__tmp_test/violation2.ts` — non-comment mixed-case
-     `Service_Role` string in `app/`. Correctly flagged, confirming the guard
-     covers **both** scanned directories, not just `lib/`.
-   - `lib/__tmp_test/ok_comment.ts` — comment-only mention of both patterns.
-     Correctly **not** flagged (allowlist works for `//`-prefixed lines).
-   - `lib/__tmp_test/ignored.json` — non-comment `SUPABASE_SERVICE_ROLE_KEY`
-     inside a `.json` file. Correctly **not** flagged (extension filter works).
-   - Combined run with all four fixtures present: exit code 1, three violation
-     lines printed (as expected — two real violations, one line matching both
-     patterns), OK message suppressed. Matches the spec's exit-1-on-violation
-     contract.
-   - After cleanup: guard returns to exit 0 / single OK line; empty directory
-     (`lib/__tmp_empty_dir`) and empty file (`lib/__tmp_empty_file.ts`) injected
-     and re-scanned separately — no crash, exit 0 (covers the spec's "must not
-     crash on directories with no matching files / empty files" edge case).
+4. **`bun run check:service-role`** — PASS
+   (`OK: no service-role key references found outside comments in app/ or lib/.`).
+   Confirmed no service-role key is referenced anywhere in the new route/schema
+   code, per the spec's Key architectural constraint.
+
+5. **Manual review of the migration** (`supabase/migrations/20260705000001_church_group_create_fn.sql`)
+   against the spec — PASS. Verified:
+   - `SECURITY DEFINER`, `SET search_path = ''`, all tables schema-qualified
+     `public.*`.
+   - `v_clerk_id := auth.jwt() ->> 'sub'` with `GR000` on null.
+   - Already-a-member guard raises `GR001` before any writes.
+   - Invite code: 8 chars, built one-`gen_random_bytes(1)`-byte-per-char from
+     the exact unambiguous alphabet specified in the spec, inserted inside a
+     `begin … exception when unique_violation … continue` retry loop.
+   - `users` insert captures `id` via `returning id into v_user_id`, used as
+     `created_by` for all 9 `instruments` rows with the exact 9 names from the
+     spec/PRD §11, `is_default = true`.
+   - `grant execute ... to authenticated;` present; commented `drop function`
+     DOWN block present.
+   - This matches the spec's Postgres SQL requirements exactly — this part is
+     out of scope for Jest unit tests per the spec's tester notes and is
+     intended for the live-DB RLS integration suite (`bun run test:rls`), which
+     was not run here (no live DB available in this environment) — consistent
+     with the spec explicitly carving this out.
+
+6. **New unit tests added by Tester** (not present in the coder's diff):
+   - `tests/unit/app/api/church-group-route.test.ts` — mocks
+     `@clerk/nextjs/server` (`auth`, `currentUser`) and
+     `@/lib/supabase/client` (`getSupabaseClient` → `{ rpc }` mock), following
+     the `admin-only-route.test.ts` / `lookup-user.test.ts` patterns named in
+     the spec. Covers:
+     - Happy path: valid body → 201, RPC called with correctly-mapped
+       snake_case params, response body echoes RPC's returned row.
+     - Omitted `timezone` → defaults to `America/Chicago` (passed through to
+       RPC).
+     - Omitted `denomination`/`logo_url` → `null` passed to RPC (not
+       `undefined`).
+     - Missing `name` → 400 `VALIDATION_FAILED`, RPC never called.
+     - Blank/whitespace-only `name` → 400 `VALIDATION_FAILED`.
+     - Non-IANA `timezone` (`"Not/AZone"`) → 400 `VALIDATION_FAILED`.
+     - Malformed JSON body (simulated `req.json()` throwing) → 400
+       `VALIDATION_FAILED`, confirms the route's `.catch(() => null)` swallows
+       the throw rather than propagating it.
+     - No Clerk session (`clerkId` null) → 401 `UNAUTHENTICATED`; asserted
+       `req.json()` is never called (fails fast before parsing).
+     - Missing Supabase JWT (`getToken` resolves `null`) → 401
+       `UNAUTHENTICATED`, RPC never called.
+     - RPC error `{ code: "GR001" }` → 409 `CONFLICT` **(failure case)**.
+     - RPC error with any other code → 500 `INTERNAL` **(failure case)**.
+     - Name derivation edge cases: falls back to `username` when
+       first/last name absent (and email falls back to `null` when no
+       Clerk email present); falls back to literal `"Admin"` when no name
+       info exists at all.
+     - `GET /api/church-group` still returns the untouched 501
+       `NOT_IMPLEMENTED` stub.
+   - `tests/unit/schemas/church-group.test.ts` — direct schema tests for
+     `createChurchGroupSchema`: happy path (trims all string fields), default
+     timezone, optional fields left `undefined` when omitted, missing name,
+     blank name, name > 100 chars, non-IANA timezone, invalid `logo_url`,
+     denomination > 100 chars **(failure cases)**.
+
+7. **`bun run test` (full suite, after adding the above)** — PASS:
+   `Test Suites: 6 passed, 6 total`, `Tests: 40 passed, 40 total`. The 4
+   pre-existing suites (17 tests) are unaffected/unchanged, confirming the new
+   code and tests introduce no regressions.
+
+8. **`bun run format:check`** — same 10 pre-existing failures as before this
+   change (`README.md`, `supabase/README.md`,
+   `tests/integration/rls/**`), none introduced by this issue's code or by the
+   Tester's new test files (both new test files were run through
+   `prettier --write` and are clean; confirmed by re-running `format:check`
+   after — file count of failures dropped from 11 to 10, i.e. only the
+   Tester's own file was flagged then fixed). This matches the coder's claim
+   that these are pre-existing, unrelated failures.
 
 ## Notes for Reviewer
 
-- No automated regression test file was added for `check-service-role.mjs`
-  itself (e.g. under `tests/`) — the spec's edge cases were verified manually
-  per the "What the Tester should focus on" section of changes.md, and the
-  script has no exported functions to unit-test without spawning a subprocess.
-  If a Sprint 4 audit (#79) or CI wiring is planned later, consider adding a
-  `tests/unit/scripts/check-service-role.test.ts` that shells out to the script
-  against fixture directories, so this behavior is regression-tested going
-  forward. Not a blocker for this issue's scope.
-- OQ-1 (dashboard toggle / CI secret placement) remains out of repo reach, as
-  correctly scoped in the spec — not something this tester pass can verify.
-- `.pipeline/spec.md` and `.pipeline/changes.md` show as modified in
-  `git status` (pipeline scratch content) — consistent with the note in
-  changes.md that these are orchestrator-managed and not part of the code
-  commit.
+- The live-DB RLS integration suite (`bun run test:rls`) was not run — no
+  Supabase instance is available in this test environment, and the spec
+  explicitly scopes SQL-level verification (invite-code collision retry,
+  atomicity, `GR000`/`GR001`) to that suite rather than Jest unit tests. The
+  migration SQL was instead manually reviewed line-by-line against the spec
+  (see item 5 above) and matches exactly.
+- No issues found in the coder's implementation. All spec requirements
+  (routes, schema, types, migration, docs) were verified either by automated
+  test or manual code review against the spec text.
 
 **Result: PASS. No blocking issues found. Ready for Reviewer.**

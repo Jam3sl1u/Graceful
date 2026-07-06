@@ -1,44 +1,81 @@
-# Review — Issue #23 (Disable PostgREST auto-API & lock down service role key)
+# Review — Issue #24: Implement church group creation
 
-VERDICT: NEEDS WORK
+## VERDICT: BLOCK
 
-## Summary
-The four in-repo deliverables match the spec: `supabase/config.toml` [api]/enabled=false
-block, README "Architecture rules (standing)" section, `scripts/check-service-role.mjs`
-guard, and the `check:service-role` package.json script. All edits are additive (only
-deletion is the package.json trailing-comma line). PRD refs (§19.3, §25.1) verified to
-exist. Commit contains only the four code files; `.pipeline/*` correctly left uncommitted
-per prior incident history. OQ-1 dashboard/secret actions correctly deferred.
+The route, schema, and types are well-built and match the spec. But the core
+SQL migration — the atomic bootstrap the whole feature depends on — contains a
+runtime bug that makes church-group creation fail on **every** call. Green unit
+tests hid it because they mock the Supabase RPC and never execute the SQL, and
+no live-DB integration test was run.
 
-I independently re-ran the guard and confirmed: passes clean repo (exit 0), the
-`lib/supabase/client.ts` comment is correctly allowlisted, real non-comment violations in
-both `app/` and `lib/` are flagged with `path:line - matched` and exit 1, trailing comments
-after real code correctly FAIL, and the extension filter skips `.json`/no-extension files.
+## Blocking issue (must fix)
 
-## Must fix
+**`supabase/migrations/20260705000001_church_group_create_fn.sql:53` — unqualified
+`gen_random_bytes(1)` fails under `set search_path = ''`.**
 
-1. **Guard silently passes (exit 0) when run from any cwd other than the repo root.**
-   `scripts/check-service-role.mjs:11` uses relative `SCAN_DIRS = ["app", "lib"]` resolved
-   against `process.cwd()`. `walk()` (lines 21-25) swallows the ENOENT in a bare `try/catch`
-   and returns zero files, so from a non-root cwd the script prints the OK message and
-   exits 0 while scanning NOTHING. Reproduced:
-     - `cd /repo && node scripts/check-service-role.mjs` with an injected violation → exit 1 (correct)
-     - `cd / && node /repo/scripts/check-service-role.mjs` same violation → exit 0 "OK" (WRONG)
-   This is a false-negative in a security guard whose only job is to fail loudly. The
-   `bun run check:service-role` path is safe today (npm/bun set cwd to package root), but
-   the spec's stated contract is `node scripts/check-service-role.mjs`, and any future
-   direct call, git hook, or CI step that runs from a different directory would get a
-   silent green while enforcing nothing.
-   Fix: resolve SCAN_DIRS against the script/repo root, e.g. anchor to
-   `import.meta.url` (`fileURLToPath` + `join(dirname, "..", dir)`), OR make a missing
-   scan dir an explicit condition (only tolerate absent dirs, still fail on read errors) —
-   do not let a missing `app/`+`lib/` resolve to a silent pass. Then verify the guard
-   flags a violation regardless of invocation cwd.
+`create_church_group` is declared `security definer set search_path = ''`. With an
+empty search_path only `pg_catalog` is implicitly searched. `gen_random_bytes()`
+is a **pgcrypto** function, not a `pg_catalog` builtin (unlike `gen_random_uuid()`,
+which moved to core in PG13 and is why the table-default usage works). So the
+unqualified call cannot resolve.
 
-## Non-blocking notes (do not need to fix for ship)
-- Block comments whose content lines lack a leading `*` (e.g. a bare line inside `/* ... */`)
-  are treated as code and would FALSE-POSITIVE fail. This errs toward strictness, which is
-  the safe direction for a security guard, and does not affect the current allowlisted file
-  (which uses `//` and `*`-prefixed lines). Acceptable as-is; worth a comment if revisited.
-- No regression test for the guard itself (tester noted this). Acceptable for this issue's
-  scope; consider a fixture-based test if #79/CI wiring lands.
+I verified this empirically against Postgres 16 with pgcrypto installed:
+
+    ERROR:  function gen_random_bytes(integer) does not exist
+    CONTEXT: PL/pgSQL function public.t() line 4 at assignment
+
+Schema-qualifying it (`public.gen_random_bytes(1)` / `extensions.gen_random_bytes(1)`)
+resolves correctly.
+
+Impact: the raised error is SQLSTATE `42883` (`undefined_function`), which is NOT
+`unique_violation`, so it escapes the retry `begin…exception` block, aborts the
+function, and the route maps it to **500 INTERNAL**. Church-group creation is
+100% non-functional in any real environment. `check_function_bodies` does not
+validate plpgsql bodies at `CREATE` time, so the migration "applies cleanly" —
+false confidence.
+
+### Fix
+Schema-qualify the pgcrypto call at line 53. Note the schema is environment-dependent:
+- This repo's `create extension if not exists "pgcrypto"` (cluster 1) has no
+  `WITH SCHEMA`, so on a fresh DB it lands in `public` → `public.gen_random_bytes`.
+- On Supabase (including `supabase start` local, which the `test:rls` suite targets)
+  pgcrypto is pre-installed in the `extensions` schema and the `if not exists`
+  no-ops, so there it is `extensions.gen_random_bytes`.
+
+Confirm which schema pgcrypto actually resides in for the target Supabase env and
+qualify accordingly (most likely `extensions.gen_random_bytes`). Then run the
+`test:rls` integration suite against a live DB to prove the function executes end
+to end — this bug is only catchable there, not in the mocked unit tests.
+
+## Secondary issues (should fix, non-blocking)
+
+1. **New tests are untracked, not committed.** `tests/unit/app/api/church-group-route.test.ts`
+   and `tests/unit/schemas/church-group.test.ts` show as untracked in `git status`
+   and are absent from `git diff main...HEAD`. As it stands the PR ships the feature
+   with zero committed tests. Ensure they are committed with the change.
+
+2. **No integration coverage was actually run.** The tester explicitly did not run
+   `test:rls` (no DB available). Given the SQL bug above, this is precisely the gap
+   that let a broken migration pass. The migration must be exercised against a live
+   DB before ship.
+
+## What is correct (verified)
+
+- Route `PUT /api/church-group`: Clerk `auth()` (not `requireAuth`), defensive body
+  parse, `safeParse` → 400, JWT check → 401, name/email derivation, RPC param
+  mapping, `GR001` → 409, other errors → 500, `ok(data, 201)`. Matches spec and
+  `admin-only` error-handling pattern.
+- `createChurchGroupSchema`: field bounds match DB column widths (name/denomination
+  varchar(100), timezone varchar(50)); IANA `.refine`; `America/Chicago` default.
+  `.default()` before `.refine()` ordering is correct.
+- `lib/supabase/types.ts`: `ChurchGroupsRow`/`InstrumentsRow`, Tables + Functions
+  entries; typecheck green.
+- Migration otherwise correct: all tables schema-qualified `public.*`, columns match
+  the cluster 1/2 table definitions, `auth.jwt() ->> 'sub'` with `GR000`, GR001
+  member guard before writes, 8-char code from the exact unambiguous alphabet,
+  `unique_violation` retry loop, 9 correct instrument names, `is_default=true`,
+  `created_by` = new user id, grant to `authenticated`, commented DOWN.
+- `lint`, `typecheck`, `check:service-role` all pass; no service-role key referenced.
+
+Fix the `gen_random_bytes` qualification, commit the tests, and prove it with the
+live-DB RLS suite. Then this is a SHIP.
