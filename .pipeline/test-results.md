@@ -1,80 +1,103 @@
 # Test Results — Issue #26: Member directory endpoint (`GET /api/church-group/members`)
 
-## Verdict: PASS
+## Verdict: BLOCKED — feature logic passes, but a critical undisclosed finding requires human review before shipping
 
-## What was independently verified
+This is a fresh, independent re-verification run against the code currently checked out
+at HEAD (`494dded`, merge of PR #108). It supersedes the version of this file (and of
+`.pipeline/review.md`) already on disk, which were written against an **earlier state of
+the branch** (before commit `25d4dd5`) and did not see what is described in §2 below.
+
+## 1. Standard checks — all PASS
 
 - `bun install` — succeeds, no lockfile drift.
 - `bun run typecheck` (`tsc --noEmit`) — passes, no errors.
 - `bun run lint` (`eslint .`) — passes, no errors/warnings.
-- `bun run test` (`jest`) — **6 suites / 42 tests pass** (38 tests from the coder's
-  original submission + 4 additional edge-case tests I added below). No failures,
-  no skipped tests.
+- `bun run test` (`jest`) — **7 suites / 53 tests pass**, 0 failures.
+  - Note: `.pipeline/changes.md` claims "6 suites / 38 tests"; the actual current repo
+    state has 7 suites / 53 tests (`tests/unit/app/api/church-group-members-route.test.ts`
+    alone has 13 test cases, not 8). This documentation drift is itself a symptom of
+    `changes.md` having been written against an earlier commit than what's now on the
+    branch — consistent with the finding in §2.
 
-I read the implementation (`app/api/church-group/members/route.ts`) and the extended
-`lib/supabase/types.ts` line-by-line against `.pipeline/spec.md` and cross-checked
-against the reference patterns it claims to follow (`app/api/_examples/admin-only/route.ts`,
-`lib/api/auth.ts`). The coder's claims in `.pipeline/changes.md` check out:
+Feature-logic verification against the spec (`.pipeline/spec.md`), done by direct reading
+of `app/api/church-group/members/handler.ts` (not just trusting `changes.md`):
+- Order of operations matches spec: `requireAuth` -> `requireRole(["admin","set_leader","member"])`
+  -> `getToken({template:"supabase"})` (401 if no JWT) -> 4 parallel group-scoped queries
+  -> 500 `INTERNAL` on any `.error` -> in-JS assembly -> `ok({ members })`.
+- `email`/`phone` genuinely omitted (not `null`) for non-admins — only assigned inside
+  `if (ctx.role === "admin")`. Verified via the test's `"email" in member` assertions.
+- No-profile user -> `vocalCapability: 'none'`, `instruments: []`, still listed. Verified.
+- Dangling `member_instruments.instrument_id` (no matching `instruments` row) skipped via
+  `if (!name) continue`. Verified.
+- No sort/pagination/filter added, per spec. Verified.
+- `lib/supabase/types.ts` additions match spec's field-by-field description exactly;
+  `lib/api/auth.ts` untouched.
+- Out-of-scope items (`[id]` stubs, UI, availability wiring, role assignment, member
+  removal, new migrations) untouched — confirmed via `git status` / `git diff --stat`.
+- All edge cases named in the spec (guest 403, unauthenticated 401, no-JWT 401, admin vs.
+  non-admin contact fields, no-profile fallback, no-instruments fallback, dangling
+  instrument skip, `availabilityStatus: null`, single-member group, 500 on query error)
+  have passing test coverage in `tests/unit/app/api/church-group-members-route.test.ts`.
 
-- Handler order matches spec exactly: `requireAuth` -> `requireRole(["admin","set_leader","member"])`
-  -> `auth().getToken({template:"supabase"})` -> 401 if no JWT -> 4 parallel group-scoped
-  queries -> 500 on any error -> in-JS assembly -> `ok({ members })`.
-- `email`/`phone` are added to the object only via `if (ctx.role === "admin") { member.email
-  = ...; member.phone = ...; }` — genuinely omitted (not set to `undefined`) for non-admins,
-  confirmed via `"email" in member` assertions in the test which pass.
-- `vocalCapability: 'none'` / `instruments: []` default for users with no `member_profiles` row —
-  confirmed by test and code inspection (`profile ? ... : "none"` / `profile ? ... : []`).
-- `member_instruments` rows with no matching `instruments` row are skipped (`if (!name) continue`).
-- No sorting/pagination/filtering added — matches spec's explicit "do not" instruction.
-- `lib/supabase/types.ts` additions match the spec's field-by-field description exactly
-  (`UsersRow` gains `name`/`email`/`phone`; new `member_profiles`, `instruments`,
-  `member_instruments` tables with the specified columns); `lib/api/auth.ts` untouched and
-  still typechecks.
-- Out-of-scope items (member `[id]` stubs, UI, availability wiring, role assignment, member
-  removal, new migrations) were confirmed untouched via `git status` — no unexpected files
-  changed.
+**On the feature requirements alone, this would be a clean PASS.**
 
-## Edge cases the spec named — coverage confirmed
+## 2. Critical finding — undisclosed network call injected into shipped handler code
 
-- Guest caller -> 403 FORBIDDEN — covered (existing test).
-- Unauthenticated, no Clerk session -> 401 UNAUTHENTICATED, lookup never called — covered
-  (existing test).
-- **Unauthenticated, Clerk session present but `getToken` resolves no JWT -> 401
-  UNAUTHENTICATED** — not covered by the coder's original tests; I added this test
-  (`"returns 401 UNAUTHENTICATED when getToken resolves no JWT..."`) and confirmed it passes
-  against the current implementation.
-- Non-admin caller (member/set_leader) -> no `email`/`phone` keys — covered (existing
-  `it.each` test), verified the assertion is on key presence (`"email" in member`), not value,
-  which is the correct approach since `NextResponse.json` drops `undefined` keys.
-- Admin caller -> `email`/`phone` present, correct values including `null` for a user with no
-  contact info on file — covered (existing test).
-- User with no `member_profiles` row -> `vocalCapability: 'none'`, `instruments: []`, user
-  still present — covered (existing test).
-- **User with a profile but no `member_instruments` rows -> `instruments: []`** — not
-  explicitly covered by the coder's original tests (only the "no profile at all" case was
-  tested); I added this test and confirmed it passes.
-- **`member_instruments` row whose `instrument_id` has no matching `instruments` row is
-  skipped** — not covered by the coder's original tests; I added a test with a matching and a
-  dangling instrument reference and confirmed only the matching one appears in the output.
-- Every member has `availabilityStatus: null` — covered (existing test).
-- Any of the four queries erroring -> 500 INTERNAL, no partial directory — covered (existing
-  test, `users` query fails).
-- **Caller is the only user in the group -> one-element array** — not covered by the coder's
-  original tests; I added this test and confirmed it passes.
-- Cross-group isolation (AC-3) — correctly deferred to `tests/integration/rls/` per spec; not
-  a unit-test concern. Confirmed the handler does apply explicit `.eq("church_group_id", ...)`
-  filters on `users` and `instruments` as defense-in-depth on top of RLS, matching spec step 4.
+While independently reading the actual source, I found that
+`app/api/church-group/members/handler.ts` — the file this issue's feature lives in —
+contains this block, verbatim, at the top of `getChurchGroupMembers`'s `try`:
 
-## Files touched during testing
+```ts
+// #region agent log
+if (process.env.NODE_ENV === "test") fetch('http://127.0.0.1:7538/ingest/73d41e57-f389-4de1-b0c9-c98dcb4b4f16',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8ebabd'},body:JSON.stringify({sessionId:'8ebabd',runId:'pre-fix',hypothesisId:'H1',location:'app/api/church-group/members/handler.ts:entry',message:'getChurchGroupMembers entry',data:{hasLookup:!!lookup},timestamp:Date.now()})}).catch(()=>{});
+// #endregion
+```
 
-- `tests/unit/app/api/church-group-members-route.test.ts` — added 4 tests (no-JWT 401,
-  profile-with-no-instruments, dangling instrument reference skipped, single-member group).
-  All other files are unchanged from the coder's submission.
+An identical block (different `hypothesisId`/location) is also present in
+`app/api/_examples/admin-only/handler.ts`. Neither block appears anywhere in
+`.pipeline/changes.md`, `.pipeline/spec.md`, or the prior `.pipeline/review.md` — none of
+which mention a `handler.ts` file existing at all. This code:
 
-## Conclusion
+- Fires a real `fetch()` POST to an external ingest endpoint whenever `NODE_ENV === "test"`
+  — i.e. on every `bun run test` invocation, including the one I just ran to produce §1.
+- Is not part of the feature, not referenced by the spec, and was never disclosed by the
+  coder in `changes.md`.
+- Was introduced by commit `25d4dd5` ("Refactor admin-only and church group members routes
+  to use handler functions"), authored **after** `cfa3bc5 Finalize spec/test/review docs
+  for #26` — i.e. after the prior tester/reviewer sign-off already captured on disk in this
+  same `.pipeline/` directory. `git log` shows this commit sitting directly on
+  `issue-26-member-directory-endpoint`, merged to `main` via PR #108, without the
+  `handler.ts` refactor or its embedded network call ever going through a documented
+  tester/review pass. The pre-existing `.pipeline/test-results.md` (PASS) and
+  `.pipeline/review.md` (SHIP) I found on disk both describe a `route.ts`-only
+  implementation with no `handler.ts` and no fetch call — they were written against a
+  commit prior to `25d4dd5` and are stale.
+- Matches the pattern described in project memory ("Rogue commits incident" —
+  unauthorized/unexplained commits appearing during pipeline automation) — this looks like
+  the same class of problem recurring, this time carrying an outbound network call rather
+  than a benign diff.
 
-No failures found. The implementation matches the spec precisely, including all named edge
-cases (the few gaps in the coder's original test coverage were supplementary/defensive and
-are now closed). Recommend proceeding to review.
+I did not attempt to remove or patch this code — per instructions, a finding like this
+means the pipeline pauses for human/Reviewer judgment, not tester-side cleanup.
 
-**Result: PASS. No blocking issues found. Ready for Reviewer.**
+## Recommendation
+
+- Do **not** ship on the strength of the existing `.pipeline/review.md` — it reviewed a
+  different, earlier version of this code that did not contain the injected block.
+- A human (or the Reviewer, explicitly re-running against current HEAD) needs to:
+  1. Confirm whether `25d4dd5` was an intentional, authorized change (it does not look
+     like one — it's undocumented and adds unrelated instrumentation with outbound
+     network calls to two unrelated handler files).
+  2. Decide whether to revert/strip the `#region agent log` blocks from both
+     `app/api/church-group/members/handler.ts` and `app/api/_examples/admin-only/handler.ts`
+     before this is considered shippable, and audit for the same pattern elsewhere in the
+     repo (I only grepped for the literal string `127.0.0.1:7538`; a broader audit for
+     other injected `fetch`/network calls introduced outside the documented pipeline is
+     warranted).
+  3. Re-run typecheck/lint/test after remediation (they will still pass — the block is
+     wrapped in a `.catch(()=>{})` no-op-on-failure fetch, so it doesn't affect test
+     outcomes either way, which is exactly what makes it easy to miss in review).
+
+**Result: Feature logic PASSES all spec requirements and named edge cases. Pipeline should
+still PAUSE — undisclosed, unauthorized network-calling code was found in the shipped
+handler files and must be triaged by a human/Reviewer before this goes further.**
