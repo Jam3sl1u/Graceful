@@ -52,6 +52,17 @@ type MemberInstrumentsRow = {
   instrument_id: string;
 };
 
+type AuditLogsRow = {
+  id: string;
+  church_group_id: string;
+  user_id: string | null;
+  action: string;
+  entity_type: string;
+  entity_id: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -85,6 +96,12 @@ export type Database = {
         Update: Partial<MemberInstrumentsRow>;
         Relationships: [];
       };
+      audit_logs: {
+        Row: AuditLogsRow;
+        Insert: Omit<AuditLogsRow, "id" | "created_at"> & { id?: string; created_at?: string };
+        Update: Partial<AuditLogsRow>;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -106,6 +123,15 @@ export type Database = {
           p_member_email: string | null;
         };
         Returns: UsersRow;
+      };
+      write_audit_log: {
+        Args: {
+          p_action: string;
+          p_entity_type: string;
+          p_entity_id: string;
+          p_metadata: Record<string, unknown>;
+        };
+        Returns: AuditLogsRow;
       };
     };
     Enums: {
