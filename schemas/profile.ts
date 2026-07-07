@@ -1,5 +1,17 @@
 import { z } from "zod";
 
-// TODO(Sprint 1 #21): fill in real field-level validation per PRD §13.4.
-export const profileSchema = z.object({});
-export type ProfileInput = z.infer<typeof profileSchema>;
+export const VOCAL_CAPABILITY_VALUES = ["lead", "harmony", "both", "none"] as const;
+
+// PUT /api/profile body. Full replace of the two editable profile fields.
+// bio: optional/nullable free text; empty/whitespace-only is normalized to null.
+export const updateProfileSchema = z.object({
+  vocalCapability: z.enum(VOCAL_CAPABILITY_VALUES),
+  bio: z
+    .string()
+    .trim()
+    .max(2000)
+    .nullish()
+    .transform((v) => (v && v.length > 0 ? v : null)),
+});
+
+export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
