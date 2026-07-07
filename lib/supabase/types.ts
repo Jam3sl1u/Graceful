@@ -6,13 +6,16 @@
 // Shape must satisfy supabase-js v2 GenericSchema / GenericTable interfaces
 // so that from().select().eq().maybeSingle() returns typed data.
 
-import type { UserRole } from "@/types/domain";
+import type { UserRole, VocalCapability } from "@/types/domain";
 
 type UsersRow = {
   id: string;
   clerk_id: string;
   church_group_id: string;
   role: UserRole;
+  name: string;
+  email: string | null;
+  phone: string | null;
 };
 
 type ChurchGroupsRow = {
@@ -24,6 +27,29 @@ type ChurchGroupsRow = {
   invite_code: string;
   created_at: string;
   updated_at: string;
+};
+
+type MemberProfilesRow = {
+  id: string;
+  user_id: string;
+  vocal_capability: VocalCapability;
+  bio: string | null;
+  created_at: string;
+};
+
+type InstrumentsRow = {
+  id: string;
+  church_group_id: string;
+  name: string;
+  is_default: boolean;
+  created_by: string | null;
+  created_at: string;
+};
+
+type MemberInstrumentsRow = {
+  id: string;
+  member_profile_id: string;
+  instrument_id: string;
 };
 
 export type Database = {
@@ -39,6 +65,24 @@ export type Database = {
         Row: ChurchGroupsRow;
         Insert: Omit<ChurchGroupsRow, "id"> & { id?: string };
         Update: Partial<ChurchGroupsRow>;
+        Relationships: [];
+      };
+      member_profiles: {
+        Row: MemberProfilesRow;
+        Insert: Omit<MemberProfilesRow, "id"> & { id?: string };
+        Update: Partial<MemberProfilesRow>;
+        Relationships: [];
+      };
+      instruments: {
+        Row: InstrumentsRow;
+        Insert: Omit<InstrumentsRow, "id"> & { id?: string };
+        Update: Partial<InstrumentsRow>;
+        Relationships: [];
+      };
+      member_instruments: {
+        Row: MemberInstrumentsRow;
+        Insert: Omit<MemberInstrumentsRow, "id"> & { id?: string };
+        Update: Partial<MemberInstrumentsRow>;
         Relationships: [];
       };
     };
