@@ -1,72 +1,46 @@
-# Review — Issue #24: Church group creation (`PUT /api/church-group`)
+# Review — Issue #26: Member directory endpoint (`GET /api/church-group/members`)
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-## What I verified independently (not just trusting the summaries)
-- Ran `git diff main...HEAD` and read every changed file.
-- `bun run typecheck` — clean.
-- `bun run lint` — clean.
-- `bun run test` — 5 suites / 29 tests, all pass.
-- Cross-checked the RPC's INSERT statements against the real table DDL in
-  `supabase/migrations/20260702000001_cluster_1_organization.sql` and
-  `20260702000002_cluster_2_instruments.sql`:
-  - `church_groups(name, denomination, timezone, logo_url, invite_code)` column
-    list and the `VALUES (p_name, p_denomination, p_timezone, p_logo_url, ...)`
-    mapping line up correctly (no transposed columns — denomination/timezone are
-    in the right slots).
-  - `users(clerk_id, church_group_id, role, name, email)` matches.
-  - `instruments(church_group_id, name, is_default, created_by)` matches;
-    `created_by` is nullable in DDL, so `NULL` seed is valid.
-  - Column length limits in the zod schema (name<=100, timezone<=50,
-    denomination<=100) match the varchar sizes. `logo_url` is `text`, so the 2048
-    cap is a self-imposed guard — fine.
-- Confirmed `ok`/`fail` signatures and `ErrorCode.{CONFLICT,VALIDATION_FAILED,
-  UNAUTHENTICATED,INTERNAL}` all exist and are used correctly; `fail` emits
-  `{ error, code }`, which the tests assert against.
-- Migration timestamp `20260706000001` sorts after the latest existing
-  `20260704000002`. GRANT EXECUTE is present for `create_church_group` and
-  correctly absent for `generate_invite_code`. Commented DOWN present.
+## What I verified independently
+- Ran `git diff main...HEAD` — only 4 files touched: the route, `lib/supabase/types.ts`,
+  the new unit test, and `.pipeline/changes.md`. No out-of-scope files (member `[id]`
+  stubs, migrations, UI) changed.
+- `bun run typecheck` — clean. `bun run lint` — clean. `bun run test` — 6 suites /
+  42 tests pass.
+- Cross-checked the hand-written Supabase types against the actual migrations:
+  - `member_profiles` (cluster_1): `id, user_id (unique), vocal_capability, bio, created_at`
+    — matches `MemberProfilesRow` exactly.
+  - `instruments` / `member_instruments` (cluster_2): `member_instruments` has a real
+    `id uuid primary key`, plus `member_profile_id`, `instrument_id` — matches
+    `MemberInstrumentsRow`. `is_default`, `created_by` on `instruments` confirmed.
+  - `vocal_capability` enum = `'none'|'lead'|'harmony'|'both'` — matches `VocalCapability`.
 
-## Correctness spot-checks
-- Spec divergences are intentional and documented in the code (PUT-creates vs
-  PRD §22.1 update; exactly 8 default instruments, no "Other" row). The 8 names
-  and their order match the spec exactly.
-- `USER_ALREADY_IN_GROUP` guard correctly prevents a user from creating a second
-  group. `UNAUTHENTICATED` raised when `auth.jwt() ->> 'sub'` is null.
-- SECURITY DEFINER + `SET search_path = ''` + schema-qualified refs throughout;
-  runs as table owner so RLS INSERT gaps are bypassed as designed — no
-  service-role key used (check:service-role passes).
-- Route returns the RPC row directly via `ok(data, 201)`; since the function
-  returns a single composite row (not SETOF), `data` is an object, matching the
-  happy-path test assertion.
+## Correctness
+- Handler order matches spec: `requireAuth` -> `requireRole(["admin","set_leader","member"])`
+  -> `getToken` (401 if no JWT) -> 4 parallel group-scoped queries -> 500 on any `.error`
+  -> in-JS assembly -> `ok({ members })`. Guest is rejected (403) before any DB access.
+- Contact-detail gating is server-side and correct: `email`/`phone` are only assigned when
+  `ctx.role === "admin"`, so the keys are genuinely absent (not `null`) for non-admins. The
+  test asserts this via `"email" in member`, which is the right check since `NextResponse.json`
+  strips `undefined` — this is the security-critical AC-2 behavior and it holds.
+- Defense-in-depth `.eq("church_group_id", ctx.churchGroupId)` applied on `users` and
+  `instruments` (the tables that carry the column), on top of RLS (AC-3).
+- Edge cases handled correctly: no-profile user -> `'none'` / `[]` and still listed;
+  profile-with-no-instruments -> `[]`; dangling `instrument_id` skipped via `if (!name) continue`;
+  `availabilityStatus: null` placeholder with #34 comment.
 
-## Tests are meaningful, not superficial
-The unit suite asserts the exact `rpc` argument object (param name mapping,
-null coercion for optional fields), exact status codes, and error-code strings
-for each branch (201/400x2/401x2/409/500) plus the "Admin" name fallback. These
-would catch a real regression in param mapping or error routing.
+## Tests
+- Meaningful, not superficial. Coverage includes both branches of the admin gate, the
+  guest 403, no-JWT 401, no-Clerk 401 (lookup asserted not called), instrument mapping,
+  the dangling-instrument skip, the no-profile fallback, single-member group, and the 500
+  path. Assertions check body shape and key presence, not just status codes.
 
-## Non-blocking notes (do not block ship; track for the DB integration pass)
-1. **Invite-code collision under concurrency**: the retry loop only re-checks
-   `EXISTS` before insert; it does not catch a `unique_violation` from the
-   `church_groups.invite_code` unique constraint if two transactions generate
-   the same code between check and insert. Probability is ~1/31^8, but a clean
-   `BEGIN/EXCEPTION WHEN unique_violation THEN retry` would be more robust. Spec
-   explicitly describes the current loop approach, so this is acceptable.
-2. **`random()` is not cryptographically secure**. Invite codes gate the future
-   join-via-code flow (#25). 31^8 keyspace makes brute force impractical, and
-   the spec prescribes this exact approach, but `gen_random_bytes`-based
-   generation would be stronger. Flagging for a future hardening pass, not this
-   issue.
-3. **Error classification is substring-based** on `error.message`
-   (`includes("USER_ALREADY_IN_GROUP")` / `includes("UNAUTHENTICATED")`), only
-   verified against mocked error shapes. The live PostgREST error payload for a
-   `RAISE EXCEPTION ... USING ERRCODE = 'P0001'` should be confirmed in the
-   `tests/integration/rls/` pass. If it holds the message elsewhere than
-   `.message`, the 409/401 mapping would silently fall through to 500.
-4. **DB-level behavior unexecuted**: exact 8-instrument seeding, admin role,
-   atomic rollback on partial failure are not run against a live Postgres in
-   this environment. Correctly deferred to `tests/integration/rls/` per spec.
+## Minor notes (non-blocking)
+- The handler calls `auth()` a second time for `getToken` (once inside `requireAuth`, once
+  in the handler). This is redundant but is exactly the pattern the spec prescribed and
+  mirrors `lookupUserByClerkId`; no correctness impact.
+- Non-admin callers cannot see their own contact info either. This matches the spec ("ONLY
+  when caller is admin") — flagging only so it's a conscious product choice, not a bug.
 
-None of the above changes correctness for the merged unit-testable behavior.
-The implementation faithfully matches the spec; tests are substantive.
+Nothing to fix. Ship it.

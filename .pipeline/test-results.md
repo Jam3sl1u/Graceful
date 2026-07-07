@@ -1,137 +1,80 @@
-# Test Results — Issue #24: Church group creation (`PUT /api/church-group`)
+# Test Results — Issue #26: Member directory endpoint (`GET /api/church-group/members`)
 
-## Summary: PASS
+## Verdict: PASS
 
-All independently re-run checks pass. The coder's claims in `.pipeline/changes.md`
-were verified against the actual code, not just trusted, and the unit test suite
-was expanded with 4 additional cases the coder's original suite did not cover.
+## What was independently verified
 
-## Commands re-run (from a clean `bun install`, not trusting the coder's report)
+- `bun install` — succeeds, no lockfile drift.
+- `bun run typecheck` (`tsc --noEmit`) — passes, no errors.
+- `bun run lint` (`eslint .`) — passes, no errors/warnings.
+- `bun run test` (`jest`) — **6 suites / 42 tests pass** (38 tests from the coder's
+  original submission + 4 additional edge-case tests I added below). No failures,
+  no skipped tests.
 
-- `bun install` — no changes needed, lockfile in sync.
-- `bun run typecheck` (`tsc --noEmit`) — **PASS**, no errors.
-- `bun run lint` (`eslint .`) — **PASS**, no errors.
-- `bun run test` (`jest`) — **PASS**, 5 suites / 29 tests (was 25; +4 added by tester).
-- `bun run check:service-role` — **PASS**: "OK: no service-role key references
-  found outside comments in app/ or lib/."
-- `bunx prettier --check` on all touched TS files (route, schema, types,
-  test) — **PASS**. Note: the migration `.sql` file cannot be checked by
-  Prettier — running it directly against the file errors with "No parser
-  could be inferred for file ... .sql", and running Prettier against the
-  whole repo silently skips `.sql` files entirely. This is a pre-existing
-  project limitation (no SQL Prettier plugin configured), not a gap
-  introduced by this change; the coder's claim of "prettier passes on all
-  touched files" should be read as "all touched files Prettier supports."
+I read the implementation (`app/api/church-group/members/route.ts`) and the extended
+`lib/supabase/types.ts` line-by-line against `.pipeline/spec.md` and cross-checked
+against the reference patterns it claims to follow (`app/api/_examples/admin-only/route.ts`,
+`lib/api/auth.ts`). The coder's claims in `.pipeline/changes.md` check out:
 
-## Code review against spec.md (manual verification, not just re-stating changes.md)
+- Handler order matches spec exactly: `requireAuth` -> `requireRole(["admin","set_leader","member"])`
+  -> `auth().getToken({template:"supabase"})` -> 401 if no JWT -> 4 parallel group-scoped
+  queries -> 500 on any error -> in-JS assembly -> `ok({ members })`.
+- `email`/`phone` are added to the object only via `if (ctx.role === "admin") { member.email
+  = ...; member.phone = ...; }` — genuinely omitted (not set to `undefined`) for non-admins,
+  confirmed via `"email" in member` assertions in the test which pass.
+- `vocalCapability: 'none'` / `instruments: []` default for users with no `member_profiles` row —
+  confirmed by test and code inspection (`profile ? ... : "none"` / `profile ? ... : []`).
+- `member_instruments` rows with no matching `instruments` row are skipped (`if (!name) continue`).
+- No sorting/pagination/filtering added — matches spec's explicit "do not" instruction.
+- `lib/supabase/types.ts` additions match the spec's field-by-field description exactly
+  (`UsersRow` gains `name`/`email`/`phone`; new `member_profiles`, `instruments`,
+  `member_instruments` tables with the specified columns); `lib/api/auth.ts` untouched and
+  still typechecks.
+- Out-of-scope items (member `[id]` stubs, UI, availability wiring, role assignment, member
+  removal, new migrations) were confirmed untouched via `git status` — no unexpected files
+  changed.
 
-Verified line-by-line against the spec:
+## Edge cases the spec named — coverage confirmed
 
-- `supabase/migrations/20260706000001_church_group_create_rpc.sql`:
-  - `generate_invite_code()` — correct alphabet (`ABCDEFGHJKMNPQRSTUVWXYZ23456789`,
-    excludes 0/O/1/I/L), 8-char length, retry-until-unique loop against
-    `church_groups.invite_code`, `SECURITY DEFINER`/`SET search_path = ''`,
-    not granted to `authenticated`. Matches spec exactly.
-  - `create_church_group(...)` — checks `auth.jwt() ->> 'sub'` null →
-    `RAISE EXCEPTION 'UNAUTHENTICATED' USING ERRCODE = 'P0001'`; existing
-    `users` row check → `USER_ALREADY_IN_GROUP`; inserts `church_groups` then
-    `users` (role `admin`) then exactly the 8 named instruments in the
-    spec's exact order via a hardcoded array, `is_default = true`,
-    `created_by = NULL`; no "Other" row (9th row) inserted. `GRANT EXECUTE
-    ... TO authenticated` present. Commented DOWN section present.
-  - Cross-checked column names/types against the actual table definitions in
-    `supabase/migrations/20260702000001_cluster_1_organization.sql` and
-    `20260702000002_cluster_2_instruments.sql` — `church_groups`
-    (name/denomination/timezone/logo_url/invite_code), `users`
-    (clerk_id/church_group_id/role/name/email), `instruments`
-    (church_group_id/name/is_default/created_by) all match the INSERT
-    statements in the RPC. No column-name mismatches found.
-  - Style matches the existing `SECURITY DEFINER` / `SET search_path = ''`
-    convention in `20260704000001_rls_policies.sql`.
-  - Not executed against a live Postgres/Supabase instance — no local
-    Supabase CLI/DB available in this environment, consistent with the
-    coder's own flag in changes.md. This is a real coverage gap for DB-level
-    behavior (exact instrument count/order under a real engine, invite-code
-    uniqueness under concurrency, atomic rollback on partial failure) — but
-    it is appropriately deferred to `tests/integration/rls/` per spec, and
-    explicitly out of scope for this pass.
+- Guest caller -> 403 FORBIDDEN — covered (existing test).
+- Unauthenticated, no Clerk session -> 401 UNAUTHENTICATED, lookup never called — covered
+  (existing test).
+- **Unauthenticated, Clerk session present but `getToken` resolves no JWT -> 401
+  UNAUTHENTICATED** — not covered by the coder's original tests; I added this test
+  (`"returns 401 UNAUTHENTICATED when getToken resolves no JWT..."`) and confirmed it passes
+  against the current implementation.
+- Non-admin caller (member/set_leader) -> no `email`/`phone` keys — covered (existing
+  `it.each` test), verified the assertion is on key presence (`"email" in member`), not value,
+  which is the correct approach since `NextResponse.json` drops `undefined` keys.
+- Admin caller -> `email`/`phone` present, correct values including `null` for a user with no
+  contact info on file — covered (existing test).
+- User with no `member_profiles` row -> `vocalCapability: 'none'`, `instruments: []`, user
+  still present — covered (existing test).
+- **User with a profile but no `member_instruments` rows -> `instruments: []`** — not
+  explicitly covered by the coder's original tests (only the "no profile at all" case was
+  tested); I added this test and confirmed it passes.
+- **`member_instruments` row whose `instrument_id` has no matching `instruments` row is
+  skipped** — not covered by the coder's original tests; I added a test with a matching and a
+  dangling instrument reference and confirmed only the matching one appears in the output.
+- Every member has `availabilityStatus: null` — covered (existing test).
+- Any of the four queries erroring -> 500 INTERNAL, no partial directory — covered (existing
+  test, `users` query fails).
+- **Caller is the only user in the group -> one-element array** — not covered by the coder's
+  original tests; I added this test and confirmed it passes.
+- Cross-group isolation (AC-3) — correctly deferred to `tests/integration/rls/` per spec; not
+  a unit-test concern. Confirmed the handler does apply explicit `.eq("church_group_id", ...)`
+  filters on `users` and `instruments` as defense-in-depth on top of RLS, matching spec step 4.
 
-- `schemas/church-group.ts` — matches spec's example exactly:
-  `name` required (1-100, trimmed), `timezone` optional with
-  `.default("America/Chicago")` and an `isValidIanaTimezone` refine (no
-  hardcoded list, uses `Intl.DateTimeFormat` try/catch), `denomination`/
-  `logoUrl` optional with correct max lengths. Old unused
-  `churchGroupSchema`/`ChurchGroupInput` removed as instructed.
+## Files touched during testing
 
-- `app/api/church-group/route.ts` — matches spec step-by-step: `auth()` →
-  401 if no `clerkId`; `getToken({ template: "supabase" })` → 401 if null;
-  `req.json().catch(() => null)` + `safeParse` → 400 `VALIDATION_FAILED`;
-  `currentUser()` → `deriveCreatorName` fallback chain
-  (fullName → "first last" → username → email local-part → "Admin", truncated
-  to 100 chars) exactly as specified; `creatorEmail` from
-  `primaryEmailAddress` or `null`; `supabase.rpc("create_church_group", {...})`
-  with the exact param names/mapping from the spec; error-message
-  substring-matching for `USER_ALREADY_IN_GROUP` (409) and `UNAUTHENTICATED`
-  (401), else 500; success → `ok(data, 201)`. Whole handler wrapped in
-  try/catch → 500 fallback. Does not call `requireAuth`, consistent with the
-  Background rationale. `GET` unchanged (`notImplemented`).
+- `tests/unit/app/api/church-group-members-route.test.ts` — added 4 tests (no-JWT 401,
+  profile-with-no-instruments, dangling instrument reference skipped, single-member group).
+  All other files are unchanged from the coder's submission.
 
-- `lib/supabase/types.ts` — `ChurchGroupsRow` and `church_groups` table entry
-  added mirroring the `users` entry style; `Functions.create_church_group`
-  typed with the exact `Args`/`Returns` shape from the spec. `bun run
-  typecheck` confirms `supabase.rpc("create_church_group", ...)` in the route
-  compiles without `any`/casts.
+## Conclusion
 
-## Unit tests — independently expanded, not just re-run
-
-The coder's original 8 tests in
-`tests/unit/app/api/church-group-route.test.ts` (201 happy path, 400 missing
-name, 400 invalid timezone, 401 no Clerk userId, 401 no JWT, 409
-USER_ALREADY_IN_GROUP, 500 generic RPC error, "Admin" name fallback) were
-reviewed and all still pass.
-
-I added 4 more cases the spec calls out as edge cases but the coder's suite
-did not exercise, per this stage's mandate to independently verify rather
-than trust the coder's test list:
-
-1. **Missing `timezone` defaults to `America/Chicago`** and is forwarded to
-   the RPC as `p_timezone` (spec: "Missing `timezone` → allowed, defaults to
-   America/Chicago" — previously asserted only indirectly, never with
-   `timezone` actually omitted from the request body).
-2. **Provided `denomination`/`logoUrl` are passed through unchanged** to
-   `p_denomination`/`p_logo_url` (previously only the `null`/omitted case was
-   asserted; the non-omitted pass-through path was untested).
-3. **Non-JSON / empty body** (`req.json()` rejects with a `SyntaxError`,
-   simulating an unparseable/empty body) → 400 `VALIDATION_FAILED`, `rpc`
-   never called (spec edge case: "Body is not JSON / empty body → 400").
-   The coder's tests only exercised `safeParse` failure on a *valid* JSON
-   object missing `name`; the `.catch(() => null)` path itself was untested.
-4. **Unexpected thrown error** (`currentUser()` rejects) → outer try/catch
-   → 500 `INTERNAL`, `rpc` never called. This is the "at least one failure
-   case" required for this stage and exercises a code path (the outer
-   try/catch) that no existing test touched — all prior 500 tests only
-   covered the RPC returning a Supabase `error` object, not a thrown
-   exception.
-
-All 4 new tests pass against the current implementation; no code changes
-were required to make them pass.
-
-Final test count: **29/29 passing** (5 suites), `jest` exit code 0.
-
-## Verdict
-
-No discrepancies found between `.pipeline/changes.md`'s claims and the
-actual code/behavior. Implementation matches `.pipeline/spec.md` in full,
-including the settled instrument-count decision (exactly 8, no "Other" row)
-and the PUT-creates (not PUT-updates) divergence from PRD §22.1. Recommend
-proceeding to review.
-
-Remaining known gaps (pre-existing/spec-acknowledged, not regressions from
-this change):
-- No live DB execution of the migration (no local Supabase instance
-  available in this environment).
-- DB-level integration coverage (instrument count/order under a real engine,
-  admin role assignment, invite-code collision handling) deferred to
-  `tests/integration/rls/`, per spec.
+No failures found. The implementation matches the spec precisely, including all named edge
+cases (the few gaps in the coder's original test coverage were supplementary/defensive and
+are now closed). Recommend proceeding to review.
 
 **Result: PASS. No blocking issues found. Ready for Reviewer.**

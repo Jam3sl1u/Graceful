@@ -188,4 +188,74 @@ describe("GET /api/church-group/members", () => {
     const body = await res.json();
     expect(body.code).toBe("INTERNAL");
   });
+
+  it("returns 401 UNAUTHENTICATED when getToken resolves no JWT (Clerk session present)", async () => {
+    mockAuth.mockResolvedValue({
+      userId: "clerk_test",
+      getToken: jest.fn().mockResolvedValue(null),
+    });
+
+    const res = await GET(fakeReq, makeLookup("admin"));
+    expect(res.status).toBe(401);
+
+    const body = await res.json();
+    expect(body.code).toBe("UNAUTHENTICATED");
+    expect(mockGetSupabaseClient).not.toHaveBeenCalled();
+  });
+
+  it("skips a member_instruments row whose instrument_id has no matching instruments row", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient({
+        member_instruments: {
+          data: [
+            { member_profile_id: "profile-2", instrument_id: "instr-1" },
+            { member_profile_id: "profile-2", instrument_id: "instr-missing" },
+          ],
+          error: null,
+        },
+      }),
+    );
+
+    const res = await GET(fakeReq, makeLookup("admin"));
+    const body = await res.json();
+    const members: DirectoryMember[] = body.data.members;
+
+    const memberTwo = members.find((m) => m.id === "user-2")!;
+    expect(memberTwo.instruments).toEqual([{ id: "instr-1", name: "Guitar" }]);
+  });
+
+  it("a user with a profile but no member_instruments rows gets instruments: []", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient({ member_instruments: { data: [], error: null } }),
+    );
+
+    const res = await GET(fakeReq, makeLookup("admin"));
+    const body = await res.json();
+    const members: DirectoryMember[] = body.data.members;
+
+    const memberTwo = members.find((m) => m.id === "user-2")!;
+    expect(memberTwo.vocalCapability).toBe("lead");
+    expect(memberTwo.instruments).toEqual([]);
+  });
+
+  it("returns a one-element array when the caller is the only user in the group", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient({
+        users: { data: [usersRows[0]], error: null },
+        member_profiles: { data: [], error: null },
+        member_instruments: { data: [], error: null },
+      }),
+    );
+
+    const res = await GET(fakeReq, makeLookup("admin"));
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    const members: DirectoryMember[] = body.data.members;
+    expect(members).toHaveLength(1);
+    expect(members[0]?.id).toBe("user-1");
+  });
 });
