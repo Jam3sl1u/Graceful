@@ -1,84 +1,90 @@
-# Changes — Issue #30: Member profile CRUD (`GET`/`PUT /api/profile`)
+# Changes — Issue #29: Audit log writer utility + read endpoint (BR-13)
 
-## Files changed
+## Summary
 
-### `schemas/profile.ts` (rewritten)
-- Replaced the `z.object({})` placeholder with `updateProfileSchema`:
-  `vocalCapability` restricted to `["lead", "harmony", "both", "none"]` (exported as
-  `VOCAL_CAPABILITY_VALUES`, matching the Postgres `vocal_capability` enum and
-  `VocalCapability` in `types/domain.ts`), and `bio` — trimmed, capped at 2000 chars,
-  nullish, with empty/whitespace-only normalized to `null` via `.transform`.
-- Exports `UpdateProfileInput` inferred type.
+Implemented exactly the two capabilities in scope: a shared `writeAuditLog()`
+server utility, and `GET /api/church-group/audit-log` (paginated, admin-only,
+read-only). No route was wired to call `writeAuditLog()` — that's explicitly
+deferred to #24/#27/#28 per the spec.
 
-### `app/api/profile/handler.ts` (new)
-- `getProfile(req, lookup?)`: `requireAuth` → Clerk JWT (401 `UNAUTHENTICATED` if
-  missing) → `getSupabaseClient(jwt)` → `member_profiles` lookup by `user_id`
-  (`.select("id, vocal_capability, bio").eq("user_id", ctx.userId).maybeSingle()`).
-  - DB error → 500 `INTERNAL`.
-  - No row → returns synthesized defaults (`vocalCapability: "none"`, `bio: null`,
-    `instruments: []`) without querying instruments.
-  - Row found → loads instruments via the shared `loadInstruments` helper and returns
-    the full `ProfileResponse`.
-- `updateProfile(req, lookup?)`: `requireAuth` → parse body via
-  `req.json().catch(() => null)` + `updateProfileSchema.safeParse` (400
-  `VALIDATION_FAILED` on failure) → Clerk JWT (401 if missing) → upserts
-  `member_profiles` keyed on `user_id` (`onConflict: "user_id"`), setting only
-  `vocal_capability` and `bio` (never `id`/`created_at` — there is no `updated_at`
-  column) → 500 `INTERNAL` on upsert error → loads instruments for the returned row
-  and returns the same `ProfileResponse` shape.
-  - Note: the hand-written `Insert` type in `lib/supabase/types.ts` marks
-    `created_at` as required (it doesn't model the DB's `now()` default). Per spec,
-    `lib/supabase/types.ts` was left untouched, so the upsert payload is built as a
-    plain object and cast (`as unknown as Database[...]["Insert"]`) locally in the
-    handler — no `created_at` value is ever actually set.
-- `loadInstruments(supabase, memberProfileId, churchGroupId)` (private helper): mirrors
-  the instrument name-mapping in `app/api/church-group/members/handler.ts` —
-  queries `member_instruments` by `member_profile_id` and `instruments` by
-  `church_group_id`, builds a `Map<instrument_id, name>`, and skips any
-  `member_instruments` row whose `instrument_id` has no matching instrument. Throws
-  `ApiException(INTERNAL, 500)` on either query error, caught by the outer
-  `try/catch` in both handlers.
-- Both handlers do **not** call `requireRole` — ownership is enforced by RLS
-  (`user_id = auth_user_id()`) and by scoping queries to `ctx.userId`.
+## Files created
 
-### `app/api/profile/route.ts` (rewritten)
-- Reduced to thin delegators: `GET` → `getProfile(req)`, `PUT` → `updateProfile(req)`.
-  The old ad-hoc `GET` (`{ userId }`) and `notImplemented` `PUT` stub are gone.
+- `supabase/migrations/20260707000001_audit_log_write_rpc.sql`
+  New `public.write_audit_log(p_action, p_entity_type, p_entity_id, p_metadata)`
+  `SECURITY DEFINER` RPC, modeled on
+  `20260706000001_church_group_create_rpc.sql`. Derives `user_id` and
+  `church_group_id` from the caller's JWT (`auth.jwt() ->> 'sub'` → `users`
+  lookup) so a route cannot forge a log entry for another user/group. Only
+  ever INSERTs (bypasses RLS for the insert only; `UPDATE`/`DELETE` remain
+  `REVOKE`d at the table level from cluster-6). `GRANT EXECUTE` to
+  `authenticated`. Includes a commented DOWN block.
 
-### `tests/unit/app/api/profile-route.test.ts` (new)
-- Mocks `@clerk/nextjs/server` (`auth`) and `@/lib/supabase/client`
-  (`getSupabaseClient`), following the harness pattern from
-  `church-group-members-route.test.ts`.
-- `makeSupabaseClient(overrides, onUpsert?)` fixture builder: `.select(...).eq(...)`
-  resolves directly (for `member_instruments`/`instruments`) or via `.maybeSingle()`
-  (for `member_profiles`); `.upsert(payload, opts)` records the payload via the
-  `onUpsert` callback and chains `.select(...).maybeSingle()` to the configured
-  `member_profiles` fixture result.
-- Covers all cases listed in the spec: `GET` 401 (no Clerk user / no JWT), 200 with
-  an existing profile (instruments name-mapped), 200 with synthesized defaults when
-  no profile row exists, skipping an unmatched `member_instruments` row, 500 on a
-  `member_profiles` query error; `PUT` 400 on invalid/malformed `vocalCapability`,
-  200 updating an existing profile (asserts the recorded upsert payload), 200
-  upserting a new profile for a member who had none, bio normalization
-  (whitespace → `null`, asserted on both the upsert payload and the response), 500
-  on upsert error, and 401 when the JWT is missing.
+- `lib/audit/write-audit-log.ts`
+  `writeAuditLog(supabase, entry)` — thin wrapper around
+  `supabase.rpc("write_audit_log", ...)`. Requires the RLS-scoped client for
+  the acting user. Defaults `metadata` to `{}`. Throws
+  `ApiException("Internal error", ErrorCode.INTERNAL, 500)` on RPC error;
+  never swallows. `import "server-only"` at top, matching
+  `loadInstruments`/`app/api/profile/handler.ts` conventions.
 
-## Verification
-- `bun run typecheck` — passes.
-- `bun run lint` — passes.
-- `bun run test` — all 8 suites / 66 tests pass (including the 13 new tests for this
-  route).
+- `schemas/audit-log.ts`
+  `auditLogQuerySchema` — Zod schema for `page` (default 1, min 1) and
+  `pageSize` (default 50, min 1, max 100), both `z.coerce.number().int()`
+  since they come from URL search params.
 
-## What the Tester should focus on
-- The `created_at` typing workaround in `updateProfile` (a narrow `as unknown as
-  Database[...]["Insert"]` cast) — confirm no `created_at`/`id` value is ever sent in
-  the upsert payload at runtime (it isn't; only `user_id`, `vocal_capability`, `bio`
-  are set).
-- Confirm `GET` never queries `member_instruments`/`instruments` when there is no
-  `member_profiles` row (per spec, that branch returns early).
-- Instrument selection (`member_instruments` writes) is intentionally out of scope —
-  deferred to #31; `PUT` never touches that table.
-- No new migration was added (schema + RLS already exist); `lib/supabase/types.ts`
-  and `types/domain.ts` were left untouched per spec.
-- Only `app/api/profile/*` and `schemas/profile.ts` were touched — no other routes
-  were modified.
+- `app/api/church-group/audit-log/handler.ts`
+  `getAuditLog(req, lookup?)` — `requireAuth` → `requireRole(["admin"])` →
+  parse `req.nextUrl.searchParams` via `auditLogQuerySchema` (400
+  VALIDATION_FAILED on failure) → get Clerk JWT / build RLS-scoped Supabase
+  client (401 UNAUTHENTICATED if no JWT) → `select` from `audit_logs` with
+  `count: "exact"`, ordered `created_at DESC, id DESC`, `.range(from, to)`
+  for offset pagination → map snake_case rows to `AuditLogItem[]` (camelCase)
+  → `ok({ entries, pagination: { page, pageSize, total } })`. Single
+  `try/catch` mapping `ApiException` → `fail(...)`, else 500 INTERNAL.
+
+## Files modified
+
+- `app/api/church-group/audit-log/route.ts`
+  Replaced the `notImplemented(...)` stub with a thin `GET` delegator to
+  `getAuditLog`, matching `app/api/church-group/members/route.ts`.
+
+- `lib/supabase/types.ts`
+  Added `AuditLogsRow` type, `audit_logs` entry under `Tables` (Row/Insert/
+  Update/Relationships, following the existing hand-written pattern — Insert
+  omits `id`/`created_at` as optional), and `write_audit_log` entry under
+  `Functions` (Args match the RPC signature; Returns `AuditLogsRow`).
+
+## Explicitly untouched (per spec's OUT OF SCOPE)
+
+- `app/api/church-group/members/[id]/role/route.ts` and
+  `app/api/church-group/members/[id]/route.ts` — still stubs, not wired to
+  `writeAuditLog()`.
+- No audit-log UI/screen added.
+- No UPDATE/DELETE route added for audit rows (append-only preserved; the RPC
+  only INSERTs).
+
+## Verification run
+
+- `bun run typecheck` — pass, no errors.
+- `bun run lint` — pass, no errors.
+- `bun run test` — pass, 8 suites / 66 tests (all pre-existing; no new test
+  files were added here — the spec assigns those to the Tester:
+  `tests/unit/app/api/audit-log-route.test.ts` and
+  `tests/unit/lib/audit/write-audit-log.test.ts`).
+- `bun run check:service-role` — pass ("OK: no service-role key references
+  found outside comments in app/ or lib/").
+
+## Notes for the Tester
+
+- The mocked `NextRequest` for the handler test must expose `nextUrl` (the
+  handler reads `req.nextUrl.searchParams`), same caveat the spec calls out.
+- `getAuditLog` takes an optional `UserLookup` injection param exactly like
+  `getChurchGroupMembers`/`getProfile`, so `tests/unit/app/api/profile-route.test.ts`'s
+  `makeLookup(role)` pattern should drop in directly.
+- For `writeAuditLog`, assert the exact RPC name (`"write_audit_log"`) and
+  arg keys (`p_action`, `p_entity_type`, `p_entity_id`, `p_metadata`), and
+  that a missing `metadata` arg becomes `{}` in the call, not `undefined`.
+- RLS/append-only enforcement itself is out of scope for new tests here
+  (already covered by `tests/integration/rls/rls.test.ts` and
+  `.../tables/role-gated.test.ts` per the spec) — the migration file has no
+  accompanying integration test in this change set.

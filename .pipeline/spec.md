@@ -1,254 +1,374 @@
-# Spec — Issue #30: Member profile CRUD (`GET`/`PUT /api/profile`)
+# Spec — Issue #29: Audit log writer utility + read endpoint (BR-13)
 
 ## OPEN QUESTIONS
 
-None blocking. Two deliberate scoping decisions the Coder must honor (not ambiguities):
+None blocking. One design decision was forced by the current RLS model and is
+resolved below (see "Key constraint / chosen approach"). If a human disagrees
+with that resolution, only the RPC migration would change.
 
-1. **Profile row may not exist yet.** The join RPC (`join_church_group`) and create-group RPC
-   both create a `users` row but **no** `member_profiles` row (verified in
-   `supabase/migrations/20260706000002_church_group_join_rpc.sql` and
-   `20260706000001_church_group_create_rpc.sql`). PRD §13.4 onboarding step 4 is what first
-   creates it. Therefore:
-   - `GET` must tolerate a missing row and return synthesized defaults (do **not** auto-create).
-   - `PUT` must **upsert** (insert if absent, update if present), keyed on the unique `user_id`.
-2. **Instruments are read-only here.** PRD §22.2 lists instrument selection under `PUT /api/profile`,
-   but Issue #30 explicitly defers that to #31. So: `GET` **returns** the joined instrument list;
-   `PUT` **ignores / does not touch** `member_instruments`. Do not add instrument write logic.
+---
 
-## Goal (scope of THIS issue)
+## Scope
 
-Implement `GET /api/profile` (caller's own `member_profiles` record + selected instruments) and
-`PUT /api/profile` (update `vocal_capability`, `bio`). Own-profile only — no `:id` param; identity
-comes from the auth context (`ctx.userId`). Validated with Zod; `vocal_capability` restricted to the
-enum. Do not touch any other route.
+Deliver exactly two capabilities, nothing more:
 
-## Current state (already done — do NOT redo)
+1. A shared server-side `writeAuditLog()` utility any authenticated API route can call.
+2. `GET /api/church-group/audit-log` — paginated, admin-only, read-only.
 
-- `app/api/profile/route.ts` exists as a scaffold: an ad-hoc `GET` returning `{ userId }` and a
-  `PUT` that returns `notImplemented(...)`. **Replace both.**
-- `schemas/profile.ts` is an empty-object placeholder (`z.object({})`). **Replace it.**
-- Schema and RLS already exist — **no new migration**:
-  - `member_profiles` (`20260702000001_cluster_1_organization.sql`):
-    `id`, `user_id` (unique FK → users.id), `vocal_capability`
-    (enum `'none'|'lead'|'harmony'|'both'`, NOT NULL default `'none'`), `bio text` (nullable),
-    `created_at`. **There is no `updated_at` column.**
-  - RLS (`20260704000001_rls_policies.sql`): `member_profiles_select_tenant` (group-scoped read),
-    `member_profiles_insert_own` and `member_profiles_update_own` (allow when
-    `user_id = auth_user_id()`). `member_instruments_select_tenant` and `instruments_select_tenant`
-    are group-scoped reads. All are already in place.
-- `lib/supabase/types.ts` already types `member_profiles`, `instruments`, `member_instruments`
-  (Row/Insert/Update). **No changes needed there.**
-- `types/domain.ts` already exports `VocalCapability = "lead" | "harmony" | "both" | "none"`.
+**Explicitly OUT OF SCOPE for this issue** (do NOT touch these files):
 
-## Files to create / modify
+- Wiring `writeAuditLog()` into group creation (#24), role change (#27), member
+  removal (#28), or any other route. Those are separate issues that will import
+  this utility "as they're built." Leave the stubs at
+  `app/api/church-group/members/[id]/role/route.ts` and
+  `app/api/church-group/members/[id]/route.ts` untouched.
+- Any audit-log UI/screen.
+- Any UPDATE/DELETE path for audit rows (must not exist — already enforced at the
+  DB layer by #21; see verification note in edge cases).
 
-### 1. REWRITE `schemas/profile.ts`
+---
 
-Replace the placeholder stub entirely:
+## Key constraint / chosen approach (read this first)
+
+`audit_logs` already exists (migration `20260702000006_cluster6_auth_audit.sql`)
+and is locked down:
+
+- RLS SELECT policy `audit_logs_select_admin` — admin, same church group only.
+- **No** `authenticated` INSERT policy. `UPDATE`/`DELETE` are `REVOKE`d from
+  `authenticated`/`anon`. The RLS comment says inserts happen "via service role /
+  triggers only."
+- The service-role key is forbidden in `app/` and `lib/`, enforced by
+  `scripts/check-service-role.mjs` (bun run `check:service-role`). So the utility
+  **cannot** insert with a service-role client.
+
+**Resolution:** insert through a `SECURITY DEFINER` RPC called by the normal
+RLS-scoped anon client, exactly like `create_church_group` / `join_church_group`
+(copy the structure of
+`supabase/migrations/20260706000001_church_group_create_rpc.sql`). The RPC runs
+as the table owner, which bypasses RLS for the INSERT while preserving the
+append-only guarantee (it only ever INSERTs; UPDATE/DELETE stay revoked). This
+keeps user-callable code free of the service-role key.
+
+The RPC derives `user_id` and `church_group_id` from the caller's JWT (never from
+caller-supplied arguments) so a route cannot forge a log entry attributed to
+another user or group.
+
+---
+
+## Files to create
+
+### 1. `supabase/migrations/20260707000001_audit_log_write_rpc.sql` (NEW)
+
+Pattern to copy: `supabase/migrations/20260706000001_church_group_create_rpc.sql`
+(same header-comment style, `SECURITY DEFINER`, `SET search_path = ''`, schema-
+qualified names, `GRANT EXECUTE ... TO authenticated`, and a commented DOWN block).
+
+Create `public.write_audit_log(...)`:
+
+```sql
+CREATE OR REPLACE FUNCTION public.write_audit_log(
+  p_action      text,
+  p_entity_type text,
+  p_entity_id   uuid,
+  p_metadata    jsonb
+)
+  RETURNS public.audit_logs
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  VOLATILE
+  SET search_path = ''
+AS $$
+DECLARE
+  v_clerk_id text;
+  v_user_id  uuid;
+  v_group_id uuid;
+  v_row      public.audit_logs%ROWTYPE;
+BEGIN
+  v_clerk_id := auth.jwt() ->> 'sub';
+  IF v_clerk_id IS NULL THEN
+    RAISE EXCEPTION 'UNAUTHENTICATED' USING ERRCODE = 'P0001';
+  END IF;
+
+  SELECT id, church_group_id INTO v_user_id, v_group_id
+  FROM public.users WHERE clerk_id = v_clerk_id;
+
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'UNAUTHENTICATED' USING ERRCODE = 'P0001';
+  END IF;
+
+  INSERT INTO public.audit_logs
+    (church_group_id, user_id, action, entity_type, entity_id, metadata)
+  VALUES
+    (v_group_id, v_user_id, p_action, p_entity_type, p_entity_id,
+     COALESCE(p_metadata, '{}'::jsonb))
+  RETURNING * INTO v_row;
+
+  RETURN v_row;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.write_audit_log(text, text, uuid, jsonb) TO authenticated;
+```
+
+Include a commented `-- ============ DOWN ============` block dropping the
+function, matching the sibling RPC migrations.
+
+### 2. `lib/audit/write-audit-log.ts` (NEW)
+
+Pattern to copy: the `SupabaseClient<Database>` typing + error-throwing style of
+`loadInstruments` in `app/api/profile/handler.ts`. Must start with
+`import "server-only";`.
+
+```ts
+import "server-only";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "@/lib/supabase/types";
+import { ApiException, ErrorCode } from "@/lib/api/errors";
+
+// action uses dot-notation, e.g. "user.role_changed", "member.removed",
+// "invitation.sent", "group.created". Free-form string (DB limit: 100 chars).
+export type AuditLogEntry = {
+  action: string;      // dot-notation; max 100 chars (DB varchar(100))
+  entityType: string;  // e.g. "user", "invitation"; max 50 chars (DB varchar(50))
+  entityId: string;    // uuid of the affected entity
+  metadata?: Record<string, unknown>; // arbitrary JSON; defaults to {}
+};
+
+// Appends one immutable audit row for the caller's user + church group (both
+// derived server-side from the JWT inside the write_audit_log RPC). `supabase`
+// MUST be the RLS-scoped client for the acting user (getSupabaseClient(jwt)).
+// Throws ApiException(INTERNAL, 500) on DB error; never swallows.
+export async function writeAuditLog(
+  supabase: SupabaseClient<Database>,
+  entry: AuditLogEntry,
+): Promise<void>;
+```
+
+Implementation notes:
+- Call
+  `supabase.rpc("write_audit_log", { p_action: entry.action, p_entity_type: entry.entityType, p_entity_id: entry.entityId, p_metadata: entry.metadata ?? {} })`.
+- On `error`, throw `new ApiException("Internal error", ErrorCode.INTERNAL, 500)`.
+  Return `void` on success (ignore returned row).
+- Do NOT catch/swallow. Callers (future issues) decide whether a logging failure
+  is fatal to their operation.
+
+### 3. `schemas/audit-log.ts` (NEW)
+
+Pattern to copy: `schemas/profile.ts`. Query-param schema (offset pagination):
 
 ```ts
 import { z } from "zod";
 
-export const VOCAL_CAPABILITY_VALUES = ["lead", "harmony", "both", "none"] as const;
-
-// PUT /api/profile body. Full replace of the two editable profile fields.
-// bio: optional/nullable free text; empty/whitespace-only is normalized to null.
-export const updateProfileSchema = z.object({
-  vocalCapability: z.enum(VOCAL_CAPABILITY_VALUES),
-  bio: z
-    .string()
-    .trim()
-    .max(2000)
-    .nullish()
-    .transform((v) => (v && v.length > 0 ? v : null)),
+export const auditLogQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(50),
 });
 
-export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
+export type AuditLogQuery = z.infer<typeof auditLogQuerySchema>;
 ```
 
-Notes:
-- Enum values match the Postgres `vocal_capability` enum and `VocalCapability` in `types/domain.ts`.
-- `2000` char cap is a defensive default (PRD §20.2 lists `bio` as plain `text`, no length given).
-  Keep it; do not invent other fields.
+### 4. `app/api/church-group/audit-log/handler.ts` (NEW)
 
-### 2. CREATE `app/api/profile/handler.ts`
-
-Follow the exact structure of `app/api/church-group/members/handler.ts` (auth → JWT → RLS client →
-queries → map → `ok(...)`; single `try/catch` converting `ApiException` to `fail`, else 500).
-
-Exports:
+Pattern to copy: `app/api/church-group/members/handler.ts` (auth → role gate →
+JWT → RLS client → query → `ok(...)`, single `try/catch` mapping `ApiException` →
+`fail`, else 500).
 
 ```ts
-import { NextRequest } from "next/server";
-import { auth } from "@clerk/nextjs/server";
-import { requireAuth, type UserLookup } from "@/lib/api/auth";
-import { ok, fail } from "@/lib/api/response";
-import { ApiException, ErrorCode } from "@/lib/api/errors";
-import { getSupabaseClient } from "@/lib/supabase/client";
-import type { VocalCapability } from "@/types/domain";
-import { updateProfileSchema } from "@/schemas/profile";
-
-export type ProfileResponse = {
-  userId: string;                              // users.id (the caller)
-  vocalCapability: VocalCapability;            // 'none' when no profile row exists yet
-  bio: string | null;
-  instruments: { id: string; name: string }[]; // read-only; [] when no profile / no instruments
+export type AuditLogItem = {
+  id: string;
+  action: string;
+  entityType: string;
+  entityId: string;
+  userId: string | null;   // nullable per schema (system actions)
+  metadata: Record<string, unknown>;
+  createdAt: string;       // ISO timestamp
 };
 
-export async function getProfile(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-export async function updateProfile(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+export async function getAuditLog(req: NextRequest, lookup?: UserLookup): Promise<Response>;
 ```
 
-Do **not** call `requireRole`. Ownership is enforced by RLS (`user_id = auth_user_id()`) and by
-querying `ctx.userId`; there is no role gate in the AC. (A `guest` would pass auth but has no
-meaningful profile — acceptable, out of scope.)
-
-**`getProfile`:**
-1. `const ctx = await requireAuth(req, lookup);` — throws 401 `UNAUTHENTICATED` when no Clerk
-   session or no `users` row.
-2. Build the Supabase client from the Clerk JWT (same as the members handler):
-   `const { getToken } = await auth();`
-   `const jwt = await getToken({ template: "supabase" });`
-   if `!jwt` → `return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);`
-   `const supabase = getSupabaseClient(jwt);`
-3. Fetch the caller's profile:
-   `supabase.from("member_profiles").select("id, vocal_capability, bio").eq("user_id", ctx.userId).maybeSingle();`
-   - On `.error` → `return fail("Internal error", ErrorCode.INTERNAL, 500);`
-   - If `data` is null → return
-     `ok({ profile: { userId: ctx.userId, vocalCapability: "none", bio: null, instruments: [] } })`.
-     Do **not** query instruments in this branch.
-4. If a profile row exists, load its instruments via the shared helper (below) and return
-   `ok({ profile })` with the assembled `ProfileResponse`
-   (`vocalCapability = data.vocal_capability`, `bio = data.bio`).
-
-**`updateProfile`:**
+Behavior:
 1. `const ctx = await requireAuth(req, lookup);`
-2. Parse body defensively (mirror `app/api/church-group/join/route.ts`):
-   `const body = await req.json().catch(() => null);`
-   `const parsedResult = updateProfileSchema.safeParse(body);`
-   if `!parsedResult.success` → `return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);`
-   `const parsed = parsedResult.data;`
-3. Get the JWT (401 if none) and `getSupabaseClient(jwt)` as in `getProfile`.
-4. Upsert the profile (row may not exist — OPEN QUESTION 1):
+2. `requireRole(ctx, ["admin"]);` — admin only (defense in depth alongside RLS;
+   yields 403 FORBIDDEN for non-admins instead of an empty list).
+3. Parse query params from `req.nextUrl.searchParams` via `auditLogQuerySchema`
+   (`.safeParse` on `Object.fromEntries(req.nextUrl.searchParams)`); on failure
+   `return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);`
+4. Get JWT (`const { getToken } = await auth();` → `getToken({ template: "supabase" })`);
+   if null → `fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);`
+5. `const supabase = getSupabaseClient(jwt);`
+6. Query with exact count + range:
    ```ts
-   const { data, error } = await supabase
-     .from("member_profiles")
-     .upsert(
-       { user_id: ctx.userId, vocal_capability: parsed.vocalCapability, bio: parsed.bio },
-       { onConflict: "user_id" },
-     )
-     .select("id, vocal_capability, bio")
-     .maybeSingle();
+   const from = (page - 1) * pageSize;
+   const to = from + pageSize - 1;
+   const { data, error, count } = await supabase
+     .from("audit_logs")
+     .select("id, action, entity_type, entity_id, user_id, metadata, created_at",
+             { count: "exact" })
+     .order("created_at", { ascending: false })
+     .order("id", { ascending: false }) // stable tiebreak
+     .range(from, to);
    ```
-   - RLS `member_profiles_insert_own` / `_update_own` permit this because `user_id = auth_user_id()`.
-   - Do **not** set `id`, `created_at`, or any `updated_at` (no such column; DB defaults handle `id`/`created_at`).
-   - On `error` → `return fail("Internal error", ErrorCode.INTERNAL, 500);`
-5. Load instruments for the returned profile row via the shared helper, and return `ok({ profile })`
-   (status 200) with the identical `ProfileResponse` shape as `getProfile`.
+   RLS already scopes to the admin's own church group; adding
+   `.eq("church_group_id", ctx.churchGroupId)` is acceptable/harmless but optional.
+7. On `error` → `fail("Internal error", ErrorCode.INTERNAL, 500);`
+8. Map rows (snake → camel) to `AuditLogItem[]`.
+9. Respond:
+   ```ts
+   return ok({ entries, pagination: { page, pageSize, total: count ?? 0 } });
+   ```
+10. Wrap the whole body in the standard catch:
+    ```ts
+    } catch (err) {
+      if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    ```
 
-**Shared private helper** (factor out to avoid drift; used by both handlers):
-```ts
-async function loadInstruments(
-  supabase: /* SupabaseClient<Database> */,
-  memberProfileId: string,
-  churchGroupId: string,
-): Promise<{ id: string; name: string }[]>
-```
-Implementation mirrors the instrument name-mapping in `app/api/church-group/members/handler.ts`:
-- `supabase.from("member_instruments").select("member_profile_id, instrument_id").eq("member_profile_id", memberProfileId)`
-- `supabase.from("instruments").select("id, name").eq("church_group_id", churchGroupId)`
-- Build a `Map<instrument_id, name>`; map the member's rows to `{ id, name }`, **skipping** any
-  `instrument_id` with no matching instrument.
-- If either query `.error` is non-null, throw `new ApiException("Internal error", ErrorCode.INTERNAL, 500)`
-  so the outer `try/catch` returns 500 (or return `fail(...)` from the caller — either is fine as long
-  as errors become 500 INTERNAL).
+## Files to modify
 
-**Catch block** (copy from members handler):
-```ts
-} catch (err) {
-  if (err instanceof ApiException) return fail(err.message, err.code, err.status);
-  return fail("Internal error", ErrorCode.INTERNAL, 500);
-}
-```
+### 5. `app/api/church-group/audit-log/route.ts` (REPLACE the stub)
 
-### 3. REWRITE `app/api/profile/route.ts`
-
-Reduce to thin delegators, mirroring `app/api/church-group/members/route.ts`:
+Currently returns `notImplemented`. Replace with the thin delegator pattern from
+`app/api/church-group/members/route.ts`:
 
 ```ts
 import { NextRequest } from "next/server";
-import { getProfile, updateProfile } from "./handler";
+import { getAuditLog } from "./handler";
 
 export async function GET(req: NextRequest): Promise<Response> {
-  return getProfile(req);
-}
-
-export async function PUT(req: NextRequest): Promise<Response> {
-  return updateProfile(req);
+  return getAuditLog(req);
 }
 ```
 
-### 4. CREATE `tests/unit/app/api/profile-route.test.ts`
+### 6. `lib/supabase/types.ts` (ADD types)
 
-Copy the mocking harness from `tests/unit/app/api/church-group-members-route.test.ts`
-(`jest.mock("@clerk/nextjs/server")`, `jest.mock("@/lib/supabase/client")`, `makeLookup(role)`,
-`setUpAuth()`, a `makeSupabaseClient(overrides)` fixture builder). Extend the fixture builder so the
-mocked `from(table)` supports the chains this handler uses:
-- `.select(...).eq(...).maybeSingle()` → resolves to the configured `member_profiles` result.
-- `.select(...).eq(...)` → resolves to the configured `member_instruments` / `instruments` result.
-- `.upsert(payload, opts).select(...).maybeSingle()` → records `payload` and resolves to the
-  configured `member_profiles` result.
+Follow the existing hand-written style. Needed so `typecheck` passes for both the
+`.from("audit_logs")` select and the `.rpc("write_audit_log", ...)` call.
 
-Cases to cover (map 1:1 to acceptance criteria + edge cases):
-- `GET` 401 when Clerk `userId` is null (lookup never consulted).
-- `GET` 401 when `getToken` yields no JWT.
-- `GET` 200 with an existing profile → `{ profile: { userId, vocalCapability, bio, instruments } }`,
-  instruments correctly name-mapped.
-- `GET` 200 when **no** `member_profiles` row → `vocalCapability: "none"`, `bio: null`,
-  `instruments: []`.
-- `GET` skips a `member_instruments` row whose `instrument_id` has no matching instrument.
-- `GET` 500 when the `member_profiles` query returns an error.
-- `PUT` 400 `VALIDATION_FAILED` when `vocalCapability` is not lead/harmony/both/none.
-- `PUT` 400 `VALIDATION_FAILED` when body is malformed / missing `vocalCapability`.
-- `PUT` 200 updates an existing profile and returns the updated `ProfileResponse`.
-- `PUT` 200 creates (upserts) a profile for a member who had none, returning the new values.
-- `PUT` normalizes empty/whitespace `bio` to `null` (assert the recorded upsert payload / response `bio`).
-- `PUT` 500 when the upsert returns an error.
-- `PUT` 401 when `getToken` yields no JWT.
+- Add row type:
+  ```ts
+  type AuditLogsRow = {
+    id: string;
+    church_group_id: string;
+    user_id: string | null;
+    action: string;
+    entity_type: string;
+    entity_id: string;
+    metadata: Record<string, unknown>;
+    created_at: string;
+  };
+  ```
+- Add to `Tables`:
+  ```ts
+  audit_logs: {
+    Row: AuditLogsRow;
+    Insert: Omit<AuditLogsRow, "id" | "created_at"> & { id?: string; created_at?: string };
+    Update: Partial<AuditLogsRow>;
+    Relationships: [];
+  };
+  ```
+- Add to `Functions`:
+  ```ts
+  write_audit_log: {
+    Args: {
+      p_action: string;
+      p_entity_type: string;
+      p_entity_id: string;
+      p_metadata: Record<string, unknown>;
+    };
+    Returns: AuditLogsRow;
+  };
+  ```
 
-## Response contract (both routes)
-
-Success: `ok({ profile: ProfileResponse })` → `{ "data": { "profile": { ... } } }` via
-`lib/api/response.ts`. Errors via `fail(message, code, status)` with `ErrorCode` from
-`lib/api/errors.ts`. No new error codes needed.
+---
 
 ## Edge cases the implementation must handle
 
-- Unauthenticated / unprovisioned user (no `users` row) → 401 (handled by `requireAuth`).
-- Missing supabase JWT despite a Clerk session → 401.
-- Missing `member_profiles` row: `GET` → synthesized defaults; `PUT` → insert via upsert.
-- `member_instruments` referencing a missing / other-group instrument → skipped in mapping.
-- Invalid `vocal_capability` value → 400 `VALIDATION_FAILED`.
-- Malformed JSON body on `PUT` → 400 (never throw; use `.catch(() => null)`).
-- Empty/whitespace `bio` → stored as `null`.
-- Any DB error → 500 `INTERNAL`.
-- No `updated_at` column on `member_profiles` — do **not** attempt to set one.
+- **writeAuditLog with no metadata** → RPC receives `{}` (utility passes
+  `entry.metadata ?? {}`; RPC also `COALESCE`s to `'{}'::jsonb`).
+- **writeAuditLog RPC error** → throw `ApiException(INTERNAL, 500)`; never swallow.
+- **Role-change metadata (AC 4)** → `metadata` must round-trip arbitrary JSON,
+  e.g. `{ old_value: "member", new_value: "set_leader" }`. No special-casing; pass
+  straight through to `p_metadata` (jsonb). This is what lets #27 satisfy its
+  old→new requirement. Do NOT implement the role-change route here.
+- **GET as non-admin (member/set_leader/guest)** → 403 FORBIDDEN.
+- **GET unauthenticated / no `users` row** → 401 UNAUTHENTICATED (via `requireAuth`).
+- **GET with no JWT from getToken** → 401 UNAUTHENTICATED (do not build a client).
+- **GET invalid/negative page or pageSize > 100** → 400 VALIDATION_FAILED.
+- **GET with zero matching rows** → 200 with `entries: []`, `pagination.total: 0`.
+- **GET DB error** → 500 INTERNAL.
+- **Ordering** → newest first (`created_at DESC`, `id DESC` tiebreak) for stable
+  pagination.
+- **No UPDATE/DELETE route** → confirm none is added. Append-only is already
+  enforced at the DB layer (cluster-6 migration `REVOKE UPDATE, DELETE`); this
+  issue must not add any handler exposing those verbs.
+
+---
+
+## Response shape (for the Tester)
+
+Success (`200`):
+```json
+{
+  "data": {
+    "entries": [
+      {
+        "id": "uuid",
+        "action": "user.role_changed",
+        "entityType": "user",
+        "entityId": "uuid",
+        "userId": "uuid-or-null",
+        "metadata": { "old_value": "member", "new_value": "set_leader" },
+        "createdAt": "2026-07-07T00:00:00.000Z"
+      }
+    ],
+    "pagination": { "page": 1, "pageSize": 50, "total": 1 }
+  }
+}
+```
+Errors use the standard `{ error, code }` envelope via `fail(...)`.
+
+---
+
+## Suggested test files (Tester will author)
+
+Follow `tests/unit/app/api/profile-route.test.ts` for mocking style
+(`jest.mock("@clerk/nextjs/server")`, `jest.mock("@/lib/supabase/client")`,
+injected `UserLookup` via `makeLookup(role)`, chainable Supabase mock).
+
+- `tests/unit/app/api/audit-log-route.test.ts` — admin 200 with mapped entries +
+  pagination; non-admin 403; missing JWT 401; unauthenticated 401; invalid query
+  params 400; DB error 500; empty result set. Note the GET reads params from
+  `req.nextUrl.searchParams`, so the mocked `NextRequest` must expose `nextUrl`.
+- `tests/unit/lib/audit/write-audit-log.test.ts` — asserts `rpc` invoked with
+  correct `p_action/p_entity_type/p_entity_id/p_metadata` (incl. metadata default
+  `{}`); throws `ApiException` INTERNAL on rpc error.
+
+RLS admin-SELECT / append-only behavior is already covered by
+`tests/integration/rls/rls.test.ts` and `.../tables/role-gated.test.ts` — do not
+duplicate.
+
+---
 
 ## Patterns to follow (name the file)
 
-- Handler structure, auth+JWT flow, instrument name-mapping, error handling:
+- SECURITY DEFINER RPC + grant + DOWN block: `supabase/migrations/20260706000001_church_group_create_rpc.sql`.
+- Handler auth → role gate → JWT → RLS client → map → `ok`, with `try/catch`:
   `app/api/church-group/members/handler.ts`.
+- Utility shape / `server-only` / throwing `ApiException`: `loadInstruments` in
+  `app/api/profile/handler.ts`.
 - Thin route delegation: `app/api/church-group/members/route.ts`.
-- Zod `safeParse` on request body + 400 mapping: `app/api/church-group/join/route.ts`.
-- Zod schema style: `schemas/church-group.ts`.
+- Zod schema style: `schemas/profile.ts`.
 - Success/error envelope: `lib/api/response.ts` (`ok`, `fail`); shape in `types/api.ts`.
-- Unit test harness / Supabase mock: `tests/unit/app/api/church-group-members-route.test.ts`.
+- Hand-written Supabase types (Tables + Functions): `lib/supabase/types.ts`.
+- Unit test harness / Supabase mock: `tests/unit/app/api/profile-route.test.ts`.
 
-## Explicitly out of scope
+---
 
-- Instrument selection writes (`member_instruments` mutations) — Issue #31.
-- Song familiarity — Phase 2.
-- Any `:id`-parameterized route or admin-edits-another-member profile.
-- New migrations — schema and RLS already exist
-  (`20260702000001_cluster_1_organization.sql`, `20260704000001_rls_policies.sql`).
-- Changes to `lib/supabase/types.ts` — the needed tables are already typed.
+## Commands (Bun)
+
+- `bun run typecheck`
+- `bun run lint`
+- `bun run test`
+- `bun run check:service-role` (must stay green — proves no service-role key leaked)

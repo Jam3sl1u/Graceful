@@ -1,38 +1,55 @@
-# Review — Issue #30: Member profile CRUD (`GET`/`PUT /api/profile`)
+# Review — Issue #29: Audit log writer utility + read endpoint (BR-13)
 
-## VERDICT: SHIP
+VERDICT: SHIP
 
-## Summary
-The implementation faithfully matches the spec. Independently re-ran `bun run lint`,
-`bun run typecheck`, and `bun run test` — all green (8 suites / 66 tests, incl. 13 new).
-Read every source/test file firsthand rather than trusting the summaries.
+## What I verified independently
+- Ran `git diff main...HEAD` on `app/ lib/ schemas/ supabase/` — only the six
+  in-scope files changed. Out-of-scope stubs
+  (`members/[id]/role/route.ts`, `members/[id]/route.ts`) untouched. No UI, no
+  UPDATE/DELETE route added.
+- Re-ran `bun run typecheck` (clean), `bun run lint` (clean),
+  `bun run check:service-role` (OK — no service-role key in app/ or lib/),
+  `bun run test` (10 suites / 84 tests, 0 failures).
 
-## What was verified
-- **schemas/profile.ts** — matches spec verbatim: `vocalCapability` enum + trimmed,
-  2000-cap, nullish `bio` normalized to `null`.
-- **app/api/profile/handler.ts** — correct auth→JWT→RLS-client flow mirroring the
-  members handler. `getProfile` returns synthesized defaults on missing row and does
-  NOT query instruments in that branch (early return confirmed). `updateProfile` upserts
-  on `user_id`, sets only `user_id`/`vocal_capability`/`bio` (no `id`/`created_at`/
-  `updated_at`). `loadInstruments` group-scopes via `ctx.churchGroupId` and skips
-  unmatched instruments. Single try/catch converts `ApiException`→`fail`, else 500.
-- **route.ts** — thin delegators, as specified.
-- **Test file** — all 13 spec-listed cases present; assertions use `toEqual` on full
-  response bodies and capture the upsert payload, so they'd catch shape drift. Not
-  superficial.
-- **Security** — ownership enforced by RLS (`user_id = auth_user_id()`) + query scoped
-  to `ctx.userId`; no `:id` param; `member_instruments` never written (deferred to #31).
-- **Scope** — only `app/api/profile/*`, `schemas/profile.ts`, and the test file changed.
-  No migrations, no `lib/supabase/types.ts` / `types/domain.ts` edits. Scanned the source
-  diff for network/exec/beacon patterns — none found.
+## Correctness
+- **RPC** (`20260707000001_audit_log_write_rpc.sql`): mirrors the approved
+  `create_church_group` pattern — `SECURITY DEFINER`, `SET search_path = ''`,
+  schema-qualified names, `GRANT EXECUTE ... TO authenticated`, commented DOWN.
+  Derives `user_id`/`church_group_id` from `auth.jwt() ->> 'sub'` → `users`
+  lookup, never from caller args, so a route cannot forge an entry for another
+  user/group. Only ever INSERTs; UPDATE/DELETE stay REVOKEd (append-only
+  preserved). Handles the no-metadata case via `COALESCE(p_metadata,'{}')`.
+- **RLS**: confirmed `audit_logs_select_admin` policy exists in
+  `20260704000001_rls_policies.sql` (church_group + role='admin' scoped) and RLS
+  is enabled. Handler relying on RLS for group scoping (spec made the extra
+  `.eq` optional) is correct and consistent.
+- **Handler**: auth → requireRole(["admin"]) → safeParse query (400) → JWT (401,
+  no client built) → RLS client → select with `count:"exact"`, `created_at DESC,
+  id DESC`, `.range(from,to)` → snake→camel map → `ok({entries,pagination})`.
+  Single try/catch maps ApiException→fail else 500. Matches spec step-for-step,
+  incl. `count ?? 0` and pagination math.
+- **Utility**: `import "server-only"` first, exact RPC arg mapping,
+  `metadata ?? {}` default, throws ApiException(INTERNAL,500) on error, never
+  swallows.
+- **Types**: `AuditLogsRow`, `Tables.audit_logs`, `Functions.write_audit_log`
+  added; typecheck passes with no `as any` escapes. `metadata` typed
+  `Record<string,unknown>` (jsonb) and `user_id` nullable — both match the DB
+  schema (varchar/uuid/jsonb NOT NULL default '{}', user_id NULL).
 
-## Non-blocking observations (no fix required)
-- PUT validates the body (400) before the JWT check (401). This is the exact order the
-  spec prescribes; acceptable.
-- `as unknown as ...Insert` cast is a narrow, spec-sanctioned workaround for the
-  hand-written `Insert` type modeling `created_at` as required. No `created_at` is sent
-  at runtime (asserted by the payload test).
-- `if (error || !data)` on the upsert collapses a "success but no row returned" case into
-  a generic 500; with `onConflict` + `.maybeSingle()` this shouldn't occur in practice.
+## Tests — meaningful, not superficial
+- `write-audit-log.test.ts`: asserts exact RPC name + arg keys, metadata
+  pass-through, `{}` default (explicitly `not.toBeUndefined()`), void on success,
+  ApiException INTERNAL/500 on error.
+- `audit-log-route.test.ts`: 401 (null userId, no users row, no JWT — with
+  "client not built" assertions), 403 for each non-admin role, 400 for
+  negative/over-max/non-numeric params, 200 happy path with camelCase mapping +
+  null userId preserved, query-shape assertions (select columns, both orders,
+  range(10,19) for page 2/size 10), empty set, null-count→0, DB error 500.
+  Covers every named edge case in the spec.
+
+## Notes (non-blocking)
+- Migration has no live-DB integration test; spec permits this (RLS/append-only
+  covered by existing integration suites; forgery-prevention logic is SQL not
+  exercised by unit run). Acceptable per scope.
 
 Green tests here reflect genuinely correct behavior. Ship it.

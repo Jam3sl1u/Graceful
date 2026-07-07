@@ -1,111 +1,132 @@
-# Test Results — Issue #30: Member profile CRUD (`GET`/`PUT /api/profile`)
+# Test Results — Issue #29: Audit log writer utility + read endpoint (BR-13)
 
 ## Verdict: PASS
 
 ## Checks re-run independently (Bun)
 
 - `bun install` — no changes, deps already in sync.
-- `bun run lint` (`eslint .`) — **PASS**, no warnings/errors.
 - `bun run typecheck` (`tsc --noEmit`) — **PASS**, no errors.
-- `bun run test` (`jest`) — **PASS**, 8 suites / 66 tests, 0 failures. Matches
-  the Coder's claim in `changes.md`. Suite list includes the new
-  `tests/unit/app/api/profile-route.test.ts` (13 tests) alongside all
-  pre-existing suites (church-group-route, admin-only, church-group-join,
-  church-group-members, lib/api/response, lib/api/auth, lib/api/lookup-user) —
-  no regressions elsewhere.
+- `bun run lint` (`eslint .`) — **PASS**, no warnings/errors.
+- `bun run test` (`jest`) — **PASS**, 10 suites / 84 tests, 0 failures. This
+  is the 8 suites / 66 pre-existing tests plus the 2 new test files below
+  (18 new tests) — no regressions elsewhere.
+- `bun run check:service-role` — **PASS**: "OK: no service-role key
+  references found outside comments in app/ or lib/."
 
-## Independent verification of spec/AC compliance
+## New test files written (spec assigned these to the Tester)
 
-1. **Scope of changed files** — confirmed via `git diff --stat main...HEAD`:
-   only `app/api/profile/handler.ts` (new), `app/api/profile/route.ts`,
-   `schemas/profile.ts`, and the new test file were touched (plus pipeline
-   docs). No other routes, no `lib/supabase/types.ts`, no `types/domain.ts`,
-   no new migrations — matches spec's "explicitly out of scope" list and
-   changes.md's claims.
+### `tests/unit/lib/audit/write-audit-log.test.ts`
 
-2. **DB schema/RLS assumptions** — checked directly against the migrations:
-   - `supabase/migrations/20260702000001_cluster_1_organization.sql`:
-     `member_profiles` has `id, user_id (unique), vocal_capability
-     (enum 'none'|'lead'|'harmony'|'both', not null default 'none'), bio text,
-     created_at` — **no `updated_at` column**, confirming the handler is
-     correct not to set one.
-   - `supabase/migrations/20260704000001_rls_policies.sql`: confirmed
-     `member_profiles_select_tenant`, `member_profiles_insert_own`,
-     `member_profiles_update_own`, `member_instruments_select_tenant`,
-     `instruments_select_tenant` all exist as described, supporting the
-     handler's choice to skip `requireRole` and rely on RLS + `ctx.userId`
-     scoping.
-   - `types/domain.ts` exports `VocalCapability = "lead" | "harmony" | "both" |
-     "none"`, matching `VOCAL_CAPABILITY_VALUES` in `schemas/profile.ts`.
+- RPC invoked with exact name `"write_audit_log"` and arg keys
+  `p_action`/`p_entity_type`/`p_entity_id`/`p_metadata`; metadata round-trips
+  arbitrary JSON (`{ old_value: "member", new_value: "set_leader" }`).
+- Missing `metadata` on the entry defaults to `{}` in the RPC call (asserted
+  it is not `undefined`), matching the spec's edge case.
+- Resolves `void` on success.
+- Failure case: RPC `error` → throws `ApiException` with `code: "INTERNAL"`,
+  `status: 500`; confirms the throw is never swallowed (spec explicitly
+  requires this).
 
-3. **Zod schema behavior** — independently exercised `updateProfileSchema`
-   with a standalone script (11 cases) outside the existing test file:
-   - Missing `bio` → defaults to `null`. Pass.
-   - `bio` with leading/trailing whitespace → trimmed. Pass.
-   - Whitespace-only / empty string `bio` → normalized to `null`. Pass.
-   - `bio` exactly 2000 chars → accepted; 2001 chars → rejected
-     ("String must contain at most 2000 character(s)"). Pass (boundary
-     verified in both directions).
-   - Invalid enum casing (`"LEAD"`) and missing `vocalCapability` → rejected
-     with clear Zod messages. Pass.
-   - Non-string `bio` (number) → rejected. Pass.
+### `tests/unit/app/api/audit-log-route.test.ts`
 
-4. **Handler logic read-through** (`app/api/profile/handler.ts`):
-   - `getProfile` returns early with synthesized defaults
-     (`vocalCapability: "none"`, `bio: null`, `instruments: []`) when
-     `member_profiles` has no row, and does **not** call `loadInstruments` in
-     that branch — confirmed by code inspection (early `return` before the
-     `loadInstruments` call) and by the existing "no member_profiles row"
-     test case.
-   - `updateProfile` builds the upsert payload as a plain object with exactly
-     `user_id`, `vocal_capability`, `bio` before the `as unknown as
-     Database[...]["Insert"]` cast — confirmed by inspection and by the
-     existing test's `toEqual({ user_id, vocal_capability, bio })` assertion
-     on the captured payload (no `id`/`created_at` present at runtime).
-   - `loadInstruments` mirrors the `church-group/members/handler.ts` pattern:
-     builds a `Map<instrument_id, name>` from group-scoped `instruments`,
-     skips any `member_instruments` row without a match, and throws
-     `ApiException(INTERNAL, 500)` on either query error, caught by the
-     shared `try/catch` in both handlers.
-   - `route.ts` is a thin delegator (`GET` → `getProfile`, `PUT` →
-     `updateProfile`), matching the spec's example verbatim.
+- 401 UNAUTHENTICATED when Clerk `userId` is null (lookup never consulted).
+- 401 UNAUTHENTICATED when `requireAuth`'s lookup returns null (no matching
+  `users` row) — "unauthenticated / no users row" edge case.
+- 403 FORBIDDEN for each non-admin role (`member`, `set_leader`, `guest`),
+  parametrized with `it.each`; confirms the Supabase client is never built
+  before the role check fails.
+- 401 UNAUTHENTICATED when `getToken` yields no JWT and confirms no
+  Supabase client is built — matches the spec's "GET with no JWT" edge case
+  verbatim.
+- 400 VALIDATION_FAILED for negative `page`, `pageSize` > 100, and
+  non-numeric `page`.
+- 200 happy path for admin: rows mapped snake_case → camelCase
+  (`AuditLogItem[]`), `userId: null` preserved for system-attributed rows,
+  `metadata` round-trips arbitrary JSON, `pagination` shape matches the
+  spec's documented response (`page`, `pageSize`, `total`).
+- Query-shape assertions independent of the implementation's internals but
+  matching the spec's required query: `.select(...)` called with the exact
+  column list and `{ count: "exact" }`; `.order("created_at", { ascending:
+  false })` then `.order("id", { ascending: false })` (stable tiebreak,
+  newest first); `.range(from, to)` computed correctly from `page`/
+  `pageSize` (page 2, pageSize 10 → `range(10, 19)`).
+- 200 with `entries: []` / `pagination.total: 0` for zero matching rows.
+- `count: null` from Supabase treated as `total: 0` (defensive `count ?? 0`
+  path).
+- Failure case: DB query `error` → 500 INTERNAL.
 
-5. **Test file coverage** (`tests/unit/app/api/profile-route.test.ts`) — all
-   13 spec-listed cases are present and pass: GET 401 (no Clerk user), GET 401
-   (no JWT), GET 200 existing profile w/ name-mapped instruments, GET 200
-   synthesized defaults, GET skips unmatched instrument row, GET 500 on DB
-   error, PUT 400 invalid enum value, PUT 400 malformed/missing body, PUT 200
-   update existing, PUT 200 upsert-create for new profile, PUT bio
-   whitespace-to-null normalization (asserted on both the upsert payload and
-   response), PUT 500 on upsert error, PUT 401 on missing JWT. Assertions use
-   `toEqual` on the full response body rather than superficial checks, so
-   they'd catch shape drift.
+## Independent verification beyond re-running the Coder's commands
+
+1. **Out-of-scope files untouched** — `git show --stat` on commit `b3232c6`
+   confirms `app/api/church-group/members/[id]/role/route.ts` and
+   `app/api/church-group/members/[id]/route.ts` are absent from the diff
+   (no matches for either path), matching the spec's explicit "do NOT
+   touch these files" instruction.
+
+2. **Migration file read in full**
+   (`supabase/migrations/20260707000001_audit_log_write_rpc.sql`):
+   `SECURITY DEFINER`, `SET search_path = ''`, derives `user_id`/
+   `church_group_id` from `auth.jwt() ->> 'sub'` → `users` lookup (never
+   from caller-supplied arguments — prevents forging a log entry for
+   another user/group), only ever `INSERT`s, `GRANT EXECUTE ...
+   TO authenticated`, commented `DOWN` block present. Matches the spec's
+   required SQL almost verbatim.
+
+3. **Handler/utility/schema read-through against every spec step**:
+   - `app/api/church-group/audit-log/handler.ts` — `requireAuth` →
+     `requireRole(["admin"])` → parses `req.nextUrl.searchParams` via
+     `auditLogQuerySchema.safeParse` (400 on failure) → `getToken` (401 if
+     null, no client built) → `getSupabaseClient(jwt)` → select with
+     `count: "exact"`, double `.order(...)`, `.range(from, to)` → maps
+     snake_case to `AuditLogItem[]` → `ok({ entries, pagination })`; single
+     `try/catch` mapping `ApiException` → `fail`, else 500 INTERNAL. Matches
+     the spec's 10-step behavior list exactly, including the `from`/`to`
+     math (`from = (page-1)*pageSize`, `to = from + pageSize - 1`).
+   - `lib/audit/write-audit-log.ts` — starts with `import "server-only"`,
+     typed `SupabaseClient<Database>`, calls the RPC with the documented
+     arg mapping, throws on error, returns `void` on success. Matches spec
+     verbatim.
+   - `schemas/audit-log.ts` — `page`/`pageSize` both `z.coerce.number().int()`
+     with the documented min/max/defaults.
+   - `app/api/church-group/audit-log/route.ts` — thin `GET` delegator to
+     `getAuditLog`, matching the spec's example and the
+     `church-group/members/route.ts` pattern.
+   - `lib/supabase/types.ts` — `AuditLogsRow`, `Tables.audit_logs`, and
+     `Functions.write_audit_log` entries present and typecheck cleanly
+     against the handler's `.from("audit_logs").select(...)` and
+     `write-audit-log.ts`'s `.rpc("write_audit_log", ...)` calls (verified
+     by `bun run typecheck` passing with no errors/`as any` escapes needed).
+
+4. **No UPDATE/DELETE route added** — confirmed by inspecting the full
+   diff of commit `b3232c6`: only `handler.ts` (new), `route.ts` (GET
+   delegator, modified), `lib/audit/write-audit-log.ts` (new),
+   `schemas/audit-log.ts` (new), and `lib/supabase/types.ts` (additive)
+   were touched under `app/`/`lib/`/`schemas/` — no new route files, no UI.
 
 ## Notes / non-blocking observations (no fix required)
 
-- `updateProfile`'s `data` null-check (`if (error || !data)`) means a
-  successful upsert that somehow returns no row would also produce a generic
-  500 `INTERNAL` rather than a more specific error — acceptable per spec
-  (upsert+`.maybeSingle()` with `onConflict: "user_id"` should always return a
-  row on success) and already implicitly covered by the "500 on upsert error"
-  test using `data: null`.
-- The `as unknown as Database[...]["Insert"]` cast is a narrowly-scoped
-  workaround for a known typing gap in the hand-written `Insert` type (not
-  modeling the `created_at` DB default); spec explicitly permits this and
-  forbids touching `lib/supabase/types.ts`, so this is intentional, not a
-  defect.
+- RLS admin-SELECT scoping and append-only enforcement (REVOKE
+  UPDATE/DELETE) are exercised by
+  `tests/integration/rls/rls.test.ts`/`.../tables/role-gated.test.ts` per
+  the spec, not duplicated here — consistent with the spec's explicit
+  instruction not to duplicate that coverage in unit tests.
+- The migration itself has no accompanying integration test in this change
+  set, as the Coder's notes state and the spec permits (RLS/append-only is
+  covered elsewhere; the RPC's forging-prevention logic is exercised
+  indirectly by `write-audit-log.test.ts`'s arg-shape assertions, but the
+  SQL itself is not executed against a live DB by this test run).
 
 ## Files touched during testing
 
-None. All existing coder-authored tests pass as-is; no additional tests were
-needed to reach full coverage of the spec's named cases, so no files were
-modified by the Tester.
+- `tests/unit/lib/audit/write-audit-log.test.ts` (new)
+- `tests/unit/app/api/audit-log-route.test.ts` (new)
+
+No implementation files were modified.
 
 ## Conclusion
 
 No failures found. The implementation matches the spec precisely, including
-all named edge cases and both deliberate scoping decisions (missing-profile
-tolerance on GET via synthesized defaults + upsert on PUT; instruments
-read-only on PUT).
+every named edge case, the exact response shape, and the scoping
+boundaries (no route wiring, no UI, no UPDATE/DELETE path).
 
 **Result: PASS. No blocking issues found. Ready for Reviewer.**
