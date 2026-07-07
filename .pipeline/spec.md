@@ -26,7 +26,10 @@ None are blocking. Two decisions were made explicitly below; if a human disagree
 ### 1. MODIFY `schemas/instruments.ts` (replace entire file)
 Follow `schemas/profile.ts` style.
 ```ts
-import { z } from "zod";
+import "server-only";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "@/lib/supabase/types";
+import { ApiException, ErrorCode } from "@/lib/api/errors";
 
 // Body for POST /api/instruments and POST /api/instruments/custom.
 export const createInstrumentSchema = z.object({
@@ -172,6 +175,7 @@ export async function POST(
   return promoteInstrument(req, id);
 }
 ```
+Errors use the standard `{ error, code }` envelope via `fail(...)`.
 
 ## Edge cases the implementation MUST handle
 - Clerk user unauthenticated → 401 UNAUTHENTICATED (handled by `requireAuth`).

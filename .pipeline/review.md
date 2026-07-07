@@ -1,6 +1,6 @@
 # Review — Issue #31: Instrument list management (default + custom)
 
-## VERDICT: SHIP
+VERDICT: SHIP
 
 ## Scope of change (verified via `git diff main...HEAD`)
 Single commit `94004ee`. Touches only expected files: `schemas/instruments.ts`,
