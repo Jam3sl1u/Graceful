@@ -251,6 +251,33 @@ describe("POST /api/instruments (admin add)", () => {
     expect(body.code).toBe("VALIDATION_FAILED");
   });
 
+  it("returns 400 VALIDATION_FAILED for a name longer than 100 chars (matches varchar(100))", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
+
+    const res = await addInstrument(makeReq({ name: "A".repeat(101) }), makeLookup("admin"));
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.code).toBe("VALIDATION_FAILED");
+    expect(mockGetSupabaseClient).not.toHaveBeenCalled();
+  });
+
+  it("accepts a name that is exactly 100 chars", async () => {
+    setUpAuth();
+    let capturedPayload: unknown;
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient(
+        { instruments: { select: { data: [], error: null } } },
+        { onInsert: (table, payload) => (capturedPayload = payload) },
+      ),
+    );
+
+    const res = await addInstrument(makeReq({ name: "A".repeat(100) }), makeLookup("admin"));
+    expect(res.status).toBe(201);
+    expect(capturedPayload).toMatchObject({ name: "A".repeat(100) });
+  });
+
   it("returns 409 CONFLICT for a case-insensitive duplicate name", async () => {
     setUpAuth();
     mockGetSupabaseClient.mockReturnValue(
@@ -359,6 +386,50 @@ describe("POST /api/instruments/custom (member submit)", () => {
 
     const body = await res.json();
     expect(body.code).toBe("CONFLICT");
+  });
+
+  it("returns 401 UNAUTHENTICATED when getToken yields no JWT", async () => {
+    setUpAuth(null);
+
+    const res = await submitCustomInstrument(makeReq({ name: "Kazoo" }), makeLookup("member"));
+    expect(res.status).toBe(401);
+
+    const body = await res.json();
+    expect(body.code).toBe("UNAUTHENTICATED");
+    expect(mockGetSupabaseClient).not.toHaveBeenCalled();
+  });
+
+  it("returns 500 INTERNAL when the insert errors", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient({
+        instruments: {
+          select: { data: [], error: null },
+          insert: { data: null, error: { message: "constraint violation" } },
+        },
+      }),
+    );
+
+    const res = await submitCustomInstrument(makeReq({ name: "Kazoo" }), makeLookup("member"));
+    expect(res.status).toBe(500);
+
+    const body = await res.json();
+    expect(body.code).toBe("INTERNAL");
+  });
+
+  it("returns 500 INTERNAL when the duplicate-guard read errors", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient({
+        instruments: { select: { data: null, error: { message: "connection refused" } } },
+      }),
+    );
+
+    const res = await submitCustomInstrument(makeReq({ name: "Kazoo" }), makeLookup("member"));
+    expect(res.status).toBe(500);
+
+    const body = await res.json();
+    expect(body.code).toBe("INTERNAL");
   });
 });
 

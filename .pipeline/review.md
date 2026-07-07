@@ -1,38 +1,41 @@
-# Review — Issue #30: Member profile CRUD (`GET`/`PUT /api/profile`)
+# Review — Issue #31: Instrument list management (default + custom)
 
 ## VERDICT: SHIP
 
-## Summary
-The implementation faithfully matches the spec. Independently re-ran `bun run lint`,
-`bun run typecheck`, and `bun run test` — all green (8 suites / 66 tests, incl. 13 new).
-Read every source/test file firsthand rather than trusting the summaries.
+## Scope of change (verified via `git diff main...HEAD`)
+Single commit `94004ee`. Touches only expected files: `schemas/instruments.ts`,
+`app/api/instruments/handler.ts` (new), the 4 route delegators, the new test file,
+plus the two `.pipeline/` docs. No stray edits, no changes to `lib/supabase/types.ts`,
+no new migrations. Beacon/network scan of all touched files: clean (no `fetch`,
+external URLs, or telemetry — relevant given the repo's recent rogue-beacon incidents).
 
-## What was verified
-- **schemas/profile.ts** — matches spec verbatim: `vocalCapability` enum + trimmed,
-  2000-cap, nullish `bio` normalized to `null`.
-- **app/api/profile/handler.ts** — correct auth→JWT→RLS-client flow mirroring the
-  members handler. `getProfile` returns synthesized defaults on missing row and does
-  NOT query instruments in that branch (early return confirmed). `updateProfile` upserts
-  on `user_id`, sets only `user_id`/`vocal_capability`/`bio` (no `id`/`created_at`/
-  `updated_at`). `loadInstruments` group-scopes via `ctx.churchGroupId` and skips
-  unmatched instruments. Single try/catch converts `ApiException`→`fail`, else 500.
-- **route.ts** — thin delegators, as specified.
-- **Test file** — all 13 spec-listed cases present; assertions use `toEqual` on full
-  response bodies and capture the upsert payload, so they'd catch shape drift. Not
-  superficial.
-- **Security** — ownership enforced by RLS (`user_id = auth_user_id()`) + query scoped
-  to `ctx.userId`; no `:id` param; `member_instruments` never written (deferred to #31).
-- **Scope** — only `app/api/profile/*`, `schemas/profile.ts`, and the test file changed.
-  No migrations, no `lib/supabase/types.ts` / `types/domain.ts` edits. Scanned the source
-  diff for network/exec/beacon patterns — none found.
+## Correctness vs spec
+- `createInstrumentSchema`: `z.string().trim().min(1).max(100)` — matches spec and `varchar(100)`.
+- `listInstruments`: requireAuth only, group-scoped, ordered `is_default desc, name asc`,
+  empty array when none, `pending = !isDefault` mapping correct.
+- `addInstrument`: admin-gated, 400 validation, case-insensitive group-scoped duplicate
+  guard (409), `is_default: true`, `created_by: ctx.userId`, 201.
+- `submitCustomInstrument`: open to any member, identical guard, `is_default: false`, 201.
+- `promoteInstrument` / `deleteInstrument`: admin-gated, id + church_group_id scoping,
+  empty result -> 404 (cross-tenant == missing, intentional), idempotent promote.
+- All routes are thin delegators; both dynamic routes `await params` (Next 15).
+- Tenant isolation enforced in-handler via `requireRole` since RLS is tenant-only — matches spec.
 
-## Non-blocking observations (no fix required)
-- PUT validates the body (400) before the JWT check (401). This is the exact order the
-  spec prescribes; acceptable.
-- `as unknown as ...Insert` cast is a narrow, spec-sanctioned workaround for the
-  hand-written `Insert` type modeling `created_at` as required. No `created_at` is sent
-  at runtime (asserted by the payload test).
-- `if (error || !data)` on the upsert collapses a "success but no row returned" case into
-  a generic 500; with `onConflict` + `.maybeSingle()` this shouldn't occur in practice.
+## Tests
+Meaningful, not superficial: assert status + error `code`, capture and assert insert/update
+payloads (`is_default`, `created_by`, `church_group_id`), verify `getSupabaseClient` is NOT
+called on early auth/validation returns, and cover case-insensitive duplicate both directions.
+Per-operation fixture harness correctly isolates select/insert/update/delete on the same chain.
+94/94 tests pass.
 
-Green tests here reflect genuinely correct behavior. Ship it.
+## Independent re-run
+- `bun run lint`: pass (0/0)
+- `bun run typecheck`: pass
+- `bun run test`: 9 suites / 94 tests pass
+
+## Non-blocking observations
+- In `addInstrument`/`submitCustomInstrument` the body-parse (400) runs before the JWT
+  check (401). If a request had both a bad body and no JWT it returns 400 rather than 401.
+  Immaterial to security/correctness; not worth a revision.
+
+No correctness, security, or performance issues found. Ship it.

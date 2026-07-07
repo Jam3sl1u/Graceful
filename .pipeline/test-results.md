@@ -1,111 +1,73 @@
-# Test Results — Issue #30: Member profile CRUD (`GET`/`PUT /api/profile`)
+# Test Results — Issue #31: Instrument list management (default + custom)
 
 ## Verdict: PASS
 
-## Checks re-run independently (Bun)
+## What was independently verified
 
-- `bun install` — no changes, deps already in sync.
-- `bun run lint` (`eslint .`) — **PASS**, no warnings/errors.
-- `bun run typecheck` (`tsc --noEmit`) — **PASS**, no errors.
-- `bun run test` (`jest`) — **PASS**, 8 suites / 66 tests, 0 failures. Matches
-  the Coder's claim in `changes.md`. Suite list includes the new
-  `tests/unit/app/api/profile-route.test.ts` (13 tests) alongside all
-  pre-existing suites (church-group-route, admin-only, church-group-join,
-  church-group-members, lib/api/response, lib/api/auth, lib/api/lookup-user) —
-  no regressions elsewhere.
+### 1. Static checks (re-run from scratch, not trusted from changes.md)
+- `bun install` — clean, no changes.
+- `bun run lint` (`eslint .`) — **passes**, 0 errors/warnings.
+- `bun run typecheck` (`tsc --noEmit`) — **passes**, 0 errors.
+- `bun run test` (`jest`) — **passes**: 9 suites, 94 tests (89 original + 5 tests I
+  added below), 0 failures.
+- `bun x prettier --check` on the touched files (`schemas/instruments.ts`,
+  `app/api/instruments/handler.ts`, all 4 route files, the test file) — all clean.
+  Confirmed the repo-wide `bun run format:check` failure is pre-existing drift in
+  unrelated files (`app/api/_examples/admin-only/handler.ts`,
+  `app/api/church-group/members/handler.ts`, `README.md`, `tsconfig.json`,
+  `tests/integration/rls/**`, `tests/unit/app/api/church-group-members-route.test.ts`)
+  — none of these were touched by this change, matching the coder's claim.
 
-## Independent verification of spec/AC compliance
+### 2. Code review against spec (`.pipeline/spec.md`)
+Read `schemas/instruments.ts`, `app/api/instruments/handler.ts`, and all 4 route
+files line-by-line against the spec's prescribed code. They match essentially
+verbatim:
+- `createInstrumentSchema`: `z.string().trim().min(1).max(100)` — correct.
+- `listInstruments`: `requireAuth` only, no role gate, correct `.select().eq().order().order()` shape, 500 on error, `ok({ instruments: (data ?? []).map(...) })` — empty array when none.
+- `addInstrument` / `submitCustomInstrument`: correct duplicate guard (case-insensitive, group-scoped, re-reads all names), correct `is_default` value per path (`true` for admin add, `false` for custom), `created_by: ctx.userId`, 201 on success.
+- `promoteInstrument` / `deleteInstrument`: `id` scoped by `.eq("id", id).eq("church_group_id", ctx.churchGroupId)`, empty result array → 404 NOT_FOUND, admin-gated via `requireRole(ctx, ["admin"])`.
+- All 4 route files are thin delegators; both dynamic routes correctly `await params` (Next 15 async dynamic API).
+- `lib/api/response.ts` / `lib/api/auth.ts` cross-checked: `ok`/`fail` envelope shape (`{data}` / `{error, code}`), `requireAuth` throws `ApiException(UNAUTHENTICATED, 401)`, `requireRole` throws `ApiException(FORBIDDEN, 403)` — both caught by each handler's shared catch block, exactly as claimed.
+- Confirmed via `git show --stat HEAD` that the committed diff touches only the files changes.md claims (schema, handler, 4 routes, test file) — no stray edits.
 
-1. **Scope of changed files** — confirmed via `git diff --stat main...HEAD`:
-   only `app/api/profile/handler.ts` (new), `app/api/profile/route.ts`,
-   `schemas/profile.ts`, and the new test file were touched (plus pipeline
-   docs). No other routes, no `lib/supabase/types.ts`, no `types/domain.ts`,
-   no new migrations — matches spec's "explicitly out of scope" list and
-   changes.md's claims.
+### 3. Test-suite review + gaps I filled in independently
+The coder's `tests/unit/app/api/instruments-route.test.ts` (23 tests) is thorough
+and uses a per-table/per-operation fixture harness that correctly isolates
+`select`/`insert`/`update`/`delete` results. I ran it as-is first (passed), then
+identified two edge cases from the spec's explicit "Edge cases" list that weren't
+covered, and added 5 tests to close them (all passing, no code changes needed —
+these confirm existing behavior, they didn't uncover bugs):
 
-2. **DB schema/RLS assumptions** — checked directly against the migrations:
-   - `supabase/migrations/20260702000001_cluster_1_organization.sql`:
-     `member_profiles` has `id, user_id (unique), vocal_capability
-     (enum 'none'|'lead'|'harmony'|'both', not null default 'none'), bio text,
-     created_at` — **no `updated_at` column**, confirming the handler is
-     correct not to set one.
-   - `supabase/migrations/20260704000001_rls_policies.sql`: confirmed
-     `member_profiles_select_tenant`, `member_profiles_insert_own`,
-     `member_profiles_update_own`, `member_instruments_select_tenant`,
-     `instruments_select_tenant` all exist as described, supporting the
-     handler's choice to skip `requireRole` and rely on RLS + `ctx.userId`
-     scoping.
-   - `types/domain.ts` exports `VocalCapability = "lead" | "harmony" | "both" |
-     "none"`, matching `VOCAL_CAPABILITY_VALUES` in `schemas/profile.ts`.
+1. **"name longer than 100 chars → 400"** (spec line 181) — not previously tested.
+   Added: 101-char name → 400 VALIDATION_FAILED, and a boundary check that exactly
+   100 chars is accepted (201).
+2. **`submitCustomInstrument` failure paths** — the admin `addInstrument` path had
+   401/500-on-insert tests but the sibling `submitCustomInstrument` path didn't.
+   Added: 401 UNAUTHENTICATED (no JWT), 500 INTERNAL (insert error), and 500
+   INTERNAL (duplicate-guard read error) for the custom-submit path.
 
-3. **Zod schema behavior** — independently exercised `updateProfileSchema`
-   with a standalone script (11 cases) outside the existing test file:
-   - Missing `bio` → defaults to `null`. Pass.
-   - `bio` with leading/trailing whitespace → trimmed. Pass.
-   - Whitespace-only / empty string `bio` → normalized to `null`. Pass.
-   - `bio` exactly 2000 chars → accepted; 2001 chars → rejected
-     ("String must contain at most 2000 character(s)"). Pass (boundary
-     verified in both directions).
-   - Invalid enum casing (`"LEAD"`) and missing `vocalCapability` → rejected
-     with clear Zod messages. Pass.
-   - Non-string `bio` (number) → rejected. Pass.
+All 5 new tests pass against the existing implementation — no code changes were
+needed; they close coverage gaps, not correctness bugs.
 
-4. **Handler logic read-through** (`app/api/profile/handler.ts`):
-   - `getProfile` returns early with synthesized defaults
-     (`vocalCapability: "none"`, `bio: null`, `instruments: []`) when
-     `member_profiles` has no row, and does **not** call `loadInstruments` in
-     that branch — confirmed by code inspection (early `return` before the
-     `loadInstruments` call) and by the existing "no member_profiles row"
-     test case.
-   - `updateProfile` builds the upsert payload as a plain object with exactly
-     `user_id`, `vocal_capability`, `bio` before the `as unknown as
-     Database[...]["Insert"]` cast — confirmed by inspection and by the
-     existing test's `toEqual({ user_id, vocal_capability, bio })` assertion
-     on the captured payload (no `id`/`created_at` present at runtime).
-   - `loadInstruments` mirrors the `church-group/members/handler.ts` pattern:
-     builds a `Map<instrument_id, name>` from group-scoped `instruments`,
-     skips any `member_instruments` row without a match, and throws
-     `ApiException(INTERNAL, 500)` on either query error, caught by the
-     shared `try/catch` in both handlers.
-   - `route.ts` is a thin delegator (`GET` → `getProfile`, `PUT` →
-     `updateProfile`), matching the spec's example verbatim.
+## Manual reasoning checks
+- Confirmed the "id from another church group is indistinguishable from a missing
+  id → 404" claim is consistent with the RLS/handler design: the `.eq("id",
+  id).eq("church_group_id", ctx.churchGroupId)` filter is the only way tenant
+  scoping is enforced for promote/delete, since RLS itself is tenant-scoped only
+  (not role-gated), matching spec's "Current state" section.
+- Confirmed `pending = !isDefault` mapping in `toInstrumentResponse` matches spec's
+  OPEN QUESTIONS decision #2 exactly.
+- Confirmed no changes to `lib/supabase/types.ts` and no new migrations (out of
+  scope per spec) — verified via `git show --stat`.
 
-5. **Test file coverage** (`tests/unit/app/api/profile-route.test.ts`) — all
-   13 spec-listed cases are present and pass: GET 401 (no Clerk user), GET 401
-   (no JWT), GET 200 existing profile w/ name-mapped instruments, GET 200
-   synthesized defaults, GET skips unmatched instrument row, GET 500 on DB
-   error, PUT 400 invalid enum value, PUT 400 malformed/missing body, PUT 200
-   update existing, PUT 200 upsert-create for new profile, PUT bio
-   whitespace-to-null normalization (asserted on both the upsert payload and
-   response), PUT 500 on upsert error, PUT 401 on missing JWT. Assertions use
-   `toEqual` on the full response body rather than superficial checks, so
-   they'd catch shape drift.
-
-## Notes / non-blocking observations (no fix required)
-
-- `updateProfile`'s `data` null-check (`if (error || !data)`) means a
-  successful upsert that somehow returns no row would also produce a generic
-  500 `INTERNAL` rather than a more specific error — acceptable per spec
-  (upsert+`.maybeSingle()` with `onConflict: "user_id"` should always return a
-  row on success) and already implicitly covered by the "500 on upsert error"
-  test using `data: null`.
-- The `as unknown as Database[...]["Insert"]` cast is a narrowly-scoped
-  workaround for a known typing gap in the hand-written `Insert` type (not
-  modeling the `created_at` DB default); spec explicitly permits this and
-  forbids touching `lib/supabase/types.ts`, so this is intentional, not a
-  defect.
+## Final numbers
+- `bun run lint`: pass
+- `bun run typecheck`: pass
+- `bun run test`: 9 suites / 94 tests pass (89 pre-existing + 5 added by tester)
+- Prettier on touched files: pass
 
 ## Files touched during testing
+- `tests/unit/app/api/instruments-route.test.ts` — added 5 tests (see above).
+  No production code was modified.
 
-None. All existing coder-authored tests pass as-is; no additional tests were
-needed to reach full coverage of the spec's named cases, so no files were
-modified by the Tester.
-
-## Conclusion
-
-No failures found. The implementation matches the spec precisely, including
-all named edge cases and both deliberate scoping decisions (missing-profile
-tolerance on GET via synthesized defaults + upsert on PUT; instruments
-read-only on PUT).
-
-**Result: PASS. No blocking issues found. Ready for Reviewer.**
+No failures found. Recommend proceeding to Reviewer.
