@@ -4,7 +4,10 @@ jest.mock("@/lib/supabase/client", () => ({ getSupabaseClient: jest.fn() }));
 import { auth } from "@clerk/nextjs/server";
 import type { NextRequest } from "next/server";
 import { getSupabaseClient } from "@/lib/supabase/client";
-import { GET, type DirectoryMember } from "@/app/api/church-group/members/route";
+import {
+  getChurchGroupMembers,
+  type DirectoryMember,
+} from "@/app/api/church-group/members/handler";
 import type { AuthContext, UserLookup } from "@/lib/api/auth";
 import type { UserRole } from "@/types/domain";
 
@@ -78,7 +81,7 @@ describe("GET /api/church-group/members", () => {
     mockAuth.mockResolvedValue({ userId: null, getToken: jest.fn() });
     const lookup = jest.fn();
 
-    const res = await GET(fakeReq, lookup as unknown as UserLookup);
+    const res = await getChurchGroupMembers(fakeReq, lookup as unknown as UserLookup);
     expect(res.status).toBe(401);
 
     const body = await res.json();
@@ -90,7 +93,7 @@ describe("GET /api/church-group/members", () => {
     setUpAuth();
     mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
 
-    const res = await GET(fakeReq, makeLookup("guest"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("guest"));
     expect(res.status).toBe(403);
 
     const body = await res.json();
@@ -102,7 +105,7 @@ describe("GET /api/church-group/members", () => {
     setUpAuth();
     mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
 
-    const res = await GET(fakeReq, makeLookup("admin"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -123,7 +126,7 @@ describe("GET /api/church-group/members", () => {
       setUpAuth();
       mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
 
-      const res = await GET(fakeReq, makeLookup(role));
+      const res = await getChurchGroupMembers(fakeReq, makeLookup(role));
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -140,7 +143,7 @@ describe("GET /api/church-group/members", () => {
     setUpAuth();
     mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
 
-    const res = await GET(fakeReq, makeLookup("admin"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
     const body = await res.json();
     const members: DirectoryMember[] = body.data.members;
 
@@ -153,7 +156,7 @@ describe("GET /api/church-group/members", () => {
     setUpAuth();
     mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
 
-    const res = await GET(fakeReq, makeLookup("admin"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
     const body = await res.json();
     const members: DirectoryMember[] = body.data.members;
 
@@ -167,7 +170,7 @@ describe("GET /api/church-group/members", () => {
     setUpAuth();
     mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
 
-    const res = await GET(fakeReq, makeLookup("admin"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
     const body = await res.json();
     const members: DirectoryMember[] = body.data.members;
 
@@ -182,7 +185,7 @@ describe("GET /api/church-group/members", () => {
       makeSupabaseClient({ users: { data: null, error: { message: "connection refused" } } }),
     );
 
-    const res = await GET(fakeReq, makeLookup("admin"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
     expect(res.status).toBe(500);
 
     const body = await res.json();
@@ -195,7 +198,7 @@ describe("GET /api/church-group/members", () => {
       getToken: jest.fn().mockResolvedValue(null),
     });
 
-    const res = await GET(fakeReq, makeLookup("admin"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
     expect(res.status).toBe(401);
 
     const body = await res.json();
@@ -217,7 +220,7 @@ describe("GET /api/church-group/members", () => {
       }),
     );
 
-    const res = await GET(fakeReq, makeLookup("admin"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
     const body = await res.json();
     const members: DirectoryMember[] = body.data.members;
 
@@ -231,7 +234,7 @@ describe("GET /api/church-group/members", () => {
       makeSupabaseClient({ member_instruments: { data: [], error: null } }),
     );
 
-    const res = await GET(fakeReq, makeLookup("admin"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
     const body = await res.json();
     const members: DirectoryMember[] = body.data.members;
 
@@ -250,7 +253,7 @@ describe("GET /api/church-group/members", () => {
       }),
     );
 
-    const res = await GET(fakeReq, makeLookup("admin"));
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
     expect(res.status).toBe(200);
 
     const body = await res.json();

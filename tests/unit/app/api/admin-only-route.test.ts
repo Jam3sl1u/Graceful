@@ -2,7 +2,7 @@ jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }));
 
 import { auth } from "@clerk/nextjs/server";
 import type { NextRequest } from "next/server";
-import { GET } from "@/app/api/_examples/admin-only/route";
+import { adminOnlyExample } from "@/app/api/_examples/admin-only/handler";
 import type { AuthContext, UserLookup } from "@/lib/api/auth";
 import type { UserRole } from "@/types/domain";
 
@@ -40,7 +40,7 @@ describe("GET /api/_examples/admin-only", () => {
     async ({ role, expectedStatus, expectedCode }) => {
       mockAuth.mockResolvedValue({ userId: "clerk_test" });
 
-      const res = await GET(fakeReq, makeLookup(role));
+      const res = await adminOnlyExample(fakeReq, makeLookup(role));
       expect(res.status).toBe(expectedStatus);
 
       const body = await res.json();
@@ -56,7 +56,7 @@ describe("GET /api/_examples/admin-only", () => {
     mockAuth.mockResolvedValue({ userId: null });
     const lookup = jest.fn();
 
-    const res = await GET(fakeReq, lookup as unknown as UserLookup);
+    const res = await adminOnlyExample(fakeReq, lookup as unknown as UserLookup);
     expect(res.status).toBe(401);
 
     const body = await res.json();
