@@ -1,207 +1,374 @@
-# Spec — Issue #31: Instrument list management (default + custom)
+# Spec — Issue #29: Audit log writer utility + read endpoint (BR-13)
 
 ## OPEN QUESTIONS
-None are blocking. Two decisions were made explicitly below; if a human disagrees, only these change:
-1. **Duplicate names** — the DB has NO unique constraint on `(church_group_id, name)`. This spec adds a case-insensitive duplicate guard at the handler layer (409 CONFLICT) for both insert paths, because duplicate instrument names break roster/list UX. If duplicates should be allowed, drop the guard.
-2. **"pending" flag** — modeled as `pending = !is_default`. Admin `POST` and `promote` set `is_default = true`; member custom submissions are `is_default = false`. No new column is added (schema is frozen from #17).
 
-## Current state (already in repo)
-- All 5 route files exist but are `notImplemented` (501) stubs:
-  - `app/api/instruments/route.ts` (GET, POST)
-  - `app/api/instruments/custom/route.ts` (POST)
-  - `app/api/instruments/[id]/route.ts` (DELETE)
-  - `app/api/instruments/[id]/promote/route.ts` (POST)
-- `schemas/instruments.ts` is an empty-object stub.
-- Table `instruments` (migration `20260702000002_cluster_2_instruments.sql`):
-  `id, church_group_id, name varchar(100), is_default bool default false, created_by uuid null (FK users.id on delete set null), created_at timestamptz default now()`.
-- Table `member_instruments`: `id, member_profile_id, instrument_id` with FK `instrument_id → instruments.id ON DELETE CASCADE` and `unique(member_profile_id, instrument_id)`.
-- RLS (`20260704000001_rls_policies.sql`): instruments SELECT/INSERT/UPDATE/DELETE are **tenant-scoped only** (`church_group_id = auth_church_group_id()`), NOT role-gated. Therefore **admin-only enforcement MUST happen in the handler** via `requireRole(ctx, ["admin"])`.
-- Types: `lib/supabase/types.ts` already has `instruments` Row/Insert/Update. `InstrumentsRow` = `{ id, church_group_id, name, is_default, created_by, created_at }`; `Insert` marks `created_at` required even though the DB defaults it (same quirk handled in the profile handler with an `as unknown as ...Insert` cast). **No changes to this file.**
-- `types/domain.ts`: `UserRole = "admin" | "set_leader" | "member" | "guest"`.
-- `lib/api/errors.ts` already exports `ErrorCode.CONFLICT` and `ErrorCode.NOT_FOUND`.
-- Next.js is `^15.3.0` → dynamic route `params` is a **Promise** and must be awaited.
+None blocking. One design decision was forced by the current RLS model and is
+resolved below (see "Key constraint / chosen approach"). If a human disagrees
+with that resolution, only the RPC migration would change.
 
-## Files to create / modify
+---
 
-### 1. MODIFY `schemas/instruments.ts` (replace entire file)
-Follow `schemas/profile.ts` style.
+## Scope
+
+Deliver exactly two capabilities, nothing more:
+
+1. A shared server-side `writeAuditLog()` utility any authenticated API route can call.
+2. `GET /api/church-group/audit-log` — paginated, admin-only, read-only.
+
+**Explicitly OUT OF SCOPE for this issue** (do NOT touch these files):
+
+- Wiring `writeAuditLog()` into group creation (#24), role change (#27), member
+  removal (#28), or any other route. Those are separate issues that will import
+  this utility "as they're built." Leave the stubs at
+  `app/api/church-group/members/[id]/role/route.ts` and
+  `app/api/church-group/members/[id]/route.ts` untouched.
+- Any audit-log UI/screen.
+- Any UPDATE/DELETE path for audit rows (must not exist — already enforced at the
+  DB layer by #21; see verification note in edge cases).
+
+---
+
+## Key constraint / chosen approach (read this first)
+
+`audit_logs` already exists (migration `20260702000006_cluster6_auth_audit.sql`)
+and is locked down:
+
+- RLS SELECT policy `audit_logs_select_admin` — admin, same church group only.
+- **No** `authenticated` INSERT policy. `UPDATE`/`DELETE` are `REVOKE`d from
+  `authenticated`/`anon`. The RLS comment says inserts happen "via service role /
+  triggers only."
+- The service-role key is forbidden in `app/` and `lib/`, enforced by
+  `scripts/check-service-role.mjs` (bun run `check:service-role`). So the utility
+  **cannot** insert with a service-role client.
+
+**Resolution:** insert through a `SECURITY DEFINER` RPC called by the normal
+RLS-scoped anon client, exactly like `create_church_group` / `join_church_group`
+(copy the structure of
+`supabase/migrations/20260706000001_church_group_create_rpc.sql`). The RPC runs
+as the table owner, which bypasses RLS for the INSERT while preserving the
+append-only guarantee (it only ever INSERTs; UPDATE/DELETE stay revoked). This
+keeps user-callable code free of the service-role key.
+
+The RPC derives `user_id` and `church_group_id` from the caller's JWT (never from
+caller-supplied arguments) so a route cannot forge a log entry attributed to
+another user or group.
+
+---
+
+## Files to create
+
+### 1. `supabase/migrations/20260707000001_audit_log_write_rpc.sql` (NEW)
+
+Pattern to copy: `supabase/migrations/20260706000001_church_group_create_rpc.sql`
+(same header-comment style, `SECURITY DEFINER`, `SET search_path = ''`, schema-
+qualified names, `GRANT EXECUTE ... TO authenticated`, and a commented DOWN block).
+
+Create `public.write_audit_log(...)`:
+
+```sql
+CREATE OR REPLACE FUNCTION public.write_audit_log(
+  p_action      text,
+  p_entity_type text,
+  p_entity_id   uuid,
+  p_metadata    jsonb
+)
+  RETURNS public.audit_logs
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  VOLATILE
+  SET search_path = ''
+AS $$
+DECLARE
+  v_clerk_id text;
+  v_user_id  uuid;
+  v_group_id uuid;
+  v_row      public.audit_logs%ROWTYPE;
+BEGIN
+  v_clerk_id := auth.jwt() ->> 'sub';
+  IF v_clerk_id IS NULL THEN
+    RAISE EXCEPTION 'UNAUTHENTICATED' USING ERRCODE = 'P0001';
+  END IF;
+
+  SELECT id, church_group_id INTO v_user_id, v_group_id
+  FROM public.users WHERE clerk_id = v_clerk_id;
+
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'UNAUTHENTICATED' USING ERRCODE = 'P0001';
+  END IF;
+
+  INSERT INTO public.audit_logs
+    (church_group_id, user_id, action, entity_type, entity_id, metadata)
+  VALUES
+    (v_group_id, v_user_id, p_action, p_entity_type, p_entity_id,
+     COALESCE(p_metadata, '{}'::jsonb))
+  RETURNING * INTO v_row;
+
+  RETURN v_row;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.write_audit_log(text, text, uuid, jsonb) TO authenticated;
+```
+
+Include a commented `-- ============ DOWN ============` block dropping the
+function, matching the sibling RPC migrations.
+
+### 2. `lib/audit/write-audit-log.ts` (NEW)
+
+Pattern to copy: the `SupabaseClient<Database>` typing + error-throwing style of
+`loadInstruments` in `app/api/profile/handler.ts`. Must start with
+`import "server-only";`.
+
+```ts
+import "server-only";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "@/lib/supabase/types";
+import { ApiException, ErrorCode } from "@/lib/api/errors";
+
+// action uses dot-notation, e.g. "user.role_changed", "member.removed",
+// "invitation.sent", "group.created". Free-form string (DB limit: 100 chars).
+export type AuditLogEntry = {
+  action: string;      // dot-notation; max 100 chars (DB varchar(100))
+  entityType: string;  // e.g. "user", "invitation"; max 50 chars (DB varchar(50))
+  entityId: string;    // uuid of the affected entity
+  metadata?: Record<string, unknown>; // arbitrary JSON; defaults to {}
+};
+
+// Appends one immutable audit row for the caller's user + church group (both
+// derived server-side from the JWT inside the write_audit_log RPC). `supabase`
+// MUST be the RLS-scoped client for the acting user (getSupabaseClient(jwt)).
+// Throws ApiException(INTERNAL, 500) on DB error; never swallows.
+export async function writeAuditLog(
+  supabase: SupabaseClient<Database>,
+  entry: AuditLogEntry,
+): Promise<void>;
+```
+
+Implementation notes:
+- Call
+  `supabase.rpc("write_audit_log", { p_action: entry.action, p_entity_type: entry.entityType, p_entity_id: entry.entityId, p_metadata: entry.metadata ?? {} })`.
+- On `error`, throw `new ApiException("Internal error", ErrorCode.INTERNAL, 500)`.
+  Return `void` on success (ignore returned row).
+- Do NOT catch/swallow. Callers (future issues) decide whether a logging failure
+  is fatal to their operation.
+
+### 3. `schemas/audit-log.ts` (NEW)
+
+Pattern to copy: `schemas/profile.ts`. Query-param schema (offset pagination):
+
 ```ts
 import { z } from "zod";
 
-// Body for POST /api/instruments and POST /api/instruments/custom.
-export const createInstrumentSchema = z.object({
-  name: z.string().trim().min(1).max(100),
+export const auditLogQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(50),
 });
-export type CreateInstrumentInput = z.infer<typeof createInstrumentSchema>;
+
+export type AuditLogQuery = z.infer<typeof auditLogQuerySchema>;
 ```
 
-### 2. CREATE `app/api/instruments/handler.ts`
-Single shared handler module (mirror `app/api/profile/handler.ts` structure: `requireAuth` → JWT → `getSupabaseClient` → query → `ok`/`fail`, wrapped in a single `try/catch` that maps `ApiException` to `fail`, else 500 INTERNAL). Export a response type and five handlers.
+### 4. `app/api/church-group/audit-log/handler.ts` (NEW)
 
-Response type + mapper:
+Pattern to copy: `app/api/church-group/members/handler.ts` (auth → role gate →
+JWT → RLS client → query → `ok(...)`, single `try/catch` mapping `ApiException` →
+`fail`, else 500).
+
 ```ts
-export type InstrumentResponse = {
+export type AuditLogItem = {
   id: string;
-  name: string;
-  isDefault: boolean;
-  pending: boolean;   // = !isDefault
-  createdBy: string | null;
+  action: string;
+  entityType: string;
+  entityId: string;
+  userId: string | null;   // nullable per schema (system actions)
+  metadata: Record<string, unknown>;
+  createdAt: string;       // ISO timestamp
 };
-// private
-function toInstrumentResponse(row: { id: string; name: string; is_default: boolean; created_by: string | null }): InstrumentResponse
+
+export async function getAuditLog(req: NextRequest, lookup?: UserLookup): Promise<Response>;
 ```
 
-Handler signatures (pass `id` explicitly so unit tests can call handlers directly, matching how `profile`/`members` handlers are tested):
-```ts
-export async function listInstruments(req: NextRequest, lookup?: UserLookup): Promise<Response>            // any authenticated member
-export async function addInstrument(req: NextRequest, lookup?: UserLookup): Promise<Response>              // admin only
-export async function submitCustomInstrument(req: NextRequest, lookup?: UserLookup): Promise<Response>     // any member
-export async function promoteInstrument(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>  // admin only
-export async function deleteInstrument(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>   // admin only
-```
+Behavior:
+1. `const ctx = await requireAuth(req, lookup);`
+2. `requireRole(ctx, ["admin"]);` — admin only (defense in depth alongside RLS;
+   yields 403 FORBIDDEN for non-admins instead of an empty list).
+3. Parse query params from `req.nextUrl.searchParams` via `auditLogQuerySchema`
+   (`.safeParse` on `Object.fromEntries(req.nextUrl.searchParams)`); on failure
+   `return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);`
+4. Get JWT (`const { getToken } = await auth();` → `getToken({ template: "supabase" })`);
+   if null → `fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);`
+5. `const supabase = getSupabaseClient(jwt);`
+6. Query with exact count + range:
+   ```ts
+   const from = (page - 1) * pageSize;
+   const to = from + pageSize - 1;
+   const { data, error, count } = await supabase
+     .from("audit_logs")
+     .select("id, action, entity_type, entity_id, user_id, metadata, created_at",
+             { count: "exact" })
+     .order("created_at", { ascending: false })
+     .order("id", { ascending: false }) // stable tiebreak
+     .range(from, to);
+   ```
+   RLS already scopes to the admin's own church group; adding
+   `.eq("church_group_id", ctx.churchGroupId)` is acceptable/harmless but optional.
+7. On `error` → `fail("Internal error", ErrorCode.INTERNAL, 500);`
+8. Map rows (snake → camel) to `AuditLogItem[]`.
+9. Respond:
+   ```ts
+   return ok({ entries, pagination: { page, pageSize, total: count ?? 0 } });
+   ```
+10. Wrap the whole body in the standard catch:
+    ```ts
+    } catch (err) {
+      if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    ```
 
-Imports to copy from `app/api/profile/handler.ts`: `NextRequest`, `auth` from `@clerk/nextjs/server`, `requireAuth`, `requireRole`, `type UserLookup` from `@/lib/api/auth`, `ok`, `fail` from `@/lib/api/response`, `ApiException`, `ErrorCode` from `@/lib/api/errors`, `getSupabaseClient` from `@/lib/supabase/client`, `type Database` from `@/lib/supabase/types`, plus `createInstrumentSchema` from `@/schemas/instruments`.
+## Files to modify
 
-Standard preamble in EVERY handler after `requireAuth` (and, where noted, `requireRole`):
-```ts
-const { getToken } = await auth();
-const jwt = await getToken({ template: "supabase" });
-if (!jwt) return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
-const supabase = getSupabaseClient(jwt);
-```
+### 5. `app/api/church-group/audit-log/route.ts` (REPLACE the stub)
 
-**`listInstruments`** — `requireAuth` only (no role gate). Query:
-```ts
-supabase.from("instruments")
-  .select("id, name, is_default, created_by")
-  .eq("church_group_id", ctx.churchGroupId)
-  .order("is_default", { ascending: false })
-  .order("name", { ascending: true })
-```
-On `error` → 500 INTERNAL. Return `ok({ instruments: (data ?? []).map(toInstrumentResponse) })` (empty array when none).
+Currently returns `notImplemented`. Replace with the thin delegator pattern from
+`app/api/church-group/members/route.ts`:
 
-**`addInstrument`** (admin) — `requireAuth` then `requireRole(ctx, ["admin"])`. Parse body with `createInstrumentSchema.safeParse(await req.json().catch(() => null))` → 400 VALIDATION_FAILED on failure. Run duplicate guard (below) → 409 CONFLICT. Insert:
-```ts
-const payload = {
-  church_group_id: ctx.churchGroupId,
-  name: parsed.name,
-  is_default: true,
-  created_by: ctx.userId,
-} as unknown as Database["public"]["Tables"]["instruments"]["Insert"];
-supabase.from("instruments").insert(payload).select("id, name, is_default, created_by").single()
-```
-Do NOT set `created_at`. On `error`/no data → 500. Return `ok({ instrument: toInstrumentResponse(data) }, 201)`.
-
-**`submitCustomInstrument`** — `requireAuth` only (any member; AC lets any member submit). Same body parse + duplicate guard. Insert identical to `addInstrument` EXCEPT `is_default: false`. Return `ok({ instrument }, 201)`.
-
-**`promoteInstrument`** (admin) — `requireAuth` + `requireRole(ctx, ["admin"])`. Update:
-```ts
-supabase.from("instruments")
-  .update({ is_default: true } as unknown as Database["public"]["Tables"]["instruments"]["Update"])
-  .eq("id", id).eq("church_group_id", ctx.churchGroupId)
-  .select("id, name, is_default, created_by")
-```
-If `error` → 500. If returned array is empty (no row matched) → 404 NOT_FOUND. Else `ok({ instrument: toInstrumentResponse(rows[0]) })`. (Promoting an already-default instrument is idempotent — still 200.)
-
-**`deleteInstrument`** (admin) — `requireAuth` + `requireRole(ctx, ["admin"])`.
-```ts
-supabase.from("instruments").delete()
-  .eq("id", id).eq("church_group_id", ctx.churchGroupId)
-  .select("id")
-```
-If `error` → 500. If returned array empty → 404 NOT_FOUND. Else `ok({ deleted: true })`. (FK cascade auto-clears `member_instruments` — no extra work.)
-
-**Duplicate guard helper** (used by `addInstrument` + `submitCustomInstrument`), run after body parse, before insert:
-```ts
-const { data: existing, error: dupErr } = await supabase
-  .from("instruments").select("name").eq("church_group_id", ctx.churchGroupId);
-if (dupErr) return fail("Internal error", ErrorCode.INTERNAL, 500);
-if ((existing ?? []).some((r) => r.name.trim().toLowerCase() === parsed.name.toLowerCase()))
-  return fail("Instrument already exists", ErrorCode.CONFLICT, 409);
-```
-
-**Catch block** (copy from profile handler): map `ApiException` → `fail(err.message, err.code, err.status)`, else `fail("Internal error", ErrorCode.INTERNAL, 500)`.
-
-### 3. MODIFY `app/api/instruments/route.ts`
 ```ts
 import { NextRequest } from "next/server";
-import { listInstruments, addInstrument } from "./handler";
+import { getAuditLog } from "./handler";
 
 export async function GET(req: NextRequest): Promise<Response> {
-  return listInstruments(req);
-}
-export async function POST(req: NextRequest): Promise<Response> {
-  return addInstrument(req);
+  return getAuditLog(req);
 }
 ```
 
-### 4. MODIFY `app/api/instruments/custom/route.ts`
-```ts
-import { NextRequest } from "next/server";
-import { submitCustomInstrument } from "../handler";
+### 6. `lib/supabase/types.ts` (ADD types)
 
-export async function POST(req: NextRequest): Promise<Response> {
-  return submitCustomInstrument(req);
+Follow the existing hand-written style. Needed so `typecheck` passes for both the
+`.from("audit_logs")` select and the `.rpc("write_audit_log", ...)` call.
+
+- Add row type:
+  ```ts
+  type AuditLogsRow = {
+    id: string;
+    church_group_id: string;
+    user_id: string | null;
+    action: string;
+    entity_type: string;
+    entity_id: string;
+    metadata: Record<string, unknown>;
+    created_at: string;
+  };
+  ```
+- Add to `Tables`:
+  ```ts
+  audit_logs: {
+    Row: AuditLogsRow;
+    Insert: Omit<AuditLogsRow, "id" | "created_at"> & { id?: string; created_at?: string };
+    Update: Partial<AuditLogsRow>;
+    Relationships: [];
+  };
+  ```
+- Add to `Functions`:
+  ```ts
+  write_audit_log: {
+    Args: {
+      p_action: string;
+      p_entity_type: string;
+      p_entity_id: string;
+      p_metadata: Record<string, unknown>;
+    };
+    Returns: AuditLogsRow;
+  };
+  ```
+
+---
+
+## Edge cases the implementation must handle
+
+- **writeAuditLog with no metadata** → RPC receives `{}` (utility passes
+  `entry.metadata ?? {}`; RPC also `COALESCE`s to `'{}'::jsonb`).
+- **writeAuditLog RPC error** → throw `ApiException(INTERNAL, 500)`; never swallow.
+- **Role-change metadata (AC 4)** → `metadata` must round-trip arbitrary JSON,
+  e.g. `{ old_value: "member", new_value: "set_leader" }`. No special-casing; pass
+  straight through to `p_metadata` (jsonb). This is what lets #27 satisfy its
+  old→new requirement. Do NOT implement the role-change route here.
+- **GET as non-admin (member/set_leader/guest)** → 403 FORBIDDEN.
+- **GET unauthenticated / no `users` row** → 401 UNAUTHENTICATED (via `requireAuth`).
+- **GET with no JWT from getToken** → 401 UNAUTHENTICATED (do not build a client).
+- **GET invalid/negative page or pageSize > 100** → 400 VALIDATION_FAILED.
+- **GET with zero matching rows** → 200 with `entries: []`, `pagination.total: 0`.
+- **GET DB error** → 500 INTERNAL.
+- **Ordering** → newest first (`created_at DESC`, `id DESC` tiebreak) for stable
+  pagination.
+- **No UPDATE/DELETE route** → confirm none is added. Append-only is already
+  enforced at the DB layer (cluster-6 migration `REVOKE UPDATE, DELETE`); this
+  issue must not add any handler exposing those verbs.
+
+---
+
+## Response shape (for the Tester)
+
+Success (`200`):
+```json
+{
+  "data": {
+    "entries": [
+      {
+        "id": "uuid",
+        "action": "user.role_changed",
+        "entityType": "user",
+        "entityId": "uuid",
+        "userId": "uuid-or-null",
+        "metadata": { "old_value": "member", "new_value": "set_leader" },
+        "createdAt": "2026-07-07T00:00:00.000Z"
+      }
+    ],
+    "pagination": { "page": 1, "pageSize": 50, "total": 1 }
+  }
 }
 ```
+Errors use the standard `{ error, code }` envelope via `fail(...)`.
 
-### 5. MODIFY `app/api/instruments/[id]/route.ts`
-```ts
-import { NextRequest } from "next/server";
-import { deleteInstrument } from "../handler";
+---
 
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-): Promise<Response> {
-  const { id } = await params;
-  return deleteInstrument(req, id);
-}
-```
+## Suggested test files (Tester will author)
 
-### 6. MODIFY `app/api/instruments/[id]/promote/route.ts`
-```ts
-import { NextRequest } from "next/server";
-import { promoteInstrument } from "../../handler";
+Follow `tests/unit/app/api/profile-route.test.ts` for mocking style
+(`jest.mock("@clerk/nextjs/server")`, `jest.mock("@/lib/supabase/client")`,
+injected `UserLookup` via `makeLookup(role)`, chainable Supabase mock).
 
-export async function POST(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-): Promise<Response> {
-  const { id } = await params;
-  return promoteInstrument(req, id);
-}
-```
+- `tests/unit/app/api/audit-log-route.test.ts` — admin 200 with mapped entries +
+  pagination; non-admin 403; missing JWT 401; unauthenticated 401; invalid query
+  params 400; DB error 500; empty result set. Note the GET reads params from
+  `req.nextUrl.searchParams`, so the mocked `NextRequest` must expose `nextUrl`.
+- `tests/unit/lib/audit/write-audit-log.test.ts` — asserts `rpc` invoked with
+  correct `p_action/p_entity_type/p_entity_id/p_metadata` (incl. metadata default
+  `{}`); throws `ApiException` INTERNAL on rpc error.
 
-## Edge cases the implementation MUST handle
-- Clerk user unauthenticated → 401 UNAUTHENTICATED (handled by `requireAuth`).
-- Valid Clerk user but no Supabase JWT → 401 UNAUTHENTICATED (before touching Supabase).
-- Non-admin calling `addInstrument` / `promoteInstrument` / `deleteInstrument` → 403 FORBIDDEN (via `requireRole`). `listInstruments` and `submitCustomInstrument` are open to any authenticated member.
-- Malformed/missing body or empty/whitespace-only `name` → 400 VALIDATION_FAILED (`name` is `.trim().min(1)`).
-- `name` longer than 100 chars → 400 (matches `varchar(100)`).
-- Duplicate name (case-insensitive, same group) on either insert path → 409 CONFLICT.
-- `promote`/`delete` with an id that doesn't exist OR belongs to another church group → 404 NOT_FOUND (the `.eq("church_group_id", ...)` scoping makes cross-tenant ids indistinguishable from missing — correct behavior).
-- All queries scoped to `ctx.churchGroupId`; inserts set `church_group_id: ctx.churchGroupId` (required by the RLS INSERT check).
-- Any Supabase `error` → 500 INTERNAL. `ApiException` from auth helpers → mapped via the shared catch block.
-- Multiple members sharing an instrument is inherently supported (no exclusivity logic); do NOT add any uniqueness on member selection here. Deleting a shared instrument cascades to `member_instruments`.
+RLS admin-SELECT / append-only behavior is already covered by
+`tests/integration/rls/rls.test.ts` and `.../tables/role-gated.test.ts` — do not
+duplicate.
 
-## Tests
-Create `tests/unit/app/api/instruments-route.test.ts`. Copy the mocking harness from `tests/unit/app/api/church-group-members-route.test.ts` / `profile-route.test.ts`:
-- `jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }))` and `jest.mock("@/lib/supabase/client", ...)`.
-- `makeLookup(role)` producing an `AuthContext`, `setUpAuth(jwt)`, and a `makeSupabaseClient(overrides)` fixture builder whose mocked `from(table)` supports the chains used here: `.select(...).eq(...).order(...).order(...)`, `.select(...).eq(...)` (duplicate-guard read), `.insert(...).select(...).single()`, `.update(...).eq(...).eq(...).select(...)`, `.delete().eq(...).eq(...).select(...)`.
-Cover, mapping to acceptance criteria + edge cases: GET 200 list (ordered, `pending` flag correct for default vs custom rows) and GET 200 empty; POST admin 201 sets `is_default: true`; POST 403 for non-admin; POST 400 empty name; POST 409 duplicate (case-insensitive); custom POST 201 sets `is_default: false` and is allowed for a plain member; promote admin 200 + 404 when id missing + 403 non-admin; delete admin 200 `{ deleted: true }` + 404 missing + 403 non-admin; 401 when no JWT; 500 on DB error.
+---
 
-## Patterns to copy
-- Handler shape, JWT/`requireAuth` flow, try/catch → `ApiException` mapping, and the `as unknown as ...Insert` cast: **`app/api/profile/handler.ts`**.
-- Role gating: **`app/api/_examples/admin-only/handler.ts`** (`requireRole(ctx, ["admin"])`).
-- Multi-select + name-map query style: **`app/api/church-group/members/handler.ts`**.
-- Route → handler delegation: **`app/api/profile/route.ts`** and **`app/api/church-group/members/route.ts`**.
-- Zod schema style: **`schemas/profile.ts`**.
-- Unit test harness / Supabase mock: **`tests/unit/app/api/profile-route.test.ts`**.
-- Response envelope: `ok`/`fail` from `lib/api/response.ts`; codes from `lib/api/errors.ts`.
+## Patterns to follow (name the file)
 
-## Out of scope (do NOT implement)
-- Attaching instruments to a member profile / editing member selections (that is #30's `member_instruments`; this issue only manages the group's instrument catalog).
-- Transposition logic (Phase 3).
-- New DB migrations or schema changes — the schema from #17 is sufficient. Do NOT add columns or constraints, and do NOT edit `lib/supabase/types.ts`.
-- Seeding the 9 defaults (done in #24).
+- SECURITY DEFINER RPC + grant + DOWN block: `supabase/migrations/20260706000001_church_group_create_rpc.sql`.
+- Handler auth → role gate → JWT → RLS client → map → `ok`, with `try/catch`:
+  `app/api/church-group/members/handler.ts`.
+- Utility shape / `server-only` / throwing `ApiException`: `loadInstruments` in
+  `app/api/profile/handler.ts`.
+- Thin route delegation: `app/api/church-group/members/route.ts`.
+- Zod schema style: `schemas/profile.ts`.
+- Success/error envelope: `lib/api/response.ts` (`ok`, `fail`); shape in `types/api.ts`.
+- Hand-written Supabase types (Tables + Functions): `lib/supabase/types.ts`.
+- Unit test harness / Supabase mock: `tests/unit/app/api/profile-route.test.ts`.
+
+---
+
+## Commands (Bun)
+
+- `bun run typecheck`
+- `bun run lint`
+- `bun run test`
+- `bun run check:service-role` (must stay green — proves no service-role key leaked)
