@@ -25,3 +25,9 @@ export const createChurchGroupSchema = z.object({
 });
 
 export type CreateChurchGroupInput = z.infer<typeof createChurchGroupSchema>;
+
+export const joinChurchGroupSchema = z.object({
+  inviteCode: z.string().trim().toUpperCase().min(1).max(20),
+});
+
+export type JoinChurchGroupInput = z.infer<typeof joinChurchGroupSchema>;
