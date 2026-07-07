@@ -118,13 +118,17 @@ if (!plan) {
   return { status: 'planner-failed', issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
-if (plan.hasOpenQuestion) {
+if (plan.hasOpenQuestion && !issueArgs.humanAnswer) {
   log(`Issue #${issue.number} has a genuine open question -- stopping for human input instead of guessing.`)
   return { status: 'blocked-on-question', issue: { number: issue.number, title: issue.title, url: issue.url }, summary: plan.summary }
 }
 
+if (plan.hasOpenQuestion && issueArgs.humanAnswer) {
+  log(`Issue #${issue.number}: resuming past the open question with a human-provided answer.`)
+}
+
 const coded = await agent(
-  `You are the coder stage. Read .pipeline/spec.md in full and implement exactly what it specifies for issue #${issue.number} -- no scope creep. Verify your changes with Bun (bun run lint, bun run typecheck, bun run test, or whatever the spec calls for) before finishing. Commit your changes on the current branch with a clear message referencing issue #${issue.number} (do not push). Write a summary of what changed and where to .pipeline/changes.md.`,
+  `You are the coder stage. Read .pipeline/spec.md in full and implement exactly what it specifies for issue #${issue.number} -- no scope creep.${issueArgs.humanAnswer ? ` A human has resolved the open question(s) the planner flagged -- apply this resolution, overriding anything in spec.md that conflicts with it: "${issueArgs.humanAnswer.replace(/"/g, '\\"')}"` : ''} Verify your changes with Bun (bun run lint, bun run typecheck, bun run test, or whatever the spec calls for) before finishing. Commit your changes on the current branch with a clear message referencing issue #${issue.number} (do not push). Write a summary of what changed and where to .pipeline/changes.md.`,
   { agentType: 'coder', label: `code:${issue.number}`, phase: 'Code', schema: { type: 'object', properties: { done: { type: 'boolean' } }, required: ['done'] } }
 )
 
@@ -182,4 +186,5 @@ return {
   issue: { number: issue.number, title: issue.title, url: issue.url },
   prUrl: ship ? ship.prUrl : null,
   verdict: review ? review.verdict : null,
+  humanAnswerApplied: issueArgs.humanAnswer || null,
 }
