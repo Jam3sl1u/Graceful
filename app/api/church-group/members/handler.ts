@@ -22,9 +22,6 @@ export async function getChurchGroupMembers(
   lookup?: UserLookup,
 ): Promise<Response> {
   try {
-    // #region agent log
-    if (process.env.NODE_ENV === "test") fetch('http://127.0.0.1:7538/ingest/73d41e57-f389-4de1-b0c9-c98dcb4b4f16',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8ebabd'},body:JSON.stringify({sessionId:'8ebabd',runId:'pre-fix',hypothesisId:'H1',location:'app/api/church-group/members/handler.ts:entry',message:'getChurchGroupMembers entry',data:{hasLookup:!!lookup},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     const ctx = await requireAuth(req, lookup);
     requireRole(ctx, ["admin", "set_leader", "member"]);
 
