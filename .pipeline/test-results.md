@@ -1,137 +1,43 @@
-# Test Results — Issue #24: Church group creation (`PUT /api/church-group`)
+# Test Results — Issue #25: Join church group via invite code (`POST /api/church-group/join`)
 
-## Summary: PASS
+Independently re-verified (not just trusting `changes.md`'s claims).
 
-All independently re-run checks pass. The coder's claims in `.pipeline/changes.md`
-were verified against the actual code, not just trusted, and the unit test suite
-was expanded with 4 additional cases the coder's original suite did not cover.
+## Automated checks (re-run independently)
 
-## Commands re-run (from a clean `bun install`, not trusting the coder's report)
+| Check | Result |
+|---|---|
+| `bun install` | OK (707 packages) |
+| `bun run typecheck` | **PASS** — no errors |
+| `bun run lint` | **PASS** — no errors |
+| `bun run test` | **PASS** — 6 suites / 40 tests, 0 failures (includes the 11 tests in `tests/unit/app/api/church-group-join-route.test.ts`) |
+| `bun run check:service-role` | **PASS** — no service-role key references in `app/`/`lib/` |
+| `bun run format:check` | Pre-existing warnings only, in files untouched by this change (`README.md`, `supabase/README.md`, `tests/integration/rls/**`). None of the files changed for #25 are flagged. Matches the coder's claim. |
 
-- `bun install` — no changes needed, lockfile in sync.
-- `bun run typecheck` (`tsc --noEmit`) — **PASS**, no errors.
-- `bun run lint` (`eslint .`) — **PASS**, no errors.
-- `bun run test` (`jest`) — **PASS**, 5 suites / 29 tests (was 25; +4 added by tester).
-- `bun run check:service-role` — **PASS**: "OK: no service-role key references
-  found outside comments in app/ or lib/."
-- `bunx prettier --check` on all touched TS files (route, schema, types,
-  test) — **PASS**. Note: the migration `.sql` file cannot be checked by
-  Prettier — running it directly against the file errors with "No parser
-  could be inferred for file ... .sql", and running Prettier against the
-  whole repo silently skips `.sql` files entirely. This is a pre-existing
-  project limitation (no SQL Prettier plugin configured), not a gap
-  introduced by this change; the coder's claim of "prettier passes on all
-  touched files" should be read as "all touched files Prettier supports."
+## Manual/functional verification of the migration (the gap flagged by the coder)
 
-## Code review against spec.md (manual verification, not just re-stating changes.md)
+`changes.md` explicitly flagged that the expiry-check branch in `join_church_group()` has no unit-test coverage (unreachable from mocked-RPC tests) and asked the tester to exercise it if a live DB were available. A live DB was not set up in this environment, but Docker was available, so I spun up a throwaway Postgres 16 container, stubbed a minimal `auth.jwt()` (reading `request.jwt.claims` via `current_setting`, matching how Supabase exposes the JWT to `SECURITY DEFINER` functions) and the `authenticated`/`anon` roles, then applied all 11 migrations in lexicographic order, including the new `20260706000002_church_group_join_rpc.sql`.
 
-Verified line-by-line against the spec:
+- **All 11 migrations applied with zero SQL errors**, confirming the new migration (the `ALTER TABLE ... ADD COLUMN invite_code_expires_at` and the `CREATE FUNCTION public.join_church_group` + `GRANT`) is syntactically valid and consistent with the existing schema.
+- Ran `join_church_group(...)` directly against seeded `church_groups` rows, simulating the joiner's Clerk `sub` via `set_config('request.jwt.claims', ...)`:
+  - **Happy path**: valid, non-expired invite code → returns the new `users` row with `role = 'member'`, correct `church_group_id`. PASS.
+  - **Already-in-group**: same clerk id joining a second time → raises `USER_ALREADY_IN_GROUP` (P0001). PASS.
+  - **Unknown invite code**: raises `INVALID_INVITE_CODE` (P0001). PASS.
+  - **Expired invite code** (`invite_code_expires_at` in the past) — the previously-untested branch — raises `INVALID_INVITE_CODE` (P0001), identical to the unknown-code case, exactly as the spec's human-resolved override requires. **PASS.**
+  - **Unauthenticated** (no `sub` in JWT claims) → raises `UNAUTHENTICATED` (P0001). PASS.
+  - **Future expiry (not yet expired)**: code with `invite_code_expires_at` in the future still allows a successful join. PASS — confirms future timestamps (and by extension NULL) don't false-positive as expired.
+- Container was torn down after the run; no persistent state left behind.
 
-- `supabase/migrations/20260706000001_church_group_create_rpc.sql`:
-  - `generate_invite_code()` — correct alphabet (`ABCDEFGHJKMNPQRSTUVWXYZ23456789`,
-    excludes 0/O/1/I/L), 8-char length, retry-until-unique loop against
-    `church_groups.invite_code`, `SECURITY DEFINER`/`SET search_path = ''`,
-    not granted to `authenticated`. Matches spec exactly.
-  - `create_church_group(...)` — checks `auth.jwt() ->> 'sub'` null →
-    `RAISE EXCEPTION 'UNAUTHENTICATED' USING ERRCODE = 'P0001'`; existing
-    `users` row check → `USER_ALREADY_IN_GROUP`; inserts `church_groups` then
-    `users` (role `admin`) then exactly the 8 named instruments in the
-    spec's exact order via a hardcoded array, `is_default = true`,
-    `created_by = NULL`; no "Other" row (9th row) inserted. `GRANT EXECUTE
-    ... TO authenticated` present. Commented DOWN section present.
-  - Cross-checked column names/types against the actual table definitions in
-    `supabase/migrations/20260702000001_cluster_1_organization.sql` and
-    `20260702000002_cluster_2_instruments.sql` — `church_groups`
-    (name/denomination/timezone/logo_url/invite_code), `users`
-    (clerk_id/church_group_id/role/name/email), `instruments`
-    (church_group_id/name/is_default/created_by) all match the INSERT
-    statements in the RPC. No column-name mismatches found.
-  - Style matches the existing `SECURITY DEFINER` / `SET search_path = ''`
-    convention in `20260704000001_rls_policies.sql`.
-  - Not executed against a live Postgres/Supabase instance — no local
-    Supabase CLI/DB available in this environment, consistent with the
-    coder's own flag in changes.md. This is a real coverage gap for DB-level
-    behavior (exact instrument count/order under a real engine, invite-code
-    uniqueness under concurrency, atomic rollback on partial failure) — but
-    it is appropriately deferred to `tests/integration/rls/` per spec, and
-    explicitly out of scope for this pass.
+This closes the one gap the coder called out — the expiry/revocation branch is now confirmed to behave correctly, not just "reviewed by eye against conventions."
 
-- `schemas/church-group.ts` — matches spec's example exactly:
-  `name` required (1-100, trimmed), `timezone` optional with
-  `.default("America/Chicago")` and an `isValidIanaTimezone` refine (no
-  hardcoded list, uses `Intl.DateTimeFormat` try/catch), `denomination`/
-  `logoUrl` optional with correct max lengths. Old unused
-  `churchGroupSchema`/`ChurchGroupInput` removed as instructed.
+## Code review of changed files (cross-checked against spec.md + changes.md)
 
-- `app/api/church-group/route.ts` — matches spec step-by-step: `auth()` →
-  401 if no `clerkId`; `getToken({ template: "supabase" })` → 401 if null;
-  `req.json().catch(() => null)` + `safeParse` → 400 `VALIDATION_FAILED`;
-  `currentUser()` → `deriveCreatorName` fallback chain
-  (fullName → "first last" → username → email local-part → "Admin", truncated
-  to 100 chars) exactly as specified; `creatorEmail` from
-  `primaryEmailAddress` or `null`; `supabase.rpc("create_church_group", {...})`
-  with the exact param names/mapping from the spec; error-message
-  substring-matching for `USER_ALREADY_IN_GROUP` (409) and `UNAUTHENTICATED`
-  (401), else 500; success → `ok(data, 201)`. Whole handler wrapped in
-  try/catch → 500 fallback. Does not call `requireAuth`, consistent with the
-  Background rationale. `GET` unchanged (`notImplemented`).
-
-- `lib/supabase/types.ts` — `ChurchGroupsRow` and `church_groups` table entry
-  added mirroring the `users` entry style; `Functions.create_church_group`
-  typed with the exact `Args`/`Returns` shape from the spec. `bun run
-  typecheck` confirms `supabase.rpc("create_church_group", ...)` in the route
-  compiles without `any`/casts.
-
-## Unit tests — independently expanded, not just re-run
-
-The coder's original 8 tests in
-`tests/unit/app/api/church-group-route.test.ts` (201 happy path, 400 missing
-name, 400 invalid timezone, 401 no Clerk userId, 401 no JWT, 409
-USER_ALREADY_IN_GROUP, 500 generic RPC error, "Admin" name fallback) were
-reviewed and all still pass.
-
-I added 4 more cases the spec calls out as edge cases but the coder's suite
-did not exercise, per this stage's mandate to independently verify rather
-than trust the coder's test list:
-
-1. **Missing `timezone` defaults to `America/Chicago`** and is forwarded to
-   the RPC as `p_timezone` (spec: "Missing `timezone` → allowed, defaults to
-   America/Chicago" — previously asserted only indirectly, never with
-   `timezone` actually omitted from the request body).
-2. **Provided `denomination`/`logoUrl` are passed through unchanged** to
-   `p_denomination`/`p_logo_url` (previously only the `null`/omitted case was
-   asserted; the non-omitted pass-through path was untested).
-3. **Non-JSON / empty body** (`req.json()` rejects with a `SyntaxError`,
-   simulating an unparseable/empty body) → 400 `VALIDATION_FAILED`, `rpc`
-   never called (spec edge case: "Body is not JSON / empty body → 400").
-   The coder's tests only exercised `safeParse` failure on a *valid* JSON
-   object missing `name`; the `.catch(() => null)` path itself was untested.
-4. **Unexpected thrown error** (`currentUser()` rejects) → outer try/catch
-   → 500 `INTERNAL`, `rpc` never called. This is the "at least one failure
-   case" required for this stage and exercises a code path (the outer
-   try/catch) that no existing test touched — all prior 500 tests only
-   covered the RPC returning a Supabase `error` object, not a thrown
-   exception.
-
-All 4 new tests pass against the current implementation; no code changes
-were required to make them pass.
-
-Final test count: **29/29 passing** (5 suites), `jest` exit code 0.
+- `supabase/migrations/20260706000002_church_group_join_rpc.sql` — matches spec's RPC pattern (auth check, already-in-group check, invite-code lookup, insert-and-return) plus the human-approved addition of `invite_code_expires_at` and the expiry check. Commented DOWN block present and correctly ordered (drops function, then column). `SECURITY DEFINER` / `SET search_path = ''` / `RAISE EXCEPTION ... USING ERRCODE = 'P0001'` conventions match `20260706000001_church_group_create_rpc.sql` exactly.
+- `schemas/church-group.ts` — `joinChurchGroupSchema` appended exactly as specified (`inviteCode: z.string().trim().toUpperCase().min(1).max(20)`); `createChurchGroupSchema` untouched.
+- `app/api/church-group/join/route.ts` — flow, error-code mapping, and status codes match spec section 3 exactly (401 no `clerkId` / 401 no JWT / 400 schema failure without calling `getSupabaseClient` / RPC call with exact param names / error-message substring mapping for `INVALID_INVITE_CODE` → 400, `USER_ALREADY_IN_GROUP` → 409, `UNAUTHENTICATED` → 401, else 500 / success → `ok(data, 201)` / outer try/catch → 500). `deriveMemberName` mirrors `deriveCreatorName` with `"Member"` fallback instead of `"Admin"`, truncated to 100 chars, verbatim otherwise.
+- `lib/supabase/types.ts` — `join_church_group` Functions entry matches the RPC signature (`Args` with `p_invite_code`/`p_member_name`/`p_member_email`, `Returns: UsersRow`); existing `create_church_group` entry and row shapes untouched. `bun run typecheck` confirms the `.rpc("join_church_group", ...)` call in the route compiles.
+- `app/(public)/join/[code]/page.tsx` + `join-form.tsx` — thin server component unwraps `Promise<{ code }>` params, client component POSTs `{ inviteCode: code }` and shows an in-place "you're in" success state (no redirect) on 2xx, renders the `error` string on non-2xx. This is consistent with the human-resolved override of spec's OPEN QUESTION #2 (the spec's own stub assumption of a `/profile` redirect via `useRouter().push` was explicitly overridden by a documented human decision in `changes.md`, deferring the redirect to issue #16) — a deliberate, documented scope decision, not a missed requirement.
+- `tests/unit/app/api/church-group-join-route.test.ts` — covers all 11 required cases from spec section 6 (201 happy path with exact rpc-arg assertions, uppercase/trim normalization, 400 INVALID_INVITE_CODE, 400 missing/empty inviteCode, 400 non-JSON/empty body, 409 USER_ALREADY_IN_GROUP, 401 no userId, 401 no JWT, 500 generic rpc error, 500 currentUser() rejects, "Member"/null fallback). All pass; `getSupabaseClient` correctly asserted as not-called on the auth/validation-failure paths.
 
 ## Verdict
 
-No discrepancies found between `.pipeline/changes.md`'s claims and the
-actual code/behavior. Implementation matches `.pipeline/spec.md` in full,
-including the settled instrument-count decision (exactly 8, no "Other" row)
-and the PUT-creates (not PUT-updates) divergence from PRD §22.1. Recommend
-proceeding to review.
-
-Remaining known gaps (pre-existing/spec-acknowledged, not regressions from
-this change):
-- No live DB execution of the migration (no local Supabase instance
-  available in this environment).
-- DB-level integration coverage (instrument count/order under a real engine,
-  admin role assignment, invite-code collision handling) deferred to
-  `tests/integration/rls/`, per spec.
-
-**Result: PASS. No blocking issues found. Ready for Reviewer.**
+**PASS.** All automated checks (`typecheck`, `lint`, `test`, `check:service-role`) pass and match the coder's claims. The migration was independently applied to a real Postgres 16 instance (not just reviewed by eye), and the RPC's behavior — including the previously-untested expiry/revocation branch — was functionally verified end-to-end and behaves exactly as `spec.md`'s human-resolved override describes. No discrepancies found between `changes.md`'s claims and the actual code/behavior. No failures found. Ready for Reviewer.

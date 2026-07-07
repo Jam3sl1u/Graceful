@@ -55,6 +55,14 @@ export type Database = {
         };
         Returns: ChurchGroupsRow;
       };
+      join_church_group: {
+        Args: {
+          p_invite_code: string;
+          p_member_name: string;
+          p_member_email: string | null;
+        };
+        Returns: UsersRow;
+      };
     };
     Enums: {
       user_role: UserRole;
