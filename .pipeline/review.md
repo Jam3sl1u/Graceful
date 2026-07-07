@@ -1,44 +1,72 @@
-# Review — Issue #23 (Disable PostgREST auto-API & lock down service role key)
+# Review — Issue #24: Church group creation (`PUT /api/church-group`)
 
-VERDICT: NEEDS WORK
+VERDICT: SHIP
 
-## Summary
-The four in-repo deliverables match the spec: `supabase/config.toml` [api]/enabled=false
-block, README "Architecture rules (standing)" section, `scripts/check-service-role.mjs`
-guard, and the `check:service-role` package.json script. All edits are additive (only
-deletion is the package.json trailing-comma line). PRD refs (§19.3, §25.1) verified to
-exist. Commit contains only the four code files; `.pipeline/*` correctly left uncommitted
-per prior incident history. OQ-1 dashboard/secret actions correctly deferred.
+## What I verified independently (not just trusting the summaries)
+- Ran `git diff main...HEAD` and read every changed file.
+- `bun run typecheck` — clean.
+- `bun run lint` — clean.
+- `bun run test` — 5 suites / 29 tests, all pass.
+- Cross-checked the RPC's INSERT statements against the real table DDL in
+  `supabase/migrations/20260702000001_cluster_1_organization.sql` and
+  `20260702000002_cluster_2_instruments.sql`:
+  - `church_groups(name, denomination, timezone, logo_url, invite_code)` column
+    list and the `VALUES (p_name, p_denomination, p_timezone, p_logo_url, ...)`
+    mapping line up correctly (no transposed columns — denomination/timezone are
+    in the right slots).
+  - `users(clerk_id, church_group_id, role, name, email)` matches.
+  - `instruments(church_group_id, name, is_default, created_by)` matches;
+    `created_by` is nullable in DDL, so `NULL` seed is valid.
+  - Column length limits in the zod schema (name<=100, timezone<=50,
+    denomination<=100) match the varchar sizes. `logo_url` is `text`, so the 2048
+    cap is a self-imposed guard — fine.
+- Confirmed `ok`/`fail` signatures and `ErrorCode.{CONFLICT,VALIDATION_FAILED,
+  UNAUTHENTICATED,INTERNAL}` all exist and are used correctly; `fail` emits
+  `{ error, code }`, which the tests assert against.
+- Migration timestamp `20260706000001` sorts after the latest existing
+  `20260704000002`. GRANT EXECUTE is present for `create_church_group` and
+  correctly absent for `generate_invite_code`. Commented DOWN present.
 
-I independently re-ran the guard and confirmed: passes clean repo (exit 0), the
-`lib/supabase/client.ts` comment is correctly allowlisted, real non-comment violations in
-both `app/` and `lib/` are flagged with `path:line - matched` and exit 1, trailing comments
-after real code correctly FAIL, and the extension filter skips `.json`/no-extension files.
+## Correctness spot-checks
+- Spec divergences are intentional and documented in the code (PUT-creates vs
+  PRD §22.1 update; exactly 8 default instruments, no "Other" row). The 8 names
+  and their order match the spec exactly.
+- `USER_ALREADY_IN_GROUP` guard correctly prevents a user from creating a second
+  group. `UNAUTHENTICATED` raised when `auth.jwt() ->> 'sub'` is null.
+- SECURITY DEFINER + `SET search_path = ''` + schema-qualified refs throughout;
+  runs as table owner so RLS INSERT gaps are bypassed as designed — no
+  service-role key used (check:service-role passes).
+- Route returns the RPC row directly via `ok(data, 201)`; since the function
+  returns a single composite row (not SETOF), `data` is an object, matching the
+  happy-path test assertion.
 
-## Must fix
+## Tests are meaningful, not superficial
+The unit suite asserts the exact `rpc` argument object (param name mapping,
+null coercion for optional fields), exact status codes, and error-code strings
+for each branch (201/400x2/401x2/409/500) plus the "Admin" name fallback. These
+would catch a real regression in param mapping or error routing.
 
-1. **Guard silently passes (exit 0) when run from any cwd other than the repo root.**
-   `scripts/check-service-role.mjs:11` uses relative `SCAN_DIRS = ["app", "lib"]` resolved
-   against `process.cwd()`. `walk()` (lines 21-25) swallows the ENOENT in a bare `try/catch`
-   and returns zero files, so from a non-root cwd the script prints the OK message and
-   exits 0 while scanning NOTHING. Reproduced:
-     - `cd /repo && node scripts/check-service-role.mjs` with an injected violation → exit 1 (correct)
-     - `cd / && node /repo/scripts/check-service-role.mjs` same violation → exit 0 "OK" (WRONG)
-   This is a false-negative in a security guard whose only job is to fail loudly. The
-   `bun run check:service-role` path is safe today (npm/bun set cwd to package root), but
-   the spec's stated contract is `node scripts/check-service-role.mjs`, and any future
-   direct call, git hook, or CI step that runs from a different directory would get a
-   silent green while enforcing nothing.
-   Fix: resolve SCAN_DIRS against the script/repo root, e.g. anchor to
-   `import.meta.url` (`fileURLToPath` + `join(dirname, "..", dir)`), OR make a missing
-   scan dir an explicit condition (only tolerate absent dirs, still fail on read errors) —
-   do not let a missing `app/`+`lib/` resolve to a silent pass. Then verify the guard
-   flags a violation regardless of invocation cwd.
+## Non-blocking notes (do not block ship; track for the DB integration pass)
+1. **Invite-code collision under concurrency**: the retry loop only re-checks
+   `EXISTS` before insert; it does not catch a `unique_violation` from the
+   `church_groups.invite_code` unique constraint if two transactions generate
+   the same code between check and insert. Probability is ~1/31^8, but a clean
+   `BEGIN/EXCEPTION WHEN unique_violation THEN retry` would be more robust. Spec
+   explicitly describes the current loop approach, so this is acceptable.
+2. **`random()` is not cryptographically secure**. Invite codes gate the future
+   join-via-code flow (#25). 31^8 keyspace makes brute force impractical, and
+   the spec prescribes this exact approach, but `gen_random_bytes`-based
+   generation would be stronger. Flagging for a future hardening pass, not this
+   issue.
+3. **Error classification is substring-based** on `error.message`
+   (`includes("USER_ALREADY_IN_GROUP")` / `includes("UNAUTHENTICATED")`), only
+   verified against mocked error shapes. The live PostgREST error payload for a
+   `RAISE EXCEPTION ... USING ERRCODE = 'P0001'` should be confirmed in the
+   `tests/integration/rls/` pass. If it holds the message elsewhere than
+   `.message`, the 409/401 mapping would silently fall through to 500.
+4. **DB-level behavior unexecuted**: exact 8-instrument seeding, admin role,
+   atomic rollback on partial failure are not run against a live Postgres in
+   this environment. Correctly deferred to `tests/integration/rls/` per spec.
 
-## Non-blocking notes (do not need to fix for ship)
-- Block comments whose content lines lack a leading `*` (e.g. a bare line inside `/* ... */`)
-  are treated as code and would FALSE-POSITIVE fail. This errs toward strictness, which is
-  the safe direction for a security guard, and does not affect the current allowlisted file
-  (which uses `//` and `*`-prefixed lines). Acceptable as-is; worth a comment if revisited.
-- No regression test for the guard itself (tester noted this). Acceptable for this issue's
-  scope; consider a fixture-based test if #79/CI wiring lands.
+None of the above changes correctness for the merged unit-testable behavior.
+The implementation faithfully matches the spec; tests are substantive.
