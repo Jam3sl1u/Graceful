@@ -1,147 +1,169 @@
-# Spec — Issue #26: Member directory endpoint (`GET /api/church-group/members`)
+# Spec — Issue #30: Member profile CRUD (`GET`/`PUT /api/profile`)
 
-## OPEN QUESTIONS (non-blocking — defaults chosen, proceed)
+## OPEN QUESTIONS
 
-1. **Live availability status.** The `availability` table exists (issue #20,
-   `20260702000005_cluster_5_partial.sql`), but the issue's Implementation Notes
-   explicitly say: "ship the directory shape now and wire in real-time status once
-   **#34** lands." There is no "current status" concept on the table — it stores one
-   `is_available` row per `(user_id, date)`, with no notion of "today live."
-   **Decision for this issue:** include an `availabilityStatus` field in every member
-   object, always set to `null` (placeholder), with a code comment referencing #34.
-   Do **not** query the `availability` table in this issue. This satisfies AC-1's
-   "directory shape" without inventing date/timezone logic that belongs to #34.
+None blocking. Two deliberate scoping decisions the Coder must honor (not ambiguities):
 
-2. **Do guests appear as rows in the directory?** Guests are group members with a
-   `guest` role. AC-4 says "Guests seeing nothing here" — that refers to guests *as
-   the caller* (they get 403). It does not say to hide guest *rows* from other
-   viewers. **Decision:** the directory lists **all `users` rows in the caller's
-   group regardless of role** (this is what the RLS `users_select_tenant` policy
-   already returns). Simple and matches "everyone in my group." Do not filter by role.
-
-Neither of these blocks implementation. If a human disagrees, only the two spots
-above change.
-
----
+1. **Profile row may not exist yet.** The join RPC (`join_church_group`) and create-group RPC
+   both create a `users` row but **no** `member_profiles` row (verified in
+   `supabase/migrations/20260706000002_church_group_join_rpc.sql` and
+   `20260706000001_church_group_create_rpc.sql`). PRD §13.4 onboarding step 4 is what first
+   creates it. Therefore:
+   - `GET` must tolerate a missing row and return synthesized defaults (do **not** auto-create).
+   - `PUT` must **upsert** (insert if absent, update if present), keyed on the unique `user_id`.
+2. **Instruments are read-only here.** PRD §22.2 lists instrument selection under `PUT /api/profile`,
+   but Issue #30 explicitly defers that to #31. So: `GET` **returns** the joined instrument list;
+   `PUT` **ignores / does not touch** `member_instruments`. Do not add instrument write logic.
 
 ## Goal (scope of THIS issue)
 
-Implement `GET /api/church-group/members`: return every user in the caller's church
-group with their instruments and vocal capability. Contact details (email/phone) are
-included **only when the caller is an `admin`**. Guests (as caller) get 403. The
-availability field ships as a `null` placeholder (see OPEN QUESTION 1).
-
-Out of scope: any UI/screen, real-time availability wiring (#34), role assignment
-(#27), member removal (#28). Do not touch other routes.
-
----
+Implement `GET /api/profile` (caller's own `member_profiles` record + selected instruments) and
+`PUT /api/profile` (update `vocal_capability`, `bio`). Own-profile only — no `:id` param; identity
+comes from the auth context (`ctx.userId`). Validated with Zod; `vocal_capability` restricted to the
+enum. Do not touch any other route.
 
 ## Current state (already done — do NOT redo)
 
-- `app/api/church-group/members/route.ts` exists as a `notImplemented` stub — you
-  will replace its `GET`.
-- All required tables already exist and are RLS group-scoped for `SELECT` to
-  `authenticated` (`20260704000001_rls_policies.sql`): `users`
-  (`users_select_tenant`), `member_profiles` (`member_profiles_select_tenant`),
-  `member_instruments` (`member_instruments_select_tenant`), `instruments`
-  (`instruments_select_tenant`). **No new migration is needed.**
-- Request-level auth is enforced by `middleware.ts` (this route is not in
-  `isPublicRoute`, so Clerk `auth.protect()` already covers it). Role-level and
-  group-scoping are enforced in the handler + RLS.
-
-Table columns you will rely on (from the migrations):
-- `users`: `id`, `church_group_id`, `role`, `name`, `email` (nullable), `phone`
-  (nullable).
-- `member_profiles`: `id`, `user_id` (unique), `vocal_capability`
-  (`'none'|'lead'|'harmony'|'both'`, NOT NULL default `'none'`). A user may have
-  **no** profile row.
-- `member_instruments`: `member_profile_id`, `instrument_id`.
-- `instruments`: `id`, `church_group_id`, `name`.
-
----
+- `app/api/profile/route.ts` exists as a scaffold: an ad-hoc `GET` returning `{ userId }` and a
+  `PUT` that returns `notImplemented(...)`. **Replace both.**
+- `schemas/profile.ts` is an empty-object placeholder (`z.object({})`). **Replace it.**
+- Schema and RLS already exist — **no new migration**:
+  - `member_profiles` (`20260702000001_cluster_1_organization.sql`):
+    `id`, `user_id` (unique FK → users.id), `vocal_capability`
+    (enum `'none'|'lead'|'harmony'|'both'`, NOT NULL default `'none'`), `bio text` (nullable),
+    `created_at`. **There is no `updated_at` column.**
+  - RLS (`20260704000001_rls_policies.sql`): `member_profiles_select_tenant` (group-scoped read),
+    `member_profiles_insert_own` and `member_profiles_update_own` (allow when
+    `user_id = auth_user_id()`). `member_instruments_select_tenant` and `instruments_select_tenant`
+    are group-scoped reads. All are already in place.
+- `lib/supabase/types.ts` already types `member_profiles`, `instruments`, `member_instruments`
+  (Row/Insert/Update). **No changes needed there.**
+- `types/domain.ts` already exports `VocalCapability = "lead" | "harmony" | "both" | "none"`.
 
 ## Files to create / modify
 
-### 1. MODIFY `app/api/church-group/members/route.ts`
+### 1. REWRITE `schemas/profile.ts`
 
-Replace the file. Keep no other exports. Pattern to copy for the
-`requireAuth` + `requireRole` + lookup-seam + try/catch + `ok`/`fail` envelope:
-**`app/api/_examples/admin-only/route.ts`**. Pattern to copy for turning the Clerk
-JWT into a Supabase client: **`lib/api/auth.ts`** (`lookupUserByClerkId` — `auth()`,
-`getToken({ template: "supabase" })`, `getSupabaseClient(jwt)`).
+Replace the placeholder stub entirely:
 
-**Signature (the second `lookup` param is required for unit testing the role):**
+```ts
+import { z } from "zod";
+
+export const VOCAL_CAPABILITY_VALUES = ["lead", "harmony", "both", "none"] as const;
+
+// PUT /api/profile body. Full replace of the two editable profile fields.
+// bio: optional/nullable free text; empty/whitespace-only is normalized to null.
+export const updateProfileSchema = z.object({
+  vocalCapability: z.enum(VOCAL_CAPABILITY_VALUES),
+  bio: z
+    .string()
+    .trim()
+    .max(2000)
+    .nullish()
+    .transform((v) => (v && v.length > 0 ? v : null)),
+});
+
+export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
+```
+
+Notes:
+- Enum values match the Postgres `vocal_capability` enum and `VocalCapability` in `types/domain.ts`.
+- `2000` char cap is a defensive default (PRD §20.2 lists `bio` as plain `text`, no length given).
+  Keep it; do not invent other fields.
+
+### 2. CREATE `app/api/profile/handler.ts`
+
+Follow the exact structure of `app/api/church-group/members/handler.ts` (auth → JWT → RLS client →
+queries → map → `ok(...)`; single `try/catch` converting `ApiException` to `fail`, else 500).
+
+Exports:
+
 ```ts
 import { NextRequest } from "next/server";
 import { auth } from "@clerk/nextjs/server";
-import { requireAuth, requireRole, type UserLookup } from "@/lib/api/auth";
+import { requireAuth, type UserLookup } from "@/lib/api/auth";
 import { ok, fail } from "@/lib/api/response";
 import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
-import type { UserRole, VocalCapability } from "@/types/domain";
+import type { VocalCapability } from "@/types/domain";
+import { updateProfileSchema } from "@/schemas/profile";
 
-export async function GET(req: NextRequest, lookup?: UserLookup): Promise<Response>
-```
-
-**Response shape** (define this type in the route file and export it):
-```ts
-export type DirectoryMember = {
-  id: string;                 // users.id
-  name: string;
-  role: UserRole;
-  vocalCapability: VocalCapability;   // 'none' when the user has no member_profile
-  instruments: { id: string; name: string }[];
-  availabilityStatus: null;   // placeholder for #34 — see spec OPEN QUESTION 1
-  email?: string | null;      // present ONLY when caller is admin
-  phone?: string | null;      // present ONLY when caller is admin
+export type ProfileResponse = {
+  userId: string;                              // users.id (the caller)
+  vocalCapability: VocalCapability;            // 'none' when no profile row exists yet
+  bio: string | null;
+  instruments: { id: string; name: string }[]; // read-only; [] when no profile / no instruments
 };
-```
-Success body: `ok({ members })` → `{ "data": { "members": DirectoryMember[] } }`.
-For non-admin callers, the `email` and `phone` keys must be **absent from the
-object entirely** (not `null`) — omit them, do not set them.
 
-**Handler behavior, in order:**
-1. `const ctx = await requireAuth(req, lookup);` — 401 `UNAUTHENTICATED` is thrown
-   by `requireAuth` when there is no Clerk session or no `users` row.
-2. `requireRole(ctx, ["admin", "set_leader", "member"]);` — throws 403 `FORBIDDEN`
-   for `guest`. (AC-4: guests see nothing here.)
-3. Build the Supabase client from the Clerk JWT:
+export async function getProfile(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+export async function updateProfile(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+```
+
+Do **not** call `requireRole`. Ownership is enforced by RLS (`user_id = auth_user_id()`) and by
+querying `ctx.userId`; there is no role gate in the AC. (A `guest` would pass auth but has no
+meaningful profile — acceptable, out of scope.)
+
+**`getProfile`:**
+1. `const ctx = await requireAuth(req, lookup);` — throws 401 `UNAUTHENTICATED` when no Clerk
+   session or no `users` row.
+2. Build the Supabase client from the Clerk JWT (same as the members handler):
    `const { getToken } = await auth();`
    `const jwt = await getToken({ template: "supabase" });`
    if `!jwt` → `return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);`
    `const supabase = getSupabaseClient(jwt);`
-4. Run these queries. Explicitly filter `church_group_id` where the column exists
-   (defense in depth on top of RLS — AC-3):
-   - `usersRes = await supabase.from("users")
-       .select("id, name, role, email, phone")
-       .eq("church_group_id", ctx.churchGroupId);`
-   - `profilesRes = await supabase.from("member_profiles")
-       .select("id, user_id, vocal_capability");`  // RLS scopes to group
-   - `miRes = await supabase.from("member_instruments")
-       .select("member_profile_id, instrument_id");`  // RLS scopes to group
-   - `instrRes = await supabase.from("instruments")
-       .select("id, name")
-       .eq("church_group_id", ctx.churchGroupId);`
-5. If any of the four results has a non-null `.error` →
-   `return fail("Internal error", ErrorCode.INTERNAL, 500);`
-   (or `throw new ApiException("Internal error", ErrorCode.INTERNAL, 500)` and let
-   the catch handle it — either is fine; match the admin-only pattern's catch.)
-6. Assemble in JS (no SQL joins needed):
-   - Build `instrumentNameById: Map<instrumentId, name>` from `instrRes.data`.
-   - Build `profileByUserId: Map<userId, {profileId, vocalCapability}>` from
-     `profilesRes.data`.
-   - Build `instrumentsByProfileId: Map<profileId, {id,name}[]>` from `miRes.data`,
-     resolving each `instrument_id` via `instrumentNameById` (skip any id with no
-     matching instrument name).
-   - For each `user` in `usersRes.data`, produce a `DirectoryMember`:
-     - `vocalCapability` = profile's value if the user has a profile, else `'none'`.
-     - `instruments` = the profile's instrument list, else `[]`.
-     - `availabilityStatus: null`.
-     - If `ctx.role === 'admin'`, add `email: user.email` and `phone: user.phone`;
-       otherwise omit both keys.
-7. `return ok({ members });`
+3. Fetch the caller's profile:
+   `supabase.from("member_profiles").select("id, vocal_capability, bio").eq("user_id", ctx.userId).maybeSingle();`
+   - On `.error` → `return fail("Internal error", ErrorCode.INTERNAL, 500);`
+   - If `data` is null → return
+     `ok({ profile: { userId: ctx.userId, vocalCapability: "none", bio: null, instruments: [] } })`.
+     Do **not** query instruments in this branch.
+4. If a profile row exists, load its instruments via the shared helper (below) and return
+   `ok({ profile })` with the assembled `ProfileResponse`
+   (`vocalCapability = data.vocal_capability`, `bio = data.bio`).
 
-**Catch block** (copy from admin-only route):
+**`updateProfile`:**
+1. `const ctx = await requireAuth(req, lookup);`
+2. Parse body defensively (mirror `app/api/church-group/join/route.ts`):
+   `const body = await req.json().catch(() => null);`
+   `const parsedResult = updateProfileSchema.safeParse(body);`
+   if `!parsedResult.success` → `return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);`
+   `const parsed = parsedResult.data;`
+3. Get the JWT (401 if none) and `getSupabaseClient(jwt)` as in `getProfile`.
+4. Upsert the profile (row may not exist — OPEN QUESTION 1):
+   ```ts
+   const { data, error } = await supabase
+     .from("member_profiles")
+     .upsert(
+       { user_id: ctx.userId, vocal_capability: parsed.vocalCapability, bio: parsed.bio },
+       { onConflict: "user_id" },
+     )
+     .select("id, vocal_capability, bio")
+     .maybeSingle();
+   ```
+   - RLS `member_profiles_insert_own` / `_update_own` permit this because `user_id = auth_user_id()`.
+   - Do **not** set `id`, `created_at`, or any `updated_at` (no such column; DB defaults handle `id`/`created_at`).
+   - On `error` → `return fail("Internal error", ErrorCode.INTERNAL, 500);`
+5. Load instruments for the returned profile row via the shared helper, and return `ok({ profile })`
+   (status 200) with the identical `ProfileResponse` shape as `getProfile`.
+
+**Shared private helper** (factor out to avoid drift; used by both handlers):
+```ts
+async function loadInstruments(
+  supabase: /* SupabaseClient<Database> */,
+  memberProfileId: string,
+  churchGroupId: string,
+): Promise<{ id: string; name: string }[]>
+```
+Implementation mirrors the instrument name-mapping in `app/api/church-group/members/handler.ts`:
+- `supabase.from("member_instruments").select("member_profile_id, instrument_id").eq("member_profile_id", memberProfileId)`
+- `supabase.from("instruments").select("id, name").eq("church_group_id", churchGroupId)`
+- Build a `Map<instrument_id, name>`; map the member's rows to `{ id, name }`, **skipping** any
+  `instrument_id` with no matching instrument.
+- If either query `.error` is non-null, throw `new ApiException("Internal error", ErrorCode.INTERNAL, 500)`
+  so the outer `try/catch` returns 500 (or return `fail(...)` from the caller — either is fine as long
+  as errors become 500 INTERNAL).
+
+**Catch block** (copy from members handler):
 ```ts
 } catch (err) {
   if (err instanceof ApiException) return fail(err.message, err.code, err.status);
@@ -149,116 +171,84 @@ object entirely** (not `null`) — omit them, do not set them.
 }
 ```
 
-Do NOT sort/paginate — return all members in whatever order the query yields
-(ordering is not an AC; keep it minimal).
+### 3. REWRITE `app/api/profile/route.ts`
 
-### 2. MODIFY `lib/supabase/types.ts`
+Reduce to thin delegators, mirroring `app/api/church-group/members/route.ts`:
 
-The queries above must typecheck (`bun run typecheck`). The current `UsersRow` lacks
-`name`, `email`, `phone`, and there are no types for `member_profiles`,
-`instruments`, `member_instruments`. Extend `Database["public"]["Tables"]`, keeping
-the existing minimal hand-written style (each table needs `Row`, `Insert`, `Update`,
-`Relationships: []`). Make these changes:
+```ts
+import { NextRequest } from "next/server";
+import { getProfile, updateProfile } from "./handler";
 
-- Add to `UsersRow`: `name: string; email: string | null; phone: string | null;`
-  (keep existing `id`, `clerk_id`, `church_group_id`, `role`). Do NOT change
-  `lib/api/auth.ts` — its `.select("id, church_group_id, role")` stays valid.
-- Add table `member_profiles` with
-  `Row = { id: string; user_id: string; vocal_capability: VocalCapability;
-  bio: string | null; created_at: string }`. Import `VocalCapability` from
-  `@/types/domain` (already imports `UserRole` from there).
-- Add table `instruments` with
-  `Row = { id: string; church_group_id: string; name: string;
-  is_default: boolean; created_by: string | null; created_at: string }`.
-- Add table `member_instruments` with
-  `Row = { id: string; member_profile_id: string; instrument_id: string }`.
-- Leave `church_groups` and the `create_church_group` function entry as-is.
+export async function GET(req: NextRequest): Promise<Response> {
+  return getProfile(req);
+}
 
-Keep the file otherwise minimal; do not add tables unrelated to this issue.
+export async function PUT(req: NextRequest): Promise<Response> {
+  return updateProfile(req);
+}
+```
 
----
+### 4. CREATE `tests/unit/app/api/profile-route.test.ts`
+
+Copy the mocking harness from `tests/unit/app/api/church-group-members-route.test.ts`
+(`jest.mock("@clerk/nextjs/server")`, `jest.mock("@/lib/supabase/client")`, `makeLookup(role)`,
+`setUpAuth()`, a `makeSupabaseClient(overrides)` fixture builder). Extend the fixture builder so the
+mocked `from(table)` supports the chains this handler uses:
+- `.select(...).eq(...).maybeSingle()` → resolves to the configured `member_profiles` result.
+- `.select(...).eq(...)` → resolves to the configured `member_instruments` / `instruments` result.
+- `.upsert(payload, opts).select(...).maybeSingle()` → records `payload` and resolves to the
+  configured `member_profiles` result.
+
+Cases to cover (map 1:1 to acceptance criteria + edge cases):
+- `GET` 401 when Clerk `userId` is null (lookup never consulted).
+- `GET` 401 when `getToken` yields no JWT.
+- `GET` 200 with an existing profile → `{ profile: { userId, vocalCapability, bio, instruments } }`,
+  instruments correctly name-mapped.
+- `GET` 200 when **no** `member_profiles` row → `vocalCapability: "none"`, `bio: null`,
+  `instruments: []`.
+- `GET` skips a `member_instruments` row whose `instrument_id` has no matching instrument.
+- `GET` 500 when the `member_profiles` query returns an error.
+- `PUT` 400 `VALIDATION_FAILED` when `vocalCapability` is not lead/harmony/both/none.
+- `PUT` 400 `VALIDATION_FAILED` when body is malformed / missing `vocalCapability`.
+- `PUT` 200 updates an existing profile and returns the updated `ProfileResponse`.
+- `PUT` 200 creates (upserts) a profile for a member who had none, returning the new values.
+- `PUT` normalizes empty/whitespace `bio` to `null` (assert the recorded upsert payload / response `bio`).
+- `PUT` 500 when the upsert returns an error.
+- `PUT` 401 when `getToken` yields no JWT.
+
+## Response contract (both routes)
+
+Success: `ok({ profile: ProfileResponse })` → `{ "data": { "profile": { ... } } }` via
+`lib/api/response.ts`. Errors via `fail(message, code, status)` with `ErrorCode` from
+`lib/api/errors.ts`. No new error codes needed.
 
 ## Edge cases the implementation must handle
 
-- **Guest caller** → 403 `FORBIDDEN` (never returns directory data).
-- **Unauthenticated** (no Clerk session, or `getToken` returns no JWT) → 401
-  `UNAUTHENTICATED`.
-- **Non-admin caller (member / set_leader)** → members returned but each object has
-  **no** `email`/`phone` keys (AC-2: enforced server-side, not just UI).
-- **Admin caller** → each member includes `email` and `phone` (either may be `null`
-  when the DB column is null).
-- **User with no `member_profiles` row** → `vocalCapability: 'none'`,
-  `instruments: []` (do not drop the user from the list).
-- **User with a profile but no `member_instruments` rows** → `instruments: []`.
-- **A `member_instruments` row whose `instrument_id` has no matching `instruments`
-  row** → skip that entry (don't emit `{id, name: undefined}`).
-- **Caller is the only user in the group** → returns a one-element array containing
-  the caller.
-- **Any of the four DB queries errors** → 500 `INTERNAL` (do not return a partial
-  directory).
-- Cross-group isolation is guaranteed by RLS + the explicit `church_group_id`
-  filters; a member from another group must never appear (AC-3).
-
----
+- Unauthenticated / unprovisioned user (no `users` row) → 401 (handled by `requireAuth`).
+- Missing supabase JWT despite a Clerk session → 401.
+- Missing `member_profiles` row: `GET` → synthesized defaults; `PUT` → insert via upsert.
+- `member_instruments` referencing a missing / other-group instrument → skipped in mapping.
+- Invalid `vocal_capability` value → 400 `VALIDATION_FAILED`.
+- Malformed JSON body on `PUT` → 400 (never throw; use `.catch(() => null)`).
+- Empty/whitespace `bio` → stored as `null`.
+- Any DB error → 500 `INTERNAL`.
+- No `updated_at` column on `member_profiles` — do **not** attempt to set one.
 
 ## Patterns to follow (name the file)
 
-- Route structure (`requireAuth` + `requireRole` + `lookup?` seam + try/catch +
-  `ok`/`fail`): `app/api/_examples/admin-only/route.ts`.
-- Clerk JWT → Supabase client: `lib/api/auth.ts` (`lookupUserByClerkId`).
-- Error codes / `ApiException`: `lib/api/errors.ts` (`ErrorCode.FORBIDDEN`,
-  `UNAUTHENTICATED`, `INTERNAL`).
-- Success/error envelope: `lib/api/response.ts` (`ok`, `fail`); envelope shape in
-  `types/api.ts`.
-- Hand-written Supabase types style: existing entries in `lib/supabase/types.ts`.
-
----
-
-## Tests the coder should add (tester will expand)
-
-Create `tests/unit/app/api/church-group-members-route.test.ts`. Combine the two
-existing patterns:
-- Role/lookup-seam mocking from `tests/unit/app/api/admin-only-route.test.ts`
-  (`makeLookup(role)` returning an `AuthContext`; mock `@clerk/nextjs/server`
-  `auth`).
-- Supabase-client mocking from `tests/unit/app/api/church-group-route.test.ts`
-  (`jest.mock("@/lib/supabase/client", ...)`, mock `getSupabaseClient`).
-
-Because the handler calls `auth()` again for `getToken`, mock `auth` to resolve
-`{ userId: "clerk_test", getToken: jest.fn().mockResolvedValue("jwt") }`.
-
-Mock the Supabase client so `from(table)` returns an object whose
-`.select(...).eq(...)` (and `.select(...)` without `.eq`) resolves to
-`{ data, error }`. A small helper that switches on the table name and returns the
-right fixture array is the clean approach. Suggested fixtures: two users in the
-group (one admin caller, one member with a profile + one instrument; and one user
-with **no** profile), one instrument row, matching `member_instruments` and
-`member_profiles` rows.
-
-Cases to cover:
-- 401 when Clerk `userId` is null (lookup never consulted).
-- 403 when `role = 'guest'`.
-- 200 for `role = 'admin'` → members include `email` + `phone` keys.
-- 200 for `role = 'member'` and `role = 'set_leader'` → member objects have **no**
-  `email`/`phone` keys (assert `"email" in member === false`).
-- Instruments mapped correctly (`instruments: [{ id, name }]`) for the member with a
-  profile.
-- User without a `member_profiles` row → `vocalCapability: 'none'`,
-  `instruments: []`, still present in the list.
-- Every member has `availabilityStatus: null`.
-- 500 when any query returns an `error`.
-
-RLS/cross-tenant behavior (that another group's users never appear) is covered by
-`tests/integration/rls/` and is out of scope for this unit test.
-
----
+- Handler structure, auth+JWT flow, instrument name-mapping, error handling:
+  `app/api/church-group/members/handler.ts`.
+- Thin route delegation: `app/api/church-group/members/route.ts`.
+- Zod `safeParse` on request body + 400 mapping: `app/api/church-group/join/route.ts`.
+- Zod schema style: `schemas/church-group.ts`.
+- Success/error envelope: `lib/api/response.ts` (`ok`, `fail`); shape in `types/api.ts`.
+- Unit test harness / Supabase mock: `tests/unit/app/api/church-group-members-route.test.ts`.
 
 ## Explicitly out of scope
 
-- Any directory UI/screen (folded into #74 / #48 later — see issue Out of Scope).
-- Real-time / live availability wiring — that is #34 (`availabilityStatus` stays
-  `null` here).
-- Role assignment (#27) and member removal (#28); leave
-  `app/api/church-group/members/[id]/*` stubs untouched.
-- New migrations — the schema and RLS policies already exist.
-- Pagination, sorting, filtering, or search over the directory.
+- Instrument selection writes (`member_instruments` mutations) — Issue #31.
+- Song familiarity — Phase 2.
+- Any `:id`-parameterized route or admin-edits-another-member profile.
+- New migrations — schema and RLS already exist
+  (`20260702000001_cluster_1_organization.sql`, `20260704000001_rls_policies.sql`).
+- Changes to `lib/supabase/types.ts` — the needed tables are already typed.
