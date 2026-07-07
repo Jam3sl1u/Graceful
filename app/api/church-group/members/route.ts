@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { getChurchGroupMembers } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/church-group/members");
+export async function GET(req: NextRequest): Promise<Response> {
+  return getChurchGroupMembers(req);
 }

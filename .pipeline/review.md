@@ -1,34 +1,46 @@
-# Review — Issue #25: Join church group via invite code
+# Review — Issue #26: Member directory endpoint (`GET /api/church-group/members`)
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-## Summary
-The implementation faithfully mirrors the established `PUT /api/church-group` (issue #24) pattern and satisfies the spec, including the two human-resolved OPEN QUESTION overrides documented in changes.md. Independently verified: `bun run typecheck`, `bun run lint`, and `bun run test` all pass (6 suites / 40 tests, incl. 11 new join-route tests).
+## What I verified independently
+- Ran `git diff main...HEAD` — only 4 files touched: the route, `lib/supabase/types.ts`,
+  the new unit test, and `.pipeline/changes.md`. No out-of-scope files (member `[id]`
+  stubs, migrations, UI) changed.
+- `bun run typecheck` — clean. `bun run lint` — clean. `bun run test` — 6 suites /
+  42 tests pass.
+- Cross-checked the hand-written Supabase types against the actual migrations:
+  - `member_profiles` (cluster_1): `id, user_id (unique), vocal_capability, bio, created_at`
+    — matches `MemberProfilesRow` exactly.
+  - `instruments` / `member_instruments` (cluster_2): `member_instruments` has a real
+    `id uuid primary key`, plus `member_profile_id`, `instrument_id` — matches
+    `MemberInstrumentsRow`. `is_default`, `created_by` on `instruments` confirmed.
+  - `vocal_capability` enum = `'none'|'lead'|'harmony'|'both'` — matches `VocalCapability`.
 
-## What I checked firsthand (git diff main...HEAD)
+## Correctness
+- Handler order matches spec: `requireAuth` -> `requireRole(["admin","set_leader","member"])`
+  -> `getToken` (401 if no JWT) -> 4 parallel group-scoped queries -> 500 on any `.error`
+  -> in-JS assembly -> `ok({ members })`. Guest is rejected (403) before any DB access.
+- Contact-detail gating is server-side and correct: `email`/`phone` are only assigned when
+  `ctx.role === "admin"`, so the keys are genuinely absent (not `null`) for non-admins. The
+  test asserts this via `"email" in member`, which is the right check since `NextResponse.json`
+  strips `undefined` — this is the security-critical AC-2 behavior and it holds.
+- Defense-in-depth `.eq("church_group_id", ctx.churchGroupId)` applied on `users` and
+  `instruments` (the tables that carry the column), on top of RLS (AC-3).
+- Edge cases handled correctly: no-profile user -> `'none'` / `[]` and still listed;
+  profile-with-no-instruments -> `[]`; dangling `instrument_id` skipped via `if (!name) continue`;
+  `availabilityStatus: null` placeholder with #34 comment.
 
-### Route — `app/api/church-group/join/route.ts`
-- Auth flow, JWT check, schema parse-before-client, RPC call, error-message substring mapping, `ok(data, 201)`, and outer try/catch are byte-for-byte consistent with the create route. `deriveMemberName` is `deriveCreatorName` verbatim with the `"Admin"` → `"Member"` fallback swap and same 100-char truncation. Correct.
-- `getSupabaseClient` is correctly NOT called on auth/JWT/validation failure paths (asserted in tests).
+## Tests
+- Meaningful, not superficial. Coverage includes both branches of the admin gate, the
+  guest 403, no-JWT 401, no-Clerk 401 (lookup asserted not called), instrument mapping,
+  the dangling-instrument skip, the no-profile fallback, single-member group, and the 500
+  path. Assertions check body shape and key presence, not just status codes.
 
-### Migration — `20260706000002_church_group_join_rpc.sql`
-- Adds nullable `invite_code_expires_at` via `ALTER TABLE` (does not touch the create migration). This is a scope expansion beyond spec §1, but it is an explicitly documented human override, is backward-compatible (NULL = never expires, so all existing codes keep working), and reuses the existing `INVALID_INVITE_CODE` → 400 mapping so no route copy changes were needed. Acceptable.
-- `SECURITY DEFINER`, `SET search_path = ''`, `RAISE ... USING ERRCODE = 'P0001'`, `GRANT EXECUTE ... TO authenticated`, and commented DOWN block all match `20260706000001` conventions. DOWN correctly drops function then column.
-- Ordering is sound: auth → already-in-group → code lookup → expiry → insert. The unique `clerk_id` constraint backstops the explicit already-in-group check under concurrency (worst case a generic 500 on a race — acceptable).
+## Minor notes (non-blocking)
+- The handler calls `auth()` a second time for `getToken` (once inside `requireAuth`, once
+  in the handler). This is redundant but is exactly the pattern the spec prescribed and
+  mirrors `lookupUserByClerkId`; no correctness impact.
+- Non-admin callers cannot see their own contact info either. This matches the spec ("ONLY
+  when caller is admin") — flagging only so it's a conscious product choice, not a bug.
 
-### Schema / types
-- `joinChurchGroupSchema` = `z.string().trim().toUpperCase().min(1).max(20)` exactly as specified; `createChurchGroupSchema` untouched.
-- `join_church_group` Functions entry added with correct Args/`Returns: UsersRow`; typecheck confirms the `.rpc()` call compiles.
-
-### Client — `page.tsx` + `join-form.tsx`
-- Thin server component unwraps `Promise<{ code }>` and delegates to a `"use client"` form. On 2xx shows in-place success (no redirect); on non-2xx renders the `error` string with `role="alert"` (satisfies AC #2 messaging). The no-redirect behavior deviates from the original AC #4 wording but is an explicit, documented human override deferring the profile-completion redirect to issue #16. Flagged, not blocking.
-
-### Tests — `church-group-join-route.test.ts`
-- All 11 spec-required cases present and meaningful (not superficial): exact rpc arg assertions, uppercase/trim normalization, each error-code branch, and `getSupabaseClient` not-called assertions on the short-circuit paths. Mocking mirrors the create-route test style.
-
-## Notes (non-blocking)
-- The RPC expiry branch is not reachable from the mocked-RPC unit tests, but the Tester exercised it against a real Postgres 16 container (unknown/expired/future/happy/already-in-group/unauthenticated paths all confirmed). Acceptable coverage.
-- `error.message.includes(...)` matching is only validated against mocked error shapes, same caveat as #24. Fine to carry forward.
-- AC #4's redirect is intentionally deferred to #16 — confirm this is the intended product decision at merge time.
-
-No security, correctness, or performance issues found. Ship.
+Nothing to fix. Ship it.

@@ -1,209 +1,264 @@
-# Spec — Issue #25: Join church group via invite code
+# Spec — Issue #26: Member directory endpoint (`GET /api/church-group/members`)
 
-## OPEN QUESTIONS (non-blocking; proceed with the stated assumption)
+## OPEN QUESTIONS (non-blocking — defaults chosen, proceed)
 
-1. **"Expired" codes have no schema support.** `church_groups.invite_code` (migration `20260702000001_cluster_1_organization.sql`) is a plain `varchar(20) unique` with no expiry/TTL column. There is no concept of an expired code in the current data model, and adding one is out of scope for this issue. **Assumption:** treat only *unknown* codes as the failure case; return a 400 whose message reads "Invalid or expired invite code" so the copy still matches AC #2. Do NOT add an expiry column.
+1. **Live availability status.** The `availability` table exists (issue #20,
+   `20260702000005_cluster_5_partial.sql`), but the issue's Implementation Notes
+   explicitly say: "ship the directory shape now and wire in real-time status once
+   **#34** lands." There is no "current status" concept on the table — it stores one
+   `is_available` row per `(user_id, date)`, with no notion of "today live."
+   **Decision for this issue:** include an `availabilityStatus` field in every member
+   object, always set to `null` (placeholder), with a code comment referencing #34.
+   Do **not** query the `availability` table in this issue. This satisfies AC-1's
+   "directory shape" without inventing date/timezone logic that belongs to #34.
 
-2. **Redirect target for "profile completion".** There is no dedicated instruments/vocal-capability onboarding form yet — that is issue #30. The only existing profile route is `/profile` (`app/(app)/profile/page.tsx`). **Assumption:** on a successful join the client redirects to `/profile`. If a human wants a distinct onboarding route, that is a #30 concern.
+2. **Do guests appear as rows in the directory?** Guests are group members with a
+   `guest` role. AC-4 says "Guests seeing nothing here" — that refers to guests *as
+   the caller* (they get 403). It does not say to hide guest *rows* from other
+   viewers. **Decision:** the directory lists **all `users` rows in the caller's
+   group regardless of role** (this is what the RLS `users_select_tenant` policy
+   already returns). Simple and matches "everyone in my group." Do not filter by role.
 
-Neither question blocks implementation.
+Neither of these blocks implementation. If a human disagrees, only the two spots
+above change.
 
 ---
 
-## Current state (already in the repo)
+## Goal (scope of THIS issue)
 
-- `app/api/church-group/join/route.ts` — a stub: `POST` returns `notImplemented(...)` (501). Must be replaced.
-- `app/(public)/join/[code]/page.tsx` — a stub server component ("coming soon"). Must be replaced with the client join flow.
-- `schemas/church-group.ts` — has `createChurchGroupSchema`; no join schema yet.
-- `lib/supabase/types.ts` — `Database.public.Functions` has `create_church_group` only.
-- The invite-code + creation RPC pattern already exists in `supabase/migrations/20260706000001_church_group_create_rpc.sql` and route `app/api/church-group/route.ts` (`PUT`). **Copy these patterns exactly.**
+Implement `GET /api/church-group/members`: return every user in the caller's church
+group with their instruments and vocal capability. Contact details (email/phone) are
+included **only when the caller is an `admin`**. Guests (as caller) get 403. The
+availability field ships as a `null` placeholder (see OPEN QUESTION 1).
+
+Out of scope: any UI/screen, real-time availability wiring (#34), role assignment
+(#27), member removal (#28). Do not touch other routes.
 
 ---
 
-## 1. Migration — CREATE
+## Current state (already done — do NOT redo)
 
-**File:** `supabase/migrations/20260706000002_church_group_join_rpc.sql`
+- `app/api/church-group/members/route.ts` exists as a `notImplemented` stub — you
+  will replace its `GET`.
+- All required tables already exist and are RLS group-scoped for `SELECT` to
+  `authenticated` (`20260704000001_rls_policies.sql`): `users`
+  (`users_select_tenant`), `member_profiles` (`member_profiles_select_tenant`),
+  `member_instruments` (`member_instruments_select_tenant`), `instruments`
+  (`instruments_select_tenant`). **No new migration is needed.**
+- Request-level auth is enforced by `middleware.ts` (this route is not in
+  `isPublicRoute`, so Clerk `auth.protect()` already covers it). Role-level and
+  group-scoping are enforced in the handler + RLS.
 
-**Pattern to copy:** `supabase/migrations/20260706000001_church_group_create_rpc.sql` (same `SECURITY DEFINER`, `SET search_path = ''`, `RAISE EXCEPTION ... USING ERRCODE = 'P0001'`, and `GRANT EXECUTE ... TO authenticated` conventions).
+Table columns you will rely on (from the migrations):
+- `users`: `id`, `church_group_id`, `role`, `name`, `email` (nullable), `phone`
+  (nullable).
+- `member_profiles`: `id`, `user_id` (unique), `vocal_capability`
+  (`'none'|'lead'|'harmony'|'both'`, NOT NULL default `'none'`). A user may have
+  **no** profile row.
+- `member_instruments`: `member_profile_id`, `instrument_id`.
+- `instruments`: `id`, `church_group_id`, `name`.
 
-Add one function:
+---
 
-```sql
-CREATE OR REPLACE FUNCTION public.join_church_group(
-  p_invite_code text,
-  p_member_name text,
-  p_member_email text
-)
-  RETURNS public.users
-  LANGUAGE plpgsql
-  SECURITY DEFINER
-  VOLATILE
-  SET search_path = ''
-AS $$
-DECLARE
-  v_clerk_id text;
-  v_group_id uuid;
-  v_user public.users%ROWTYPE;
-BEGIN
-  -- 1. auth
-  v_clerk_id := auth.jwt() ->> 'sub';
-  IF v_clerk_id IS NULL THEN
-    RAISE EXCEPTION 'UNAUTHENTICATED' USING ERRCODE = 'P0001';
-  END IF;
+## Files to create / modify
 
-  -- 2. reject users already in a group (users.clerk_id is unique)
-  IF EXISTS (SELECT 1 FROM public.users WHERE clerk_id = v_clerk_id) THEN
-    RAISE EXCEPTION 'USER_ALREADY_IN_GROUP' USING ERRCODE = 'P0001';
-  END IF;
+### 1. MODIFY `app/api/church-group/members/route.ts`
 
-  -- 3. resolve the group from the invite code
-  SELECT id INTO v_group_id
-  FROM public.church_groups
-  WHERE invite_code = p_invite_code;
+Replace the file. Keep no other exports. Pattern to copy for the
+`requireAuth` + `requireRole` + lookup-seam + try/catch + `ok`/`fail` envelope:
+**`app/api/_examples/admin-only/route.ts`**. Pattern to copy for turning the Clerk
+JWT into a Supabase client: **`lib/api/auth.ts`** (`lookupUserByClerkId` — `auth()`,
+`getToken({ template: "supabase" })`, `getSupabaseClient(jwt)`).
 
-  IF v_group_id IS NULL THEN
-    RAISE EXCEPTION 'INVALID_INVITE_CODE' USING ERRCODE = 'P0001';
-  END IF;
+**Signature (the second `lookup` param is required for unit testing the role):**
+```ts
+import { NextRequest } from "next/server";
+import { auth } from "@clerk/nextjs/server";
+import { requireAuth, requireRole, type UserLookup } from "@/lib/api/auth";
+import { ok, fail } from "@/lib/api/response";
+import { ApiException, ErrorCode } from "@/lib/api/errors";
+import { getSupabaseClient } from "@/lib/supabase/client";
+import type { UserRole, VocalCapability } from "@/types/domain";
 
-  -- 4. provision the member
-  INSERT INTO public.users (clerk_id, church_group_id, role, name, email)
-  VALUES (v_clerk_id, v_group_id, 'member', p_member_name, p_member_email)
-  RETURNING * INTO v_user;
-
-  RETURN v_user;
-END;
-$$;
-
-GRANT EXECUTE ON FUNCTION public.join_church_group(text, text, text) TO authenticated;
+export async function GET(req: NextRequest, lookup?: UserLookup): Promise<Response>
 ```
 
-- Include a commented `-- ============ DOWN ============` block with `DROP FUNCTION IF EXISTS public.join_church_group(text, text, text);` mirroring the create migration.
-- Do NOT seed instruments (that is admin/creation-only). Do NOT create a `member_profiles` row (that is #30 territory).
-- Runs `SECURITY DEFINER` for the same reason as create: the joiner has no `users` row yet, so `requireAuth` and the authenticated INSERT policies do not apply.
-
-**Invite-code matching is exact/case-sensitive.** `generate_invite_code()` emits only uppercase `A–Z` (minus `0/O/1/I/L`) and `2–9`. The API layer normalizes input to uppercase (see §2), so the DB comparison stays a plain `=`.
-
----
-
-## 2. Schema — MODIFY
-
-**File:** `schemas/church-group.ts` (append; do not touch `createChurchGroupSchema`).
-
+**Response shape** (define this type in the route file and export it):
 ```ts
-export const joinChurchGroupSchema = z.object({
-  inviteCode: z.string().trim().toUpperCase().min(1).max(20),
-});
-
-export type JoinChurchGroupInput = z.infer<typeof joinChurchGroupSchema>;
-```
-
-- `.toUpperCase()` normalizes user-typed lowercase codes to match the stored uppercase codes.
-- Keep `max(20)` aligned to the `varchar(20)` column. A well-formed but unknown code surfaces as 400 (`VALIDATION_FAILED`) from the RPC mapping in §3.
-
----
-
-## 3. Route — REPLACE
-
-**File:** `app/api/church-group/join/route.ts` (replace the stub entirely).
-
-**Pattern to copy:** the `PUT` handler in `app/api/church-group/route.ts` — same auth flow, same `getSupabaseClient(jwt).rpc(...)` call, same try/catch → `INTERNAL` 500, same `deriveCreatorName` helper (rename to `deriveMemberName`, fallback string `"Member"` instead of `"Admin"`).
-
-Signature:
-
-```ts
-export async function POST(req: NextRequest): Promise<Response>
-```
-
-Flow (in order):
-1. `const { userId: clerkId, getToken } = await auth();` → if no `clerkId`, `fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`.
-2. `const jwt = await getToken({ template: "supabase" });` → if falsy, same 401.
-3. `const body = await req.json().catch(() => null);` then `joinChurchGroupSchema.safeParse(body)` → on failure `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)` (do not call `getSupabaseClient`).
-4. `const user = await currentUser();` → derive `p_member_name` via `deriveMemberName(user)` and `p_member_email = user?.primaryEmailAddress?.emailAddress ?? null`.
-5. `const supabase = getSupabaseClient(jwt);` then:
-   ```ts
-   const { data, error } = await supabase.rpc("join_church_group", {
-     p_invite_code: parsed.inviteCode,
-     p_member_name: memberName,
-     p_member_email: memberEmail,
-   });
-   ```
-6. On `error`, map by `error.message.includes(...)`:
-   - `"INVALID_INVITE_CODE"` → `fail("Invalid or expired invite code", ErrorCode.VALIDATION_FAILED, 400)`
-   - `"USER_ALREADY_IN_GROUP"` → `fail("User already belongs to a church group", ErrorCode.CONFLICT, 409)`
-   - `"UNAUTHENTICATED"` → `fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`
-   - else → `fail("Internal error", ErrorCode.INTERNAL, 500)`
-7. On success: `return ok(data, 201);` (`data` is the new `users` row incl. `church_group_id` and `role: "member"`).
-8. Wrap the whole body in `try { ... } catch { return fail("Internal error", ErrorCode.INTERNAL, 500); }` exactly like the `PUT` handler.
-
-`deriveMemberName` — copy `deriveCreatorName` from `app/api/church-group/route.ts` verbatim, changing only the fallback literal `"Admin"` → `"Member"`.
-
----
-
-## 4. Supabase types — MODIFY
-
-**File:** `lib/supabase/types.ts`
-
-Add a `join_church_group` entry to `Database.public.Functions` (alongside `create_church_group`) so the `.rpc()` call type-checks:
-
-```ts
-join_church_group: {
-  Args: {
-    p_invite_code: string;
-    p_member_name: string;
-    p_member_email: string | null;
-  };
-  Returns: UsersRow;
+export type DirectoryMember = {
+  id: string;                 // users.id
+  name: string;
+  role: UserRole;
+  vocalCapability: VocalCapability;   // 'none' when the user has no member_profile
+  instruments: { id: string; name: string }[];
+  availabilityStatus: null;   // placeholder for #34 — see spec OPEN QUESTION 1
+  email?: string | null;      // present ONLY when caller is admin
+  phone?: string | null;      // present ONLY when caller is admin
 };
 ```
+Success body: `ok({ members })` → `{ "data": { "members": DirectoryMember[] } }`.
+For non-admin callers, the `email` and `phone` keys must be **absent from the
+object entirely** (not `null`) — omit them, do not set them.
 
-(`UsersRow` already exists in this file. `bun run typecheck` must stay green.)
+**Handler behavior, in order:**
+1. `const ctx = await requireAuth(req, lookup);` — 401 `UNAUTHENTICATED` is thrown
+   by `requireAuth` when there is no Clerk session or no `users` row.
+2. `requireRole(ctx, ["admin", "set_leader", "member"]);` — throws 403 `FORBIDDEN`
+   for `guest`. (AC-4: guests see nothing here.)
+3. Build the Supabase client from the Clerk JWT:
+   `const { getToken } = await auth();`
+   `const jwt = await getToken({ template: "supabase" });`
+   if `!jwt` → `return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);`
+   `const supabase = getSupabaseClient(jwt);`
+4. Run these queries. Explicitly filter `church_group_id` where the column exists
+   (defense in depth on top of RLS — AC-3):
+   - `usersRes = await supabase.from("users")
+       .select("id, name, role, email, phone")
+       .eq("church_group_id", ctx.churchGroupId);`
+   - `profilesRes = await supabase.from("member_profiles")
+       .select("id, user_id, vocal_capability");`  // RLS scopes to group
+   - `miRes = await supabase.from("member_instruments")
+       .select("member_profile_id, instrument_id");`  // RLS scopes to group
+   - `instrRes = await supabase.from("instruments")
+       .select("id, name")
+       .eq("church_group_id", ctx.churchGroupId);`
+5. If any of the four results has a non-null `.error` →
+   `return fail("Internal error", ErrorCode.INTERNAL, 500);`
+   (or `throw new ApiException("Internal error", ErrorCode.INTERNAL, 500)` and let
+   the catch handle it — either is fine; match the admin-only pattern's catch.)
+6. Assemble in JS (no SQL joins needed):
+   - Build `instrumentNameById: Map<instrumentId, name>` from `instrRes.data`.
+   - Build `profileByUserId: Map<userId, {profileId, vocalCapability}>` from
+     `profilesRes.data`.
+   - Build `instrumentsByProfileId: Map<profileId, {id,name}[]>` from `miRes.data`,
+     resolving each `instrument_id` via `instrumentNameById` (skip any id with no
+     matching instrument name).
+   - For each `user` in `usersRes.data`, produce a `DirectoryMember`:
+     - `vocalCapability` = profile's value if the user has a profile, else `'none'`.
+     - `instruments` = the profile's instrument list, else `[]`.
+     - `availabilityStatus: null`.
+     - If `ctx.role === 'admin'`, add `email: user.email` and `phone: user.phone`;
+       otherwise omit both keys.
+7. `return ok({ members });`
+
+**Catch block** (copy from admin-only route):
+```ts
+} catch (err) {
+  if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+  return fail("Internal error", ErrorCode.INTERNAL, 500);
+}
+```
+
+Do NOT sort/paginate — return all members in whatever order the query yields
+(ordering is not an AC; keep it minimal).
+
+### 2. MODIFY `lib/supabase/types.ts`
+
+The queries above must typecheck (`bun run typecheck`). The current `UsersRow` lacks
+`name`, `email`, `phone`, and there are no types for `member_profiles`,
+`instruments`, `member_instruments`. Extend `Database["public"]["Tables"]`, keeping
+the existing minimal hand-written style (each table needs `Row`, `Insert`, `Update`,
+`Relationships: []`). Make these changes:
+
+- Add to `UsersRow`: `name: string; email: string | null; phone: string | null;`
+  (keep existing `id`, `clerk_id`, `church_group_id`, `role`). Do NOT change
+  `lib/api/auth.ts` — its `.select("id, church_group_id, role")` stays valid.
+- Add table `member_profiles` with
+  `Row = { id: string; user_id: string; vocal_capability: VocalCapability;
+  bio: string | null; created_at: string }`. Import `VocalCapability` from
+  `@/types/domain` (already imports `UserRole` from there).
+- Add table `instruments` with
+  `Row = { id: string; church_group_id: string; name: string;
+  is_default: boolean; created_by: string | null; created_at: string }`.
+- Add table `member_instruments` with
+  `Row = { id: string; member_profile_id: string; instrument_id: string }`.
+- Leave `church_groups` and the `create_church_group` function entry as-is.
+
+Keep the file otherwise minimal; do not add tables unrelated to this issue.
 
 ---
 
-## 5. Client join page — REPLACE
+## Edge cases the implementation must handle
 
-**File:** `app/(public)/join/[code]/page.tsx` (replace the stub).
-
-Purpose: satisfy AC #4 (redirect into profile completion after joining). Keep it minimal.
-
-- Convert to a flow that reads the `code` route param and, on submit, `POST`s `{ inviteCode: code }` to `/api/church-group/join`.
-- Use a Client Component (`"use client"`) for the interactive/redirect part. A thin server component may unwrap `params` (which is `Promise<{ code: string }>`) and pass `code` to the client component — follow the existing param-unwrapping shape in the current stub.
-- On a `2xx` response: redirect to `/profile` via `useRouter().push("/profile")` from `next/navigation` (the "profile completion" destination per OPEN QUESTION #2).
-- On a non-2xx response: render the returned `error` string (from the `{ error, code }` envelope) as visible text. A 400 must show a clear "invalid/expired code" message to the user (AC #2).
-- Do not build instrument/vocal-capability fields here — that is #30.
-- Keep styling minimal/consistent with existing pages (inline styles like `app/(app)/profile/page.tsx` are acceptable; no new component library).
-
----
-
-## 6. Unit tests — CREATE
-
-**File:** `tests/unit/app/api/church-group-join-route.test.ts`
-
-**Pattern to copy:** `tests/unit/app/api/church-group-route.test.ts` (same mocking of `@clerk/nextjs/server` and `@/lib/supabase/client`, same `makeReq` / `makeSupabaseRpc` helpers, same import style). Import `{ POST }` from `@/app/api/church-group/join/route`.
-
-Required cases:
-- **201 happy path** — valid code; asserts `rpc` called with `"join_church_group"` and `{ p_invite_code: "ABCD2345", p_member_name, p_member_email }`; response body is `{ data: <users row> }`; status 201.
-- **inviteCode is uppercased/trimmed** — send `{ inviteCode: " abcd2345 " }`, assert `p_invite_code: "ABCD2345"`.
-- **400 INVALID_INVITE_CODE** — rpc returns `error: { message: "INVALID_INVITE_CODE" }`; status 400, `body.code === "VALIDATION_FAILED"`.
-- **400 on missing/empty inviteCode** — schema failure; status 400, `VALIDATION_FAILED`, `getSupabaseClient` NOT called.
-- **400 on non-JSON/empty body** — `req.json()` rejects; status 400, `VALIDATION_FAILED`, `getSupabaseClient` NOT called.
-- **409 USER_ALREADY_IN_GROUP** — rpc error message includes it; status 409, `CONFLICT`.
-- **401 when no Clerk userId** — status 401, `UNAUTHENTICATED`, `getSupabaseClient` NOT called.
-- **401 when getToken returns no JWT** — status 401, `UNAUTHENTICATED`, `getSupabaseClient` NOT called.
-- **500 on generic rpc error** — rpc error `"connection refused"`; status 500, `INTERNAL`.
-- **500 when currentUser rejects** — status 500, `INTERNAL`, `getSupabaseClient` NOT called (mirrors the create test's unexpected-error case).
-- **falls back to "Member"** when `currentUser()` resolves `null` — assert `p_member_name: "Member"`, `p_member_email: null`.
+- **Guest caller** → 403 `FORBIDDEN` (never returns directory data).
+- **Unauthenticated** (no Clerk session, or `getToken` returns no JWT) → 401
+  `UNAUTHENTICATED`.
+- **Non-admin caller (member / set_leader)** → members returned but each object has
+  **no** `email`/`phone` keys (AC-2: enforced server-side, not just UI).
+- **Admin caller** → each member includes `email` and `phone` (either may be `null`
+  when the DB column is null).
+- **User with no `member_profiles` row** → `vocalCapability: 'none'`,
+  `instruments: []` (do not drop the user from the list).
+- **User with a profile but no `member_instruments` rows** → `instruments: []`.
+- **A `member_instruments` row whose `instrument_id` has no matching `instruments`
+  row** → skip that entry (don't emit `{id, name: undefined}`).
+- **Caller is the only user in the group** → returns a one-element array containing
+  the caller.
+- **Any of the four DB queries errors** → 500 `INTERNAL` (do not return a partial
+  directory).
+- Cross-group isolation is guaranteed by RLS + the explicit `church_group_id`
+  filters; a member from another group must never appear (AC-3).
 
 ---
 
-## Out of scope (do not implement)
+## Patterns to follow (name the file)
 
-- Direct email invites (explicitly deferred by the issue).
-- Invite-code expiry/TTL.
-- `member_profiles` creation and the instruments/vocal-capability form (issue #30).
-- Any change to `createChurchGroupSchema`, the create RPC, or the create route.
+- Route structure (`requireAuth` + `requireRole` + `lookup?` seam + try/catch +
+  `ok`/`fail`): `app/api/_examples/admin-only/route.ts`.
+- Clerk JWT → Supabase client: `lib/api/auth.ts` (`lookupUserByClerkId`).
+- Error codes / `ApiException`: `lib/api/errors.ts` (`ErrorCode.FORBIDDEN`,
+  `UNAUTHENTICATED`, `INTERNAL`).
+- Success/error envelope: `lib/api/response.ts` (`ok`, `fail`); envelope shape in
+  `types/api.ts`.
+- Hand-written Supabase types style: existing entries in `lib/supabase/types.ts`.
 
-## Verification
+---
 
-- `bun run typecheck`, `bun run lint`, and `bun run test` must all pass.
-- The migration is plain SQL; it is not executed by the test suite but must be valid and follow the `20260706000001_*` conventions.
+## Tests the coder should add (tester will expand)
+
+Create `tests/unit/app/api/church-group-members-route.test.ts`. Combine the two
+existing patterns:
+- Role/lookup-seam mocking from `tests/unit/app/api/admin-only-route.test.ts`
+  (`makeLookup(role)` returning an `AuthContext`; mock `@clerk/nextjs/server`
+  `auth`).
+- Supabase-client mocking from `tests/unit/app/api/church-group-route.test.ts`
+  (`jest.mock("@/lib/supabase/client", ...)`, mock `getSupabaseClient`).
+
+Because the handler calls `auth()` again for `getToken`, mock `auth` to resolve
+`{ userId: "clerk_test", getToken: jest.fn().mockResolvedValue("jwt") }`.
+
+Mock the Supabase client so `from(table)` returns an object whose
+`.select(...).eq(...)` (and `.select(...)` without `.eq`) resolves to
+`{ data, error }`. A small helper that switches on the table name and returns the
+right fixture array is the clean approach. Suggested fixtures: two users in the
+group (one admin caller, one member with a profile + one instrument; and one user
+with **no** profile), one instrument row, matching `member_instruments` and
+`member_profiles` rows.
+
+Cases to cover:
+- 401 when Clerk `userId` is null (lookup never consulted).
+- 403 when `role = 'guest'`.
+- 200 for `role = 'admin'` → members include `email` + `phone` keys.
+- 200 for `role = 'member'` and `role = 'set_leader'` → member objects have **no**
+  `email`/`phone` keys (assert `"email" in member === false`).
+- Instruments mapped correctly (`instruments: [{ id, name }]`) for the member with a
+  profile.
+- User without a `member_profiles` row → `vocalCapability: 'none'`,
+  `instruments: []`, still present in the list.
+- Every member has `availabilityStatus: null`.
+- 500 when any query returns an `error`.
+
+RLS/cross-tenant behavior (that another group's users never appear) is covered by
+`tests/integration/rls/` and is out of scope for this unit test.
+
+---
+
+## Explicitly out of scope
+
+- Any directory UI/screen (folded into #74 / #48 later — see issue Out of Scope).
+- Real-time / live availability wiring — that is #34 (`availabilityStatus` stays
+  `null` here).
+- Role assignment (#27) and member removal (#28); leave
+  `app/api/church-group/members/[id]/*` stubs untouched.
+- New migrations — the schema and RLS policies already exist.
+- Pagination, sorting, filtering, or search over the directory.
