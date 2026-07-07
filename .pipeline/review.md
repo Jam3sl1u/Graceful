@@ -1,49 +1,38 @@
-# Review — Issue #27: Role assignment & multi-admin support
+# Review — Issue #30: Member profile CRUD (`GET`/`PUT /api/profile`)
 
-## VERDICT: BLOCK
+## VERDICT: SHIP
 
-## Reason: no implementation exists, and the pipeline docs describe the wrong issue
+## Summary
+The implementation faithfully matches the spec. Independently re-ran `bun run lint`,
+`bun run typecheck`, and `bun run test` — all green (8 suites / 66 tests, incl. 13 new).
+Read every source/test file firsthand rather than trusting the summaries.
 
-This worktree is on branch `issue-27-role-assignment-multi-admin-support`, whose
-subject (per `gh issue view 27`) is `PATCH /api/church-group/members/:id/role`
-with the BR-12 last-admin guard, admin-only enforcement, and audit-log write.
+## What was verified
+- **schemas/profile.ts** — matches spec verbatim: `vocalCapability` enum + trimmed,
+  2000-cap, nullish `bio` normalized to `null`.
+- **app/api/profile/handler.ts** — correct auth→JWT→RLS-client flow mirroring the
+  members handler. `getProfile` returns synthesized defaults on missing row and does
+  NOT query instruments in that branch (early return confirmed). `updateProfile` upserts
+  on `user_id`, sets only `user_id`/`vocal_capability`/`bio` (no `id`/`created_at`/
+  `updated_at`). `loadInstruments` group-scopes via `ctx.churchGroupId` and skips
+  unmatched instruments. Single try/catch converts `ApiException`→`fail`, else 500.
+- **route.ts** — thin delegators, as specified.
+- **Test file** — all 13 spec-listed cases present; assertions use `toEqual` on full
+  response bodies and capture the upsert payload, so they'd catch shape drift. Not
+  superficial.
+- **Security** — ownership enforced by RLS (`user_id = auth_user_id()`) + query scoped
+  to `ctx.userId`; no `:id` param; `member_instruments` never written (deferred to #31).
+- **Scope** — only `app/api/profile/*`, `schemas/profile.ts`, and the test file changed.
+  No migrations, no `lib/supabase/types.ts` / `types/domain.ts` edits. Scanned the source
+  diff for network/exec/beacon patterns — none found.
 
-### Independently verified (not just trusting test-results.md)
-- `git rev-parse HEAD` == `git rev-parse main` == `dba4126`. The branch has **zero
-  commits** beyond main. `git diff main...HEAD` and `git diff main..HEAD` are both
-  empty. The only working-tree change is `.pipeline/test-results.md` itself.
-- The issue #27 target, `app/api/church-group/members/[id]/role/route.ts`, is still
-  the original stub:
-  ```ts
-  export async function PATCH(_req: NextRequest) {
-    return notImplemented("PATCH /api/church-group/members/[id]/role");
-  }
-  ```
-  No admin-only check, no BR-12 last-admin-demotion 422, no BR-03/BR-04 multi-admin
-  handling, no audit-log write, no 403 for set_leader/member. None of AC-1..AC-5 met.
+## Non-blocking observations (no fix required)
+- PUT validates the body (400) before the JWT check (401). This is the exact order the
+  spec prescribes; acceptable.
+- `as unknown as ...Insert` cast is a narrow, spec-sanctioned workaround for the
+  hand-written `Insert` type modeling `created_at` as required. No `created_at` is sent
+  at runtime (asserted by the payload test).
+- `if (error || !data)` on the upsert collapses a "success but no row returned" case into
+  a generic 500; with `onConflict` + `.maybeSingle()` this shouldn't occur in practice.
 
-### The spec/changes docs are for a different, already-shipped issue
-- `.pipeline/spec.md` and `.pipeline/changes.md` describe **issue #26** ("Member
-  directory endpoint, `GET /api/church-group/members`"), not #27. `changes.md` claims
-  edits to `route.ts`, `lib/supabase/types.ts`, and a new test — but those are already
-  merged to `main` (PR #108, plus the PR #110 beacon-strip fix per project memory) and
-  are therefore **not** in this branch's diff. The claimed "38 tests pass" reflects
-  main's state, not new work for #27.
-
-## What must happen before this can ship
-1. Regenerate `.pipeline/spec.md` and `.pipeline/changes.md` for issue #27
-   (role-assignment `PATCH .../[id]/role`), not #26.
-2. Actually implement `app/api/church-group/members/[id]/role/route.ts`:
-   - admin-only via `requireAuth` + `requireRole(["admin"])`; 403 for set_leader/member.
-   - BR-12: count `role='admin'` users in the group; reject demoting the last admin
-     with 422 + clear message.
-   - BR-03/BR-04: promoting additional admins works with no special-casing.
-   - Audit-log write (note: depends on #29 — confirm whether that dependency is landed).
-   - This must be the only route that writes `users.role`.
-3. Add real unit tests for the above and re-run `bun run lint`, `bun run typecheck`,
-   `bun run test`.
-
-## Operational flag
-Given the recent rogue-commit incident in project memory, someone should confirm this
-worktree/branch wasn't misconfigured or the spec files stale-copied from the #26 run.
-The Coder stage produced nothing for #27 in this worktree.
+Green tests here reflect genuinely correct behavior. Ship it.
