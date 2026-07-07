@@ -1,6 +1,10 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { promoteInstrument } from "../../handler";
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/instruments/[id]/promote");
+export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Response> {
+  const { id } = await params;
+  return promoteInstrument(req, id);
 }
