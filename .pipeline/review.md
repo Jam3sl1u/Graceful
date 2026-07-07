@@ -1,46 +1,49 @@
-# Review — Issue #26: Member directory endpoint (`GET /api/church-group/members`)
+# Review — Issue #27: Role assignment & multi-admin support
 
-## VERDICT: SHIP
+## VERDICT: BLOCK
 
-## What I verified independently
-- Ran `git diff main...HEAD` — only 4 files touched: the route, `lib/supabase/types.ts`,
-  the new unit test, and `.pipeline/changes.md`. No out-of-scope files (member `[id]`
-  stubs, migrations, UI) changed.
-- `bun run typecheck` — clean. `bun run lint` — clean. `bun run test` — 6 suites /
-  42 tests pass.
-- Cross-checked the hand-written Supabase types against the actual migrations:
-  - `member_profiles` (cluster_1): `id, user_id (unique), vocal_capability, bio, created_at`
-    — matches `MemberProfilesRow` exactly.
-  - `instruments` / `member_instruments` (cluster_2): `member_instruments` has a real
-    `id uuid primary key`, plus `member_profile_id`, `instrument_id` — matches
-    `MemberInstrumentsRow`. `is_default`, `created_by` on `instruments` confirmed.
-  - `vocal_capability` enum = `'none'|'lead'|'harmony'|'both'` — matches `VocalCapability`.
+## Reason: no implementation exists, and the pipeline docs describe the wrong issue
 
-## Correctness
-- Handler order matches spec: `requireAuth` -> `requireRole(["admin","set_leader","member"])`
-  -> `getToken` (401 if no JWT) -> 4 parallel group-scoped queries -> 500 on any `.error`
-  -> in-JS assembly -> `ok({ members })`. Guest is rejected (403) before any DB access.
-- Contact-detail gating is server-side and correct: `email`/`phone` are only assigned when
-  `ctx.role === "admin"`, so the keys are genuinely absent (not `null`) for non-admins. The
-  test asserts this via `"email" in member`, which is the right check since `NextResponse.json`
-  strips `undefined` — this is the security-critical AC-2 behavior and it holds.
-- Defense-in-depth `.eq("church_group_id", ctx.churchGroupId)` applied on `users` and
-  `instruments` (the tables that carry the column), on top of RLS (AC-3).
-- Edge cases handled correctly: no-profile user -> `'none'` / `[]` and still listed;
-  profile-with-no-instruments -> `[]`; dangling `instrument_id` skipped via `if (!name) continue`;
-  `availabilityStatus: null` placeholder with #34 comment.
+This worktree is on branch `issue-27-role-assignment-multi-admin-support`, whose
+subject (per `gh issue view 27`) is `PATCH /api/church-group/members/:id/role`
+with the BR-12 last-admin guard, admin-only enforcement, and audit-log write.
 
-## Tests
-- Meaningful, not superficial. Coverage includes both branches of the admin gate, the
-  guest 403, no-JWT 401, no-Clerk 401 (lookup asserted not called), instrument mapping,
-  the dangling-instrument skip, the no-profile fallback, single-member group, and the 500
-  path. Assertions check body shape and key presence, not just status codes.
+### Independently verified (not just trusting test-results.md)
+- `git rev-parse HEAD` == `git rev-parse main` == `dba4126`. The branch has **zero
+  commits** beyond main. `git diff main...HEAD` and `git diff main..HEAD` are both
+  empty. The only working-tree change is `.pipeline/test-results.md` itself.
+- The issue #27 target, `app/api/church-group/members/[id]/role/route.ts`, is still
+  the original stub:
+  ```ts
+  export async function PATCH(_req: NextRequest) {
+    return notImplemented("PATCH /api/church-group/members/[id]/role");
+  }
+  ```
+  No admin-only check, no BR-12 last-admin-demotion 422, no BR-03/BR-04 multi-admin
+  handling, no audit-log write, no 403 for set_leader/member. None of AC-1..AC-5 met.
 
-## Minor notes (non-blocking)
-- The handler calls `auth()` a second time for `getToken` (once inside `requireAuth`, once
-  in the handler). This is redundant but is exactly the pattern the spec prescribed and
-  mirrors `lookupUserByClerkId`; no correctness impact.
-- Non-admin callers cannot see their own contact info either. This matches the spec ("ONLY
-  when caller is admin") — flagging only so it's a conscious product choice, not a bug.
+### The spec/changes docs are for a different, already-shipped issue
+- `.pipeline/spec.md` and `.pipeline/changes.md` describe **issue #26** ("Member
+  directory endpoint, `GET /api/church-group/members`"), not #27. `changes.md` claims
+  edits to `route.ts`, `lib/supabase/types.ts`, and a new test — but those are already
+  merged to `main` (PR #108, plus the PR #110 beacon-strip fix per project memory) and
+  are therefore **not** in this branch's diff. The claimed "38 tests pass" reflects
+  main's state, not new work for #27.
 
-Nothing to fix. Ship it.
+## What must happen before this can ship
+1. Regenerate `.pipeline/spec.md` and `.pipeline/changes.md` for issue #27
+   (role-assignment `PATCH .../[id]/role`), not #26.
+2. Actually implement `app/api/church-group/members/[id]/role/route.ts`:
+   - admin-only via `requireAuth` + `requireRole(["admin"])`; 403 for set_leader/member.
+   - BR-12: count `role='admin'` users in the group; reject demoting the last admin
+     with 422 + clear message.
+   - BR-03/BR-04: promoting additional admins works with no special-casing.
+   - Audit-log write (note: depends on #29 — confirm whether that dependency is landed).
+   - This must be the only route that writes `users.role`.
+3. Add real unit tests for the above and re-run `bun run lint`, `bun run typecheck`,
+   `bun run test`.
+
+## Operational flag
+Given the recent rogue-commit incident in project memory, someone should confirm this
+worktree/branch wasn't misconfigured or the spec files stale-copied from the #26 run.
+The Coder stage produced nothing for #27 in this worktree.
