@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { submitCustomInstrument } from "../handler";
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/instruments/custom");
+export async function POST(req: NextRequest): Promise<Response> {
+  return submitCustomInstrument(req);
 }
