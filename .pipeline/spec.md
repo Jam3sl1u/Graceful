@@ -1,211 +1,313 @@
-# Spec — Issue #31: Instrument list management (default + custom)
+# Spec — Issue #37: Service Week CRUD
+
+Implements `POST /api/service-weeks`, `GET /api/service-weeks`, `GET /api/service-weeks/:id`,
+`PUT /api/service-weeks/:id`. Scope is CRUD only. `DELETE`, `/cancel`, `/reactivate`,
+setlist song editing, and event creation are OTHER issues (#38/#39/#54/#59) — leave their
+route stubs untouched.
+
+The Cluster 3 schema (`service_weeks`, `setlists`, `invitations`) and the tenant RLS policies
+already exist and are applied. No new migration is needed for this issue.
+
+---
 
 ## OPEN QUESTIONS
-None are blocking. Two decisions were made explicitly below; if a human disagrees, only these change:
-1. **Duplicate names** — the DB has NO unique constraint on `(church_group_id, name)`. This spec adds a case-insensitive duplicate guard at the handler layer (409 CONFLICT) for both insert paths, because duplicate instrument names break roster/list UX. If duplicates should be allowed, drop the guard.
-2. **"pending" flag** — modeled as `pending = !is_default`. Admin `POST` and `promote` set `is_default = true`; member custom submissions are `is_default = false`. No new column is added (schema is frozen from #17).
 
-## Current state (already in repo)
-- All 5 route files exist but are `notImplemented` (501) stubs:
-  - `app/api/instruments/route.ts` (GET, POST)
-  - `app/api/instruments/custom/route.ts` (POST)
-  - `app/api/instruments/[id]/route.ts` (DELETE)
-  - `app/api/instruments/[id]/promote/route.ts` (POST)
-- `schemas/instruments.ts` is an empty-object stub.
-- Table `instruments` (migration `20260702000002_cluster_2_instruments.sql`):
-  `id, church_group_id, name varchar(100), is_default bool default false, created_by uuid null (FK users.id on delete set null), created_at timestamptz default now()`.
-- Table `member_instruments`: `id, member_profile_id, instrument_id` with FK `instrument_id → instruments.id ON DELETE CASCADE` and `unique(member_profile_id, instrument_id)`.
-- RLS (`20260704000001_rls_policies.sql`): instruments SELECT/INSERT/UPDATE/DELETE are **tenant-scoped only** (`church_group_id = auth_church_group_id()`), NOT role-gated. Therefore **admin-only enforcement MUST happen in the handler** via `requireRole(ctx, ["admin"])`.
-- Types: `lib/supabase/types.ts` already has `instruments` Row/Insert/Update. `InstrumentsRow` = `{ id, church_group_id, name, is_default, created_by, created_at }`; `Insert` marks `created_at` required even though the DB defaults it (same quirk handled in the profile handler with an `as unknown as ...Insert` cast). **No changes to this file.**
-- `types/domain.ts`: `UserRole = "admin" | "set_leader" | "member" | "guest"`.
-- `lib/api/errors.ts` already exports `ErrorCode.CONFLICT` and `ErrorCode.NOT_FOUND`.
-- Next.js is `^15.3.0` → dynamic route `params` is a **Promise** and must be awaited.
+### 1. Chat room placeholder is NOT buildable — defer it (recommended, non-blocking)
 
-## Files to create / modify
+The issue says "Creating a week should auto-create a draft setlist **and an inactive chat room
+placeholder** per Flow 4." There is **no `chat_rooms` table** — `supabase/migrations/20260702000005_cluster_5_partial.sql`
+explicitly defers `chat_rooms`/`chat_messages`/`chat_mentions` to Phase 2 (see its header comment).
+The issue itself notes "chat activation itself is Phase 2."
 
-### 1. MODIFY `schemas/instruments.ts` (replace entire file)
-Follow `schemas/profile.ts` style.
-```ts
-import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
-import type { Database } from "@/lib/supabase/types";
-import { ApiException, ErrorCode } from "@/lib/api/errors";
+**Decision taken in this spec:** On week creation, auto-create the **draft setlist only**. Do
+**not** attempt any chat-room write (the table does not exist; it would not compile/run). This is
+tracked as a Phase 2 follow-up. If a human wants the chat room now, they must first land the
+Phase 2 chat schema — out of scope here.
 
-// Body for POST /api/instruments and POST /api/instruments/custom.
-export const createInstrumentSchema = z.object({
-  name: z.string().trim().min(1).max(100),
-});
-export type CreateInstrumentInput = z.infer<typeof createInstrumentSchema>;
-```
+### 2. Required vs optional fields — follow the issue AC (all five required)
 
-### 2. CREATE `app/api/instruments/handler.ts`
-Single shared handler module (mirror `app/api/profile/handler.ts` structure: `requireAuth` → JWT → `getSupabaseClient` → query → `ok`/`fail`, wrapped in a single `try/catch` that maps `ApiException` to `fail`, else 500 INTERNAL). Export a response type and five handlers.
+The issue AC states the five fields are "all required fields validated". The DB columns
+(`title`, `sermon_topic`, `sermon_scripture`, `speaker_name`) are nullable and PRD Flow 4 §21.4
+calls sermon topic/scripture "optional". **Decision taken in this spec:** follow the issue AC
+literally — the create schema requires all five as non-empty. This is the authoritative
+instruction for this task. (Noted only so a reviewer knows it was deliberate, not an oversight.)
 
-Response type + mapper:
-```ts
-export type InstrumentResponse = {
-  id: string;
-  name: string;
-  isDefault: boolean;
-  pending: boolean;   // = !isDefault
-  createdBy: string | null;
-};
-// private
-function toInstrumentResponse(row: { id: string; name: string; is_default: boolean; created_by: string | null }): InstrumentResponse
-```
-
-Handler signatures (pass `id` explicitly so unit tests can call handlers directly, matching how `profile`/`members` handlers are tested):
-```ts
-export async function listInstruments(req: NextRequest, lookup?: UserLookup): Promise<Response>            // any authenticated member
-export async function addInstrument(req: NextRequest, lookup?: UserLookup): Promise<Response>              // admin only
-export async function submitCustomInstrument(req: NextRequest, lookup?: UserLookup): Promise<Response>     // any member
-export async function promoteInstrument(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>  // admin only
-export async function deleteInstrument(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>   // admin only
-```
-
-Imports to copy from `app/api/profile/handler.ts`: `NextRequest`, `auth` from `@clerk/nextjs/server`, `requireAuth`, `requireRole`, `type UserLookup` from `@/lib/api/auth`, `ok`, `fail` from `@/lib/api/response`, `ApiException`, `ErrorCode` from `@/lib/api/errors`, `getSupabaseClient` from `@/lib/supabase/client`, `type Database` from `@/lib/supabase/types`, plus `createInstrumentSchema` from `@/schemas/instruments`.
-
-Standard preamble in EVERY handler after `requireAuth` (and, where noted, `requireRole`):
-```ts
-const { getToken } = await auth();
-const jwt = await getToken({ template: "supabase" });
-if (!jwt) return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
-const supabase = getSupabaseClient(jwt);
-```
-
-**`listInstruments`** — `requireAuth` only (no role gate). Query:
-```ts
-supabase.from("instruments")
-  .select("id, name, is_default, created_by")
-  .eq("church_group_id", ctx.churchGroupId)
-  .order("is_default", { ascending: false })
-  .order("name", { ascending: true })
-```
-On `error` → 500 INTERNAL. Return `ok({ instruments: (data ?? []).map(toInstrumentResponse) })` (empty array when none).
-
-**`addInstrument`** (admin) — `requireAuth` then `requireRole(ctx, ["admin"])`. Parse body with `createInstrumentSchema.safeParse(await req.json().catch(() => null))` → 400 VALIDATION_FAILED on failure. Run duplicate guard (below) → 409 CONFLICT. Insert:
-```ts
-const payload = {
-  church_group_id: ctx.churchGroupId,
-  name: parsed.name,
-  is_default: true,
-  created_by: ctx.userId,
-} as unknown as Database["public"]["Tables"]["instruments"]["Insert"];
-supabase.from("instruments").insert(payload).select("id, name, is_default, created_by").single()
-```
-Do NOT set `created_at`. On `error`/no data → 500. Return `ok({ instrument: toInstrumentResponse(data) }, 201)`.
-
-**`submitCustomInstrument`** — `requireAuth` only (any member; AC lets any member submit). Same body parse + duplicate guard. Insert identical to `addInstrument` EXCEPT `is_default: false`. Return `ok({ instrument }, 201)`.
-
-**`promoteInstrument`** (admin) — `requireAuth` + `requireRole(ctx, ["admin"])`. Update:
-```ts
-supabase.from("instruments")
-  .update({ is_default: true } as unknown as Database["public"]["Tables"]["instruments"]["Update"])
-  .eq("id", id).eq("church_group_id", ctx.churchGroupId)
-  .select("id, name, is_default, created_by")
-```
-If `error` → 500. If returned array is empty (no row matched) → 404 NOT_FOUND. Else `ok({ instrument: toInstrumentResponse(rows[0]) })`. (Promoting an already-default instrument is idempotent — still 200.)
-
-**`deleteInstrument`** (admin) — `requireAuth` + `requireRole(ctx, ["admin"])`.
-```ts
-supabase.from("instruments").delete()
-  .eq("id", id).eq("church_group_id", ctx.churchGroupId)
-  .select("id")
-```
-If `error` → 500. If returned array empty → 404 NOT_FOUND. Else `ok({ deleted: true })`. (FK cascade auto-clears `member_instruments` — no extra work.)
-
-**Duplicate guard helper** (used by `addInstrument` + `submitCustomInstrument`), run after body parse, before insert:
-```ts
-const { data: existing, error: dupErr } = await supabase
-  .from("instruments").select("name").eq("church_group_id", ctx.churchGroupId);
-if (dupErr) return fail("Internal error", ErrorCode.INTERNAL, 500);
-if ((existing ?? []).some((r) => r.name.trim().toLowerCase() === parsed.name.toLowerCase()))
-  return fail("Instrument already exists", ErrorCode.CONFLICT, 409);
-```
-
-**Catch block** (copy from profile handler): map `ApiException` → `fail(err.message, err.code, err.status)`, else `fail("Internal error", ErrorCode.INTERNAL, 500)`.
-
-### 3. MODIFY `app/api/instruments/route.ts`
-```ts
-import { NextRequest } from "next/server";
-import { listInstruments, addInstrument } from "./handler";
-
-export async function GET(req: NextRequest): Promise<Response> {
-  return listInstruments(req);
-}
-export async function POST(req: NextRequest): Promise<Response> {
-  return addInstrument(req);
-}
-```
-
-### 4. MODIFY `app/api/instruments/custom/route.ts`
-```ts
-import { NextRequest } from "next/server";
-import { submitCustomInstrument } from "../handler";
-
-export async function POST(req: NextRequest): Promise<Response> {
-  return submitCustomInstrument(req);
-}
-```
-
-### 5. MODIFY `app/api/instruments/[id]/route.ts`
-```ts
-import { NextRequest } from "next/server";
-import { deleteInstrument } from "../handler";
-
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-): Promise<Response> {
-  const { id } = await params;
-  return deleteInstrument(req, id);
-}
-```
-
-### 6. MODIFY `app/api/instruments/[id]/promote/route.ts`
-```ts
-import { NextRequest } from "next/server";
-import { promoteInstrument } from "../../handler";
-
-export async function POST(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> },
-): Promise<Response> {
-  const { id } = await params;
-  return promoteInstrument(req, id);
-}
-```
-Errors use the standard `{ error, code }` envelope via `fail(...)`.
-
-## Edge cases the implementation MUST handle
-- Clerk user unauthenticated → 401 UNAUTHENTICATED (handled by `requireAuth`).
-- Valid Clerk user but no Supabase JWT → 401 UNAUTHENTICATED (before touching Supabase).
-- Non-admin calling `addInstrument` / `promoteInstrument` / `deleteInstrument` → 403 FORBIDDEN (via `requireRole`). `listInstruments` and `submitCustomInstrument` are open to any authenticated member.
-- Malformed/missing body or empty/whitespace-only `name` → 400 VALIDATION_FAILED (`name` is `.trim().min(1)`).
-- `name` longer than 100 chars → 400 (matches `varchar(100)`).
-- Duplicate name (case-insensitive, same group) on either insert path → 409 CONFLICT.
-- `promote`/`delete` with an id that doesn't exist OR belongs to another church group → 404 NOT_FOUND (the `.eq("church_group_id", ...)` scoping makes cross-tenant ids indistinguishable from missing — correct behavior).
-- All queries scoped to `ctx.churchGroupId`; inserts set `church_group_id: ctx.churchGroupId` (required by the RLS INSERT check).
-- Any Supabase `error` → 500 INTERNAL. `ApiException` from auth helpers → mapped via the shared catch block.
-- Multiple members sharing an instrument is inherently supported (no exclusivity logic); do NOT add any uniqueness on member selection here. Deleting a shared instrument cascades to `member_instruments`.
-
-## Tests
-Create `tests/unit/app/api/instruments-route.test.ts`. Copy the mocking harness from `tests/unit/app/api/church-group-members-route.test.ts` / `profile-route.test.ts`:
-- `jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }))` and `jest.mock("@/lib/supabase/client", ...)`.
-- `makeLookup(role)` producing an `AuthContext`, `setUpAuth(jwt)`, and a `makeSupabaseClient(overrides)` fixture builder whose mocked `from(table)` supports the chains used here: `.select(...).eq(...).order(...).order(...)`, `.select(...).eq(...)` (duplicate-guard read), `.insert(...).select(...).single()`, `.update(...).eq(...).eq(...).select(...)`, `.delete().eq(...).eq(...).select(...)`.
-Cover, mapping to acceptance criteria + edge cases: GET 200 list (ordered, `pending` flag correct for default vs custom rows) and GET 200 empty; POST admin 201 sets `is_default: true`; POST 403 for non-admin; POST 400 empty name; POST 409 duplicate (case-insensitive); custom POST 201 sets `is_default: false` and is allowed for a plain member; promote admin 200 + 404 when id missing + 403 non-admin; delete admin 200 `{ deleted: true }` + 404 missing + 403 non-admin; 401 when no JWT; 500 on DB error.
+---
 
 ## Patterns to copy
-- Handler shape, JWT/`requireAuth` flow, try/catch → `ApiException` mapping, and the `as unknown as ...Insert` cast: **`app/api/profile/handler.ts`**.
-- Role gating: **`app/api/_examples/admin-only/handler.ts`** (`requireRole(ctx, ["admin"])`).
-- Multi-select + name-map query style: **`app/api/church-group/members/handler.ts`**.
-- Route → handler delegation: **`app/api/profile/route.ts`** and **`app/api/church-group/members/route.ts`**.
-- Zod schema style: **`schemas/profile.ts`**.
-- Unit test harness / Supabase mock: **`tests/unit/app/api/profile-route.test.ts`**.
-- Response envelope: `ok`/`fail` from `lib/api/response.ts`; codes from `lib/api/errors.ts`.
+
+- Handler structure, auth, JWT fetch, error envelope: **copy `app/api/profile/handler.ts`**.
+- Route → handler delegation: **copy `app/api/profile/route.ts`**.
+- Role gating: `requireRole(ctx, [...])` from `lib/api/auth.ts` (see `app/api/church-group/members/handler.ts`).
+- Insert type cast for the `created_at`-required hand-rolled Insert types:
+  copy the `as unknown as Database["public"]["Tables"][...]["Insert"]` cast used in
+  `app/api/profile/handler.ts` `updateProfile` (lines 90-99).
+- Zod schema file: **copy the style of `schemas/profile.ts`**.
+- Unit test structure and Supabase mock: **copy `tests/unit/app/api/profile-route.test.ts`**.
+
+Envelope: success `{ data: ... }` via `ok(...)`; error `{ error, code }` via `fail(...)`.
+Error codes from `lib/api/errors.ts`. All handlers wrap in try/catch and map `ApiException`
+to `fail(err.message, err.code, err.status)`, else `fail("Internal error", INTERNAL, 500)`.
+
+---
+
+## Files to modify / create
+
+### 1. `schemas/service-weeks.ts` — REPLACE the placeholder
+
+Replace the empty `serviceWeeksSchema` with two schemas. Use `z` from `zod`.
+
+```ts
+export const createServiceWeekSchema = z.object({
+  serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD"),
+  title: z.string().trim().min(1).max(100),
+  sermonTopic: z.string().trim().min(1),
+  sermonScripture: z.string().trim().min(1),
+  speakerName: z.string().trim().min(1).max(100),
+});
+export type CreateServiceWeekInput = z.infer<typeof createServiceWeekSchema>;
+
+// PUT: same fields, all optional; at least one must be present.
+export const updateServiceWeekSchema = z
+  .object({
+    serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    title: z.string().trim().min(1).max(100).optional(),
+    sermonTopic: z.string().trim().min(1).optional(),
+    sermonScripture: z.string().trim().min(1).optional(),
+    speakerName: z.string().trim().min(1).max(100).optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, "at least one field required");
+export type UpdateServiceWeekInput = z.infer<typeof updateServiceWeekSchema>;
+```
+
+Keep the request body camelCase; map to snake_case DB columns in the handler.
+
+### 2. `lib/supabase/types.ts` — ADD three tables
+
+The file is hand-written (Cluster 1 only). Add `service_weeks`, `setlists`, and `invitations`
+to `Database["public"]["Tables"]`, following the existing `Row`/`Insert`/`Update`/`Relationships`
+shape. Import `SetlistStatus` (and `InvitationStatus`) from `@/types/domain`.
+
+`ServiceWeeksRow`:
+```ts
+{
+  id: string;
+  church_group_id: string;
+  service_date: string;
+  title: string | null;
+  sermon_topic: string | null;
+  sermon_scripture: string | null;
+  speaker_name: string | null;
+  notes: string | null;
+  is_cancelled: boolean;
+  created_by: string | null;
+  created_at: string;
+}
+```
+- `Insert: Omit<ServiceWeeksRow, "id" | "created_at" | "is_cancelled"> & { id?: string; created_at?: string; is_cancelled?: boolean }`
+- `Update: Partial<ServiceWeeksRow>`
+
+`SetlistsRow`:
+```ts
+{
+  id: string;
+  church_group_id: string;
+  service_week_id: string;
+  status: SetlistStatus;
+  published_at: string | null;
+  notes: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+```
+- `Insert: Omit<SetlistsRow, "id" | "created_at" | "updated_at" | "status" | "published_at" | "notes"> & { id?: string; created_at?: string; updated_at?: string; status?: SetlistStatus; published_at?: string | null; notes?: string | null }`
+- `Update: Partial<SetlistsRow>`
+
+`InvitationsRow` (only the columns queried for guest scoping are load-bearing; include these):
+```ts
+{
+  id: string;
+  church_group_id: string;
+  service_week_id: string;
+  user_id: string;
+  status: InvitationStatus;
+  created_at: string;
+}
+```
+- `Insert: Omit<InvitationsRow, "id" | "created_at"> & { id?: string; created_at?: string }`
+- `Update: Partial<InvitationsRow>`
+- All three tables: `Relationships: []`
+
+Run `bun run typecheck` — it must stay green.
+
+### 3. `app/api/service-weeks/handler.ts` — CREATE (list + create)
+
+Export a shared response type and two handlers.
+
+```ts
+export type ServiceWeekResponse = {
+  id: string;
+  serviceDate: string;      // service_date
+  title: string | null;
+  sermonTopic: string | null;
+  sermonScripture: string | null;
+  speakerName: string | null;
+  notes: string | null;
+  isCancelled: boolean;     // is_cancelled
+  createdBy: string | null; // created_by
+  createdAt: string;        // created_at
+};
+
+export async function listServiceWeeks(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+export async function createServiceWeek(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+```
+
+Add and **export** `toServiceWeekResponse(row: ServiceWeeksRow): ServiceWeekResponse` (snake → camel);
+import it in `[id]/handler.ts` to avoid duplication.
+
+**`listServiceWeeks` (GET /api/service-weeks) — Auth: any authenticated member of the group.**
+1. `ctx = await requireAuth(req, lookup)`.
+2. Fetch JWT (`auth()` → `getToken({ template: "supabase" })`); 401 `UNAUTHENTICATED` if missing.
+   `supabase = getSupabaseClient(jwt)`.
+3. Query `service_weeks` scoped `church_group_id = ctx.churchGroupId`, ordered `service_date` desc.
+   (RLS already enforces the tenant scope; keep the explicit `.eq` too, matching the members handler.)
+4. **Guest scoping:** if `ctx.role === "guest"`, restrict to weeks the guest is invited to.
+   Query `invitations` for `user_id = ctx.userId` (RLS scopes to the tenant), collect the set of
+   `service_week_id`, and filter the returned rows to that set (or add `.in("id", ids)`).
+   If the guest has zero invitations, return `{ data: { serviceWeeks: [] } }`.
+5. On any query `error` → 500 `INTERNAL`.
+6. Return `ok({ serviceWeeks: rows.map(toServiceWeekResponse) })` (200).
+
+**`createServiceWeek` (POST /api/service-weeks) — Auth: set_leader / admin only.**
+1. `ctx = await requireAuth(req, lookup)`; then `requireRole(ctx, ["admin", "set_leader"])`
+   (throws `ApiException` FORBIDDEN 403 — caught by the wrapper).
+2. Parse body: `const body = await req.json().catch(() => null)`; `createServiceWeekSchema.safeParse`.
+   On failure → 400 `VALIDATION_FAILED`.
+3. Fetch JWT / supabase as above (401 if no JWT).
+4. Insert into `service_weeks`:
+   - `church_group_id: ctx.churchGroupId`
+   - `service_date: parsed.serviceDate`
+   - `title`, `sermon_topic`, `sermon_scripture`, `speaker_name` from parsed
+   - `created_by: ctx.userId`
+   - Do NOT set `id`, `created_at`, `is_cancelled`, `notes` (DB defaults / nullable).
+   Use the `as unknown as Database[...]["service_weeks"]["Insert"]` cast pattern from the profile
+   handler. `.select(...).maybeSingle()` to get the created row. On `error || !data` → 500 `INTERNAL`.
+5. **Auto-create the draft setlist** for the new week: insert into `setlists`:
+   - `church_group_id: ctx.churchGroupId`
+   - `service_week_id: <new week id>`
+   - `created_by: ctx.userId`
+   - Do NOT set `status` (DB default `'draft'`) or `id`/timestamps.
+   On error → 500 `INTERNAL`. Because `setlists.service_week_id` is `unique`, this must run after
+   the week insert succeeds. Two sequential inserts (not a transaction) is acceptable — there is no
+   RPC in scope. If the setlist insert fails, return 500; the orphaned week is an accepted edge here.
+6. **Do NOT create a chat room** (see OPEN QUESTION 1).
+7. Return `ok({ serviceWeek: toServiceWeekResponse(row) }, 201)`.
+
+### 4. `app/api/service-weeks/route.ts` — REWRITE to delegate
+
+Mirror `app/api/profile/route.ts`:
+```ts
+import { NextRequest } from "next/server";
+import { listServiceWeeks, createServiceWeek } from "./handler";
+
+export async function GET(req: NextRequest): Promise<Response> { return listServiceWeeks(req); }
+export async function POST(req: NextRequest): Promise<Response> { return createServiceWeek(req); }
+```
+
+### 5. `app/api/service-weeks/[id]/handler.ts` — CREATE (get one + update)
+
+```ts
+export async function getServiceWeek(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>;
+export async function updateServiceWeek(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>;
+```
+Import `toServiceWeekResponse` (and `ServiceWeekResponse` if needed) from `../handler`.
+
+**`getServiceWeek` (GET /api/service-weeks/:id) — Auth: any authenticated member.**
+1. `requireAuth`; JWT/supabase (401 if no JWT).
+2. Query `service_weeks` by `.eq("id", id).eq("church_group_id", ctx.churchGroupId).maybeSingle()`.
+   On `error` → 500. On `!data` → 404 `NOT_FOUND`.
+3. **Guest scoping:** if `ctx.role === "guest"`, verify an `invitations` row exists for
+   `service_week_id = id` AND `user_id = ctx.userId`. If none → 404 `NOT_FOUND` (do NOT leak
+   existence via 403). On invitation-query error → 500.
+4. Return `ok({ serviceWeek: toServiceWeekResponse(row) })` (200).
+
+**`updateServiceWeek` (PUT /api/service-weeks/:id) — Auth: set_leader / admin only.**
+1. `requireAuth`; `requireRole(ctx, ["admin", "set_leader"])`.
+2. Parse body with `updateServiceWeekSchema` → 400 `VALIDATION_FAILED` on failure.
+3. JWT/supabase (401 if no JWT).
+4. Build a snake_case partial update object from only the provided fields
+   (`serviceDate→service_date`, `title`, `sermonTopic→sermon_topic`,
+   `sermonScripture→sermon_scripture`, `speakerName→speaker_name`).
+5. `supabase.from("service_weeks").update(patch).eq("id", id).eq("church_group_id", ctx.churchGroupId)
+   .select(...).maybeSingle()`. On `error` → 500. On `!data` (no row matched) → 404 `NOT_FOUND`.
+6. Return `ok({ serviceWeek: toServiceWeekResponse(row) })` (200).
+
+### 6. `app/api/service-weeks/[id]/route.ts` — REWRITE GET + PUT, keep DELETE stub
+
+Next.js 15: the second arg is `{ params }: { params: Promise<{ id: string }> }`; `await params`.
+```ts
+import { NextRequest } from "next/server";
+import { notImplemented } from "@/lib/api/response";
+import { getServiceWeek, updateServiceWeek } from "./handler";
+
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function GET(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return getServiceWeek(req, id);
+}
+export async function PUT(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return updateServiceWeek(req, id);
+}
+export async function DELETE(_req: NextRequest) {
+  return notImplemented("DELETE /api/service-weeks/[id]"); // #38 — out of scope
+}
+```
+
+### 7. Tests — CREATE
+
+Copy the mock/harness style of `tests/unit/app/api/profile-route.test.ts`
+(`jest.mock("@clerk/nextjs/server")`, `jest.mock("@/lib/supabase/client")`, `makeLookup`,
+`setUpAuth`, a `makeSupabaseClient` fixture keyed by table name). The Supabase mock must support
+the chains used: `.select().eq()...` (+ `.order`), `.eq().eq().maybeSingle()`,
+`.insert().select().maybeSingle()`, `.update().eq().eq().select().maybeSingle()`, and `.in(...)`.
+Give `makeLookup` a `role` argument so guest/member/leader/admin can be exercised.
+
+- `tests/unit/app/api/service-weeks-route.test.ts` — covers `listServiceWeeks` + `createServiceWeek`.
+- `tests/unit/app/api/service-weeks-id-route.test.ts` — covers `getServiceWeek` + `updateServiceWeek`.
+
+Required cases per the Edge cases below.
+
+---
+
+## Edge cases the implementation MUST handle
+
+1. **No Clerk session** → 401 `UNAUTHENTICATED` (lookup never consulted). All four handlers.
+2. **No Supabase JWT** (`getToken` returns null) → 401 `UNAUTHENTICATED`; `getSupabaseClient` not called.
+3. **POST/PUT by a `member` or `guest`** → 403 `FORBIDDEN` (from `requireRole`).
+4. **POST with missing/empty any of the five fields, or bad `serviceDate` format** → 400 `VALIDATION_FAILED`.
+5. **POST malformed/non-JSON body** (`req.json()` throws → null) → 400 `VALIDATION_FAILED`.
+6. **POST success** → 201; response is camelCase `serviceWeek`; a draft `setlists` row is inserted
+   with the new `service_week_id` and no explicit `status`. Assert the setlist insert was attempted
+   (capture the insert payload; assert no `status` key).
+7. **Setlist auto-insert error after week insert succeeds** → 500 `INTERNAL`.
+8. **GET list as a guest** → only weeks with a matching `invitations` row for that user; guest with
+   zero invitations → `{ serviceWeeks: [] }`.
+9. **GET list as member/leader/admin** → all weeks in the group.
+10. **GET :id not found / different tenant** → 404 `NOT_FOUND`.
+11. **GET :id as guest with no invitation for that week** → 404 `NOT_FOUND` (not 403).
+12. **PUT with empty body `{}`** → 400 `VALIDATION_FAILED` (refine: at least one field).
+13. **PUT :id not found** (no row matched the `id`+tenant) → 404 `NOT_FOUND`.
+14. **PUT partial update** → only provided fields are written; assert the captured update payload
+    contains only the mapped snake_case keys sent.
+15. **Any DB `error`** on a query/insert/update → 500 `INTERNAL`.
 
 ## Out of scope (do NOT implement)
-- Attaching instruments to a member profile / editing member selections (that is #30's `member_instruments`; this issue only manages the group's instrument catalog).
-- Transposition logic (Phase 3).
-- New DB migrations or schema changes — the schema from #17 is sufficient. Do NOT add columns or constraints, and do NOT edit `lib/supabase/types.ts`.
-- Seeding the 9 defaults (done in #24).
+
+- `DELETE /api/service-weeks/:id`, `/cancel`, `/reactivate` (#38/#39) — leave as `notImplemented`.
+- Setlist song editing / publish, event CRUD, invitation sending (#54/#59/#40).
+- Chat room creation (no table — OPEN QUESTION 1).
+- Audit-log writes (not in this issue's AC).
+- Regenerating full Supabase types — only add the three tables needed.

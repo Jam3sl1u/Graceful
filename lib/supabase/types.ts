@@ -6,7 +6,7 @@
 // Shape must satisfy supabase-js v2 GenericSchema / GenericTable interfaces
 // so that from().select().eq().maybeSingle() returns typed data.
 
-import type { UserRole, VocalCapability } from "@/types/domain";
+import type { InvitationStatus, SetlistStatus, UserRole, VocalCapability } from "@/types/domain";
 
 type UsersRow = {
   id: string;
@@ -63,6 +63,54 @@ type AuditLogsRow = {
   created_at: string;
 };
 
+type ServiceWeeksRow = {
+  id: string;
+  church_group_id: string;
+  service_date: string;
+  title: string | null;
+  sermon_topic: string | null;
+  sermon_scripture: string | null;
+  speaker_name: string | null;
+  notes: string | null;
+  is_cancelled: boolean;
+  created_by: string | null;
+  created_at: string;
+};
+
+type SetlistsRow = {
+  id: string;
+  church_group_id: string;
+  service_week_id: string;
+  status: SetlistStatus;
+  published_at: string | null;
+  notes: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type InvitationsRow = {
+  id: string;
+  church_group_id: string;
+  service_week_id: string;
+  user_id: string;
+  status: InvitationStatus;
+  created_at: string;
+};
+
+// Minimal placeholder table — see
+// supabase/migrations/20260708000001_chat_rooms_placeholder.sql. Only
+// enough columns to hold an inactive chat room row linked to a service week;
+// full chat functionality is Phase 2.
+type ChatRoomsRow = {
+  id: string;
+  church_group_id: string;
+  service_week_id: string;
+  is_active: boolean;
+  created_by: string | null;
+  created_at: string;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -100,6 +148,48 @@ export type Database = {
         Row: AuditLogsRow;
         Insert: Omit<AuditLogsRow, "id" | "created_at"> & { id?: string; created_at?: string };
         Update: Partial<AuditLogsRow>;
+        Relationships: [];
+      };
+      service_weeks: {
+        Row: ServiceWeeksRow;
+        Insert: Omit<ServiceWeeksRow, "id" | "created_at" | "is_cancelled"> & {
+          id?: string;
+          created_at?: string;
+          is_cancelled?: boolean;
+        };
+        Update: Partial<ServiceWeeksRow>;
+        Relationships: [];
+      };
+      setlists: {
+        Row: SetlistsRow;
+        Insert: Omit<
+          SetlistsRow,
+          "id" | "created_at" | "updated_at" | "status" | "published_at" | "notes"
+        > & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+          status?: SetlistStatus;
+          published_at?: string | null;
+          notes?: string | null;
+        };
+        Update: Partial<SetlistsRow>;
+        Relationships: [];
+      };
+      invitations: {
+        Row: InvitationsRow;
+        Insert: Omit<InvitationsRow, "id" | "created_at"> & { id?: string; created_at?: string };
+        Update: Partial<InvitationsRow>;
+        Relationships: [];
+      };
+      chat_rooms: {
+        Row: ChatRoomsRow;
+        Insert: Omit<ChatRoomsRow, "id" | "created_at" | "is_active"> & {
+          id?: string;
+          created_at?: string;
+          is_active?: boolean;
+        };
+        Update: Partial<ChatRoomsRow>;
         Relationships: [];
       };
     };

@@ -1,92 +1,110 @@
-# Changes — Issue #31: Instrument list management (default + custom)
+# Changes — Issue #37: Service Week CRUD
+
+## Human-resolved open questions applied (override spec.md's OPEN QUESTIONS section)
+
+1. **Chat room placeholder is now built, not deferred.** Added a new, minimal
+   `chat_rooms` migration and table so `POST /api/service-weeks` can auto-create an
+   inactive chat-room placeholder row alongside the draft setlist, per PRD Flow 4 /
+   the issue AC. Full chat functionality (messages, mentions, activation) is still
+   Phase 2 — only the placeholder row exists.
+2. **All five create fields are required** (already matched spec.md's stated
+   decision — no change needed here beyond implementing it).
 
 ## Files changed
 
-### `schemas/instruments.ts` (rewritten)
-- Replaced the `z.object({})` placeholder with `createInstrumentSchema`:
-  `name` — trimmed, `min(1)`, `max(100)` (matches the `varchar(100)` column). Used by
-  both `POST /api/instruments` and `POST /api/instruments/custom`.
-- Exports `CreateInstrumentInput` inferred type.
+### `supabase/migrations/20260708000001_chat_rooms_placeholder.sql` (new)
+- `chat_rooms` table: `id`, `church_group_id` (FK → `church_groups`, cascade),
+  `service_week_id` (FK → `service_weeks`, cascade, **unique** — one room per week),
+  `is_active boolean not null default false`, `created_by` (FK → `users`, set null),
+  `created_at`. Deliberately minimal — no message/mention tables, no activation
+  columns (see the migration's header comment referencing
+  `20260702000005_cluster_5_partial.sql`, which still defers the rest of chat).
+- RLS enabled: `chat_rooms_select_tenant` (any authenticated member of the tenant)
+  and `chat_rooms_insert_leader_admin` (set_leader/admin only, matching who can
+  create the service week it's attached to). No UPDATE/DELETE policy yet —
+  activation is Phase 2's job.
 
-### `app/api/instruments/handler.ts` (new)
-Single shared handler module, mirroring `app/api/profile/handler.ts` (JWT/`requireAuth`
-flow, try/catch → `ApiException` mapping, `as unknown as ...Insert`/`...Update` casts)
-and `app/api/_examples/admin-only/handler.ts` (`requireRole(ctx, ["admin"])`).
+### `lib/supabase/types.ts` (modified)
+- Added four hand-written table types to `Database["public"]["Tables"]`:
+  `service_weeks`, `setlists`, `invitations` (per spec.md §2), and `chat_rooms`
+  (per the human override). Each follows the existing `Row`/`Insert`/`Update`/
+  `Relationships: []` shape; `Insert` omits DB-defaulted columns (`id`,
+  `created_at`, `is_cancelled` / `status`+`published_at`+`notes` / `is_active`)
+  as optional. Imports `SetlistStatus`/`InvitationStatus` from `@/types/domain`.
 
-- `toInstrumentResponse` (private): maps a DB row to `InstrumentResponse`
-  (`{ id, name, isDefault, pending, createdBy }`), with `pending = !isDefault`.
-- `listInstruments(req, lookup?)` — any authenticated member (`requireAuth` only).
-  Queries `instruments` scoped to `ctx.churchGroupId`, ordered `is_default desc, name
-  asc`. Empty array when none. 500 on query error.
-- `addInstrument(req, lookup?)` — admin only (`requireRole(ctx, ["admin"])`). Parses
-  body with `createInstrumentSchema` (400 `VALIDATION_FAILED`), runs the
-  case-insensitive duplicate guard (409 `CONFLICT`), inserts with `is_default: true`,
-  `created_by: ctx.userId`. Returns 201.
-- `submitCustomInstrument(req, lookup?)` — any authenticated member. Same body parse
-  + duplicate guard as `addInstrument`; inserts with `is_default: false`. Returns 201.
-- `promoteInstrument(req, id, lookup?)` — admin only. Updates `is_default: true` for
-  the row matching `id` + `ctx.churchGroupId`. Empty result → 404 `NOT_FOUND`
-  (covers both "doesn't exist" and "belongs to another group", since the
-  `church_group_id` scoping makes them indistinguishable — this is intentional per
-  spec). Idempotent (re-promoting an already-default instrument still 200s).
-- `deleteInstrument(req, id, lookup?)` — admin only. Deletes the row matching `id` +
-  `ctx.churchGroupId`. Empty result → 404 `NOT_FOUND`. Returns `{ deleted: true }`.
-  FK cascade (`member_instruments.instrument_id ON DELETE CASCADE`) handles cleanup
-  with no extra handler work.
-- Duplicate guard (private, inlined in both insert paths, per spec — not factored
-  into a shared helper function since the spec showed it inline): re-reads all
-  `name`s for the group and does a case-insensitive `.trim().toLowerCase()`
-  comparison before inserting.
-- `id` is passed as an explicit parameter to `promoteInstrument`/`deleteInstrument`
-  (not read from the route's dynamic segment inside the handler) so unit tests can
-  call the handlers directly, matching the `profile`/`members` handler test pattern.
+### `schemas/service-weeks.ts` (rewritten)
+- Replaced the empty placeholder with `createServiceWeekSchema` (all five fields —
+  `serviceDate`, `title`, `sermonTopic`, `sermonScripture`, `speakerName` —
+  required, non-empty after trim, per the issue AC) and `updateServiceWeekSchema`
+  (all fields optional, `.refine` requires at least one key present).
 
-### `app/api/instruments/route.ts`, `app/api/instruments/custom/route.ts`,
-### `app/api/instruments/[id]/route.ts`, `app/api/instruments/[id]/promote/route.ts`
-- All four rewritten from `notImplemented` (501) stubs to thin delegators to the new
-  handler functions. The two dynamic routes (`[id]/route.ts`, `[id]/promote/route.ts`)
-  `await params` per Next.js 15's async dynamic APIs before calling the handler.
+### `app/api/service-weeks/handler.ts` (new)
+- `toServiceWeekResponse` (exported, reused by `[id]/handler.ts`) maps the DB row
+  (snake_case) to the camelCase `ServiceWeekResponse` shape.
+- `listServiceWeeks` — any authenticated member; guests are scoped to weeks they
+  have an `invitations` row for (queries `invitations.user_id`, collects
+  `service_week_id`s, then `.in("id", ids)` on `service_weeks`; zero invitations ⇒
+  `{ serviceWeeks: [] }` without querying `service_weeks` at all).
+- `createServiceWeek` — set_leader/admin only (`requireRole`). Validates with
+  `createServiceWeekSchema`, inserts `service_weeks`, then **sequentially** inserts
+  the draft `setlists` row (no explicit `status` — DB default `'draft'`) and the
+  inactive `chat_rooms` row (no explicit `is_active` — DB default `false`). Any of
+  the three inserts failing → 500 `INTERNAL`; an orphaned week/setlist on a later
+  failure is an accepted edge case (no transaction/RPC in scope), matching
+  spec.md's stated tradeoff for the setlist insert, now also applied to the chat
+  room insert.
 
-### `tests/unit/app/api/instruments-route.test.ts` (new)
-- Mocks `@clerk/nextjs/server` (`auth`) and `@/lib/supabase/client`
-  (`getSupabaseClient`), following the harness pattern from `profile-route.test.ts` /
-  `church-group-members-route.test.ts`.
-- `makeSupabaseClient(overrides, hooks?)` fixture builder: fixtures are keyed per
-  table **and per operation** (`select` / `insert` / `update` / `delete`) so a test
-  can, e.g., override only the duplicate-check `select` result without accidentally
-  changing the `insert` result the same call chain returns later (an early version of
-  this harness applied one override to all four operations, which silently corrupted
-  unrelated assertions — fixed before landing). `makeChain(result)` returns a
-  thenable object exposing `.eq`/`.order`/`.select`/`.single`, all chainable, covering
-  every call shape used by the handler: `.select().eq().order().order()` (list),
-  `.select().eq()` (duplicate-guard read), `.insert().select().single()`,
-  `.update().eq().eq().select()`, `.delete().eq().eq().select()`.
-- 23 tests covering: `GET` 200 (ordered list, `pending` flag correct for default vs.
-  custom rows) and 200 empty; `POST /api/instruments` 201 (`is_default: true`,
-  captures insert payload), 403 non-admin, 400 empty/whitespace name, 400 malformed
-  body, 409 case-insensitive duplicate, 401 no JWT, 500 on insert error;
-  `POST /api/instruments/custom` 201 (`is_default: false`, allowed for a plain
-  member), 400 empty name, 409 duplicate; `promote` 200 (idempotent-shaped, captures
-  update payload), 404 missing id, 403 non-admin, 500 on update error; `delete` 200
-  `{ deleted: true }`, 404 missing id, 403 non-admin, 401 no JWT, 500 on delete error.
+### `app/api/service-weeks/route.ts` (rewritten)
+- Thin `GET`/`POST` delegators to the new handler, replacing the `notImplemented`
+  stubs.
+
+### `app/api/service-weeks/[id]/handler.ts` (new)
+- `getServiceWeek` — any authenticated member; 404 (not 403) for a guest with no
+  matching invitation, so existence isn't leaked. 404 for wrong-tenant/missing id.
+- `updateServiceWeek` — set_leader/admin only. Builds a snake_case patch object
+  from only the provided fields, `.update(...).eq("id", id).eq("church_group_id",
+  ...)`. No matching row → 404.
+
+### `app/api/service-weeks/[id]/route.ts` (rewritten)
+- `GET`/`PUT` now delegate (Next 15 async `params`); `DELETE` untouched —
+  still `notImplemented("DELETE /api/service-weeks/[id]")` (#38, out of scope).
+
+### `tests/unit/app/api/service-weeks-route.test.ts` (new — 24 tests)
+### `tests/unit/app/api/service-weeks-id-route.test.ts` (new — 16 tests)
+- Copy the `profile-route.test.ts` / `instruments-route.test.ts` mock harness
+  (`jest.mock` Clerk + Supabase client, `makeLookup(role)`, `setUpAuth(jwt)`, a
+  thenable `makeChain(result)` supporting `.eq/.order/.in/.select/.maybeSingle`
+  chains keyed per table+operation).
+- Cover every edge case in spec.md's list, plus two added for the human-override
+  chat-room behavior: POST 201 asserts the `chat_rooms` insert payload has no
+  `is_active` key (mirrors the existing `setlists` no-`status` assertion), and a
+  new 500 case for a `chat_rooms` insert error after the week+setlist inserts
+  succeed.
 
 ## Verification
-- `bun run lint` — passes.
 - `bun run typecheck` — passes.
-- `bun run test` — all 9 suites / 89 tests pass (23 new for this route).
-- `bun run format:check` (on the touched files only) — passes; the rest of the repo
-  had pre-existing Prettier drift unrelated to this change, left untouched.
+- `bun run lint` — passes.
+- `bun run test` — all 13 suites / 152 tests pass (40 new for this issue).
+- `bun run format:check` (touched files only, via `prettier --write`) — clean;
+  the rest of the repo has pre-existing Prettier drift unrelated to this change,
+  left untouched.
+- Not run: `bun run test:rls` (integration tests against a live Supabase
+  instance) and no `supabase db push`/migration apply — this is a code-review
+  environment with no DB; the new `chat_rooms` RLS policies follow the exact
+  pattern of the existing `service_weeks`/`instruments` tenant policies in
+  `20260704000001_rls_policies.sql` but have not been exercised against a real
+  Postgres instance.
 
 ## What the Tester should focus on
-- The duplicate guard is intentionally a spec-driven addition (schema has no unique
-  constraint on `(church_group_id, name)` — see spec OPEN QUESTIONS #1). Confirm the
-  409 path only triggers on case-insensitive, group-scoped matches.
-- `promote`/`delete` 404 semantics: an id from another church group is
-  indistinguishable from a missing id (both resolve to an empty result array from the
-  `.eq("church_group_id", ...)` scoping) — this is intentional, not a bug.
-- `listInstruments` and `submitCustomInstrument` are open to any authenticated
-  member (no `requireRole`); `addInstrument`, `promoteInstrument`, `deleteInstrument`
-  are admin-only.
-- Out of scope, not touched: `lib/supabase/types.ts`, member-profile instrument
-  selection (`member_instruments` writes, #30's territory), transposition logic,
-  seeding defaults, and no new DB migrations were added.
+- The `chat_rooms` migration and its RLS policies are new for this issue (not
+  pre-existing, unlike `service_weeks`/`setlists`/`invitations`) — worth a closer
+  look since they weren't in the original spec.
+- `createServiceWeek` now does three sequential inserts (week → setlist → chat
+  room); confirm the ordering and the "accepted orphan on later failure" tradeoff
+  is acceptable, since it now applies twice instead of once.
+- Guest scoping in both `listServiceWeeks` and `getServiceWeek` — 404 (not 403)
+  is deliberate to avoid leaking existence to guests without an invitation.
+- Out of scope, intentionally not touched: `DELETE /api/service-weeks/:id`,
+  `/cancel`, `/reactivate` (#38/#39), setlist song editing/publish, event CRUD,
+  invitation sending (#54/#59/#40), and any chat message/mention functionality
+  (still Phase 2 — only the inactive placeholder row exists now).
