@@ -73,26 +73,50 @@ export const IDS = {
   invitations: {
     memberA:  "00000000-0000-4000-800a-000000000001",
     memberA2: "00000000-0000-4000-800a-000000000002",
+    memberB:  "00000000-0000-4000-800a-000000000003",
   },
   conflicts: {
     A: "00000000-0000-4000-800b-000000000001",
+    B: "00000000-0000-4000-800b-000000000002",
   },
   availability: {
     memberA:  "00000000-0000-4000-800c-000000000001",
     memberA2: "00000000-0000-4000-800c-000000000002",
+    memberB:  "00000000-0000-4000-800c-000000000003",
   },
   notifications: {
     memberA: "00000000-0000-4000-800d-000000000001",
+    memberB: "00000000-0000-4000-800d-000000000002",
   },
   auditLogs: {
     A: "00000000-0000-4000-800f-000000000001",
+    B: "00000000-0000-4000-800f-000000000002",
   },
   gCalTokens: {
     memberA: "00000000-0000-4000-8010-000000000001",
+    memberB: "00000000-0000-4000-8010-000000000002",
   },
   memberProfiles: {
     memberA:  "00000000-0000-4000-8004-000000000001",
     memberA2: "00000000-0000-4000-8004-000000000002",
+    memberB:  "00000000-0000-4000-8004-000000000003",
+  },
+  memberInstruments: {
+    memberA:  "00000000-0000-4000-8004-000000000010",
+    memberA2: "00000000-0000-4000-8004-000000000011",
+    memberB:  "00000000-0000-4000-8004-000000000012",
+  },
+  songDocuments: {
+    A: "00000000-0000-4000-8011-000000000001",
+    B: "00000000-0000-4000-8011-000000000002",
+  },
+  notificationPreferences: {
+    memberA: "00000000-0000-4000-800e-000000000001",
+    memberB: "00000000-0000-4000-800e-000000000002",
+  },
+  eventAttendees: {
+    A: "00000000-0000-4000-8012-000000000001",
+    B: "00000000-0000-4000-8012-000000000002",
   },
 } as const;
 
@@ -185,12 +209,14 @@ export async function seedViaServiceClient(): Promise<void> {
   await svc.from("member_profiles").insert([
     { id: IDS.memberProfiles.memberA,  user_id: IDS.users.memberA,  vocal_capability: "lead" },
     { id: IDS.memberProfiles.memberA2, user_id: IDS.users.memberA2, vocal_capability: "harmony" },
+    { id: IDS.memberProfiles.memberB,  user_id: IDS.users.memberB,  vocal_capability: "lead" },
   ]);
 
   // Member instruments
   await svc.from("member_instruments").insert([
-    { id: "00000000-0000-4000-8004-000000000010", member_profile_id: IDS.memberProfiles.memberA,  instrument_id: IDS.instruments.pianoA },
-    { id: "00000000-0000-4000-8004-000000000011", member_profile_id: IDS.memberProfiles.memberA2, instrument_id: IDS.instruments.guitarA },
+    { id: IDS.memberInstruments.memberA,  member_profile_id: IDS.memberProfiles.memberA,  instrument_id: IDS.instruments.pianoA },
+    { id: IDS.memberInstruments.memberA2, member_profile_id: IDS.memberProfiles.memberA2, instrument_id: IDS.instruments.guitarA },
+    { id: IDS.memberInstruments.memberB,  member_profile_id: IDS.memberProfiles.memberB,  instrument_id: IDS.instruments.drumsB },
   ]);
 
   // Service weeks
@@ -231,41 +257,55 @@ export async function seedViaServiceClient(): Promise<void> {
   await svc.from("invitations").insert([
     { id: IDS.invitations.memberA,  church_group_id: IDS.churches.A, service_week_id: IDS.serviceWeeks.A1, user_id: IDS.users.memberA,  status: "pending", response_token: "token-member-a-001" },
     { id: IDS.invitations.memberA2, church_group_id: IDS.churches.A, service_week_id: IDS.serviceWeeks.A1, user_id: IDS.users.memberA2, status: "pending", response_token: "token-member-a2-001" },
+    { id: IDS.invitations.memberB,  church_group_id: IDS.churches.B, service_week_id: IDS.serviceWeeks.B1, user_id: IDS.users.memberB,  status: "pending", response_token: "token-member-b-001" },
   ]);
 
   // Conflicts
   await svc.from("conflicts").insert([
     { id: IDS.conflicts.A, church_group_id: IDS.churches.A, invitation_id: IDS.invitations.memberA },
+    { id: IDS.conflicts.B, church_group_id: IDS.churches.B, invitation_id: IDS.invitations.memberB },
   ]);
 
   // Availability
   await svc.from("availability").insert([
     { id: IDS.availability.memberA,  user_id: IDS.users.memberA,  church_group_id: IDS.churches.A, date: "2026-07-06", is_available: true },
     { id: IDS.availability.memberA2, user_id: IDS.users.memberA2, church_group_id: IDS.churches.A, date: "2026-07-06", is_available: false },
+    { id: IDS.availability.memberB,  user_id: IDS.users.memberB,  church_group_id: IDS.churches.B, date: "2026-07-06", is_available: true },
   ]);
 
   // Notifications
   await svc.from("notifications").insert([
     { id: IDS.notifications.memberA, church_group_id: IDS.churches.A, user_id: IDS.users.memberA, type: "set_invitation", title: "You have been invited" },
+    { id: IDS.notifications.memberB, church_group_id: IDS.churches.B, user_id: IDS.users.memberB, type: "set_invitation", title: "Church B notification" },
   ]);
 
   // Notification preferences
   await svc.from("notification_preferences").insert([
-    { id: "00000000-0000-4000-800e-000000000001", user_id: IDS.users.memberA },
+    { id: IDS.notificationPreferences.memberA, user_id: IDS.users.memberA },
+    { id: IDS.notificationPreferences.memberB, user_id: IDS.users.memberB },
   ]);
 
   // Audit logs
   await svc.from("audit_logs").insert([
     { id: IDS.auditLogs.A, church_group_id: IDS.churches.A, user_id: IDS.users.adminA, action: "user.role_changed", entity_type: "user", entity_id: IDS.users.memberA },
+    { id: IDS.auditLogs.B, church_group_id: IDS.churches.B, user_id: IDS.users.adminB, action: "user.role_changed", entity_type: "user", entity_id: IDS.users.memberB },
   ]);
 
   // Google calendar tokens
   await svc.from("google_calendar_tokens").insert([
     { id: IDS.gCalTokens.memberA, user_id: IDS.users.memberA, access_token_encrypted: "enc_access", refresh_token_encrypted: "enc_refresh", token_expiry: new Date(Date.now() + 3600000).toISOString(), calendar_id: "cal@test.example", scope: "https://www.googleapis.com/auth/calendar" },
+    { id: IDS.gCalTokens.memberB, user_id: IDS.users.memberB, access_token_encrypted: "enc_access", refresh_token_encrypted: "enc_refresh", token_expiry: new Date(Date.now() + 3600000).toISOString(), calendar_id: "cal-b@test.example", scope: "https://www.googleapis.com/auth/calendar" },
   ]);
 
   // Song documents
   await svc.from("song_documents").insert([
-    { id: "00000000-0000-4000-8011-000000000001", song_id: IDS.songs.A1, church_group_id: IDS.churches.A, name: "Chord Chart", file_key: "songs/chord-a1.pdf", file_type: "application/pdf", file_size_bytes: 12345 },
+    { id: IDS.songDocuments.A, song_id: IDS.songs.A1, church_group_id: IDS.churches.A, name: "Chord Chart", file_key: "songs/chord-a1.pdf", file_type: "application/pdf", file_size_bytes: 12345 },
+    { id: IDS.songDocuments.B, song_id: IDS.songs.B1, church_group_id: IDS.churches.B, name: "Chord Chart B", file_key: "songs/chord-b1.pdf", file_type: "application/pdf", file_size_bytes: 2222 },
+  ]);
+
+  // Event attendees (must come after events and users)
+  await svc.from("event_attendees").insert([
+    { id: IDS.eventAttendees.A, event_id: IDS.events.A, user_id: IDS.users.memberA },
+    { id: IDS.eventAttendees.B, event_id: IDS.events.B, user_id: IDS.users.memberB },
   ]);
 }
