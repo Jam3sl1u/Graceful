@@ -1,55 +1,50 @@
-# Review — Issue #29: Audit log writer utility + read endpoint (BR-13)
+# Review — Issue #33: RLS cross-tenant bypass tests
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-## What I verified independently
-- Ran `git diff main...HEAD` on `app/ lib/ schemas/ supabase/` — only the six
-  in-scope files changed. Out-of-scope stubs
-  (`members/[id]/role/route.ts`, `members/[id]/route.ts`) untouched. No UI, no
-  UPDATE/DELETE route added.
-- Re-ran `bun run typecheck` (clean), `bun run lint` (clean),
-  `bun run check:service-role` (OK — no service-role key in app/ or lib/),
-  `bun run test` (10 suites / 84 tests, 0 failures).
+## Basis
+Reviewed the full `git diff main...HEAD` firsthand (not just the summaries), re-ran
+`bun run typecheck` (clean), `bun run lint` (clean), and `bun run test:rls`
+(8 suites / 227 tests skipped, 0 failed — new file is picked up by the glob and the
+skip guard works).
 
-## Correctness
-- **RPC** (`20260707000001_audit_log_write_rpc.sql`): mirrors the approved
-  `create_church_group` pattern — `SECURITY DEFINER`, `SET search_path = ''`,
-  schema-qualified names, `GRANT EXECUTE ... TO authenticated`, commented DOWN.
-  Derives `user_id`/`church_group_id` from `auth.jwt() ->> 'sub'` → `users`
-  lookup, never from caller args, so a route cannot forge an entry for another
-  user/group. Only ever INSERTs; UPDATE/DELETE stay REVOKEd (append-only
-  preserved). Handles the no-metadata case via `COALESCE(p_metadata,'{}')`.
-- **RLS**: confirmed `audit_logs_select_admin` policy exists in
-  `20260704000001_rls_policies.sql` (church_group + role='admin' scoped) and RLS
-  is enabled. Handler relying on RLS for group scoping (spec made the extra
-  `.eq` optional) is correct and consistent.
-- **Handler**: auth → requireRole(["admin"]) → safeParse query (400) → JWT (401,
-  no client built) → RLS client → select with `count:"exact"`, `created_at DESC,
-  id DESC`, `.range(from,to)` → snake→camel map → `ok({entries,pagination})`.
-  Single try/catch maps ApiException→fail else 500. Matches spec step-for-step,
-  incl. `count ?? 0` and pagination math.
-- **Utility**: `import "server-only"` first, exact RPC arg mapping,
-  `metadata ?? {}` default, throws ApiException(INTERNAL,500) on error, never
-  swallows.
-- **Types**: `AuditLogsRow`, `Tables.audit_logs`, `Functions.write_audit_log`
-  added; typecheck passes with no `as any` escapes. `metadata` typed
-  `Record<string,unknown>` (jsonb) and `user_id` nullable — both match the DB
-  schema (varchar/uuid/jsonb NOT NULL default '{}', user_id NULL).
+## Assessment against spec
+- **`setup.ts` IDS**: All 15 new/promoted UUIDs match the spec's exact table, placed in
+  the correct new sub-objects (`memberInstruments`, `songDocuments`,
+  `notificationPreferences`, `eventAttendees`) and extended sub-objects. The three
+  promoted inline literals keep identical values. Every id referenced by the new test
+  (including pre-existing `setlists.publishedB`, `setlistSongs.publishedB`, `songs.B1`,
+  `events.B`, `instruments.drumsB`) exists.
+- **`seedViaServiceClient()`**: Church-B rows added for all specified tables with the
+  exact column sets; new `event_attendees` A+B block placed after events/users. The
+  matching Church-B rows for setlists/setlist_songs/songs/events already existed, so
+  all UPDATE/DELETE targets are seeded.
+- **`seed-rls-test.sql`**: Mirrors the TS seed row-for-row with identical UUIDs/columns.
+- **`helpers.ts`**: `assertUpdateNoOp` / `assertDeleteNoOp` implement the spec's ground-
+  truth pattern correctly — read-before via service client, ignore the attacker write's
+  error (tolerating both silent 0-row no-op and hard privilege error), re-read, assert
+  patched columns unchanged / row survives. This is meaningful, not superficial: it
+  verifies actual DB state via an RLS-bypassing client rather than trusting a null error.
+- **`cross-tenant-bypass.test.ts`**: One describe per all 19 tables, SELECT/INSERT/
+  UPDATE/DELETE from Church A memberA against Church B rows; the four role-gated tables
+  additionally repeat writes as adminA. SELECT filters use `church_group_id` for Tier-1
+  and `id` for Tier-2/Tier-3 exactly as specified. All patches target columns that
+  differ from the seeded value, so a successful mutation would be detected (no trivial
+  passes).
+- **`rls.test.ts`**: Three inline→IDS refactors, same UUID values, no behavior change.
+- **`README.md`**: Documents the canonical file and the CI skip≠block limitation per the
+  spec's open-question resolution.
 
-## Tests — meaningful, not superficial
-- `write-audit-log.test.ts`: asserts exact RPC name + arg keys, metadata
-  pass-through, `{}` default (explicitly `not.toBeUndefined()`), void on success,
-  ApiException INTERNAL/500 on error.
-- `audit-log-route.test.ts`: 401 (null userId, no users row, no JWT — with
-  "client not built" assertions), 403 for each non-admin role, 400 for
-  negative/over-max/non-numeric params, 200 happy path with camelCase mapping +
-  null userId preserved, query-shape assertions (select columns, both orders,
-  range(10,19) for page 2/size 10), empty set, null-count→0, DB error 500.
-  Covers every named edge case in the spec.
+## Notes (not blockers)
+- The `notification_preferences` INSERT collides on `user_id` unique → may surface as
+  `23505` rather than `42501`; `assertInsertDenied` only requires *an* error. This is an
+  explicit spec choice, called out by both coder and tester, not an oversight.
+- The `supabase-js` HTTP path was not exercised end-to-end (needs a full Supabase stack).
+  The tester ran an independent raw-SQL harness applying all migrations + the SQL seed and
+  executing the exact 19×4 matrix (+ adminA repeats), confirming SELECT=0 rows,
+  INSERT=RLS denial, UPDATE/DELETE=silent no-op (audit_logs=hard privilege error), plus a
+  positive-control sanity check. Strong proxy; the untested plumbing predates this issue.
+- CI required-status-check + secrets is a repo-settings action, correctly left out of scope.
 
-## Notes (non-blocking)
-- Migration has no live-DB integration test; spec permits this (RLS/append-only
-  covered by existing integration suites; forgery-prevention logic is SQL not
-  exercised by unit run). Acceptable per scope.
-
-Green tests here reflect genuinely correct behavior. Ship it.
+Green tests here reflect correct behavior. No correctness, security, or performance
+issues found.
