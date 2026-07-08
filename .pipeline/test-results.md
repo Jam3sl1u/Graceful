@@ -1,4 +1,4 @@
-# Test Results — Issue #31: Instrument list management (default + custom)
+# Test Results — Issue #33: RLS bypass tests for Sprint 0–1 tables
 
 ## Verdict: PASS
 
@@ -6,68 +6,121 @@
 
 ### 1. Static checks (re-run from scratch, not trusted from changes.md)
 - `bun install` — clean, no changes.
-- `bun run lint` (`eslint .`) — **passes**, 0 errors/warnings.
 - `bun run typecheck` (`tsc --noEmit`) — **passes**, 0 errors.
-- `bun run test` (`jest`) — **passes**: 9 suites, 94 tests (89 original + 5 tests I
-  added below), 0 failures.
-- `bun x prettier --check` on the touched files (`schemas/instruments.ts`,
-  `app/api/instruments/handler.ts`, all 4 route files, the test file) — all clean.
-  Confirmed the repo-wide `bun run format:check` failure is pre-existing drift in
-  unrelated files (`app/api/_examples/admin-only/handler.ts`,
-  `app/api/church-group/members/handler.ts`, `README.md`, `tsconfig.json`,
-  `tests/integration/rls/**`, `tests/unit/app/api/church-group-members-route.test.ts`)
-  — none of these were touched by this change, matching the coder's claim.
+- `bun run lint` (`eslint .`) — **passes**, 0 errors/warnings.
+- `bun run test` (`jest`, unit suite) — **passes**: 11 suites / 112 tests, 0
+  failures. Confirms the RLS changes do not touch/break the unit suite.
+- `bun run test:rls` (`jest --config jest.config.integration.ts`) with
+  `SUPABASE_TEST_URL`/`SUPABASE_TEST_ANON_KEY`/`SUPABASE_TEST_SERVICE_ROLE_KEY`/
+  `SUPABASE_JWT_SECRET` all unset — **8 suites skipped, 227 tests skipped, 0
+  failed**. Confirms the `describe.skip` guard works and `cross-tenant-bypass.test.ts`
+  is correctly picked up by the `jest.config.integration.ts` glob (matches the
+  coder's reported numbers exactly).
+
+All of the above match changes.md's claims exactly.
 
 ### 2. Code review against spec (`.pipeline/spec.md`)
-Read `schemas/instruments.ts`, `app/api/instruments/handler.ts`, and all 4 route
-files line-by-line against the spec's prescribed code. They match essentially
-verbatim:
-- `createInstrumentSchema`: `z.string().trim().min(1).max(100)` — correct.
-- `listInstruments`: `requireAuth` only, no role gate, correct `.select().eq().order().order()` shape, 500 on error, `ok({ instruments: (data ?? []).map(...) })` — empty array when none.
-- `addInstrument` / `submitCustomInstrument`: correct duplicate guard (case-insensitive, group-scoped, re-reads all names), correct `is_default` value per path (`true` for admin add, `false` for custom), `created_by: ctx.userId`, 201 on success.
-- `promoteInstrument` / `deleteInstrument`: `id` scoped by `.eq("id", id).eq("church_group_id", ctx.churchGroupId)`, empty result array → 404 NOT_FOUND, admin-gated via `requireRole(ctx, ["admin"])`.
-- All 4 route files are thin delegators; both dynamic routes correctly `await params` (Next 15 async dynamic API).
-- `lib/api/response.ts` / `lib/api/auth.ts` cross-checked: `ok`/`fail` envelope shape (`{data}` / `{error, code}`), `requireAuth` throws `ApiException(UNAUTHENTICATED, 401)`, `requireRole` throws `ApiException(FORBIDDEN, 403)` — both caught by each handler's shared catch block, exactly as claimed.
-- Confirmed via `git show --stat HEAD` that the committed diff touches only the files changes.md claims (schema, handler, 4 routes, test file) — no stray edits.
+Read `tests/integration/rls/setup.ts`, `helpers.ts`,
+`tables/cross-tenant-bypass.test.ts`, `supabase/seed-rls-test.sql`, the diff to
+`rls.test.ts`, and `supabase/README.md` line-by-line against the spec.
 
-### 3. Test-suite review + gaps I filled in independently
-The coder's `tests/unit/app/api/instruments-route.test.ts` (23 tests) is thorough
-and uses a per-table/per-operation fixture harness that correctly isolates
-`select`/`insert`/`update`/`delete` results. I ran it as-is first (passed), then
-identified two edge cases from the spec's explicit "Edge cases" list that weren't
-covered, and added 5 tests to close them (all passing, no code changes needed —
-these confirm existing behavior, they didn't uncover bugs):
+- `IDS` extensions match the spec's exact UUID table verbatim (all 15 new/promoted
+  ids, all in the right sub-objects).
+- `seedViaServiceClient()` Church-B inserts match the spec's per-table column
+  sets exactly, including the new `event_attendees` A+B block placed after
+  `events`/`users`.
+- `assertUpdateNoOp` / `assertDeleteNoOp` in `helpers.ts` implement the spec's
+  pseudocode verbatim: before/after service-client reads, error from the
+  attacker's write is ignored (tolerates both silent no-op and hard privilege
+  error), per-patch-key equality assertion; delete checks exactly-one-row-survives.
+- `cross-tenant-bypass.test.ts` has a `describe` block for all 19 Sprint 0–1
+  tables (`church_groups` through `audit_logs`), each running
+  SELECT/INSERT/UPDATE/DELETE from `memberA` against Church B's seeded rows. The
+  four role-gated tables (`setlists`, `invitations`, `conflicts`, `audit_logs`)
+  additionally repeat INSERT/UPDATE/DELETE as `adminA`, matching the spec's
+  requirement. Every target id / INSERT row / UPDATE patch matches the spec's
+  table verbatim (checked all 19 rows individually).
+- `supabase/seed-rls-test.sql` mirrors `seedViaServiceClient()` row-for-row with
+  identical UUIDs and columns (diffed both side by side).
+- `rls.test.ts`'s three inline-literal → `IDS.*` promotions are pure refactors
+  (same UUID values), confirmed via diff.
+- `supabase/README.md` additions accurately describe both the new canonical test
+  file and the CI "skip ≠ block" limitation, matching the spec's open-question
+  resolution.
 
-1. **"name longer than 100 chars → 400"** (spec line 181) — not previously tested.
-   Added: 101-char name → 400 VALIDATION_FAILED, and a boundary check that exactly
-   100 chars is accepted (201).
-2. **`submitCustomInstrument` failure paths** — the admin `addInstrument` path had
-   401/500-on-insert tests but the sibling `submitCustomInstrument` path didn't.
-   Added: 401 UNAUTHENTICATED (no JWT), 500 INTERNAL (insert error), and 500
-   INTERNAL (duplicate-guard read error) for the custom-submit path.
+### 3. Live RLS verification (the part changes.md flagged it could not do)
+The coder's own changes.md said `bun run test:rls` could not be run against a
+live Supabase instance in their environment, and asked the Tester to do so. I
+built an independent (non-Supabase-CLI) verification harness rather than
+skipping this:
 
-All 5 new tests pass against the existing implementation — no code changes were
-needed; they close coverage gaps, not correctness bugs.
+- Started a bare `postgres:16-alpine` Docker container.
+- Created `anon`/`authenticated`/`service_role` roles and a minimal `auth.jwt()`
+  stub reading the `request.jwt.claims` GUC (the same mechanism Supabase's
+  Postgres image provides), matching what `auth_church_group_id()` /
+  `auth_user_role()` in the migrations rely on.
+- Applied all 13 files under `supabase/migrations/` in lexicographic order —
+  **all applied with zero errors**, producing the full 19-table schema with RLS
+  enabled and all policies created.
+- Granted default `SELECT/INSERT/UPDATE/DELETE` to `authenticated`/`anon` (as
+  Supabase's project bootstrap does), then re-applied the `audit_logs`
+  UPDATE/DELETE `REVOKE` from the Cluster 6 migration.
+- Loaded `supabase/seed-rls-test.sql` as-is against this schema — **loaded with
+  zero errors** (19 `INSERT` statements + 1 `TRUNCATE`, all columns/FKs valid).
+  This independently confirms the new Church-B rows and the new
+  `event_attendees` block are schema-correct, not just structurally mirrored
+  between the TS and SQL seed paths.
+- Set `request.jwt.claims` to memberA's/adminA's Church-A claims under `SET ROLE
+  authenticated`, then ran the actual SQL each verb in the bypass matrix issues,
+  against every one of the 19 tables' Church-B target row (using the spec's
+  exact target ids / INSERT rows / UPDATE patches):
+  - **SELECT**: 0 rows returned for all 19 tables (`church_groups` included).
+  - **INSERT**: `new row violates row-level security policy` for all 19 tables
+    (including `church_groups`, which has no INSERT policy at all).
+  - **UPDATE**: `UPDATE 0` (silent no-op, row unchanged) for all tables except
+    `audit_logs`.
+  - **DELETE**: `DELETE 0` (silent no-op, row still present) for all tables
+    except `audit_logs`.
+  - **audit_logs UPDATE/DELETE**: `permission denied for table audit_logs` (hard
+    privilege error from the `REVOKE`), exactly the edge case the coder
+    flagged — confirms `assertUpdateNoOp`/`assertDeleteNoOp`'s error-tolerant
+    design is necessary and correct here.
+  - Repeated INSERT/UPDATE/DELETE as `adminA` for `setlists`, `invitations`,
+    `conflicts`, `audit_logs` — all identically denied/no-op, confirming
+    privilege escalation doesn't bypass tenant isolation.
+- **Sanity check (to rule out a false-pass from a broken harness)**: confirmed
+  memberA CAN `SELECT` all Church-A `users` rows and CAN `UPDATE` their own
+  Church-A `availability` row (`UPDATE 1`, value changed) under the exact same
+  role/JWT setup. This proves the harness genuinely distinguishes tenant
+  boundaries rather than blocking all access indiscriminately.
+- Removed the Docker container after verification.
 
-## Manual reasoning checks
-- Confirmed the "id from another church group is indistinguishable from a missing
-  id → 404" claim is consistent with the RLS/handler design: the `.eq("id",
-  id).eq("church_group_id", ctx.churchGroupId)` filter is the only way tenant
-  scoping is enforced for promote/delete, since RLS itself is tenant-scoped only
-  (not role-gated), matching spec's "Current state" section.
-- Confirmed `pending = !isDefault` mapping in `toInstrumentResponse` matches spec's
-  OPEN QUESTIONS decision #2 exactly.
-- Confirmed no changes to `lib/supabase/types.ts` and no new migrations (out of
-  scope per spec) — verified via `git show --stat`.
+This directly exercises the same RLS policies, the same seed data, and the same
+per-table target/INSERT/UPDATE values the Jest matrix uses (via raw SQL rather
+than through `supabase-js`/PostgREST, since the full Supabase CLI/GoTrue/PostgREST
+stack wasn't available in this environment) — every one of the 19 tables × 4
+verbs behaved exactly as `cross-tenant-bypass.test.ts` asserts.
+
+## Known residual gap (not a blocker, inherited from spec's own open question)
+- I did not run `bun run test:rls` through the actual `supabase-js` HTTP path
+  (needs a full `supabase start`/PostgREST/GoTrue stack or a linked test
+  project, neither available here). The raw-SQL verification above exercises
+  the identical RLS policies and seed data, so this is a strong proxy, but it
+  does not prove the `mintJwt`/`getUserClient`/`getServiceClient` plumbing in
+  `client.ts`/`jwt.ts` (unchanged by this PR, reused as-is) works correctly
+  end-to-end over HTTP. That plumbing predates this issue and is out of this
+  issue's scope.
+- The CI `rls-integration` job is still not a required/blocking status check —
+  per the spec's OPEN QUESTIONS #1, this is an explicitly out-of-scope
+  repo-settings action for a human, correctly called out in `supabase/README.md`.
 
 ## Final numbers
-- `bun run lint`: pass
 - `bun run typecheck`: pass
-- `bun run test`: 9 suites / 94 tests pass (89 pre-existing + 5 added by tester)
-- Prettier on touched files: pass
-
-## Files touched during testing
-- `tests/unit/app/api/instruments-route.test.ts` — added 5 tests (see above).
-  No production code was modified.
+- `bun run lint`: pass
+- `bun run test`: 11 suites / 112 tests pass
+- `bun run test:rls` (no env vars): 8 suites / 227 tests skipped, 0 failed
+- Live raw-SQL RLS matrix (19 tables × 4 verbs, + adminA repeats for 4 role-gated
+  tables): all behaved exactly as `cross-tenant-bypass.test.ts` asserts — no
+  cross-tenant leak or mutation found.
 
 No failures found. Recommend proceeding to Reviewer.

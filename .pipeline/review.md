@@ -1,41 +1,50 @@
-# Review — Issue #31: Instrument list management (default + custom)
+# Review — Issue #33: RLS cross-tenant bypass tests
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-## Scope of change (verified via `git diff main...HEAD`)
-Single commit `94004ee`. Touches only expected files: `schemas/instruments.ts`,
-`app/api/instruments/handler.ts` (new), the 4 route delegators, the new test file,
-plus the two `.pipeline/` docs. No stray edits, no changes to `lib/supabase/types.ts`,
-no new migrations. Beacon/network scan of all touched files: clean (no `fetch`,
-external URLs, or telemetry — relevant given the repo's recent rogue-beacon incidents).
+## Basis
+Reviewed the full `git diff main...HEAD` firsthand (not just the summaries), re-ran
+`bun run typecheck` (clean), `bun run lint` (clean), and `bun run test:rls`
+(8 suites / 227 tests skipped, 0 failed — new file is picked up by the glob and the
+skip guard works).
 
-## Correctness vs spec
-- `createInstrumentSchema`: `z.string().trim().min(1).max(100)` — matches spec and `varchar(100)`.
-- `listInstruments`: requireAuth only, group-scoped, ordered `is_default desc, name asc`,
-  empty array when none, `pending = !isDefault` mapping correct.
-- `addInstrument`: admin-gated, 400 validation, case-insensitive group-scoped duplicate
-  guard (409), `is_default: true`, `created_by: ctx.userId`, 201.
-- `submitCustomInstrument`: open to any member, identical guard, `is_default: false`, 201.
-- `promoteInstrument` / `deleteInstrument`: admin-gated, id + church_group_id scoping,
-  empty result -> 404 (cross-tenant == missing, intentional), idempotent promote.
-- All routes are thin delegators; both dynamic routes `await params` (Next 15).
-- Tenant isolation enforced in-handler via `requireRole` since RLS is tenant-only — matches spec.
+## Assessment against spec
+- **`setup.ts` IDS**: All 15 new/promoted UUIDs match the spec's exact table, placed in
+  the correct new sub-objects (`memberInstruments`, `songDocuments`,
+  `notificationPreferences`, `eventAttendees`) and extended sub-objects. The three
+  promoted inline literals keep identical values. Every id referenced by the new test
+  (including pre-existing `setlists.publishedB`, `setlistSongs.publishedB`, `songs.B1`,
+  `events.B`, `instruments.drumsB`) exists.
+- **`seedViaServiceClient()`**: Church-B rows added for all specified tables with the
+  exact column sets; new `event_attendees` A+B block placed after events/users. The
+  matching Church-B rows for setlists/setlist_songs/songs/events already existed, so
+  all UPDATE/DELETE targets are seeded.
+- **`seed-rls-test.sql`**: Mirrors the TS seed row-for-row with identical UUIDs/columns.
+- **`helpers.ts`**: `assertUpdateNoOp` / `assertDeleteNoOp` implement the spec's ground-
+  truth pattern correctly — read-before via service client, ignore the attacker write's
+  error (tolerating both silent 0-row no-op and hard privilege error), re-read, assert
+  patched columns unchanged / row survives. This is meaningful, not superficial: it
+  verifies actual DB state via an RLS-bypassing client rather than trusting a null error.
+- **`cross-tenant-bypass.test.ts`**: One describe per all 19 tables, SELECT/INSERT/
+  UPDATE/DELETE from Church A memberA against Church B rows; the four role-gated tables
+  additionally repeat writes as adminA. SELECT filters use `church_group_id` for Tier-1
+  and `id` for Tier-2/Tier-3 exactly as specified. All patches target columns that
+  differ from the seeded value, so a successful mutation would be detected (no trivial
+  passes).
+- **`rls.test.ts`**: Three inline→IDS refactors, same UUID values, no behavior change.
+- **`README.md`**: Documents the canonical file and the CI skip≠block limitation per the
+  spec's open-question resolution.
 
-## Tests
-Meaningful, not superficial: assert status + error `code`, capture and assert insert/update
-payloads (`is_default`, `created_by`, `church_group_id`), verify `getSupabaseClient` is NOT
-called on early auth/validation returns, and cover case-insensitive duplicate both directions.
-Per-operation fixture harness correctly isolates select/insert/update/delete on the same chain.
-94/94 tests pass.
+## Notes (not blockers)
+- The `notification_preferences` INSERT collides on `user_id` unique → may surface as
+  `23505` rather than `42501`; `assertInsertDenied` only requires *an* error. This is an
+  explicit spec choice, called out by both coder and tester, not an oversight.
+- The `supabase-js` HTTP path was not exercised end-to-end (needs a full Supabase stack).
+  The tester ran an independent raw-SQL harness applying all migrations + the SQL seed and
+  executing the exact 19×4 matrix (+ adminA repeats), confirming SELECT=0 rows,
+  INSERT=RLS denial, UPDATE/DELETE=silent no-op (audit_logs=hard privilege error), plus a
+  positive-control sanity check. Strong proxy; the untested plumbing predates this issue.
+- CI required-status-check + secrets is a repo-settings action, correctly left out of scope.
 
-## Independent re-run
-- `bun run lint`: pass (0/0)
-- `bun run typecheck`: pass
-- `bun run test`: 9 suites / 94 tests pass
-
-## Non-blocking observations
-- In `addInstrument`/`submitCustomInstrument` the body-parse (400) runs before the JWT
-  check (401). If a request had both a bad body and no JWT it returns 400 rather than 401.
-  Immaterial to security/correctness; not worth a revision.
-
-No correctness, security, or performance issues found. Ship it.
+Green tests here reflect correct behavior. No correctness, security, or performance
+issues found.
