@@ -410,7 +410,7 @@ maybeDescribe("RLS Integration", () => {
   // -------------------------------------------------------------------------
 
   describe("notification_preferences", () => {
-    const NP_ID = "00000000-0000-4000-800e-000000000001";
+    const NP_ID = IDS.notificationPreferences.memberA;
 
     it("member_a can SELECT their own preferences", async () => {
       await expectRow(clients.memberA(), "notification_preferences", NP_ID);
@@ -470,7 +470,7 @@ maybeDescribe("RLS Integration", () => {
   });
 
   describe("member_instruments — Tier 2 indirect FK via member_profiles → users", () => {
-    const MI_A = "00000000-0000-4000-8004-000000000010";
+    const MI_A = IDS.memberInstruments.memberA;
 
     it("member_a can SELECT Church A member instruments", async () => {
       await expectRow(clients.memberA(), "member_instruments", MI_A);
@@ -500,7 +500,7 @@ maybeDescribe("RLS Integration", () => {
   // -------------------------------------------------------------------------
 
   describe("song_documents", () => {
-    const SD_A = "00000000-0000-4000-8011-000000000001";
+    const SD_A = IDS.songDocuments.A;
 
     it("Church A member can SELECT Church A song documents", async () => {
       await expectRow(clients.memberA(), "song_documents", SD_A);
