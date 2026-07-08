@@ -126,6 +126,55 @@ export async function assertInsertDenied(
   return expectInsertDenied(client, table, row);
 }
 
+/**
+ * Assert a cross-tenant UPDATE is a no-op: the target row's patched columns are
+ * unchanged when read back via the service client. Tolerates both a silent
+ * 0-row update and a hard RLS/privilege error.
+ */
+export async function assertUpdateNoOp(
+  userClient: SupabaseClient,
+  serviceClient: SupabaseClient,
+  table: string,
+  id: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  const { data: before } = await serviceClient
+    .from(table)
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  await userClient.from(table).update(patch).eq("id", id); // error, if any, is an acceptable block
+
+  const { data: after } = await serviceClient
+    .from(table)
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  for (const key of Object.keys(patch)) {
+    expect((after as Record<string, unknown> | null)?.[key]).toEqual(
+      (before as Record<string, unknown> | null)?.[key],
+    );
+  }
+}
+
+/**
+ * Assert a cross-tenant DELETE is a no-op: the target row still exists when read
+ * back via the service client. Tolerates both a silent 0-row delete and an error.
+ */
+export async function assertDeleteNoOp(
+  userClient: SupabaseClient,
+  serviceClient: SupabaseClient,
+  table: string,
+  id: string,
+): Promise<void> {
+  await userClient.from(table).delete().eq("id", id); // error, if any, is an acceptable block
+
+  const { data } = await serviceClient.from(table).select("id").eq("id", id);
+  expect(data).toHaveLength(1);
+}
+
 // ---------------------------------------------------------------------------
 // Pre-built user clients keyed by seed persona
 // ---------------------------------------------------------------------------

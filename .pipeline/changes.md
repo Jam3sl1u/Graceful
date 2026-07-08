@@ -1,92 +1,124 @@
-# Changes — Issue #31: Instrument list management (default + custom)
+# Changes — Issue #33: RLS bypass tests for Sprint 0–1 tables
+
+## Open question resolution (applied, per human decision)
+
+The planner flagged that making the `rls-integration` CI job a **required/blocking**
+status check is a GitHub repo-settings action (branch protection + the four
+`SUPABASE_TEST_*`/`SUPABASE_JWT_SECRET` secrets), not a code change, and is out of
+scope for the Coder. Resolution applied: implement the test coverage now (this PR),
+leave `.github/workflows/ci.yml` and branch protection untouched, and call out in the
+PR description that turning `rls-integration` into a required check needs a separate
+branch-protection/repo-secrets change outside this PR's scope. `supabase/README.md`
+now documents this explicitly (see below).
 
 ## Files changed
 
-### `schemas/instruments.ts` (rewritten)
-- Replaced the `z.object({})` placeholder with `createInstrumentSchema`:
-  `name` — trimmed, `min(1)`, `max(100)` (matches the `varchar(100)` column). Used by
-  both `POST /api/instruments` and `POST /api/instruments/custom`.
-- Exports `CreateInstrumentInput` inferred type.
+### `tests/integration/rls/setup.ts`
+- Extended the `IDS` object with Church-B ids for every table that previously only had
+  Church-A seed rows, plus new sub-objects: `memberInstruments`, `songDocuments`,
+  `notificationPreferences`, `eventAttendees`.
+- Promoted three previously-inline UUID literals into `IDS` constants:
+  `memberInstruments.memberA` (`...8004-000000000010`), `notificationPreferences.memberA`
+  (`...800e-000000000001`), `songDocuments.A` (`...8011-000000000001`) — these ids are
+  unchanged, only their source of truth moved into `setup.ts`.
+- `seedViaServiceClient()`: added Church-B rows for `member_profiles`,
+  `member_instruments`, `invitations`, `conflicts`, `availability`, `notifications`,
+  `notification_preferences`, `google_calendar_tokens`, `audit_logs`, `song_documents`,
+  and a brand-new `event_attendees` insert block (Church A + Church B rows — this table
+  had no seed rows before). All inserts mirror the exact column sets specified in the
+  spec.
 
-### `app/api/instruments/handler.ts` (new)
-Single shared handler module, mirroring `app/api/profile/handler.ts` (JWT/`requireAuth`
-flow, try/catch → `ApiException` mapping, `as unknown as ...Insert`/`...Update` casts)
-and `app/api/_examples/admin-only/handler.ts` (`requireRole(ctx, ["admin"])`).
+### `supabase/seed-rls-test.sql`
+- Mirrored the identical Church-B rows (and the two `event_attendees` rows) as SQL
+  `INSERT` statements in the matching sections, using the same UUIDs and columns as
+  `seedViaServiceClient()`. `event_attendees` was already listed in the file's
+  `TRUNCATE ... CASCADE` header but had no insert section before this change.
 
-- `toInstrumentResponse` (private): maps a DB row to `InstrumentResponse`
-  (`{ id, name, isDefault, pending, createdBy }`), with `pending = !isDefault`.
-- `listInstruments(req, lookup?)` — any authenticated member (`requireAuth` only).
-  Queries `instruments` scoped to `ctx.churchGroupId`, ordered `is_default desc, name
-  asc`. Empty array when none. 500 on query error.
-- `addInstrument(req, lookup?)` — admin only (`requireRole(ctx, ["admin"])`). Parses
-  body with `createInstrumentSchema` (400 `VALIDATION_FAILED`), runs the
-  case-insensitive duplicate guard (409 `CONFLICT`), inserts with `is_default: true`,
-  `created_by: ctx.userId`. Returns 201.
-- `submitCustomInstrument(req, lookup?)` — any authenticated member. Same body parse
-  + duplicate guard as `addInstrument`; inserts with `is_default: false`. Returns 201.
-- `promoteInstrument(req, id, lookup?)` — admin only. Updates `is_default: true` for
-  the row matching `id` + `ctx.churchGroupId`. Empty result → 404 `NOT_FOUND`
-  (covers both "doesn't exist" and "belongs to another group", since the
-  `church_group_id` scoping makes them indistinguishable — this is intentional per
-  spec). Idempotent (re-promoting an already-default instrument still 200s).
-- `deleteInstrument(req, id, lookup?)` — admin only. Deletes the row matching `id` +
-  `ctx.churchGroupId`. Empty result → 404 `NOT_FOUND`. Returns `{ deleted: true }`.
-  FK cascade (`member_instruments.instrument_id ON DELETE CASCADE`) handles cleanup
-  with no extra handler work.
-- Duplicate guard (private, inlined in both insert paths, per spec — not factored
-  into a shared helper function since the spec showed it inline): re-reads all
-  `name`s for the group and does a case-insensitive `.trim().toLowerCase()`
-  comparison before inserting.
-- `id` is passed as an explicit parameter to `promoteInstrument`/`deleteInstrument`
-  (not read from the route's dynamic segment inside the handler) so unit tests can
-  call the handlers directly, matching the `profile`/`members` handler test pattern.
+### `tests/integration/rls/helpers.ts`
+- Added `assertUpdateNoOp(userClient, serviceClient, table, id, patch)`: reads the row
+  via the service client before the attacker's UPDATE, runs the UPDATE (ignoring any
+  error — a hard privilege error is an acceptable block), re-reads via the service
+  client, and asserts every patched column is unchanged from the BEFORE value.
+- Added `assertDeleteNoOp(userClient, serviceClient, table, id)`: runs the attacker's
+  DELETE (ignoring any error), then asserts the row still exists via the service
+  client.
+- Both reuse the existing `assertInsertDenied`/`assertSelectBlocked` — no duplication.
 
-### `app/api/instruments/route.ts`, `app/api/instruments/custom/route.ts`,
-### `app/api/instruments/[id]/route.ts`, `app/api/instruments/[id]/promote/route.ts`
-- All four rewritten from `notImplemented` (501) stubs to thin delegators to the new
-  handler functions. The two dynamic routes (`[id]/route.ts`, `[id]/promote/route.ts`)
-  `await params` per Next.js 15's async dynamic APIs before calling the handler.
+### `tests/integration/rls/tables/cross-tenant-bypass.test.ts` (new)
+- The canonical AC-1 matrix: one `describe` block per all 19 Sprint 0–1 tables
+  (`church_groups`, `users`, `member_profiles`, `instruments`, `member_instruments`,
+  `service_weeks`, `setlists`, `setlist_songs`, `events`, `invitations`,
+  `event_attendees`, `conflicts`, `songs`, `song_documents`, `availability`,
+  `notification_preferences`, `notifications`, `google_calendar_tokens`,
+  `audit_logs`), each running SELECT/INSERT/UPDATE/DELETE from a Church-A attacker
+  (`memberA`) against Church-B's seeded rows.
+- For the four role-gated tables (`setlists`, `invitations`, `conflicts`,
+  `audit_logs`), the INSERT/UPDATE/DELETE attempts are additionally run as `adminA`
+  to prove even a privileged Church-A user cannot cross tenants.
+- SELECT filters use `church_group_id: IDS.churches.B` for Tier-1 tables and the
+  specific Church-B row `id` for Tier-2/Tier-3 tables (`member_profiles`,
+  `member_instruments`, `setlist_songs`, `event_attendees`,
+  `notification_preferences`, `google_calendar_tokens`), per the spec's table-by-table
+  breakdown.
+- Follows the existing skip guard (`!rlsTestsEnabled || !process.env.SUPABASE_TEST_URL`
+  → `describe.skip`) and `beforeAll` seeding pattern from `cross-tenant.test.ts`, so the
+  suite is a no-op under `bun run test` (unit) and in CI without the four Supabase test
+  secrets.
 
-### `tests/unit/app/api/instruments-route.test.ts` (new)
-- Mocks `@clerk/nextjs/server` (`auth`) and `@/lib/supabase/client`
-  (`getSupabaseClient`), following the harness pattern from `profile-route.test.ts` /
-  `church-group-members-route.test.ts`.
-- `makeSupabaseClient(overrides, hooks?)` fixture builder: fixtures are keyed per
-  table **and per operation** (`select` / `insert` / `update` / `delete`) so a test
-  can, e.g., override only the duplicate-check `select` result without accidentally
-  changing the `insert` result the same call chain returns later (an early version of
-  this harness applied one override to all four operations, which silently corrupted
-  unrelated assertions — fixed before landing). `makeChain(result)` returns a
-  thenable object exposing `.eq`/`.order`/`.select`/`.single`, all chainable, covering
-  every call shape used by the handler: `.select().eq().order().order()` (list),
-  `.select().eq()` (duplicate-guard read), `.insert().select().single()`,
-  `.update().eq().eq().select()`, `.delete().eq().eq().select()`.
-- 23 tests covering: `GET` 200 (ordered list, `pending` flag correct for default vs.
-  custom rows) and 200 empty; `POST /api/instruments` 201 (`is_default: true`,
-  captures insert payload), 403 non-admin, 400 empty/whitespace name, 400 malformed
-  body, 409 case-insensitive duplicate, 401 no JWT, 500 on insert error;
-  `POST /api/instruments/custom` 201 (`is_default: false`, allowed for a plain
-  member), 400 empty name, 409 duplicate; `promote` 200 (idempotent-shaped, captures
-  update payload), 404 missing id, 403 non-admin, 500 on update error; `delete` 200
-  `{ deleted: true }`, 404 missing id, 403 non-admin, 401 no JWT, 500 on delete error.
+### `tests/integration/rls/rls.test.ts`
+- Updated three previously-inline UUID literals (`NP_ID`, `MI_A`, `SD_A`) to reference
+  the newly-promoted `IDS.notificationPreferences.memberA`, `IDS.memberInstruments.memberA`,
+  and `IDS.songDocuments.A` constants respectively. No behavior change — same UUIDs,
+  now sourced from `setup.ts` instead of being duplicated inline.
+
+### `supabase/README.md`
+- Added a sentence under "RLS Integration Tests (#33)" noting that
+  `tables/cross-tenant-bypass.test.ts` is the canonical four-verb cross-tenant matrix
+  and must be extended (with a new `describe` block + Church-B seed row) whenever a new
+  table is added in later sprints.
+- Extended the existing "In CI" note to spell out the open-question resolution: the
+  `rls-integration` job is *skipped* (not failed) when `SUPABASE_TEST_URL` is unset,
+  which GitHub treats as passing and does not block merge; making it a required status
+  check plus provisioning the four CI secrets is a repo-settings change outside this
+  PR's scope, tracked as a follow-up.
+
+## No changes needed (confirmed, not touched)
+- `jest.config.integration.ts` — `testMatch` glob already picks up the new file
+  automatically.
+- `.github/workflows/ci.yml` — `rls-integration` job already runs `bun run test:rls`
+  after applying migrations; no branch-protection/required-check change made (see open
+  question resolution above).
+- `tests/integration/rls/client.ts`, `jwt.ts` — reused as-is.
 
 ## Verification
-- `bun run lint` — passes.
 - `bun run typecheck` — passes.
-- `bun run test` — all 9 suites / 89 tests pass (23 new for this route).
-- `bun run format:check` (on the touched files only) — passes; the rest of the repo
-  had pre-existing Prettier drift unrelated to this change, left untouched.
+- `bun run lint` — passes.
+- `bun run test` (unit) — 11 suites / 112 tests pass, unaffected by the RLS changes.
+- `bun run test:rls` — without live Supabase env vars, all 8 integration suites
+  (including the new `cross-tenant-bypass.test.ts`) report skipped (227 tests skipped,
+  0 failed), confirming the skip guard works and the new file is correctly picked up by
+  the glob. Could not run against a live seeded Supabase instance in this environment;
+  the Tester should run `bun run test:rls` against a real Supabase test project (or
+  local `supabase start`) to exercise the full 19-table × 4-verb matrix.
 
 ## What the Tester should focus on
-- The duplicate guard is intentionally a spec-driven addition (schema has no unique
-  constraint on `(church_group_id, name)` — see spec OPEN QUESTIONS #1). Confirm the
-  409 path only triggers on case-insensitive, group-scoped matches.
-- `promote`/`delete` 404 semantics: an id from another church group is
-  indistinguishable from a missing id (both resolve to an empty result array from the
-  `.eq("church_group_id", ...)` scoping) — this is intentional, not a bug.
-- `listInstruments` and `submitCustomInstrument` are open to any authenticated
-  member (no `requireRole`); `addInstrument`, `promoteInstrument`, `deleteInstrument`
-  are admin-only.
-- Out of scope, not touched: `lib/supabase/types.ts`, member-profile instrument
-  selection (`member_instruments` writes, #30's territory), transposition logic,
-  seeding defaults, and no new DB migrations were added.
+- Running `bun run test:rls` against an actual seeded Supabase instance is the only way
+  to validate the core of this issue — the matrix logic cannot be verified via
+  typecheck/lint/unit tests alone.
+- `audit_logs` UPDATE/DELETE are REVOKEd at the DB level (hard privilege error, not a
+  silent no-op) — `assertUpdateNoOp`/`assertDeleteNoOp` must tolerate that error path
+  while still confirming the row is unchanged/present.
+- `church_groups` has no INSERT/UPDATE/DELETE policy at all — verify all writes are
+  denied by RLS default and that SELECT is filtered by `id` (there's no
+  `church_group_id` self-reference column).
+- `notification_preferences` INSERT test uses `{ user_id: IDS.users.memberB }`, which
+  collides with the seeded Church-B row on `user_id` — this INSERT will likely fail on
+  a unique constraint (`23505`) rather than a pure RLS denial (`42501`).
+  `assertInsertDenied` only checks that an error is present (any error), so this still
+  passes, but it does not, by itself, prove RLS is the cause for that specific
+  assertion — this is an accepted spec choice (the per-table INSERT row for
+  `notification_preferences` was specified explicitly by the spec), not an oversight.
+- Verify no Church-B data was actually mutated in a real run — the bypass tests are
+  designed to be no-ops (INSERT attempts fail and insert nothing; UPDATE/DELETE
+  attempts are filtered to 0 rows), so `beforeAll`'s idempotent
+  delete-then-insert reseed should leave the fixture stable across repeated runs.
