@@ -80,7 +80,12 @@ bun run test:rls
 
 Tests are skipped automatically when `SUPABASE_TEST_URL` or `SUPABASE_JWT_SECRET` are unset.
 
-In CI: set `vars.RLS_TESTS_ENABLED=true` and configure the four secrets above to enable the `rls-integration` job.
+`tables/cross-tenant-bypass.test.ts` is the canonical four-verb (SELECT / INSERT
+/ UPDATE / DELETE) cross-tenant matrix required by issue #33's acceptance
+criteria — extend it (and add a Church B seed row) whenever a new table is
+added in later sprints, rather than starting a new file.
+
+In CI: set `vars.RLS_TESTS_ENABLED=true` and configure the four secrets above to enable the `rls-integration` job. Note the `rls-integration` job only *runs* when the `SUPABASE_TEST_URL` secret is set — if the secret is absent, GitHub reports the job as skipped, which counts as passing and does **not** block merge. Making `rls-integration` a required status check (and provisioning the four secrets in CI) is a repo-settings change outside this repo's code, tracked as a follow-up.
 
 ## Roadmap (Phase 1 Sprint 0 backlog)
 
