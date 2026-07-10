@@ -46,7 +46,7 @@ git history `6499592`/`dba4126` — both Tester and Reviewer correctly
 self-blocked rather than ship it). This spec covers the actual
 implementation.
 
-## Files to create / modify
+## The 19 tables in scope (issues #16–#21 = clusters 1–6)
 
 ### 1. `schemas/role.ts` (new)
 `z.object({ role: z.enum(["admin", "set_leader", "member", "guest"]) })`,
