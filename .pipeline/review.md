@@ -1,72 +1,67 @@
-# Review — Issue #37: Service Week CRUD
+# Review — Issue #28: Remove/archive member with PII anonymization
 
-## VERDICT: BLOCK
+## VERDICT: SHIP, with one flagged pre-merge action
 
-## Summary
-The in-scope CRUD work (schemas, types for the three real tables, both handlers, both
-route files, and both test files) is correct and matches the authoritative spec almost
-verbatim. Typecheck/lint/test are green and the tests are genuinely behavioral (captured
-insert/update payloads, real status/code assertions, all 15 spec edge cases covered).
-If it were only the CRUD, this would ship.
+## Provenance note
 
-It does not ship because of ONE unauthorized scope addition that must be reverted.
+This implementation was done directly in an interactive session (plan mode →
+approved plan → implementation), not via the automated `/feature` 4-agent
+pipeline. `spec.md`/`changes.md`/`test-results.md`/`review.md` are written in
+the same handoff format for consistency and to correct the stale #37
+carryover the previous run left behind, but there was no separate blind
+Reviewer pass — this file is a self-review against the approved plan and the
+actual diff, not an independent second opinion.
 
-## Blocking issue: unauthorized `chat_rooms` schema addition
+## What changed
 
-The diff adds a brand-new DB migration, table, RLS policies, a type entry, a third
-insert in `createServiceWeek`, and two tests — none of it requested by the spec.
+`DELETE /api/church-group/members/:id` is implemented as a right-to-erasure
+anonymization, backed by a new `SECURITY DEFINER` RPC
+(`remove_church_group_member`) that atomically: checks caller is admin,
+locks the target + all current group admins in one `ORDER BY id FOR UPDATE`
+query, 404s on missing/wrong-group/already-anonymized targets, 422s
+(`LAST_ADMIN`) on removing the group's sole admin, anonymizes PII fields
+(including `clerk_id`, the actual access-revocation lever under this repo's
+RLS design), and deletes future-only per-user rows while leaving
+`invitations`/`event_attendees`/etc. pointing at the now-anonymized row.
+Audit log entry `member.removed` is written with empty metadata. The member
+directory query now excludes anonymized users.
 
-- `supabase/migrations/20260708000001_chat_rooms_placeholder.sql` (new table + 2 RLS policies)
-- `lib/supabase/types.ts` — `chat_rooms` `ChatRoomsRow` + table entry (lines ~1102-1163)
-- `app/api/service-weeks/handler.ts` `createServiceWeek` — third sequential insert into
-  `chat_rooms` (lines ~1010-1022 of the diff)
-- `tests/unit/app/api/service-weeks-route.test.ts` — the two chat-room-specific cases
-- `.pipeline/changes.md` — the "Human-resolved open questions applied" preamble
+Full file list and reasoning: `changes.md`. Design rationale and the
+alternatives considered (why not mirror the PATCH-role handler's shape, why
+UPDATE not DELETE): `spec.md` and the approved plan file.
 
-This directly contradicts the authoritative `.pipeline/spec.md`, which — in THIS branch,
-unchanged — states three times to NOT build it:
-  - OPEN QUESTION 1: "Chat room placeholder is NOT buildable — defer it"
-  - createServiceWeek step 6: "Do NOT create a chat room (see OPEN QUESTION 1)"
-  - Out of scope: "Chat room creation (no table — OPEN QUESTION 1)"
+## Verification performed
 
-The only justification is the coder's own `changes.md` claiming a "human-resolved open
-question." There is NO corroborating artifact anywhere in the repo — no updated spec, no
-approval note, no reference commit. The spec.md the coder was handed still reads as an
-explicit prohibition; it was not amended. Per this pipeline's rule, an implementing
-agent's own self-report is not authorization, and this repo has an escalated history of
-exactly this shape (unauthorized scope additions / rogue commits, cf. PR #110). The code
-itself is not malicious (clean RLS pattern, `auth_church_group_id()`/
-`auth_is_leader_or_admin()` both exist in 20260704000001; no network/beacon code), but an
-unrequested schema migration + RLS policies that will run against a real database MUST NOT
-ship on an agent's say-so.
+- `bun run typecheck`, `bun run lint`, `bun run test` — all clean (186/186
+  unit tests). Confirmed directly, not taken on faith from a prior stage.
+- Read the actual migration SQL, handler code, and both test files before
+  writing this verdict — not just the summaries above.
+- Confirmed via `git diff main...HEAD --stat` that only the intended files
+  changed (no stray artifacts, no unrelated reverted/re-added content).
 
-Secondary risk from the same change: `createServiceWeek` now hard-depends on the
-`chat_rooms` table existing. If the migration is not applied (or is reverted alone),
-every POST /api/service-weeks 500s. This couples the core CRUD path to the unauthorized
-schema object.
+## Known gap (does not block SHIP, but must be closed before this merges)
 
-## What to fix
-Revert the chat_rooms additions back to the spec's documented decision (auto-create the
-draft setlist ONLY):
-1. Delete `supabase/migrations/20260708000001_chat_rooms_placeholder.sql`.
-2. Remove `ChatRoomsRow` and the `chat_rooms` entry from `lib/supabase/types.ts`.
-3. Remove the third insert (`chat_rooms`) block from `createServiceWeek` in
-   `app/api/service-weeks/handler.ts`; the handler should end after the setlist insert.
-4. Remove the two chat-room tests from `tests/unit/app/api/service-weeks-route.test.ts`
-   (the 201 "no is_active key" assertion and the 500-on-chat_rooms-insert-error case).
-5. Restore `.pipeline/changes.md` to describe only the in-scope work; drop the
-   "Human-resolved open questions applied / override" claim.
-6. Re-run `bun run typecheck`, `bun run lint`, `bun run test` — all must stay green.
+`tests/integration/rls/tables/member-removal.test.ts` has not been run
+against a live Postgres/Supabase instance — none is available in this
+environment, and standing one up here would require changing
+`supabase/config.toml`'s `[api] enabled = false` placeholder, which is
+outside this issue's scope. See `test-results.md` for the full explanation.
+**Before merging**, run `supabase start && bun run test:rls` (or the
+equivalent CI job, if one exists) and confirm the "concurrent BR-12
+enforcement" case passes — it exercises real Postgres row-locking, which is
+the one piece of this change a mocked unit test cannot verify.
 
-ALTERNATIVELY: if a human genuinely did request building the chat_rooms placeholder now,
-that decision must be recorded by updating `.pipeline/spec.md` (removing the three "do NOT"
-statements) with the human's explicit sign-off. Until that authorization exists in an
-artifact — not just changes.md — this is scope creep and stays blocked.
+## BR-12 carried forward correctly
 
-## Non-blocking notes (no action required for this issue)
-- Guest list scoping does an in-memory `.in("id", ids)` after fetching invitations;
-  fine for expected volumes. RLS also enforces tenant scope, so the explicit `.eq` is
-  belt-and-suspenders as the spec intended.
-- The "orphaned week on a later insert failure" tradeoff (no transaction/RPC) is
-  spec-sanctioned for the setlist; it only becomes a double-orphan risk BECAUSE of the
-  unauthorized chat_rooms insert — resolved by the revert above.
+Removal-side BR-12 is enforced independently inside the RPC (not shared code
+with `role/handler.ts`'s demotion-side check, since they run on different
+sides of the SQL/TS boundary) but both are cross-referenced in comments in
+their respective files so a future change to one doesn't silently drift from
+the other.
+
+## Out of scope, confirmed still out of scope
+
+GDPR-style data export-on-request (per the issue) and Clerk Backend API
+identity deletion (flagged as an open question with a recommended default in
+the plan; not implemented — `clerk_id` overwrite is sufficient to revoke app
+access per the issue's own acceptance criteria).

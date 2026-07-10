@@ -16,6 +16,8 @@ type UsersRow = {
   name: string;
   email: string | null;
   phone: string | null;
+  sms_opted_in: boolean;
+  anonymized_at: string | null;
 };
 
 type ChurchGroupsRow = {
@@ -199,6 +201,12 @@ export type Database = {
           p_metadata: Record<string, unknown>;
         };
         Returns: AuditLogsRow;
+      };
+      remove_church_group_member: {
+        Args: {
+          p_target_user_id: string;
+        };
+        Returns: UsersRow;
       };
     };
     Enums: {
