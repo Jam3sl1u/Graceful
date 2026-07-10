@@ -1,85 +1,104 @@
-# Changes — Issue #37: Service Week CRUD
+# Changes — Issue #32: API auth-matrix tests for Sprint 0–1 routes
 
-## Open questions resolved per spec.md
+## Open questions — resolution applied
 
-1. **Chat room placeholder stays deferred**, per spec.md's OPEN QUESTION 1: there is
-   no `chat_rooms` table (`20260702000005_cluster_5_partial.sql` explicitly defers all
-   of chat to Phase 2), so `POST /api/service-weeks` auto-creates the draft setlist
-   only. The chat room placeholder is left for a follow-up issue with its own migration.
-2. **All five create fields are required** (already matched spec.md's stated
-   decision — no change needed here beyond implementing it).
+A human resolved spec.md's two OPEN QUESTIONS with: proceed as scoped — add
+coverage reporting config, write auth-matrix tests for the 7 already-implemented
+route groups, and add a test that pins the 501 stub for the #28 route. Defer the
+real auth-matrix for member-removal until #28 is actually implemented. This is
+exactly what spec.md's own "This spec assumes" / default text already described
+for both open questions, so the implementation below follows spec.md as written:
+
+1. `DELETE /api/church-group/members/:id` (#28) is left as a 501 stub; only its
+   current stub behavior is pinned under test (T4). The real four-case auth
+   matrix is deferred until #28 lands.
+2. No real JWT signing was introduced. The harness mocks `@clerk/nextjs/server`'s
+   `auth()` and injects a `UserLookup`, matching the existing per-route test
+   pattern (`tests/unit/app/api/service-weeks-route.test.ts`,
+   `tests/unit/app/api/instruments-route.test.ts`).
 
 ## Files changed
 
-### `lib/supabase/types.ts` (modified)
-- Added three hand-written table types to `Database["public"]["Tables"]`:
-  `service_weeks`, `setlists`, `invitations` (per spec.md §2). Each follows the
-  existing `Row`/`Insert`/`Update`/`Relationships: []` shape; `Insert` omits
-  DB-defaulted columns (`id`, `created_at`, `is_cancelled` / `status`+`published_at`+
-  `notes`) as optional. Imports `SetlistStatus`/`InvitationStatus` from `@/types/domain`.
+### `jest.config.ts` (modified) — T1
+Added `collectCoverageFrom` (scoped to `app/api/church-group/**`,
+`app/api/profile/**`, `app/api/instruments/**`, `lib/api/**`),
+`coveragePathIgnorePatterns`, `coverageDirectory`, and `coverageReporters:
+["text-summary", "lcov"]`. No `coverageThreshold` was added (report-only, per
+spec, so this doesn't fail unrelated PRs). Nothing pre-existing in the config
+was changed.
 
-### `schemas/service-weeks.ts` (rewritten)
-- Replaced the empty placeholder with `createServiceWeekSchema` (all five fields —
-  `serviceDate`, `title`, `sermonTopic`, `sermonScripture`, `speakerName` —
-  required, non-empty after trim, per the issue AC) and `updateServiceWeekSchema`
-  (all fields optional, `.refine` requires at least one key present).
+### `package.json` (modified) — T1
+Added `"test:coverage": "jest --coverage"` next to the existing `"test": "jest"`
+script.
 
-### `app/api/service-weeks/handler.ts` (new)
-- `toServiceWeekResponse` (exported, reused by `[id]/handler.ts`) maps the DB row
-  (snake_case) to the camelCase `ServiceWeekResponse` shape.
-- `listServiceWeeks` — any authenticated member; guests are scoped to weeks they
-  have an `invitations` row for (queries `invitations.user_id`, collects
-  `service_week_id`s, then `.in("id", ids)` on `service_weeks`; zero invitations ⇒
-  `{ serviceWeeks: [] }` without querying `service_weeks` at all).
-- `createServiceWeek` — set_leader/admin only (`requireRole`). Validates with
-  `createServiceWeekSchema`, inserts `service_weeks`, then sequentially inserts
-  the draft `setlists` row (no explicit `status` — DB default `'draft'`). Either
-  insert failing → 500 `INTERNAL`; an orphaned week on setlist-insert failure is
-  an accepted edge case (no transaction/RPC in scope), matching spec.md's stated
-  tradeoff.
+### `.github/workflows/ci.yml` (modified) — T1
+In the `checks` job, changed `- run: bun run test` to `- run: bun run
+test:coverage` so CI emits the coverage text-summary in the logs. The
+`check-secrets` and `rls-integration` jobs, and every other step in `checks`,
+are untouched.
 
-### `app/api/service-weeks/route.ts` (rewritten)
-- Thin `GET`/`POST` delegators to the new handler, replacing the `notImplemented`
-  stubs.
+### `.gitignore` — not modified
+`/coverage` was already present under the "testing" section; no duplicate entry
+added.
 
-### `app/api/service-weeks/[id]/handler.ts` (new)
-- `getServiceWeek` — any authenticated member; 404 (not 403) for a guest with no
-  matching invitation, so existence isn't leaked. 404 for wrong-tenant/missing id.
-- `updateServiceWeek` — set_leader/admin only. Builds a snake_case patch object
-  from only the provided fields, `.update(...).eq("id", id).eq("church_group_id",
-  ...)`. No matching row → 404.
+### `tests/support/api-auth.ts` (new) — T2
+Reusable auth-matrix harness exporting exactly `makeLookup(role, overrides?)`,
+`mockClerkAuthed(jwt?)`, `mockClerkAnonymous()`, and `makeJsonReq(body?)`, with
+the same resolved shapes as the copy-pasted per-route helpers (`userId:
+"clerk_test"` / `getToken` for authed, `userId: null` for anonymous; default
+fixed IDs `userId: "user-1"`, `churchGroupId: "group-1"`, overridable). It casts
+the mocked `auth` import from `@clerk/nextjs/server` internally; consuming test
+files must still declare `jest.mock("@clerk/nextjs/server", () => ({ auth:
+jest.fn() }))` at the top of their own file so the module registry resolves to
+the same mock instance. No existing test file was rewritten or migrated — this
+module is purely additive.
 
-### `app/api/service-weeks/[id]/route.ts` (rewritten)
-- `GET`/`PUT` now delegate (Next 15 async `params`); `DELETE` untouched —
-  still `notImplemented("DELETE /api/service-weeks/[id]")` (#38, out of scope).
+### `tests/unit/app/api/auth-matrix.test.ts` (new) — T3
+Consolidated auth-matrix pass consuming the harness, covering the admin-gated
+handler-style routes: `patchMemberRole` (#27), `getAuditLog` (#29),
+`addInstrument` / `promoteInstrument` / `deleteInstrument` (#31), and
+`getChurchGroupMembers` (#26, admin-vs-guest gating). For each handler it
+asserts the applicable matrix cells (unauth→401, disallowed-role→403,
+malformed-body→400 for the two routes with a request body, admin-success 2xx),
+calling each handler with the exact argument arity used by its existing
+per-route test file, and reusing (not inventing) the same chainable/RPC
+Supabase mock shapes from those files (`instruments-route.test.ts`,
+`church-group-members-role-route.test.ts`, `audit-log-route.test.ts`,
+`church-group-members-route.test.ts`). `beforeEach` resets both the `auth` and
+`getSupabaseClient` mocks.
 
-### `tests/unit/app/api/service-weeks-route.test.ts` (new — 22 tests)
-### `tests/unit/app/api/service-weeks-id-route.test.ts` (new — 16 tests)
-- Copy the `profile-route.test.ts` / `instruments-route.test.ts` mock harness
-  (`jest.mock` Clerk + Supabase client, `makeLookup(role)`, `setUpAuth(jwt)`, a
-  thenable `makeChain(result)` supporting `.eq/.order/.in/.select/.maybeSingle`
-  chains keyed per table+operation).
-- Cover every edge case in spec.md's list.
+### `tests/unit/app/api/church-group-members-id-route.test.ts` (new) — T4
+Pins the current 501 stub behavior of `DELETE
+/api/church-group/members/[id]`: calls `DELETE({} as unknown as NextRequest)`
+and asserts `res.status === 501` and `(await res.json()).code ===
+"NOT_IMPLEMENTED"`. Includes a top-of-file comment noting this is issue #28
+(Remove/archive member) and should be replaced with the full auth matrix once
+#28 is implemented. No Clerk/Supabase mocking needed — the stub short-circuits
+before any auth code runs.
 
 ## Verification
 - `bun run typecheck` — passes.
-- `bun run lint` — passes.
-- `bun run test` — full suite passes.
-- `bun run format:check` (touched files only, via `prettier --write`) — clean;
-  the rest of the repo has pre-existing Prettier drift unrelated to this change,
-  left untouched.
-- Not run: `bun run test:rls` (integration tests against a live Supabase
-  instance) — this is a code-review environment with no DB. `service_weeks`,
-  `setlists`, and `invitations` (and their RLS policies) are pre-existing from
-  the Cluster 3 schema (#18) and were not modified by this issue.
+- `bun run lint` — passes (0 errors, 0 warnings; verified with no stray
+  `coverage/` output directory present, since generated coverage artifacts are
+  gitignored but not eslint-ignored).
+- `bun run test` and `bun run test:coverage` — both pass: 16 suites, 192 tests.
+  The coverage text-summary lists all eight #24–#31 route files plus
+  `lib/api/*` with non-zero coverage; `members/[id]/route.ts` registers because
+  of the new T4 test.
+- No existing test file's assertions were touched, weakened, or rewritten.
+- No real network calls or real JWT signing were introduced.
 
 ## What the Tester should focus on
-- `createServiceWeek` does two sequential inserts (week → setlist); confirm the
-  ordering and the "accepted orphan on later failure" tradeoff is acceptable.
-- Guest scoping in both `listServiceWeeks` and `getServiceWeek` — 404 (not 403)
-  is deliberate to avoid leaking existence to guests without an invitation.
-- Out of scope, intentionally not touched: `DELETE /api/service-weeks/:id`,
-  `/cancel`, `/reactivate` (#38/#39), setlist song editing/publish, event CRUD,
-  invitation sending (#54/#59/#40), and chat room/message functionality (no
-  `chat_rooms` table exists yet — deferred to Phase 2 per spec.md OPEN QUESTION 1;
-  tracked as a follow-up issue rather than built here).
+- Confirm `tests/support/api-auth.ts`'s exported shapes exactly match what
+  `service-weeks-route.test.ts` / `instruments-route.test.ts` already use, so
+  it's a true drop-in replacement for future sprints (not just superficially
+  similar).
+- In `auth-matrix.test.ts`, confirm each handler call's argument order/arity
+  matches its real per-route test file exactly (e.g. `promoteInstrument(req,
+  id, lookup)`, `getAuditLog(req, lookup)`) and that no assumption papered over
+  a real behavior difference.
+- Confirm the CI diff only swaps `bun run test` → `bun run test:coverage` in
+  the `checks` job and leaves `check-secrets` / `rls-integration` untouched.
+- Confirm `jest.config.ts`'s new coverage fields don't introduce a
+  `coverageThreshold` (none should exist) — a failing threshold would block
+  unrelated PRs, which spec.md explicitly says to avoid.

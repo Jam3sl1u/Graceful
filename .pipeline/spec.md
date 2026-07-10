@@ -1,313 +1,238 @@
-# Spec — Issue #37: Service Week CRUD
+# Spec — Issue #32: API auth-matrix tests for Sprint 0–1 routes
 
-Implements `POST /api/service-weeks`, `GET /api/service-weeks`, `GET /api/service-weeks/:id`,
-`PUT /api/service-weeks/:id`. Scope is CRUD only. `DELETE`, `/cancel`, `/reactivate`,
-setlist song editing, and event creation are OTHER issues (#38/#39/#54/#59) — leave their
-route stubs untouched.
+## OPEN QUESTIONS (read first)
 
-The Cluster 3 schema (`service_weeks`, `setlists`, `invitations`) and the tenant RLS policies
-already exist and are applied. No new migration is needed for this issue.
+1. **`DELETE /api/church-group/members/:id` is a 501 stub, not a real route.**
+   `app/api/church-group/members/[id]/route.ts` returns `notImplemented(...)` (HTTP
+   501, code `NOT_IMPLEMENTED`) with zero auth or validation logic. That route is
+   backlog #19 / GitHub #28 (Remove/archive member), which #32 lists as a blocker.
+   Because it has no auth/validation code, the full four-case matrix
+   (admin-2xx / member-403 / unauth-401 / malformed-400) **cannot** be written for it.
+   **This spec assumes:** keep #32 unblocked by pinning the current 501 behavior
+   under test (task T4) and defer the real matrix to when #28 lands. If the pipeline
+   owner instead wants #32 to block until #28 is implemented, stop and say so. Do NOT
+   implement the removal feature here — it is out of scope for a test issue.
 
----
+2. **Real JWT signing is NOT wanted here.** The issue says "mint fake Clerk JWTs,"
+   but the established unit-test pattern in this repo mints role identity by mocking
+   `@clerk/nextjs/server`'s `auth()` and injecting a `UserLookup` — no signing, no
+   secret. The `checks` CI job has no `SUPABASE_JWT_SECRET`, so real signing would
+   break CI. The harness in T2 MUST follow the existing mock pattern. Real signed
+   JWTs live only in the separate RLS suite (`tests/integration/rls/jwt.ts`) and are
+   out of scope. If you believe real signing is required, stop and ask.
 
-## OPEN QUESTIONS
+## Scope
 
-### 1. Chat room placeholder is NOT buildable — defer it (recommended, non-blocking)
+The routes enumerated by #32 as #24–#31 are the eight Sprint-1 feature routes =
+backlog rows #15–#22 (GitHub numbers are offset +9 from the backlog doc; backlog #23
+"auth-matrix tests" == GitHub #32). Sprint 0 produced no user-facing feature routes;
+its only auth surface is `lib/api/auth.ts`, already covered by
+`tests/unit/lib/api/auth.test.ts`. **Do NOT** add tests for `app/api/health` or
+`app/api/webhooks/*` — outside the #24–#31 enumeration and outside this issue.
 
-The issue says "Creating a week should auto-create a draft setlist **and an inactive chat room
-placeholder** per Flow 4." There is **no `chat_rooms` table** — `supabase/migrations/20260702000005_cluster_5_partial.sql`
-explicitly defers `chat_rooms`/`chat_messages`/`chat_mentions` to Phase 2 (see its header comment).
-The issue itself notes "chat activation itself is Phase 2."
+## Current state (VERIFIED — do NOT redo or modify these)
 
-**Decision taken in this spec:** On week creation, auto-create the **draft setlist only**. Do
-**not** attempt any chat-room write (the table does not exist; it would not compile/run). This is
-tracked as a Phase 2 follow-up. If a human wants the chat room now, they must first land the
-Phase 2 chat schema — out of scope here.
+Every implemented Sprint-1 route already has full auth-matrix coverage under
+`tests/unit/app/api/`. These tests pass and are thorough. Leave every assertion in
+them untouched.
 
-### 2. Required vs optional fields — follow the issue AC (all five required)
+| GitHub | Route | Existing test file | Matrix status |
+|---|---|---|---|
+| #24 | `PUT /api/church-group` | `church-group-route.test.ts` | 401 ✓, 400 ✓, success ✓ (any authed user creates → 403 N/A) |
+| #25 | `POST /api/church-group/join` | `church-group-join-route.test.ts` | 401 ✓, 400 ✓, success ✓ (not admin-gated → 403 N/A) |
+| #26 | `GET /api/church-group/members` | `church-group-members-route.test.ts` | 401 ✓, guest→403 ✓, success ✓ (GET, no body → 400 N/A) |
+| #27 | `PATCH /api/church-group/members/:id/role` | `church-group-members-role-route.test.ts` | 401 ✓, non-admin→403 ✓, 400 ✓, admin-success ✓ |
+| #28 | `DELETE /api/church-group/members/:id` | **none** | **STUB (501) — see Open Question 1 + T4** |
+| #29 | `GET /api/church-group/audit-log` | `audit-log-route.test.ts` | 401 ✓, non-admin→403 ✓, 400 ✓, admin-success ✓ |
+| #30 | `GET/PUT /api/profile` | `profile-route.test.ts` | 401 ✓, 400 ✓, success ✓ (self-scoped → 403 N/A) |
+| #31 | instruments `GET/POST`, `/custom`, `/:id/promote`, `DELETE /:id` | `instruments-route.test.ts` | 401 ✓, non-admin→403 ✓, 400 ✓, admin-success ✓ |
 
-The issue AC states the five fields are "all required fields validated". The DB columns
-(`title`, `sermon_topic`, `sermon_scripture`, `speaker_name`) are nullable and PRD Flow 4 §21.4
-calls sermon topic/scripture "optional". **Decision taken in this spec:** follow the issue AC
-literally — the create schema requires all five as non-empty. This is the authoritative
-instruction for this task. (Noted only so a reviewer knows it was deliberate, not an oversight.)
+Acceptance-criteria status going in:
+- **"tests run in CI and block merge on failure": already met.** `.github/workflows/ci.yml`
+  runs `bun run test` (Jest) on every `pull_request`.
+- **"every route tested with the 4 cases": met for #24–#27, #29–#31.** Only gap is #28 (a stub).
+- **"coverage report shows these routes covered": NOT met.** `jest.config.ts` collects no
+  coverage. This is new work (T1).
+- **Implementation Note "reusable harness that mints fake role identities":** the pattern
+  exists but is copy-pasted per file, not shared. New work (T2 + T3).
 
----
+The real deliverables for this issue are therefore: coverage reporting (T1), a shared
+reusable harness (T2) with a real consumer (T3), and pinning the #28 stub (T4).
 
-## Patterns to copy
+## Tasks
 
-- Handler structure, auth, JWT fetch, error envelope: **copy `app/api/profile/handler.ts`**.
-- Route → handler delegation: **copy `app/api/profile/route.ts`**.
-- Role gating: `requireRole(ctx, [...])` from `lib/api/auth.ts` (see `app/api/church-group/members/handler.ts`).
-- Insert type cast for the `created_at`-required hand-rolled Insert types:
-  copy the `as unknown as Database["public"]["Tables"][...]["Insert"]` cast used in
-  `app/api/profile/handler.ts` `updateProfile` (lines 90-99).
-- Zod schema file: **copy the style of `schemas/profile.ts`**.
-- Unit test structure and Supabase mock: **copy `tests/unit/app/api/profile-route.test.ts`**.
+### T1 — Add coverage reporting scoped to the Sprint-1 API routes (AC: coverage report)
 
-Envelope: success `{ data: ... }` via `ok(...)`; error `{ error, code }` via `fail(...)`.
-Error codes from `lib/api/errors.ts`. All handlers wrap in try/catch and map `ApiException`
-to `fail(err.message, err.code, err.status)`, else `fail("Internal error", INTERNAL, 500)`.
-
----
-
-## Files to modify / create
-
-### 1. `schemas/service-weeks.ts` — REPLACE the placeholder
-
-Replace the empty `serviceWeeksSchema` with two schemas. Use `z` from `zod`.
-
-```ts
-export const createServiceWeekSchema = z.object({
-  serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD"),
-  title: z.string().trim().min(1).max(100),
-  sermonTopic: z.string().trim().min(1),
-  sermonScripture: z.string().trim().min(1),
-  speakerName: z.string().trim().min(1).max(100),
-});
-export type CreateServiceWeekInput = z.infer<typeof createServiceWeekSchema>;
-
-// PUT: same fields, all optional; at least one must be present.
-export const updateServiceWeekSchema = z
-  .object({
-    serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-    title: z.string().trim().min(1).max(100).optional(),
-    sermonTopic: z.string().trim().min(1).optional(),
-    sermonScripture: z.string().trim().min(1).optional(),
-    speakerName: z.string().trim().min(1).max(100).optional(),
-  })
-  .refine((v) => Object.keys(v).length > 0, "at least one field required");
-export type UpdateServiceWeekInput = z.infer<typeof updateServiceWeekSchema>;
-```
-
-Keep the request body camelCase; map to snake_case DB columns in the handler.
-
-### 2. `lib/supabase/types.ts` — ADD three tables
-
-The file is hand-written (Cluster 1 only). Add `service_weeks`, `setlists`, and `invitations`
-to `Database["public"]["Tables"]`, following the existing `Row`/`Insert`/`Update`/`Relationships`
-shape. Import `SetlistStatus` (and `InvitationStatus`) from `@/types/domain`.
-
-`ServiceWeeksRow`:
-```ts
-{
-  id: string;
-  church_group_id: string;
-  service_date: string;
-  title: string | null;
-  sermon_topic: string | null;
-  sermon_scripture: string | null;
-  speaker_name: string | null;
-  notes: string | null;
-  is_cancelled: boolean;
-  created_by: string | null;
-  created_at: string;
-}
-```
-- `Insert: Omit<ServiceWeeksRow, "id" | "created_at" | "is_cancelled"> & { id?: string; created_at?: string; is_cancelled?: boolean }`
-- `Update: Partial<ServiceWeeksRow>`
-
-`SetlistsRow`:
-```ts
-{
-  id: string;
-  church_group_id: string;
-  service_week_id: string;
-  status: SetlistStatus;
-  published_at: string | null;
-  notes: string | null;
-  created_by: string | null;
-  created_at: string;
-  updated_at: string;
-}
-```
-- `Insert: Omit<SetlistsRow, "id" | "created_at" | "updated_at" | "status" | "published_at" | "notes"> & { id?: string; created_at?: string; updated_at?: string; status?: SetlistStatus; published_at?: string | null; notes?: string | null }`
-- `Update: Partial<SetlistsRow>`
-
-`InvitationsRow` (only the columns queried for guest scoping are load-bearing; include these):
-```ts
-{
-  id: string;
-  church_group_id: string;
-  service_week_id: string;
-  user_id: string;
-  status: InvitationStatus;
-  created_at: string;
-}
-```
-- `Insert: Omit<InvitationsRow, "id" | "created_at"> & { id?: string; created_at?: string }`
-- `Update: Partial<InvitationsRow>`
-- All three tables: `Relationships: []`
-
-Run `bun run typecheck` — it must stay green.
-
-### 3. `app/api/service-weeks/handler.ts` — CREATE (list + create)
-
-Export a shared response type and two handlers.
+**Modify `jest.config.ts`** (existing unit config at repo root). Add these fields to
+the exported `config` object; keep everything already there unchanged:
 
 ```ts
-export type ServiceWeekResponse = {
-  id: string;
-  serviceDate: string;      // service_date
-  title: string | null;
-  sermonTopic: string | null;
-  sermonScripture: string | null;
-  speakerName: string | null;
-  notes: string | null;
-  isCancelled: boolean;     // is_cancelled
-  createdBy: string | null; // created_by
-  createdAt: string;        // created_at
-};
-
-export async function listServiceWeeks(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-export async function createServiceWeek(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+collectCoverageFrom: [
+  "app/api/church-group/**/*.ts",
+  "app/api/profile/**/*.ts",
+  "app/api/instruments/**/*.ts",
+  "lib/api/**/*.ts",
+],
+coveragePathIgnorePatterns: ["<rootDir>/node_modules/"],
+coverageDirectory: "<rootDir>/coverage",
+coverageReporters: ["text-summary", "lcov"],
 ```
 
-Add and **export** `toServiceWeekResponse(row: ServiceWeeksRow): ServiceWeekResponse` (snake → camel);
-import it in `[id]/handler.ts` to avoid duplication.
+Do NOT add a `coverageThreshold`. A failing threshold would break unrelated PRs;
+report-only is the safe default for this issue.
 
-**`listServiceWeeks` (GET /api/service-weeks) — Auth: any authenticated member of the group.**
-1. `ctx = await requireAuth(req, lookup)`.
-2. Fetch JWT (`auth()` → `getToken({ template: "supabase" })`); 401 `UNAUTHENTICATED` if missing.
-   `supabase = getSupabaseClient(jwt)`.
-3. Query `service_weeks` scoped `church_group_id = ctx.churchGroupId`, ordered `service_date` desc.
-   (RLS already enforces the tenant scope; keep the explicit `.eq` too, matching the members handler.)
-4. **Guest scoping:** if `ctx.role === "guest"`, restrict to weeks the guest is invited to.
-   Query `invitations` for `user_id = ctx.userId` (RLS scopes to the tenant), collect the set of
-   `service_week_id`, and filter the returned rows to that set (or add `.in("id", ids)`).
-   If the guest has zero invitations, return `{ data: { serviceWeeks: [] } }`.
-5. On any query `error` → 500 `INTERNAL`.
-6. Return `ok({ serviceWeeks: rows.map(toServiceWeekResponse) })` (200).
+**Modify `package.json`** — add one script next to the existing `"test": "jest"`:
 
-**`createServiceWeek` (POST /api/service-weeks) — Auth: set_leader / admin only.**
-1. `ctx = await requireAuth(req, lookup)`; then `requireRole(ctx, ["admin", "set_leader"])`
-   (throws `ApiException` FORBIDDEN 403 — caught by the wrapper).
-2. Parse body: `const body = await req.json().catch(() => null)`; `createServiceWeekSchema.safeParse`.
-   On failure → 400 `VALIDATION_FAILED`.
-3. Fetch JWT / supabase as above (401 if no JWT).
-4. Insert into `service_weeks`:
-   - `church_group_id: ctx.churchGroupId`
-   - `service_date: parsed.serviceDate`
-   - `title`, `sermon_topic`, `sermon_scripture`, `speaker_name` from parsed
-   - `created_by: ctx.userId`
-   - Do NOT set `id`, `created_at`, `is_cancelled`, `notes` (DB defaults / nullable).
-   Use the `as unknown as Database[...]["service_weeks"]["Insert"]` cast pattern from the profile
-   handler. `.select(...).maybeSingle()` to get the created row. On `error || !data` → 500 `INTERNAL`.
-5. **Auto-create the draft setlist** for the new week: insert into `setlists`:
-   - `church_group_id: ctx.churchGroupId`
-   - `service_week_id: <new week id>`
-   - `created_by: ctx.userId`
-   - Do NOT set `status` (DB default `'draft'`) or `id`/timestamps.
-   On error → 500 `INTERNAL`. Because `setlists.service_week_id` is `unique`, this must run after
-   the week insert succeeds. Two sequential inserts (not a transaction) is acceptable — there is no
-   RPC in scope. If the setlist insert fails, return 500; the orphaned week is an accepted edge here.
-6. **Do NOT create a chat room** (see OPEN QUESTION 1).
-7. Return `ok({ serviceWeek: toServiceWeekResponse(row) }, 201)`.
-
-### 4. `app/api/service-weeks/route.ts` — REWRITE to delegate
-
-Mirror `app/api/profile/route.ts`:
-```ts
-import { NextRequest } from "next/server";
-import { listServiceWeeks, createServiceWeek } from "./handler";
-
-export async function GET(req: NextRequest): Promise<Response> { return listServiceWeeks(req); }
-export async function POST(req: NextRequest): Promise<Response> { return createServiceWeek(req); }
+```json
+"test:coverage": "jest --coverage"
 ```
 
-### 5. `app/api/service-weeks/[id]/handler.ts` — CREATE (get one + update)
+Use Bun wording only; never reference npm/yarn/pnpm anywhere.
+
+**Modify `.github/workflows/ci.yml`** — in the `checks` job, change the existing step
+`- run: bun run test` to `- run: bun run test:coverage` so CI emits the coverage
+report (text-summary in the logs). Leave every other CI step and both other jobs
+(`check-secrets`, `rls-integration`) untouched.
+
+**Modify `.gitignore`** — add `/coverage` if not already ignored (check first; do not
+duplicate an existing entry).
+
+### T2 — Create the shared, reusable auth-matrix harness (AC: reusable harness)
+
+Create **`tests/support/api-auth.ts`**. This centralizes the Clerk-auth + role-lookup
+mock boilerplate currently copy-pasted across the per-route test files, so future
+sprints import instead of re-implement.
+
+It must export exactly:
 
 ```ts
-export async function getServiceWeek(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>;
-export async function updateServiceWeek(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>;
+import type { NextRequest } from "next/server";
+import type { AuthContext, UserLookup } from "@/lib/api/auth";
+import type { UserRole } from "@/types/domain";
+
+// Injectable lookup returning a fixed AuthContext for the given role.
+// Mirrors the makeLookup() duplicated in the existing handler tests.
+export function makeLookup(role: UserRole, overrides?: Partial<AuthContext>): UserLookup;
+
+// Configure the module-mocked auth() (from "@clerk/nextjs/server") as a signed-in
+// Clerk user whose supabase JWT is `jwt` (default a non-empty string; pass null to
+// simulate "session present but no JWT issued"). The consuming test file MUST have
+// `jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }))` at top so the
+// auth import here resolves to that mock.
+export function mockClerkAuthed(jwt?: string | null): void;
+
+// Configure the module-mocked auth() as NO Clerk session (userId: null, getToken jest.fn()).
+export function mockClerkAnonymous(): void;
+
+// Build a NextRequest whose .json() resolves `body` (pass nothing / undefined to
+// simulate a malformed/empty body).
+export function makeJsonReq(body?: unknown): NextRequest;
 ```
-Import `toServiceWeekResponse` (and `ServiceWeekResponse` if needed) from `../handler`.
 
-**`getServiceWeek` (GET /api/service-weeks/:id) — Auth: any authenticated member.**
-1. `requireAuth`; JWT/supabase (401 if no JWT).
-2. Query `service_weeks` by `.eq("id", id).eq("church_group_id", ctx.churchGroupId).maybeSingle()`.
-   On `error` → 500. On `!data` → 404 `NOT_FOUND`.
-3. **Guest scoping:** if `ctx.role === "guest"`, verify an `invitations` row exists for
-   `service_week_id = id` AND `user_id = ctx.userId`. If none → 404 `NOT_FOUND` (do NOT leak
-   existence via 403). On invitation-query error → 500.
-4. Return `ok({ serviceWeek: toServiceWeekResponse(row) })` (200).
+Implementation constraints:
+- Import `auth` from `@clerk/nextjs/server` and cast to `jest.Mock` internally; the
+  helpers call `.mockResolvedValue(...)` on it. Match the exact resolved shapes used
+  in `tests/unit/app/api/service-weeks-route.test.ts` (`setUpAuth`, `makeLookup`,
+  `makeReq`) so behavior is identical: authed = `{ userId: "clerk_test", getToken:
+  jest.fn().mockResolvedValue(jwt) }`; anonymous = `{ userId: null, getToken: jest.fn() }`.
+- Default fixed IDs: `userId: "user-1"`, `churchGroupId: "group-1"` (overridable via
+  `overrides`), matching the existing tests.
+- **Do NOT** rewrite, migrate, or delete any existing test file. This module is
+  additive.
+- No real JWT signing (see Open Question 2).
 
-**`updateServiceWeek` (PUT /api/service-weeks/:id) — Auth: set_leader / admin only.**
-1. `requireAuth`; `requireRole(ctx, ["admin", "set_leader"])`.
-2. Parse body with `updateServiceWeekSchema` → 400 `VALIDATION_FAILED` on failure.
-3. JWT/supabase (401 if no JWT).
-4. Build a snake_case partial update object from only the provided fields
-   (`serviceDate→service_date`, `title`, `sermonTopic→sermon_topic`,
-   `sermonScripture→sermon_scripture`, `speakerName→speaker_name`).
-5. `supabase.from("service_weeks").update(patch).eq("id", id).eq("church_group_id", ctx.churchGroupId)
-   .select(...).maybeSingle()`. On `error` → 500. On `!data` (no row matched) → 404 `NOT_FOUND`.
-6. Return `ok({ serviceWeek: toServiceWeekResponse(row) })` (200).
+### T3 — Add one consolidated auth-matrix pass that consumes the harness (AC: dedicated pass + real consumer)
 
-### 6. `app/api/service-weeks/[id]/route.ts` — REWRITE GET + PUT, keep DELETE stub
+Create **`tests/unit/app/api/auth-matrix.test.ts`**. This is the "dedicated test pass
+over everything built so far" the issue describes, written against the harness so the
+pattern is demonstrably reusable. It complements — does not replace — the deep
+per-route tests.
 
-Next.js 15: the second arg is `{ params }: { params: Promise<{ id: string }> }`; `await params`.
+Top of file (hoisted, required for the harness to bind the mock):
 ```ts
-import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
-import { getServiceWeek, updateServiceWeek } from "./handler";
-
-type Ctx = { params: Promise<{ id: string }> };
-
-export async function GET(req: NextRequest, { params }: Ctx): Promise<Response> {
-  const { id } = await params;
-  return getServiceWeek(req, id);
-}
-export async function PUT(req: NextRequest, { params }: Ctx): Promise<Response> {
-  const { id } = await params;
-  return updateServiceWeek(req, id);
-}
-export async function DELETE(_req: NextRequest) {
-  return notImplemented("DELETE /api/service-weeks/[id]"); // #38 — out of scope
-}
+jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }));
+jest.mock("@/lib/supabase/client", () => ({ getSupabaseClient: jest.fn() }));
 ```
 
-### 7. Tests — CREATE
+Cover the **admin-only, handler-style** Sprint-1 routes (those exporting a testable
+handler that takes an injected `UserLookup`). For each, assert the applicable matrix
+cells using `mockClerkAuthed` / `mockClerkAnonymous` / `makeLookup` / `makeJsonReq`
+from `tests/support/api-auth.ts`:
 
-Copy the mock/harness style of `tests/unit/app/api/profile-route.test.ts`
-(`jest.mock("@clerk/nextjs/server")`, `jest.mock("@/lib/supabase/client")`, `makeLookup`,
-`setUpAuth`, a `makeSupabaseClient` fixture keyed by table name). The Supabase mock must support
-the chains used: `.select().eq()...` (+ `.order`), `.eq().eq().maybeSingle()`,
-`.insert().select().maybeSingle()`, `.update().eq().eq().select().maybeSingle()`, and `.in(...)`.
-Give `makeLookup` a `role` argument so guest/member/leader/admin can be exercised.
+- `patchMemberRole` — `@/app/api/church-group/members/[id]/role/handler` (#27)
+- `getAuditLog` — `@/app/api/church-group/audit-log/handler` (#29)
+- `addInstrument`, `promoteInstrument`, `deleteInstrument` — `@/app/api/instruments/handler` (#31)
+- `getChurchGroupMembers` — `@/app/api/church-group/members/handler` (#26, admin-vs-guest gating)
 
-- `tests/unit/app/api/service-weeks-route.test.ts` — covers `listServiceWeeks` + `createServiceWeek`.
-- `tests/unit/app/api/service-weeks-id-route.test.ts` — covers `getServiceWeek` + `updateServiceWeek`.
+Matrix cells per route (only those that apply to that route’s shape):
+- **unauth → 401 `UNAUTHENTICATED`**: `mockClerkAnonymous()`, then call the handler
+  with a lookup that must never be consulted (assert 401).
+- **disallowed role → 403 `FORBIDDEN`**: `mockClerkAuthed()`, `makeLookup("member")`
+  (use `"guest"` for `getChurchGroupMembers`), assert 403.
+- **malformed input → 400 `VALIDATION_FAILED`**: only for routes with a request body
+  (`patchMemberRole`, `addInstrument`). `mockClerkAuthed()`, `makeLookup("admin")`,
+  `makeJsonReq(null)`, assert 400.
+- **admin success**: `mockClerkAuthed()`, `makeLookup("admin")`, assert 2xx. Supply the
+  minimal Supabase mock the handler needs.
 
-Required cases per the Edge cases below.
+Critical: **call each handler with EXACTLY the argument arity its existing per-route
+test uses** (e.g. `promoteInstrument(req, id, lookup)`, `getAuditLog(req, lookup)`).
+Copy the argument order and the chainable/RPC Supabase mock shapes directly from the
+matching existing file listed in the table above — do not invent new mock shapes.
+Route-export routes (#24 `PUT`, #25 `POST /join`) are already fully covered by their
+existing files and are not admin-gated; do NOT duplicate them here.
 
----
+`beforeEach` must `mockReset()` the `auth` and `getSupabaseClient` mocks, same as the
+existing files.
 
-## Edge cases the implementation MUST handle
+### T4 — Pin the #28 stub route under test
 
-1. **No Clerk session** → 401 `UNAUTHENTICATED` (lookup never consulted). All four handlers.
-2. **No Supabase JWT** (`getToken` returns null) → 401 `UNAUTHENTICATED`; `getSupabaseClient` not called.
-3. **POST/PUT by a `member` or `guest`** → 403 `FORBIDDEN` (from `requireRole`).
-4. **POST with missing/empty any of the five fields, or bad `serviceDate` format** → 400 `VALIDATION_FAILED`.
-5. **POST malformed/non-JSON body** (`req.json()` throws → null) → 400 `VALIDATION_FAILED`.
-6. **POST success** → 201; response is camelCase `serviceWeek`; a draft `setlists` row is inserted
-   with the new `service_week_id` and no explicit `status`. Assert the setlist insert was attempted
-   (capture the insert payload; assert no `status` key).
-7. **Setlist auto-insert error after week insert succeeds** → 500 `INTERNAL`.
-8. **GET list as a guest** → only weeks with a matching `invitations` row for that user; guest with
-   zero invitations → `{ serviceWeeks: [] }`.
-9. **GET list as member/leader/admin** → all weeks in the group.
-10. **GET :id not found / different tenant** → 404 `NOT_FOUND`.
-11. **GET :id as guest with no invitation for that week** → 404 `NOT_FOUND` (not 403).
-12. **PUT with empty body `{}`** → 400 `VALIDATION_FAILED` (refine: at least one field).
-13. **PUT :id not found** (no row matched the `id`+tenant) → 404 `NOT_FOUND`.
-14. **PUT partial update** → only provided fields are written; assert the captured update payload
-    contains only the mapped snake_case keys sent.
-15. **Any DB `error`** on a query/insert/update → 500 `INTERNAL`.
+Create **`tests/unit/app/api/church-group-members-id-route.test.ts`**.
 
-## Out of scope (do NOT implement)
+- Import `{ DELETE }` from `@/app/api/church-group/members/[id]/route`.
+- The current handler takes only `_req` (no `params`). Call it as
+  `DELETE({} as unknown as NextRequest)` and assert the resolved `Response`:
+  - `res.status === 501`
+  - `(await res.json()).code === "NOT_IMPLEMENTED"`
+- Add a top-of-file comment: this route is issue #28 (Remove/archive member), still a
+  stub; replace with the full auth matrix (admin success / member→403 / unauth→401 /
+  malformed→400) once #28 is implemented.
+- No Clerk/Supabase mocking needed — the stub short-circuits before any auth.
+  `@/lib/api/response` imports `server-only`, which `jest.config.ts` already maps to
+  `tests/mocks/server-only.js`, so the import resolves under the node test env.
 
-- `DELETE /api/service-weeks/:id`, `/cancel`, `/reactivate` (#38/#39) — leave as `notImplemented`.
-- Setlist song editing / publish, event CRUD, invitation sending (#54/#59/#40).
-- Chat room creation (no table — OPEN QUESTION 1).
-- Audit-log writes (not in this issue's AC).
-- Regenerating full Supabase types — only add the three tables needed.
+## Edge cases / invariants the implementation MUST hold
+
+- `bun run test` and `bun run test:coverage` must both pass locally and in CI.
+- The coverage report must list all eight #24–#31 route files (plus `lib/api/*`) with
+  non-zero coverage. T4 is what makes `members/[id]/route.ts` register.
+- Do NOT weaken, delete, or rewrite any assertion in the existing test files.
+- Do NOT introduce real network calls or real JWT signing (Open Question 2).
+- The new consolidated test (T3) must not reduce or contradict existing coverage; if a
+  handler's real arity/behavior differs from an assumption here, follow the existing
+  per-route test as the source of truth and adjust.
+- `bun run typecheck` and `bun run lint` must stay green — new test + config + support
+  files must be typed and lint-clean (no unused exports/vars).
+
+## Patterns to copy (name the file)
+
+- Harness mock shapes (`setUpAuth`, `makeLookup`, `makeReq`, chainable Supabase mock):
+  `tests/unit/app/api/service-weeks-route.test.ts` and
+  `tests/unit/app/api/instruments-route.test.ts` (most complete references).
+- Route-export test that mocks `auth()` + `getSupabaseClient` directly:
+  `tests/unit/app/api/church-group-route.test.ts`.
+- Auth seam (`AuthContext`, `UserLookup`, `requireAuth`, `requireRole`): `lib/api/auth.ts`.
+- Response/error contract (`ok`, `fail`, `notImplemented`): `lib/api/response.ts`;
+  error codes incl. `NOT_IMPLEMENTED`: `lib/api/errors.ts`.
+- Jest config shape (`roots`, `testMatch`, `moduleNameMapper` for `server-only` and
+  `@/`): `jest.config.ts`.
+
+## Files touched (summary)
+
+- Modify: `jest.config.ts` — coverage config (T1)
+- Modify: `package.json` — add `test:coverage` script (T1)
+- Modify: `.github/workflows/ci.yml` — `checks` job: `bun run test` → `bun run test:coverage` (T1)
+- Modify: `.gitignore` — ignore `/coverage` if not already (T1)
+- Create: `tests/support/api-auth.ts` — reusable harness (T2)
+- Create: `tests/unit/app/api/auth-matrix.test.ts` — consolidated matrix pass (T3)
+- Create: `tests/unit/app/api/church-group-members-id-route.test.ts` — pin #28 stub (T4)
