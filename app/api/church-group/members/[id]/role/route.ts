@@ -1,6 +1,10 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { patchMemberRole } from "./handler";
 
-export async function PATCH(_req: NextRequest) {
-  return notImplemented("PATCH /api/church-group/members/[id]/role");
+export async function PATCH(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Response> {
+  const { id } = await params;
+  return patchMemberRole(req, id);
 }
