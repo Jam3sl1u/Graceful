@@ -97,9 +97,7 @@ export async function listServiceWeeks(req: NextRequest, lookup?: UserLookup): P
 }
 
 // POST /api/service-weeks — set_leader/admin only. Auto-creates a draft
-// setlist and an inactive chat room placeholder for the new week (PRD Flow
-// 4). Chat activation itself is Phase 2 — this only inserts the placeholder
-// row; see supabase/migrations/20260708000001_chat_rooms_placeholder.sql.
+// setlist for the new week (PRD Flow 4).
 export async function createServiceWeek(req: NextRequest, lookup?: UserLookup): Promise<Response> {
   try {
     const ctx = await requireAuth(req, lookup);
@@ -156,20 +154,6 @@ export async function createServiceWeek(req: NextRequest, lookup?: UserLookup): 
     const { error: setlistError } = await supabase.from("setlists").insert(setlistInsertPayload);
 
     if (setlistError) {
-      return fail("Internal error", ErrorCode.INTERNAL, 500);
-    }
-
-    const chatRoomInsertPayload = {
-      church_group_id: ctx.churchGroupId,
-      service_week_id: week.id,
-      created_by: ctx.userId,
-    } as unknown as Database["public"]["Tables"]["chat_rooms"]["Insert"];
-
-    const { error: chatRoomError } = await supabase
-      .from("chat_rooms")
-      .insert(chatRoomInsertPayload);
-
-    if (chatRoomError) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 

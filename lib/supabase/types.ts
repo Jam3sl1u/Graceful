@@ -98,19 +98,6 @@ type InvitationsRow = {
   created_at: string;
 };
 
-// Minimal placeholder table — see
-// supabase/migrations/20260708000001_chat_rooms_placeholder.sql. Only
-// enough columns to hold an inactive chat room row linked to a service week;
-// full chat functionality is Phase 2.
-type ChatRoomsRow = {
-  id: string;
-  church_group_id: string;
-  service_week_id: string;
-  is_active: boolean;
-  created_by: string | null;
-  created_at: string;
-};
-
 export type Database = {
   public: {
     Tables: {
@@ -180,16 +167,6 @@ export type Database = {
         Row: InvitationsRow;
         Insert: Omit<InvitationsRow, "id" | "created_at"> & { id?: string; created_at?: string };
         Update: Partial<InvitationsRow>;
-        Relationships: [];
-      };
-      chat_rooms: {
-        Row: ChatRoomsRow;
-        Insert: Omit<ChatRoomsRow, "id" | "created_at" | "is_active"> & {
-          id?: string;
-          created_at?: string;
-          is_active?: boolean;
-        };
-        Update: Partial<ChatRoomsRow>;
         Relationships: [];
       };
     };

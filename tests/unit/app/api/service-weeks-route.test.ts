@@ -87,9 +87,6 @@ const DEFAULT_FIXTURES: Record<string, TableFixture> = {
   setlists: {
     insert: { data: null, error: null },
   },
-  chat_rooms: {
-    insert: { data: null, error: null },
-  },
 };
 
 // Generic chainable mock covering:
@@ -342,7 +339,7 @@ describe("POST /api/service-weeks", () => {
     expect(body.code).toBe("VALIDATION_FAILED");
   });
 
-  it("returns 201, auto-creates a draft setlist and an inactive chat room placeholder", async () => {
+  it("returns 201, auto-creates a draft setlist", async () => {
     setUpAuth();
     const capturedInserts: Record<string, unknown> = {};
     mockGetSupabaseClient.mockReturnValue(
@@ -372,13 +369,6 @@ describe("POST /api/service-weeks", () => {
       created_by: USER_ID,
     });
     expect(capturedInserts.setlists).not.toHaveProperty("status");
-
-    expect(capturedInserts.chat_rooms).toEqual({
-      church_group_id: CHURCH_GROUP_ID,
-      service_week_id: "week-1",
-      created_by: USER_ID,
-    });
-    expect(capturedInserts.chat_rooms).not.toHaveProperty("is_active");
   });
 
   it("returns 500 INTERNAL when the service_weeks insert errors", async () => {
@@ -401,21 +391,6 @@ describe("POST /api/service-weeks", () => {
     mockGetSupabaseClient.mockReturnValue(
       makeSupabaseClient({
         setlists: { insert: { data: null, error: { message: "constraint violation" } } },
-      }),
-    );
-
-    const res = await createServiceWeek(makeReq(validBody), makeLookup("admin"));
-    expect(res.status).toBe(500);
-
-    const body = await res.json();
-    expect(body.code).toBe("INTERNAL");
-  });
-
-  it("returns 500 INTERNAL when the chat room placeholder auto-insert errors", async () => {
-    setUpAuth();
-    mockGetSupabaseClient.mockReturnValue(
-      makeSupabaseClient({
-        chat_rooms: { insert: { data: null, error: { message: "constraint violation" } } },
       }),
     );
 
