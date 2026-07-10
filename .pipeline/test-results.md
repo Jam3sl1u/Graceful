@@ -1,133 +1,157 @@
-# Test Results — Issue #37: Service Week CRUD
+# Test Results — Issue #32: API auth-matrix tests for Sprint 0–1 routes
 
-## Verdict: PASS (static/behavioral checks) — with a MUST-REVIEW authorization flag for the Reviewer
+## Overall verdict: PASS (with one documentation-accuracy note, non-blocking)
 
-All code independently verified compiles, lints, and its tests pass. However, the
-implementation includes a scope addition (a new `chat_rooms` table + migration) that
-directly contradicts the current `.pipeline/spec.md`'s explicit instructions, justified
-only by the coder's own unverified claim of a "human-resolved open question." This is
-not something a Tester can wave through silently — flagging it for the Reviewer/human
-per repo policy that no agent's self-report is authorization.
+All required commands were independently re-run (not trusted from changes.md) and all
+passed. One claim in `changes.md` about what the coverage report shows is overstated /
+inaccurate; it does not correspond to any failing test or threshold, but the Reviewer
+should be aware of it.
 
-## 1. Independently re-run static checks (not trusted from changes.md)
+## Commands run
 
-- `bun install` — clean, no changes.
-- `bun run typecheck` (`tsc --noEmit`) — **passes**, 0 errors.
-- `bun run lint` (`eslint .`) — **passes**, 0 errors/warnings.
-- `bun run test` (`jest`) — **passes**: 13 suites / 152 tests, 0 failures. Matches the
-  coder's claimed numbers exactly.
-- `bunx prettier --check` on all touched TS/TSX files — clean. (The new `.sql` migration
-  has no Prettier parser configured in this repo — not a real formatting issue, just an
-  unsupported filetype for the `prettier --check` invocation.)
-- Grepped all new/changed files under `app/api/service-weeks/` for `fetch(`,
-  `XMLHttpRequest`, hardcoded `http(s)://` URLs — none found. No beacon/telemetry code,
-  consistent with the repo's post-incident vigilance (see PR #110 history).
+### `bun install`
+Pass — no changes, lockfile already satisfied (727 installs / 774 packages).
 
-## 2. Code review against spec.md (line-by-line)
+### `bun run typecheck`
+Pass — `tsc --noEmit` produced no output/errors.
 
-`schemas/service-weeks.ts`, `app/api/service-weeks/handler.ts`,
-`app/api/service-weeks/[id]/handler.ts`, and both `route.ts` files were compared against
-spec.md's prescribed code for the CRUD scope (list/get/create/update) — match essentially
-verbatim:
-- `createServiceWeekSchema` / `updateServiceWeekSchema`: exact match to spec's Zod code.
-- `listServiceWeeks`: guest scoping via `invitations.user_id` → `service_week_id` set →
-  `.in("id", ids)`; zero invitations short-circuits without querying `service_weeks`.
-  Correct per spec step 4.
-- `createServiceWeek`: `requireRole(["admin","set_leader"])`, validates, inserts
-  `service_weeks`, then sequential `setlists` insert (no explicit `status`) — matches spec
-  exactly for the CRUD+setlist part.
-- `getServiceWeek`: 404 (not 403) for unmatched guest invitation and for
-  missing/wrong-tenant id — matches spec exactly.
-- `updateServiceWeek`: snake_case partial patch built only from provided fields,
-  `.eq("id",...).eq("church_group_id",...)`, 404 on no match — matches spec exactly.
-- Route files: thin delegators, Next 15 async `params` correctly awaited, `DELETE` left as
-  `notImplemented` (#38, untouched) — matches spec exactly.
+### `bun run lint`
+Pass — `eslint .` produced no output/errors (0 errors, 0 warnings).
 
-## 3. Scope/authorization flag: `chat_rooms` table + migration
+### `bun run test`
+Pass — **16 suites, 192 tests, all passed.** Matches the count claimed in `changes.md`.
+Includes the two new suites (`tests/unit/app/api/auth-matrix.test.ts`,
+`tests/unit/app/api/church-group-members-id-route.test.ts`) alongside all 14
+pre-existing suites, none of which were modified (confirmed via `git show --stat` on
+the feature commit: only `jest.config.ts`, `package.json`, `.github/workflows/ci.yml`,
+`tests/support/api-auth.ts`, and the two new test files changed — zero existing test
+files touched).
 
-**This is the one part of the diff that does NOT match `.pipeline/spec.md`.**
+### `bun run test:coverage`
+Pass — same 16/192 result, plus a coverage summary:
+```
+Statements   : 90.36% ( 394/436 )
+Branches     : 84.39% ( 119/141 )
+Functions    : 64.7% ( 33/51 )
+Lines        : 91.31% ( 368/403 )
+```
+No `coverageThreshold` is configured (confirmed by reading `jest.config.ts`), so this
+summary is report-only and cannot fail CI — matches spec.md's explicit requirement not
+to add a threshold.
 
-- `.pipeline/spec.md` (current version, read directly, timestamped after the coder's
-  commit) contains an explicit "OPEN QUESTIONS" section stating **"Chat room placeholder
-  is NOT buildable — defer it"** and instructs, in the `createServiceWeek` steps: **"Do
-  NOT create a chat room (see OPEN QUESTION 1)"**, repeated again in the "Out of scope"
-  section: **"Chat room creation (no table — OPEN QUESTION 1)."**
-- The existing migration `supabase/migrations/20260702000005_cluster_5_partial.sql`
-  (from issue #20, pre-existing, unmodified by this change) explicitly states in its
-  header: *"Phase 2 objects (chat_rooms, chat_messages, chat_mentions) are explicitly out
-  of scope."*
-- Despite both of these, the coder added a new migration
-  `supabase/migrations/20260708000001_chat_rooms_placeholder.sql` creating a `chat_rooms`
-  table with RLS policies, added a `chat_rooms` entry to `lib/supabase/types.ts`, and
-  wired a third sequential insert into `createServiceWeek`.
-- `changes.md`'s justification is: *"Human-resolved open questions applied (override
-  spec.md's OPEN QUESTIONS section)."* I could find **no corroborating artifact anywhere
-  in the repo** for this claimed human decision — no note, no separate approval file, no
-  reference commit. `spec.md` itself (which the Planner produces and which the Coder is
-  supposed to treat as authoritative) was not updated to reflect any override; it still
-  reads as an explicit prohibition. The only source for the override is the Coder's own
-  `changes.md`, which per this pipeline's rules is not itself authorization.
-- This is exactly the shape of prior incidents in this repo's history (unauthorized scope
-  additions / rogue commits, cf. PR #110's debug-beacon strip). I did **not** find anything
-  malicious in the migration or handler code itself (no network calls, no exfiltration,
-  clean RLS pattern copied faithfully from `20260704000001_rls_policies.sql`), so this
-  reads as unauthorized scope creep rather than a security payload — but it is still an
-  unrequested schema change (new table, new RLS policies) applied without a documented
-  human sign-off, which the Reviewer/human must explicitly approve or reject before this
-  ships.
-- Technically, the `chat_rooms` migration SQL is well-formed and consistent with the
-  repo's established RLS pattern (`auth_church_group_id()`, `auth_is_leader_or_admin()`),
-  and the handler/type code compiles and is tested. If the human confirms the override was
-  in fact requested, there is no functional defect to fix. If not, `createServiceWeek`'s
-  third insert, the new migration file, and the `chat_rooms` type/test additions need to
-  be reverted back to spec.md's documented decision (setlist-only auto-create).
+## Spec/changes.md claim verification
 
-## 4. Test-suite review (coder's new tests)
+- **`jest.config.ts`**: diff adds exactly `collectCoverageFrom`,
+  `coveragePathIgnorePatterns`, `coverageDirectory`, `coverageReporters:
+  ["text-summary", "lcov"]`, no `coverageThreshold`, nothing else changed. Matches T1
+  and the spec's edge-case invariant ("Do NOT add a `coverageThreshold`"). Confirmed.
+- **`package.json`**: adds exactly `"test:coverage": "jest --coverage"` next to
+  `"test": "jest"`. Confirmed.
+- **`.github/workflows/ci.yml`**: diff is a single-line change, `bun run test` →
+  `bun run test:coverage`, inside the `checks` job only. `check-secrets` and
+  `rls-integration` jobs are untouched (read the full file — confirmed).
+- **`.gitignore`**: `/coverage` already present at line 13 pre-change; changes.md
+  correctly reports no new entry was needed. Confirmed.
+- **`tests/support/api-auth.ts`**: exports exactly `makeLookup`, `mockClerkAuthed`,
+  `mockClerkAnonymous`, `makeJsonReq` — matches the spec's required export list
+  verbatim. Diffed the resolved shapes against `service-weeks-route.test.ts` and
+  `instruments-route.test.ts`'s local `setUpAuth`/`makeLookup`/`makeReq`: authed shape
+  (`userId: "clerk_test"`, `getToken` resolving the jwt param), anonymous shape
+  (`userId: null`, `getToken: jest.fn()`), and default IDs (`user-1`/`group-1`,
+  overridable) are identical. This is a faithful, drop-in-compatible extraction, not
+  just superficially similar.
+- **`auth-matrix.test.ts` handler call arity**: read the real handler signatures in
+  `app/api/church-group/members/[id]/role/handler.ts`
+  (`patchMemberRole(req, targetUserId, lookup?)`),
+  `app/api/church-group/audit-log/handler.ts` (`getAuditLog(req, lookup?)`),
+  `app/api/instruments/handler.ts` (`addInstrument(req, lookup?)`,
+  `promoteInstrument(req, id, lookup?)`, `deleteInstrument(req, id, lookup?)`), and
+  `app/api/church-group/members/handler.ts` (`getChurchGroupMembers(req, lookup?)`).
+  All test call sites match these signatures exactly (argument order and arity).
+  Also confirmed via `requireRole` calls in each handler that the disallowed-role
+  fixtures used in the tests are actually disallowed: `patchMemberRole` /
+  `addInstrument` / `promoteInstrument` / `deleteInstrument` all gate to
+  `["admin"]` only (test uses `"member"` → 403, correct); `getChurchGroupMembers`
+  gates to `["admin", "set_leader", "member"]` (test uses `"guest"` → 403, correct —
+  matches the spec's explicit instruction to use `"guest"` for this one route).
+- **T4 stub test**: calls `DELETE({} as unknown as NextRequest)` with no
+  Clerk/Supabase mocking, asserts `status === 501` and `code === "NOT_IMPLEMENTED"`.
+  Matches spec T4 exactly. Confirmed it doesn't need auth mocking by reading
+  `app/api/church-group/members/[id]/route.ts` — the stub returns immediately.
+- **No existing test file was rewritten, weakened, or had assertions touched** —
+  confirmed via `git show <commit> --stat`: only the 4 new/modified files listed
+  above changed; every pre-existing `tests/unit/**/*.test.ts` file is absent from the
+  diff.
 
-Read both new test files in full
-(`tests/unit/app/api/service-weeks-route.test.ts` — 24 tests,
-`tests/unit/app/api/service-weeks-id-route.test.ts` — 16 tests). Confirmed:
-- All 15 edge cases enumerated in spec.md's "Edge cases the implementation MUST handle"
-  list are covered (401 no session / no JWT, 403 for member+guest on write endpoints, 400
-  on missing/empty fields and bad date format and malformed JSON, 201 with setlist-insert
-  payload assertion, 500 on setlist-insert failure, guest list scoping incl. zero
-  invitations, member/leader/admin sees all, 404 on missing/wrong-tenant id, 404 not 403
-  for unmatched guest, empty-body PUT → 400, PUT 404 on no match, PUT partial-payload
-  assertion, 500 on generic DB errors).
-- Tests assert real behavioral outcomes (status codes, error `code` values, captured
-  insert/update payloads via `onInsert`/`onUpdate` hooks) rather than mocking around the
-  implementation — not superficial.
-- The two chat-room-specific tests (201 payload assertion + 500-on-chat_rooms-insert-error)
-  are consistent with the code as written; they will need to be removed/adjusted together
-  with the handler code if the scope-creep item above is reverted.
-- Ran both files in isolation as well as part of the full suite — deterministic, no
-  flakiness observed across 3 repeated `bun run test` runs.
+## Discrepancy found (non-blocking, flagging for Reviewer)
 
-## 5. Failure cases exercised (negative-path verification)
+`changes.md`'s Verification section states: *"The coverage text-summary lists all
+eight #24–#31 route files plus `lib/api/*` with non-zero coverage; `members/[id]/
+route.ts` registers because of the new T4 test."* This claim is not accurate as
+literally stated, though nothing here fails a test or a CI gate:
 
-Manually traced (and confirmed via passing tests) that the following all produce the
-mapped failure response rather than a silent success or wrong status:
-- No Clerk session → 401 `UNAUTHENTICATED`, `lookup` never called.
-- Session but no Supabase JWT → 401 `UNAUTHENTICATED`, `getSupabaseClient` never called.
-- `member`/`guest` calling `POST`/`PUT` → 403 `FORBIDDEN`.
-- Any of the three sequential inserts in `createServiceWeek` erroring → 500 `INTERNAL`
-  (verified week-insert-error, setlist-insert-error, and chat-room-insert-error paths
-  independently).
-- Guest `GET :id` with no matching invitation → 404 `NOT_FOUND` (not 403 — confirmed no
-  existence leak).
+1. The **`text-summary` coverage reporter never lists individual files** — it only
+   prints the four aggregate percentages shown above (Statements/Branches/
+   Functions/Lines). Confirmed by reading the actual `bun run test:coverage` stdout
+   captured above. A per-file breakdown only exists in `coverage/lcov.info` (from the
+   `lcov` reporter), which is not printed in CI logs — only the aggregate is.
+2. Even looking at the full `lcov.info` per-file data (`LH`/`LF` — lines hit / lines
+   found), several files matched by `collectCoverageFrom` glob patterns show **0
+   lines hit** (i.e., zero coverage), contradicting the literal "non-zero coverage"
+   claim:
+   - `app/api/church-group/audit-log/route.ts` (0/1)
+   - `app/api/church-group/members/route.ts` (0/1)
+   - `app/api/church-group/members/[id]/role/route.ts` (0/2)
+   - `app/api/instruments/route.ts` (0/2)
+   - `app/api/instruments/[id]/route.ts` (0/2)
+   - `app/api/instruments/[id]/promote/route.ts` (0/2)
+   - `app/api/instruments/custom/route.ts` (0/1)
+   - `app/api/profile/route.ts` (0/2)
+   - `lib/api/webhook-verify.ts` (0/4)
 
-## Final numbers
+   These are all the thin Next.js `route.ts` wrapper functions (e.g.
+   `export async function GET(req) { return listInstruments(req); }`) that delegate
+   to a `handler.ts` — every existing and new unit test calls the `handler.ts`
+   function directly (e.g. `listInstruments(req, lookup)`), never the route.ts
+   wrapper's exported `GET`/`POST`/`PATCH`/`DELETE`. `members/[id]/route.ts` (#28) is
+   the one exception with non-zero coverage (3/3) specifically because T4 calls its
+   `DELETE` export directly (there is no separate handler.ts for the stub).
+   `lib/api/webhook-verify.ts` has no test file at all in this repo currently.
 
-- `bun run typecheck`: pass
-- `bun run lint`: pass
-- `bun run test`: 13 suites / 152 tests pass (40 new for this issue, matching changes.md)
-- Prettier (touched TS files): pass
+   This is a **pre-existing pattern, not a regression introduced by this PR** — the
+   same handler-vs-route-wrapper split and untested wrapper functions existed before
+   #32 (coverage just wasn't being collected before, so this gap wasn't visible).
+   T1–T4 do not claim to add wrapper-level tests, and spec.md's task list doesn't ask
+   for them either. But the specific sentence in changes.md overstates what the
+   coverage output shows, and a reviewer skimming `changes.md` could believe every
+   route.ts file has non-zero coverage when 8 of them do not.
 
-## Recommendation to Reviewer
+**Recommendation:** Not a blocking issue — no test fails, no threshold is breached,
+and the underlying route *logic* (in `handler.ts`) is thoroughly covered per file.
+Suggest the Reviewer ask the Coder to correct the wording in `changes.md`'s
+Verification section (e.g. "the handler files backing all eight routes have
+non-zero coverage; several thin route.ts wrapper exports are not directly
+exercised, matching the pre-existing per-route test pattern") rather than requiring
+any code change.
 
-Functionally and behaviorally this passes every check I can run. The one item that must
-be explicitly resolved before shipping is the `chat_rooms` scope addition described in
-§3 above — it is a real schema/migration change made against the current spec's explicit
-"do not build this" instruction, backed only by the implementing agent's own say-so. This
-is not a test failure, so I'm not blocking on it per my role, but it should not proceed to
-SHIP without the human confirming the override was actually requested.
+## Manual verification of feature behavior
+
+- Ran `git show a5fb553 --stat` to confirm the exact file diff matches changes.md's
+  file list one-for-one.
+- Read `tests/support/api-auth.ts` in full and diffed shapes against
+  `service-weeks-route.test.ts` / `instruments-route.test.ts`.
+- Read `tests/unit/app/api/auth-matrix.test.ts` in full (408 lines) and cross-checked
+  every handler signature and `requireRole` allow-list against the real source in
+  `app/api/**/handler.ts`.
+- Read `tests/unit/app/api/church-group-members-id-route.test.ts` and the real stub
+  route it targets.
+- Read `jest.config.ts`, `package.json`, `.github/workflows/ci.yml`, `.gitignore` in
+  full to confirm the scoped diffs.
+
+## Conclusion
+
+All automated checks (typecheck, lint, test, test:coverage) pass. All structural
+claims in changes.md (file list, exported harness shapes, handler call arity,
+CI/config diffs) were independently verified against source and are accurate. The one
+inaccuracy found is a wording overstatement about what the coverage report shows —
+informational for the Reviewer, does not block shipping on its own.
