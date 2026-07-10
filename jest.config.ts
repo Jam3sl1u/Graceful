@@ -19,6 +19,15 @@ const config: Config = {
     "^@/(.*)$": "<rootDir>/$1",
   },
   setupFilesAfterEnv: ["<rootDir>/jest.setup.ts"],
+  collectCoverageFrom: [
+    "app/api/church-group/**/*.ts",
+    "app/api/profile/**/*.ts",
+    "app/api/instruments/**/*.ts",
+    "lib/api/**/*.ts",
+  ],
+  coveragePathIgnorePatterns: ["<rootDir>/node_modules/"],
+  coverageDirectory: "<rootDir>/coverage",
+  coverageReporters: ["text-summary", "lcov"],
 };
 
 export default config;

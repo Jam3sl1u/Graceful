@@ -23,7 +23,7 @@ jobs:
 
       - run: bun run lint
 
-      - run: bun run test
+      - run: bun run test:coverage
 
       - run: bun audit --audit-level=high
 
