@@ -1,23 +1,25 @@
-# Changes — Issue #32: API auth-matrix tests for Sprint 0–1 routes
+# Changes — Merge: Issue #32 + Issue #28 (main)
+
+This branch merges `main` (Issue #28 — member removal) into the Issue #32
+auth-matrix/coverage work. Conflict resolution kept both feature sets; the #32
+T4 stub test for `DELETE /api/church-group/members/:id` was superseded by #28's
+full implementation and its 13-test per-route suite.
+
+---
+
+# Issue #32: API auth-matrix tests for Sprint 0–1 routes
 
 ## Open questions — resolution applied
 
-A human resolved spec.md's two OPEN QUESTIONS with: proceed as scoped — add
-coverage reporting config, write auth-matrix tests for the 7 already-implemented
-route groups, and add a test that pins the 501 stub for the #28 route. Defer the
-real auth-matrix for member-removal until #28 is actually implemented. This is
-exactly what spec.md's own "This spec assumes" / default text already described
-for both open questions, so the implementation below follows spec.md as written:
-
-1. `DELETE /api/church-group/members/:id` (#28) is left as a 501 stub; only its
-   current stub behavior is pinned under test (T4). The real four-case auth
-   matrix is deferred until #28 lands.
+1. `DELETE /api/church-group/members/:id` (#28) was a 501 stub when #32 was
+   written; #28 has since landed on `main` and was merged here. The original T4
+   stub-pin test is replaced by #28's full auth-matrix per-route tests (see
+   Issue #28 section below).
 2. No real JWT signing was introduced. The harness mocks `@clerk/nextjs/server`'s
    `auth()` and injects a `UserLookup`, matching the existing per-route test
-   pattern (`tests/unit/app/api/service-weeks-route.test.ts`,
-   `tests/unit/app/api/instruments-route.test.ts`).
+   pattern.
 
-## Files changed
+## Files changed (#32)
 
 ### `jest.config.ts` (modified) — T1
 Added `collectCoverageFrom` (scoped to `app/api/church-group/**`,
@@ -44,61 +46,93 @@ added.
 ### `tests/support/api-auth.ts` (new) — T2
 Reusable auth-matrix harness exporting exactly `makeLookup(role, overrides?)`,
 `mockClerkAuthed(jwt?)`, `mockClerkAnonymous()`, and `makeJsonReq(body?)`, with
-the same resolved shapes as the copy-pasted per-route helpers (`userId:
-"clerk_test"` / `getToken` for authed, `userId: null` for anonymous; default
-fixed IDs `userId: "user-1"`, `churchGroupId: "group-1"`, overridable). It casts
-the mocked `auth` import from `@clerk/nextjs/server` internally; consuming test
-files must still declare `jest.mock("@clerk/nextjs/server", () => ({ auth:
-jest.fn() }))` at the top of their own file so the module registry resolves to
-the same mock instance. No existing test file was rewritten or migrated — this
-module is purely additive.
+the same resolved shapes as the copy-pasted per-route helpers. No existing test
+file was rewritten or migrated — this module is purely additive.
 
 ### `tests/unit/app/api/auth-matrix.test.ts` (new) — T3
 Consolidated auth-matrix pass consuming the harness, covering the admin-gated
 handler-style routes: `patchMemberRole` (#27), `getAuditLog` (#29),
 `addInstrument` / `promoteInstrument` / `deleteInstrument` (#31), and
-`getChurchGroupMembers` (#26, admin-vs-guest gating). For each handler it
-asserts the applicable matrix cells (unauth→401, disallowed-role→403,
-malformed-body→400 for the two routes with a request body, admin-success 2xx),
-calling each handler with the exact argument arity used by its existing
-per-route test file, and reusing (not inventing) the same chainable/RPC
-Supabase mock shapes from those files (`instruments-route.test.ts`,
-`church-group-members-role-route.test.ts`, `audit-log-route.test.ts`,
-`church-group-members-route.test.ts`). `beforeEach` resets both the `auth` and
-`getSupabaseClient` mocks.
+`getChurchGroupMembers` (#26, admin-vs-guest gating).
 
-### `tests/unit/app/api/church-group-members-id-route.test.ts` (new) — T4
-Pins the current 501 stub behavior of `DELETE
-/api/church-group/members/[id]`: calls `DELETE({} as unknown as NextRequest)`
-and asserts `res.status === 501` and `(await res.json()).code ===
-"NOT_IMPLEMENTED"`. Includes a top-of-file comment noting this is issue #28
-(Remove/archive member) and should be replaced with the full auth matrix once
-#28 is implemented. No Clerk/Supabase mocking needed — the stub short-circuits
-before any auth code runs.
+---
 
-## Verification
-- `bun run typecheck` — passes.
-- `bun run lint` — passes (0 errors, 0 warnings; verified with no stray
-  `coverage/` output directory present, since generated coverage artifacts are
-  gitignored but not eslint-ignored).
-- `bun run test` and `bun run test:coverage` — both pass: 16 suites, 192 tests.
-  The coverage text-summary lists all eight #24–#31 route files plus
-  `lib/api/*` with non-zero coverage; `members/[id]/route.ts` registers because
-  of the new T4 test.
-- No existing test file's assertions were touched, weakened, or rewritten.
-- No real network calls or real JWT signing were introduced.
+# Issue #28: Remove/archive member with PII anonymization
 
-## What the Tester should focus on
-- Confirm `tests/support/api-auth.ts`'s exported shapes exactly match what
-  `service-weeks-route.test.ts` / `instruments-route.test.ts` already use, so
-  it's a true drop-in replacement for future sprints (not just superficially
-  similar).
-- In `auth-matrix.test.ts`, confirm each handler call's argument order/arity
-  matches its real per-route test file exactly (e.g. `promoteInstrument(req,
-  id, lookup)`, `getAuditLog(req, lookup)`) and that no assumption papered over
-  a real behavior difference.
-- Confirm the CI diff only swaps `bun run test` → `bun run test:coverage` in
-  the `checks` job and leaves `check-secrets` / `rls-integration` untouched.
-- Confirm `jest.config.ts`'s new coverage fields don't introduce a
-  `coverageThreshold` (none should exist) — a failing threshold would block
-  unrelated PRs, which spec.md explicitly says to avoid.
+All changes below were merged from `main`.
+
+## `supabase/migrations/20260710000001_member_removal_rpc.sql` (new)
+
+- `ALTER TABLE public.users ADD COLUMN anonymized_at timestamptz;` + a partial index
+  (`WHERE anonymized_at IS NULL`) for the active-roster query.
+- `remove_church_group_member(p_target_user_id uuid) RETURNS public.users` —
+  `SECURITY DEFINER` (bypasses RLS to bypass the owner-only policies on
+  `notification_preferences`/`notifications`/`google_calendar_tokens`; the
+  function's own caller-role check is therefore the real "Admin only"
+  enforcement, not RLS). Does, in one transaction:
+  1. Resolves the caller from the JWT; 401 if no session/row.
+  2. 403 if the caller's role isn't `admin`.
+  3. Locks `{target row} ∪ {every current admin row in the group}` in one
+     `ORDER BY id FOR UPDATE` query — a single combined lock acquisition,
+     not two sequential ones, specifically to avoid a deadlock between two
+     concurrent admin removals.
+  4. 404 if the target is missing / wrong group / already anonymized.
+  5. 422 (`LAST_ADMIN`) if the target is the group's last non-anonymized admin.
+  6. Anonymizes `name`/`email`/`phone`/`sms_opted_in`/`clerk_id`/`role`/
+     `anonymized_at` in place.
+  7. Deletes `member_profiles` (cascades `member_instruments`), `availability`,
+     `notification_preferences`, `notifications`, `google_calendar_tokens` for
+     the user. Leaves `invitations`, `event_attendees`,
+     `setlists`/`events`/`service_weeks.created_by`, `conflicts.*` untouched.
+
+## `lib/supabase/types.ts`
+
+- Added `sms_opted_in: boolean` and `anonymized_at: string | null` to `UsersRow`.
+- Added a `remove_church_group_member` entry to `Functions`.
+
+## `app/api/church-group/members/[id]/route.ts`
+
+- Replaced the `notImplemented` DELETE stub with a thin wrapper (awaits
+  `params`, delegates to `deleteMember`), matching the `role/route.ts` pattern.
+
+## `app/api/church-group/members/[id]/handler.ts` (new)
+
+- `deleteMember(req, targetUserId, lookup?)`: `requireAuth` → `requireRole(ctx,
+  ["admin"])` → validate `:id` as a UUID →
+  `supabase.rpc("remove_church_group_member", ...)` → maps RPC error substrings
+  to HTTP codes → `writeAuditLog({ action: "member.removed", ... })` →
+  `ok({ id: targetUserId })`.
+
+## `app/api/church-group/members/handler.ts`
+
+- Added `.is("anonymized_at", null)` to the roster query so removed members no
+  longer appear in the member directory.
+
+## `tests/unit/app/api/church-group-members-id-route.test.ts` (new — 13 tests)
+
+- Full auth-matrix coverage for `deleteMember` (replaces the #32 T4 stub-pin test).
+  Covers 401, 403 per-role, 400, 404/422/403/401 from RPC errors, 500 paths,
+  200 success, and audit-log failure.
+
+## `tests/unit/app/api/church-group-members-route.test.ts`
+
+- Extended the mock query-builder chain to support `.eq().is()`. Added one
+  test asserting the roster query calls `.is("anonymized_at", null)`.
+
+## `tests/integration/rls/tables/member-removal.test.ts` (new)
+
+- RPC integration tests including BR-12 concurrent-removal locking.
+
+## Verification (post-merge)
+
+- `bun run typecheck` — must pass.
+- `bun run lint` — must pass.
+- `bun run test` and `bun run test:coverage` — must pass (combined suite).
+- `bun run test:rls` — integration file loads; skipped without live Supabase.
+
+## What the Reviewer should focus on
+
+- #32: harness shapes, handler call arity in `auth-matrix.test.ts`, CI coverage
+  config has no `coverageThreshold`.
+- #28: RPC locking strategy, integration test gap (run `test:rls` against live DB
+  before merge if possible).

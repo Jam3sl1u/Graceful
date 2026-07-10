@@ -36,7 +36,8 @@ export async function getChurchGroupMembers(
       supabase
         .from("users")
         .select("id, name, role, email, phone")
-        .eq("church_group_id", ctx.churchGroupId),
+        .eq("church_group_id", ctx.churchGroupId)
+        .is("anonymized_at", null),
       supabase.from("member_profiles").select("id, user_id, vocal_capability"),
       supabase.from("member_instruments").select("member_profile_id, instrument_id"),
       supabase.from("instruments").select("id, name").eq("church_group_id", ctx.churchGroupId),

@@ -50,17 +50,28 @@ function makeSupabaseClient(overrides: Partial<Record<string, QueryResult>> = {}
     ...overrides,
   };
 
+  const eqMock = jest.fn();
+  const isMock = jest.fn();
+
   return {
     from: jest.fn((table: string) => ({
       select: jest.fn(() => {
         const result = fixtures[table];
         const chain = Promise.resolve(result) as Promise<QueryResult> & {
           eq: jest.Mock;
+          is: jest.Mock;
         };
-        chain.eq = jest.fn(() => Promise.resolve(result));
+        chain.eq = eqMock.mockImplementation(() => {
+          const eqChain = Promise.resolve(result) as Promise<QueryResult> & { is: jest.Mock };
+          eqChain.is = isMock.mockImplementation(() => Promise.resolve(result));
+          return eqChain;
+        });
+        chain.is = isMock;
         return chain;
       }),
     })),
+    _eqMock: eqMock,
+    _isMock: isMock,
   };
 }
 
@@ -241,6 +252,17 @@ describe("GET /api/church-group/members", () => {
     const memberTwo = members.find((m) => m.id === "user-2")!;
     expect(memberTwo.vocalCapability).toBe("lead");
     expect(memberTwo.instruments).toEqual([]);
+  });
+
+  it("filters the roster query to exclude anonymized (removed) members", async () => {
+    setUpAuth();
+    const client = makeSupabaseClient();
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await getChurchGroupMembers(fakeReq, makeLookup("admin"));
+    expect(res.status).toBe(200);
+    expect(client._eqMock).toHaveBeenCalledWith("church_group_id", CHURCH_GROUP_ID);
+    expect(client._isMock).toHaveBeenCalledWith("anonymized_at", null);
   });
 
   it("returns a one-element array when the caller is the only user in the group", async () => {

@@ -362,12 +362,23 @@ describe("getChurchGroupMembers (#26, admin-vs-guest gating)", () => {
       ...overrides,
     };
 
+    const eqMock = jest.fn();
+    const isMock = jest.fn();
+
     return {
       from: jest.fn((table: string) => ({
         select: jest.fn(() => {
           const result = fixtures[table];
-          const chain = Promise.resolve(result) as Promise<QueryResult> & { eq: jest.Mock };
-          chain.eq = jest.fn(() => Promise.resolve(result));
+          const chain = Promise.resolve(result) as Promise<QueryResult> & {
+            eq: jest.Mock;
+            is: jest.Mock;
+          };
+          chain.eq = eqMock.mockImplementation(() => {
+            const eqChain = Promise.resolve(result) as Promise<QueryResult> & { is: jest.Mock };
+            eqChain.is = isMock.mockImplementation(() => Promise.resolve(result));
+            return eqChain;
+          });
+          chain.is = isMock;
           return chain;
         }),
       })),
