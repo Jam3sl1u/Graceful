@@ -1,14 +1,19 @@
 import { NextRequest } from "next/server";
 import { notImplemented } from "@/lib/api/response";
+import { getServiceWeek, updateServiceWeek } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/service-weeks/[id]");
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function GET(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return getServiceWeek(req, id);
 }
 
-export async function PUT(_req: NextRequest) {
-  return notImplemented("PUT /api/service-weeks/[id]");
+export async function PUT(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return updateServiceWeek(req, id);
 }
 
 export async function DELETE(_req: NextRequest) {
-  return notImplemented("DELETE /api/service-weeks/[id]");
+  return notImplemented("DELETE /api/service-weeks/[id]"); // #38 — out of scope
 }

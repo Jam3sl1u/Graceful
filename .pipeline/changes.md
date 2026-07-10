@@ -1,91 +1,85 @@
-# Changes — Issue #27: Role assignment & multi-admin support
+# Changes — Issue #37: Service Week CRUD
 
-## Context: why this file previously described the wrong issue
-A prior automated pipeline run on this branch produced **zero commits** for
-#27 — the Coder stage silently no-op'd, leaving `.pipeline/spec.md`/
-`changes.md` describing issue #26 (already shipped) and the target route
-still an unimplemented stub. The Tester and Reviewer stages both caught this
-independently and issued BLOCK verdicts (see `6499592` in git history). This
-file documents the actual manual implementation that followed.
+## Open questions resolved per spec.md
 
-## Prerequisite: branch brought current with `origin/main`
-This branch was 15 commits behind `origin/main`, missing #29's audit-log
-infrastructure (`lib/audit/write-audit-log.ts`, the `write_audit_log` RPC,
-`schemas/audit-log.ts`) that this issue's AC requires. Merged `origin/main`
-in (merge, not rebase, since the branch's PR was already open/pushed);
-resolved the two doc-only conflicts (`.pipeline/review.md`,
-`test-results.md`) by taking `origin/main`'s side, since both are rewritten
-below anyway. No application-code conflicts.
+1. **Chat room placeholder stays deferred**, per spec.md's OPEN QUESTION 1: there is
+   no `chat_rooms` table (`20260702000005_cluster_5_partial.sql` explicitly defers all
+   of chat to Phase 2), so `POST /api/service-weeks` auto-creates the draft setlist
+   only. The chat room placeholder is left for a follow-up issue with its own migration.
+2. **All five create fields are required** (already matched spec.md's stated
+   decision — no change needed here beyond implementing it).
 
 ## Files changed
 
-### `schemas/role.ts` (new)
-`updateRoleSchema = z.object({ role: z.enum(["admin", "set_leader",
-"member", "guest"]) })`, mirroring `schemas/church-group.ts`'s style.
+### `lib/supabase/types.ts` (modified)
+- Added three hand-written table types to `Database["public"]["Tables"]`:
+  `service_weeks`, `setlists`, `invitations` (per spec.md §2). Each follows the
+  existing `Row`/`Insert`/`Update`/`Relationships: []` shape; `Insert` omits
+  DB-defaulted columns (`id`, `created_at`, `is_cancelled` / `status`+`published_at`+
+  `notes`) as optional. Imports `SetlistStatus`/`InvitationStatus` from `@/types/domain`.
 
-### `app/api/church-group/members/[id]/role/handler.ts` (new)
-`patchMemberRole(req, targetUserId, lookup?)` implementing the full control
-flow: `requireAuth` → `requireRole(["admin"])` → path-id/body validation →
-target-user lookup (404 if missing/cross-group) → BR-12 last-admin check
-(422) → `update` → `writeAuditLog` (`action: "user.role_changed"`,
-`metadata: { old_value, new_value }`) → `ok({ id, role })`. This is:
-- The first real consumer of `writeAuditLog` outside its own unit test.
-- The first `.update()` call anywhere in this codebase (no existing pattern
-  to copy; `Database["public"]["Tables"]["users"]["Update"]` already
-  supported `{ role }` with no type changes needed).
+### `schemas/service-weeks.ts` (rewritten)
+- Replaced the empty placeholder with `createServiceWeekSchema` (all five fields —
+  `serviceDate`, `title`, `sermonTopic`, `sermonScripture`, `speakerName` —
+  required, non-empty after trim, per the issue AC) and `updateServiceWeekSchema`
+  (all fields optional, `.refine` requires at least one key present).
 
-### `app/api/church-group/members/[id]/role/route.ts` (rewritten from stub)
-Was a `notImplemented` PATCH stub; now unwraps Next 15's async `params` and
-delegates to `patchMemberRole`, matching the
-`app/api/instruments/[id]/route.ts` pattern exactly.
+### `app/api/service-weeks/handler.ts` (new)
+- `toServiceWeekResponse` (exported, reused by `[id]/handler.ts`) maps the DB row
+  (snake_case) to the camelCase `ServiceWeekResponse` shape.
+- `listServiceWeeks` — any authenticated member; guests are scoped to weeks they
+  have an `invitations` row for (queries `invitations.user_id`, collects
+  `service_week_id`s, then `.in("id", ids)` on `service_weeks`; zero invitations ⇒
+  `{ serviceWeeks: [] }` without querying `service_weeks` at all).
+- `createServiceWeek` — set_leader/admin only (`requireRole`). Validates with
+  `createServiceWeekSchema`, inserts `service_weeks`, then sequentially inserts
+  the draft `setlists` row (no explicit `status` — DB default `'draft'`). Either
+  insert failing → 500 `INTERNAL`; an orphaned week on setlist-insert failure is
+  an accepted edge case (no transaction/RPC in scope), matching spec.md's stated
+  tradeoff.
 
-### `tests/unit/app/api/church-group-members-role-route.test.ts` (new)
-20 cases: 401 (no Clerk user; no JWT), 403 for each of
-set_leader/member/guest, 400 for invalid role value / non-JSON body /
-malformed target-id UUID, 404 for missing target and cross-group target,
-422 for BR-12 (including self-demotion as sole admin), 200 for demoting an
-admin with a co-admin present (including self-demotion with a co-admin),
-200 for promoting a second admin (BR-03/BR-04, asserted via call-count that
-no admin-count query is made for promotions), 200 for a same-role no-op
-PATCH (still audit-logged), and 500 for target-lookup/count/update/
-audit-log failures. Uses a queue-based chainable Supabase query-builder mock
-(no existing test mocked a multi-call-same-table sequence with mixed
-`.select()+.eq()+.maybeSingle()`, a bare-count `.select(...).eq().eq()`, and
-`.update()...maybeSingle()` shapes, so this is a new small mock utility
-local to this file).
+### `app/api/service-weeks/route.ts` (rewritten)
+- Thin `GET`/`POST` delegators to the new handler, replacing the `notImplemented`
+  stubs.
 
-## Design note flagged for reviewers (not fixed here, out of scope)
-The `users_update_leader_admin` RLS policy permits any `set_leader` **or**
-`admin` to `UPDATE` any same-group `users` row at the Postgres layer, with
-no column-level restriction. `requireRole(ctx, ["admin"])` in this handler
-is therefore the **sole** enforcement point for both "only admins may change
-role" and "this route is the only writer of `users.role`" — a future route
-doing a raw `.update()` on `users` could still write `role` at the DB layer.
-A real fix (column-level RLS or a dedicated RPC) is a larger, separate
-change.
+### `app/api/service-weeks/[id]/handler.ts` (new)
+- `getServiceWeek` — any authenticated member; 404 (not 403) for a guest with no
+  matching invitation, so existence isn't leaked. 404 for wrong-tenant/missing id.
+- `updateServiceWeek` — set_leader/admin only. Builds a snake_case patch object
+  from only the provided fields, `.update(...).eq("id", id).eq("church_group_id",
+  ...)`. No matching row → 404.
 
-## No changes needed (confirmed, not touched)
-- `lib/api/auth.ts`, `lib/api/errors.ts`, `lib/api/response.ts`,
-  `lib/supabase/client.ts` — reused as-is.
-- `lib/supabase/types.ts` — `users.Update` already typed for `{ role }`.
+### `app/api/service-weeks/[id]/route.ts` (rewritten)
+- `GET`/`PUT` now delegate (Next 15 async `params`); `DELETE` untouched —
+  still `notImplemented("DELETE /api/service-weeks/[id]")` (#38, out of scope).
+
+### `tests/unit/app/api/service-weeks-route.test.ts` (new — 22 tests)
+### `tests/unit/app/api/service-weeks-id-route.test.ts` (new — 16 tests)
+- Copy the `profile-route.test.ts` / `instruments-route.test.ts` mock harness
+  (`jest.mock` Clerk + Supabase client, `makeLookup(role)`, `setUpAuth(jwt)`, a
+  thenable `makeChain(result)` supporting `.eq/.order/.in/.select/.maybeSingle`
+  chains keyed per table+operation).
+- Cover every edge case in spec.md's list.
 
 ## Verification
 - `bun run typecheck` — passes.
 - `bun run lint` — passes.
-- `bun run test` — 12 suites / 132 tests pass (20 new for this route; no
-  regressions in the suites pulled in by the `origin/main` merge).
-- `bun run format:check` — the 4 files this issue touched are formatted;
-  16 pre-existing files flagged by prettier (brought in by the
-  `origin/main` merge, e.g. `tests/integration/rls/**`, README.md,
-  tsconfig.json) were already unformatted before this change and are out of
-  this issue's scope.
+- `bun run test` — full suite passes.
+- `bun run format:check` (touched files only, via `prettier --write`) — clean;
+  the rest of the repo has pre-existing Prettier drift unrelated to this change,
+  left untouched.
+- Not run: `bun run test:rls` (integration tests against a live Supabase
+  instance) — this is a code-review environment with no DB. `service_weeks`,
+  `setlists`, and `invitations` (and their RLS policies) are pre-existing from
+  the Cluster 3 schema (#18) and were not modified by this issue.
 
-## What a reviewer should focus on
-- BR-12's exact trigger condition (`target.role === "admin" && newRole !==
-  "admin"`, count ≤ 1) — confirm it never fires for promotions or same-role
-  no-ops, and always fires for self-demotion identically to any other
-  demotion.
-- The 404-not-403 decision for missing/cross-group targets (Open Question 1
-  in `spec.md`).
-- The `old_value`/`new_value` metadata key choice against #29's actual
-  contract, not just the issue text.
+## What the Tester should focus on
+- `createServiceWeek` does two sequential inserts (week → setlist); confirm the
+  ordering and the "accepted orphan on later failure" tradeoff is acceptable.
+- Guest scoping in both `listServiceWeeks` and `getServiceWeek` — 404 (not 403)
+  is deliberate to avoid leaking existence to guests without an invitation.
+- Out of scope, intentionally not touched: `DELETE /api/service-weeks/:id`,
+  `/cancel`, `/reactivate` (#38/#39), setlist song editing/publish, event CRUD,
+  invitation sending (#54/#59/#40), and chat room/message functionality (no
+  `chat_rooms` table exists yet — deferred to Phase 2 per spec.md OPEN QUESTION 1;
+  tracked as a follow-up issue rather than built here).

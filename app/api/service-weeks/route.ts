@@ -1,10 +1,10 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { listServiceWeeks, createServiceWeek } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/service-weeks");
+export async function GET(req: NextRequest): Promise<Response> {
+  return listServiceWeeks(req);
 }
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/service-weeks");
+export async function POST(req: NextRequest): Promise<Response> {
+  return createServiceWeek(req);
 }

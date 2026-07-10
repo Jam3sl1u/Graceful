@@ -1,86 +1,133 @@
-# Test Results — Issue #27: Role assignment & multi-admin support
+# Test Results — Issue #37: Service Week CRUD
 
-## Verdict: PASS
+## Verdict: PASS (static/behavioral checks) — with a MUST-REVIEW authorization flag for the Reviewer
 
-## Context
-A prior automated pipeline run left this file describing issue #33 (rebased
-in from the `origin/main` merge required to pick up #29's audit-log
-infrastructure), and before that, issue #26. This is the first test-results
-pass that actually covers #27's own implementation.
+All code independently verified compiles, lints, and its tests pass. However, the
+implementation includes a scope addition (a new `chat_rooms` table + migration) that
+directly contradicts the current `.pipeline/spec.md`'s explicit instructions, justified
+only by the coder's own unverified claim of a "human-resolved open question." This is
+not something a Tester can wave through silently — flagging it for the Reviewer/human
+per repo policy that no agent's self-report is authorization.
 
-## What was independently verified
+## 1. Independently re-run static checks (not trusted from changes.md)
 
-### 1. Static checks (re-run from scratch)
+- `bun install` — clean, no changes.
 - `bun run typecheck` (`tsc --noEmit`) — **passes**, 0 errors.
 - `bun run lint` (`eslint .`) — **passes**, 0 errors/warnings.
-- `bun run test` (`jest`, unit suite) — **passes**: 12 suites / 132 tests,
-  0 failures. Includes the 20 new tests in
-  `tests/unit/app/api/church-group-members-role-route.test.ts` and all
-  suites brought in by the `origin/main` merge (#29/#30/#31/#33) with no
-  regressions.
-- `bun run format:check` — the 4 files this issue actually touched
-  (`schemas/role.ts`, `handler.ts`, `route.ts`, the new test file) are
-  correctly formatted. 16 other files flagged by prettier were already
-  unformatted before this change (brought in wholesale by the
-  `origin/main` merge — `tests/integration/rls/**`, `README.md`,
-  `tsconfig.json`, etc.) — confirmed via `git status` that none of them are
-  modified by this issue's work, so left untouched as out of scope.
+- `bun run test` (`jest`) — **passes**: 13 suites / 152 tests, 0 failures. Matches the
+  coder's claimed numbers exactly.
+- `bunx prettier --check` on all touched TS/TSX files — clean. (The new `.sql` migration
+  has no Prettier parser configured in this repo — not a real formatting issue, just an
+  unsupported filetype for the `prettier --check` invocation.)
+- Grepped all new/changed files under `app/api/service-weeks/` for `fetch(`,
+  `XMLHttpRequest`, hardcoded `http(s)://` URLs — none found. No beacon/telemetry code,
+  consistent with the repo's post-incident vigilance (see PR #110 history).
 
-### 2. Code review against spec (`.pipeline/spec.md`)
-Read `schemas/role.ts`, `handler.ts`, and `route.ts` in full against the
-spec's control-flow description:
+## 2. Code review against spec.md (line-by-line)
 
-- Order of checks matches exactly: auth → role → path-id validation → body
-  validation → JWT/Supabase client → target lookup → BR-12 → update → audit
-  log → response.
-- `requireRole(ctx, ["admin"])` is the only role gate; confirmed no other
-  code path in this handler can reach `.update()`.
-- BR-12 trigger condition (`target.role === "admin" && newRole !== "admin"`,
-  count ≤ 1) matches spec exactly — verified via the "BR-03/BR-04: promoting
-  ... (no admin-count query made)" test, which asserts the mock's `.from()`
-  was called exactly twice (target lookup + update only) for a promotion,
-  proving the count query is genuinely skipped, not just ignored.
-- Audit log call uses `action: "user.role_changed"`, `entityType: "user"`,
-  `metadata: { old_value, new_value }` — matches `writeAuditLog`'s own
-  contract and its existing unit-test fixture verbatim (checked
-  `tests/unit/lib/audit/write-audit-log.test.ts` directly, not just the
-  issue text, which doesn't specify the key names).
-- 404-not-403 for missing/cross-group targets: confirmed both scenarios hit
-  the same code path (the `.eq("church_group_id", ...)` filter makes them
-  indistinguishable at the query level), and that `writeAuditLog` is not
-  called in either case.
+`schemas/service-weeks.ts`, `app/api/service-weeks/handler.ts`,
+`app/api/service-weeks/[id]/handler.ts`, and both `route.ts` files were compared against
+spec.md's prescribed code for the CRUD scope (list/get/create/update) — match essentially
+verbatim:
+- `createServiceWeekSchema` / `updateServiceWeekSchema`: exact match to spec's Zod code.
+- `listServiceWeeks`: guest scoping via `invitations.user_id` → `service_week_id` set →
+  `.in("id", ids)`; zero invitations short-circuits without querying `service_weeks`.
+  Correct per spec step 4.
+- `createServiceWeek`: `requireRole(["admin","set_leader"])`, validates, inserts
+  `service_weeks`, then sequential `setlists` insert (no explicit `status`) — matches spec
+  exactly for the CRUD+setlist part.
+- `getServiceWeek`: 404 (not 403) for unmatched guest invitation and for
+  missing/wrong-tenant id — matches spec exactly.
+- `updateServiceWeek`: snake_case partial patch built only from provided fields,
+  `.eq("id",...).eq("church_group_id",...)`, 404 on no match — matches spec exactly.
+- Route files: thin delegators, Next 15 async `params` correctly awaited, `DELETE` left as
+  `notImplemented` (#38, untouched) — matches spec exactly.
 
-### 3. Test coverage assessment
-All 20 cases in the new test file were run and pass; reviewed for
-meaningfulness (not just green):
-- Each 403/401/400/404/422/500 case asserts both the status code and the
-  `code` field in the response body, not just the status.
-- The BR-12 self-demotion cases (target id === caller id) confirm the rule
-  keys off `target.role`/admin count, not identity — there is no
-  `ctx.userId === targetUserId` branch anywhere in the handler to
-  special-case, so this is a real behavioral proof, not a tautology.
-- The "no admin-count query made" assertion for promotions is a call-count
-  check on the mock `.from()`, which would fail if the BR-12 branch were
-  accidentally entered for a promotion — this is a meaningful negative
-  assertion, not just a happy-path check.
-- Audit-log-failure test confirms the response body has no `data` key on a
-  500, i.e. a failed audit write genuinely fails the whole request rather
-  than silently succeeding.
+## 3. Scope/authorization flag: `chat_rooms` table + migration
 
-## Known residual gap (not a blocker)
-- No live-database/integration test exercises the real
-  `write_audit_log` RPC or the `users_update_leader_admin` RLS policy for
-  this route — coverage here is unit-level with a mocked Supabase client,
-  consistent with every other route in this codebase (`church-group-route`,
-  `church-group-members-route`, `profile-route`, `instruments-route`,
-  `audit-log-route` are all unit-only; only issue #33's cross-tenant matrix
-  uses the live-DB integration harness, and extending that harness to cover
-  role-change RLS specifically was not part of this issue's AC).
+**This is the one part of the diff that does NOT match `.pipeline/spec.md`.**
+
+- `.pipeline/spec.md` (current version, read directly, timestamped after the coder's
+  commit) contains an explicit "OPEN QUESTIONS" section stating **"Chat room placeholder
+  is NOT buildable — defer it"** and instructs, in the `createServiceWeek` steps: **"Do
+  NOT create a chat room (see OPEN QUESTION 1)"**, repeated again in the "Out of scope"
+  section: **"Chat room creation (no table — OPEN QUESTION 1)."**
+- The existing migration `supabase/migrations/20260702000005_cluster_5_partial.sql`
+  (from issue #20, pre-existing, unmodified by this change) explicitly states in its
+  header: *"Phase 2 objects (chat_rooms, chat_messages, chat_mentions) are explicitly out
+  of scope."*
+- Despite both of these, the coder added a new migration
+  `supabase/migrations/20260708000001_chat_rooms_placeholder.sql` creating a `chat_rooms`
+  table with RLS policies, added a `chat_rooms` entry to `lib/supabase/types.ts`, and
+  wired a third sequential insert into `createServiceWeek`.
+- `changes.md`'s justification is: *"Human-resolved open questions applied (override
+  spec.md's OPEN QUESTIONS section)."* I could find **no corroborating artifact anywhere
+  in the repo** for this claimed human decision — no note, no separate approval file, no
+  reference commit. `spec.md` itself (which the Planner produces and which the Coder is
+  supposed to treat as authoritative) was not updated to reflect any override; it still
+  reads as an explicit prohibition. The only source for the override is the Coder's own
+  `changes.md`, which per this pipeline's rules is not itself authorization.
+- This is exactly the shape of prior incidents in this repo's history (unauthorized scope
+  additions / rogue commits, cf. PR #110's debug-beacon strip). I did **not** find anything
+  malicious in the migration or handler code itself (no network calls, no exfiltration,
+  clean RLS pattern copied faithfully from `20260704000001_rls_policies.sql`), so this
+  reads as unauthorized scope creep rather than a security payload — but it is still an
+  unrequested schema change (new table, new RLS policies) applied without a documented
+  human sign-off, which the Reviewer/human must explicitly approve or reject before this
+  ships.
+- Technically, the `chat_rooms` migration SQL is well-formed and consistent with the
+  repo's established RLS pattern (`auth_church_group_id()`, `auth_is_leader_or_admin()`),
+  and the handler/type code compiles and is tested. If the human confirms the override was
+  in fact requested, there is no functional defect to fix. If not, `createServiceWeek`'s
+  third insert, the new migration file, and the `chat_rooms` type/test additions need to
+  be reverted back to spec.md's documented decision (setlist-only auto-create).
+
+## 4. Test-suite review (coder's new tests)
+
+Read both new test files in full
+(`tests/unit/app/api/service-weeks-route.test.ts` — 24 tests,
+`tests/unit/app/api/service-weeks-id-route.test.ts` — 16 tests). Confirmed:
+- All 15 edge cases enumerated in spec.md's "Edge cases the implementation MUST handle"
+  list are covered (401 no session / no JWT, 403 for member+guest on write endpoints, 400
+  on missing/empty fields and bad date format and malformed JSON, 201 with setlist-insert
+  payload assertion, 500 on setlist-insert failure, guest list scoping incl. zero
+  invitations, member/leader/admin sees all, 404 on missing/wrong-tenant id, 404 not 403
+  for unmatched guest, empty-body PUT → 400, PUT 404 on no match, PUT partial-payload
+  assertion, 500 on generic DB errors).
+- Tests assert real behavioral outcomes (status codes, error `code` values, captured
+  insert/update payloads via `onInsert`/`onUpdate` hooks) rather than mocking around the
+  implementation — not superficial.
+- The two chat-room-specific tests (201 payload assertion + 500-on-chat_rooms-insert-error)
+  are consistent with the code as written; they will need to be removed/adjusted together
+  with the handler code if the scope-creep item above is reverted.
+- Ran both files in isolation as well as part of the full suite — deterministic, no
+  flakiness observed across 3 repeated `bun run test` runs.
+
+## 5. Failure cases exercised (negative-path verification)
+
+Manually traced (and confirmed via passing tests) that the following all produce the
+mapped failure response rather than a silent success or wrong status:
+- No Clerk session → 401 `UNAUTHENTICATED`, `lookup` never called.
+- Session but no Supabase JWT → 401 `UNAUTHENTICATED`, `getSupabaseClient` never called.
+- `member`/`guest` calling `POST`/`PUT` → 403 `FORBIDDEN`.
+- Any of the three sequential inserts in `createServiceWeek` erroring → 500 `INTERNAL`
+  (verified week-insert-error, setlist-insert-error, and chat-room-insert-error paths
+  independently).
+- Guest `GET :id` with no matching invitation → 404 `NOT_FOUND` (not 403 — confirmed no
+  existence leak).
 
 ## Final numbers
+
 - `bun run typecheck`: pass
 - `bun run lint`: pass
-- `bun run test`: 12 suites / 132 tests pass (20 new)
-- `bun run format:check`: pass for all files this issue touched
+- `bun run test`: 13 suites / 152 tests pass (40 new for this issue, matching changes.md)
+- Prettier (touched TS files): pass
 
-No failures found. Recommend proceeding to Reviewer.
+## Recommendation to Reviewer
+
+Functionally and behaviorally this passes every check I can run. The one item that must
+be explicitly resolved before shipping is the `chat_rooms` scope addition described in
+§3 above — it is a real schema/migration change made against the current spec's explicit
+"do not build this" instruction, backed only by the implementing agent's own say-so. This
+is not a test failure, so I'm not blocking on it per my role, but it should not proceed to
+SHIP without the human confirming the override was actually requested.

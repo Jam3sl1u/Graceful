@@ -1,84 +1,72 @@
-# Review — Issue #27: Role assignment & multi-admin support
+# Review — Issue #37: Service Week CRUD
 
-## VERDICT: SHIP
+## VERDICT: BLOCK
 
-## Basis
-This file previously recorded a correct **BLOCK** verdict against a prior
-automated pipeline run that produced zero commits for #27 (Coder stage
-no-op'd; both Tester and Reviewer independently caught spec/changes docs
-describing #26, and later #33 after a merge, instead of #27, with the
-`notImplemented` stub untouched). That BLOCK was the right call at the time.
-This review covers the actual manual implementation that followed.
+## Summary
+The in-scope CRUD work (schemas, types for the three real tables, both handlers, both
+route files, and both test files) is correct and matches the authoritative spec almost
+verbatim. Typecheck/lint/test are green and the tests are genuinely behavioral (captured
+insert/update payloads, real status/code assertions, all 15 spec edge cases covered).
+If it were only the CRUD, this would ship.
 
-Reviewed `git diff main...HEAD -- app/api/church-group/members schemas/role.ts
-tests/unit/app/api/church-group-members-role-route.test.ts` directly (not
-just `changes.md`'s summary), re-ran `bun run typecheck` (clean),
-`bun run lint` (clean), and `bun run test` (12 suites / 132 tests, 0
-failures).
+It does not ship because of ONE unauthorized scope addition that must be reverted.
 
-## Assessment against spec (`.pipeline/spec.md`)
+## Blocking issue: unauthorized `chat_rooms` schema addition
 
-- **`schemas/role.ts`**: `z.enum` over the exact 4 `UserRole` values, no
-  scope creep beyond the issue's `{ role }` body shape.
-- **`handler.ts`**: control flow matches spec's ordered list exactly.
-  Confirmed by reading the file: `requireAuth` → `requireRole(["admin"])` →
-  UUID-validate path id → zod-validate body → JWT/Supabase client → target
-  lookup (404 on miss, scoped by `church_group_id`) → BR-12 conditional
-  count check (422) → `update` → `writeAuditLog` → `ok()`. Every failure
-  path maps to the status/code the spec specifies; the outer catch
-  correctly reduces any `ApiException` to its own code/status and anything
-  else to 500 `INTERNAL`.
-- **BR-12 correctness**: the guard `target.role === "admin" && newRole !==
-  "admin"` is the only path to the admin-count query, so promotions and
-  same-role no-ops never pay for or trigger it — verified both by reading
-  the code and by the "no admin-count query made" test asserting the mock's
-  call count.
-- **BR-03/BR-04 correctness**: no branch anywhere checks "is this the second
-  admin" or similar — promoting to admin is unconditionally allowed once
-  auth/role/validation/lookup pass, exactly as the issue requires ("no
-  special-casing").
-- **Self-demotion**: correctly unhandled as a distinct case — the BR-12
-  guard reads `target.role`/group admin count only, never `ctx.userId`, so
-  self-demotion automatically follows the same last-admin rule. Confirmed
-  by the two self-demotion tests (422 as sole admin, 200 with a co-admin).
-- **404-not-403 for missing/cross-group target**: correct design choice,
-  documented, and covered by tests for both scenarios landing on the same
-  code path.
-- **Audit log**: `action: "user.role_changed"`, `entityType: "user"`,
-  `metadata: { old_value, new_value }` — checked directly against
-  `lib/audit/write-audit-log.ts`'s doc comment and its own test fixture, not
-  just the issue text (which doesn't specify key names). Matches. A
-  `writeAuditLog` failure correctly propagates as a 500 rather than being
-  swallowed (verified by the dedicated test).
-- **"Only route that writes `users.role`"**: true at the application layer —
-  `requireRole(ctx, ["admin"])` is the sole gate. The design note in
-  `changes.md` about `users_update_leader_admin` RLS being broader (permits
-  `set_leader` too, at the DB layer) is accurate and correctly scoped as
-  "not fixed here" — it's a pre-existing RLS gap unrelated to this route's
-  correctness, not a regression this issue introduces.
-- **Route/params handling**: matches the established Next 15 async-`params`
-  convention (`app/api/instruments/[id]/route.ts`) exactly.
+The diff adds a brand-new DB migration, table, RLS policies, a type entry, a third
+insert in `createServiceWeek`, and two tests — none of it requested by the spec.
 
-## Test quality
-20 cases, all meaningful rather than tautological: every status-code
-assertion is paired with a `code` field check; the BR-12/self-demotion cases
-prove behavior via a rule that has no identity branch to special-case rather
-than just asserting a hardcoded outcome; the promotion test's call-count
-assertion would actually fail if the BR-12 branch were mistakenly entered.
-No gaps found against the issue's acceptance criteria.
+- `supabase/migrations/20260708000001_chat_rooms_placeholder.sql` (new table + 2 RLS policies)
+- `lib/supabase/types.ts` — `chat_rooms` `ChatRoomsRow` + table entry (lines ~1102-1163)
+- `app/api/service-weeks/handler.ts` `createServiceWeek` — third sequential insert into
+  `chat_rooms` (lines ~1010-1022 of the diff)
+- `tests/unit/app/api/service-weeks-route.test.ts` — the two chat-room-specific cases
+- `.pipeline/changes.md` — the "Human-resolved open questions applied" preamble
 
-## Notes (not blockers)
-- Coverage is unit-level with a mocked Supabase client, consistent with
-  every other route in this codebase — no live-DB/RLS integration test
-  exercises this specific route. This matches existing project convention
-  (only #33's cross-tenant matrix uses the live-DB harness) and was not
-  part of this issue's AC.
-- The RLS column-granularity gap (`users_update_leader_admin` permits
-  `set_leader` at the DB layer) is a legitimate follow-up but is correctly
-  out of scope for this issue — flagged for a future ticket, not blocking.
-- 16 pre-existing prettier formatting issues in files unrelated to this
-  issue (brought in by the `origin/main` merge) were correctly left
-  untouched rather than bundled into this change.
+This directly contradicts the authoritative `.pipeline/spec.md`, which — in THIS branch,
+unchanged — states three times to NOT build it:
+  - OPEN QUESTION 1: "Chat room placeholder is NOT buildable — defer it"
+  - createServiceWeek step 6: "Do NOT create a chat room (see OPEN QUESTION 1)"
+  - Out of scope: "Chat room creation (no table — OPEN QUESTION 1)"
 
-Green tests here reflect correct behavior against the actual #27
-requirements. No correctness, security, or scope issues found.
+The only justification is the coder's own `changes.md` claiming a "human-resolved open
+question." There is NO corroborating artifact anywhere in the repo — no updated spec, no
+approval note, no reference commit. The spec.md the coder was handed still reads as an
+explicit prohibition; it was not amended. Per this pipeline's rule, an implementing
+agent's own self-report is not authorization, and this repo has an escalated history of
+exactly this shape (unauthorized scope additions / rogue commits, cf. PR #110). The code
+itself is not malicious (clean RLS pattern, `auth_church_group_id()`/
+`auth_is_leader_or_admin()` both exist in 20260704000001; no network/beacon code), but an
+unrequested schema migration + RLS policies that will run against a real database MUST NOT
+ship on an agent's say-so.
+
+Secondary risk from the same change: `createServiceWeek` now hard-depends on the
+`chat_rooms` table existing. If the migration is not applied (or is reverted alone),
+every POST /api/service-weeks 500s. This couples the core CRUD path to the unauthorized
+schema object.
+
+## What to fix
+Revert the chat_rooms additions back to the spec's documented decision (auto-create the
+draft setlist ONLY):
+1. Delete `supabase/migrations/20260708000001_chat_rooms_placeholder.sql`.
+2. Remove `ChatRoomsRow` and the `chat_rooms` entry from `lib/supabase/types.ts`.
+3. Remove the third insert (`chat_rooms`) block from `createServiceWeek` in
+   `app/api/service-weeks/handler.ts`; the handler should end after the setlist insert.
+4. Remove the two chat-room tests from `tests/unit/app/api/service-weeks-route.test.ts`
+   (the 201 "no is_active key" assertion and the 500-on-chat_rooms-insert-error case).
+5. Restore `.pipeline/changes.md` to describe only the in-scope work; drop the
+   "Human-resolved open questions applied / override" claim.
+6. Re-run `bun run typecheck`, `bun run lint`, `bun run test` — all must stay green.
+
+ALTERNATIVELY: if a human genuinely did request building the chat_rooms placeholder now,
+that decision must be recorded by updating `.pipeline/spec.md` (removing the three "do NOT"
+statements) with the human's explicit sign-off. Until that authorization exists in an
+artifact — not just changes.md — this is scope creep and stays blocked.
+
+## Non-blocking notes (no action required for this issue)
+- Guest list scoping does an in-memory `.in("id", ids)` after fetching invitations;
+  fine for expected volumes. RLS also enforces tenant scope, so the explicit `.eq` is
+  belt-and-suspenders as the spec intended.
+- The "orphaned week on a later insert failure" tradeoff (no transaction/RPC) is
+  spec-sanctioned for the setlist; it only becomes a double-orphan risk BECAUSE of the
+  unauthorized chat_rooms insert — resolved by the revert above.
