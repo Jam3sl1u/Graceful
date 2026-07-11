@@ -6,7 +6,7 @@ export const DATE_RE = /^\d{4}-\d{2}-\d{2}$/; // YYYY-MM-DD
 // round-tripping through Date: constructing it (UTC, to avoid local-timezone
 // off-by-one) and confirming it re-serializes to the same string. This
 // rejects strings like "2026-02-30" that pass the regex but aren't real dates.
-function isValidDateString(value: string): boolean {
+export function isValidDateString(value: string): boolean {
   if (!DATE_RE.test(value)) return false;
   const parsed = new Date(`${value}T00:00:00Z`);
   if (Number.isNaN(parsed.getTime())) return false;
@@ -18,6 +18,62 @@ export const getAvailabilityQuerySchema = z.object({
   user_id: z.string().uuid().optional(),
 });
 export type GetAvailabilityQuery = z.infer<typeof getAvailabilityQuerySchema>;
+
+// Guards against pathologically large team-range queries (e.g. a year-long
+// range) while still comfortably covering a month-view calendar with a few
+// months of forward/back paging.
+export const MAX_TEAM_RANGE_DAYS = 180;
+
+// GET /api/availability/team query params
+export const getTeamAvailabilityQuerySchema = z
+  .object({
+    startDate: z.string(),
+    endDate: z.string(),
+  })
+  .superRefine((query, ctx) => {
+    const startValid = isValidDateString(query.startDate);
+    const endValid = isValidDateString(query.endDate);
+
+    if (!startValid) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "`startDate` must be a valid YYYY-MM-DD calendar date",
+        path: ["startDate"],
+      });
+    }
+    if (!endValid) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "`endDate` must be a valid YYYY-MM-DD calendar date",
+        path: ["endDate"],
+      });
+    }
+    if (!startValid || !endValid) return;
+
+    if (query.startDate > query.endDate) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "`startDate` must be less than or equal to `endDate`",
+        path: ["startDate"],
+      });
+      return;
+    }
+
+    const days =
+      Math.round(
+        (new Date(`${query.endDate}T00:00:00Z`).getTime() -
+          new Date(`${query.startDate}T00:00:00Z`).getTime()) /
+          86_400_000,
+      ) + 1;
+    if (days > MAX_TEAM_RANGE_DAYS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Range must not exceed ${MAX_TEAM_RANGE_DAYS} days`,
+        path: ["endDate"],
+      });
+    }
+  });
+export type GetTeamAvailabilityQuery = z.infer<typeof getTeamAvailabilityQuerySchema>;
 
 // One PUT entry: EITHER a single `date` OR an inclusive `startDate`..`endDate`
 // range. isAvailable defaults true (applied in the handler, not here).
