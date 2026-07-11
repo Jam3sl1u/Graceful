@@ -6,7 +6,13 @@
 // Shape must satisfy supabase-js v2 GenericSchema / GenericTable interfaces
 // so that from().select().eq().maybeSingle() returns typed data.
 
-import type { InvitationStatus, SetlistStatus, UserRole, VocalCapability } from "@/types/domain";
+import type {
+  InvitationStatus,
+  NotificationType,
+  SetlistStatus,
+  UserRole,
+  VocalCapability,
+} from "@/types/domain";
 
 type UsersRow = {
   id: string;
@@ -110,6 +116,19 @@ type AvailabilityRow = {
   created_at: string;
 };
 
+type NotificationsRow = {
+  id: string;
+  church_group_id: string;
+  user_id: string;
+  type: NotificationType;
+  title: string;
+  body: string | null;
+  link_entity_type: string | null;
+  link_entity_id: string | null;
+  is_read: boolean;
+  created_at: string;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -189,6 +208,16 @@ export type Database = {
           is_available?: boolean;
         };
         Update: Partial<AvailabilityRow>;
+        Relationships: [];
+      };
+      notifications: {
+        Row: NotificationsRow;
+        Insert: Omit<NotificationsRow, "id" | "created_at" | "is_read"> & {
+          id?: string;
+          created_at?: string;
+          is_read?: boolean;
+        };
+        Update: Partial<NotificationsRow>;
         Relationships: [];
       };
     };
