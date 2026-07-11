@@ -1,10 +1,10 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { getAvailability, setAvailability } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/availability");
+export async function GET(req: NextRequest): Promise<Response> {
+  return getAvailability(req);
 }
 
-export async function PUT(_req: NextRequest) {
-  return notImplemented("PUT /api/availability");
+export async function PUT(req: NextRequest): Promise<Response> {
+  return setAvailability(req);
 }

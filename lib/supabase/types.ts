@@ -100,6 +100,16 @@ type InvitationsRow = {
   created_at: string;
 };
 
+type AvailabilityRow = {
+  id: string;
+  user_id: string;
+  church_group_id: string;
+  date: string; // YYYY-MM-DD
+  is_available: boolean;
+  note: string | null;
+  created_at: string;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -169,6 +179,16 @@ export type Database = {
         Row: InvitationsRow;
         Insert: Omit<InvitationsRow, "id" | "created_at"> & { id?: string; created_at?: string };
         Update: Partial<InvitationsRow>;
+        Relationships: [];
+      };
+      availability: {
+        Row: AvailabilityRow;
+        Insert: Omit<AvailabilityRow, "id" | "created_at" | "is_available"> & {
+          id?: string;
+          created_at?: string;
+          is_available?: boolean;
+        };
+        Update: Partial<AvailabilityRow>;
         Relationships: [];
       };
     };
