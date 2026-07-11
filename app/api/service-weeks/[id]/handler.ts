@@ -115,3 +115,85 @@ export async function updateServiceWeek(
     return fail("Internal error", ErrorCode.INTERNAL, 500);
   }
 }
+
+const CANCEL_INSTEAD_HINT =
+  "Use POST /api/service-weeks/:id/cancel instead — it preserves scheduling history.";
+
+// DELETE /api/service-weeks/:id — admin only, true hard delete (BR-16). Only
+// allowed when service_date is in the future AND zero accepted invitations
+// exist — this is reserved for pre-invite mistakes, since service-week data
+// feeds AI Pipelines 2 and 3. All other cases return 409 pointing at /cancel
+// (#39) instead. Child rows (setlists, events, invitations, ...) are removed
+// via DB-level `on delete cascade`, not deleted individually here.
+export async function deleteServiceWeek(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+    requireRole(ctx, ["admin"]);
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data: week, error: weekError } = await supabase
+      .from("service_weeks")
+      .select("*")
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .maybeSingle();
+
+    if (weekError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if (!week) {
+      return fail("Not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    if (week.service_date <= today) {
+      return fail(
+        `Service week's date has already passed. ${CANCEL_INSTEAD_HINT}`,
+        ErrorCode.CONFLICT,
+        409,
+      );
+    }
+
+    const { data: acceptedInvitations, error: invitationsError } = await supabase
+      .from("invitations")
+      .select("id")
+      .eq("service_week_id", id)
+      .eq("status", "accepted");
+
+    if (invitationsError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if ((acceptedInvitations ?? []).length > 0) {
+      return fail(
+        `Service week has accepted invitations. ${CANCEL_INSTEAD_HINT}`,
+        ErrorCode.CONFLICT,
+        409,
+      );
+    }
+
+    const { error: deleteError } = await supabase
+      .from("service_weeks")
+      .delete()
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId);
+
+    if (deleteError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    return ok({ deleted: true });
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
