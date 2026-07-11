@@ -1,325 +1,254 @@
-# Spec — Merge: Issue #32 + Issue #28 (main)
+# Spec — Issue #34: Implement availability set/get
 
-This branch merges `main` (Issue #28) into Issue #32. Both specs are retained below.
+## OPEN QUESTION (needs human decision, but a concrete default is specced below)
 
----
+1. **How are "weekly / monthly blocks" expressed in the `PUT` body?** The
+   `availability` table is one row per `(user_id, date)` — there is no recurring
+   or range column. Two readings of the AC ("sets availability for one or more
+   dates (weekly or per-day), and supports monthly blocks"):
+   - (a) Client always sends explicit per-date entries; server just upserts them.
+   - (b) Server accepts optional inclusive date **ranges** and expands them into
+     per-date upserts, so a member can block a whole month in one call.
 
-# Spec — Issue #32: API auth-matrix tests for Sprint 0–1 routes
+   **Default chosen for this spec: (b).** It satisfies "monthly blocks for known
+   absences" without forcing the client to enumerate 30 dates, and still supports
+   single dates. If the team prefers (a), drop the `startDate`/`endDate` branch
+   from `setAvailabilityEntrySchema` and the expansion loop — nothing else changes.
 
-## OPEN QUESTIONS (read first)
+Everything below is unambiguous and must be implemented.
 
-1. **`DELETE /api/church-group/members/:id` is a 501 stub, not a real route.**
-   `app/api/church-group/members/[id]/route.ts` returns `notImplemented(...)` (HTTP
-   501, code `NOT_IMPLEMENTED`) with zero auth or validation logic. That route is
-   backlog #19 / GitHub #28 (Remove/archive member), which #32 lists as a blocker.
-   Because it has no auth/validation code, the full four-case matrix
-   (admin-2xx / member-403 / unauth-401 / malformed-400) **cannot** be written for it.
-   **This spec assumes:** keep #32 unblocked by pinning the current 501 behavior
-   under test (task T4) and defer the real matrix to when #28 lands. If the pipeline
-   owner instead wants #32 to block until #28 is implemented, stop and say so. Do NOT
-   implement the removal feature here — it is out of scope for a test issue.
+## Current state (already in repo — do not recreate)
 
-2. **Real JWT signing is NOT wanted here.** The issue says "mint fake Clerk JWTs,"
-   but the established unit-test pattern in this repo mints role identity by mocking
-   `@clerk/nextjs/server`'s `auth()` and injecting a `UserLookup` — no signing, no
-   secret. The `checks` CI job has no `SUPABASE_JWT_SECRET`, so real signing would
-   break CI. The harness in T2 MUST follow the existing mock pattern. Real signed
-   JWTs live only in the separate RLS suite (`tests/integration/rls/jwt.ts`) and are
-   out of scope. If you believe real signing is required, stop and ask.
+- DB table `availability` exists (migration `20260702000005_cluster_5_partial.sql`):
+  `id uuid pk`, `user_id uuid not null → users(id)`, `church_group_id uuid not null → church_groups(id)`,
+  `date date not null`, `is_available boolean not null default true`, `note text`,
+  `created_at timestamptz not null default now()`, `unique (user_id, date)`.
+- RLS is live (`20260704000001_rls_policies.sql`): SELECT is group-scoped
+  (`church_group_id = auth_church_group_id()`); INSERT/UPDATE/DELETE allow a row
+  only when `user_id = auth_user_id()` OR the caller is leader/admin. A
+  leader/admin passing `user_id` on GET will therefore only ever see rows in
+  their own group.
+- Route stubs exist and currently return `notImplemented`:
+  `app/api/availability/route.ts` (GET, PUT).
+- `app/api/availability/[date]/route.ts` (DELETE) and
+  `app/api/availability/team/route.ts` (GET) are **out of scope** (#35, #36) —
+  leave them as stubs, do not touch.
+- `schemas/availability.ts` is an empty placeholder — replace it.
+- `lib/supabase/types.ts` has NO `availability` table type — you must add one.
 
-## Scope
+## Files to modify / create
 
-The routes enumerated by #32 as #24–#31 are the eight Sprint-1 feature routes =
-backlog rows #15–#22 (GitHub numbers are offset +9 from the backlog doc; backlog #23
-"auth-matrix tests" == GitHub #32). Sprint 0 produced no user-facing feature routes;
-its only auth surface is `lib/api/auth.ts`, already covered by
-`tests/unit/lib/api/auth.test.ts`. **Do NOT** add tests for `app/api/health` or
-`app/api/webhooks/*` — outside the #24–#31 enumeration and outside this issue.
+### 1. `lib/supabase/types.ts` (modify)
 
-## Current state (VERIFIED — do NOT redo or modify these)
-
-Every implemented Sprint-1 route already has full auth-matrix coverage under
-`tests/unit/app/api/`. These tests pass and are thorough. Leave every assertion in
-them untouched.
-
-| GitHub | Route | Existing test file | Matrix status |
-|---|---|---|---|
-| #24 | `PUT /api/church-group` | `church-group-route.test.ts` | 401 ✓, 400 ✓, success ✓ (any authed user creates → 403 N/A) |
-| #25 | `POST /api/church-group/join` | `church-group-join-route.test.ts` | 401 ✓, 400 ✓, success ✓ (not admin-gated → 403 N/A) |
-| #26 | `GET /api/church-group/members` | `church-group-members-route.test.ts` | 401 ✓, guest→403 ✓, success ✓ (GET, no body → 400 N/A) |
-| #27 | `PATCH /api/church-group/members/:id/role` | `church-group-members-role-route.test.ts` | 401 ✓, non-admin→403 ✓, 400 ✓, admin-success ✓ |
-| #28 | `DELETE /api/church-group/members/:id` | **none** | **STUB (501) — see Open Question 1 + T4** |
-| #29 | `GET /api/church-group/audit-log` | `audit-log-route.test.ts` | 401 ✓, non-admin→403 ✓, 400 ✓, admin-success ✓ |
-| #30 | `GET/PUT /api/profile` | `profile-route.test.ts` | 401 ✓, 400 ✓, success ✓ (self-scoped → 403 N/A) |
-| #31 | instruments `GET/POST`, `/custom`, `/:id/promote`, `DELETE /:id` | `instruments-route.test.ts` | 401 ✓, non-admin→403 ✓, 400 ✓, admin-success ✓ |
-
-Acceptance-criteria status going in:
-- **"tests run in CI and block merge on failure": already met.** `.github/workflows/ci.yml`
-  runs `bun run test` (Jest) on every `pull_request`.
-- **"every route tested with the 4 cases": met for #24–#27, #29–#31.** Only gap is #28 (a stub).
-- **"coverage report shows these routes covered": NOT met.** `jest.config.ts` collects no
-  coverage. This is new work (T1).
-- **Implementation Note "reusable harness that mints fake role identities":** the pattern
-  exists but is copy-pasted per file, not shared. New work (T2 + T3).
-
-The real deliverables for this issue are therefore: coverage reporting (T1), a shared
-reusable harness (T2) with a real consumer (T3), and pinning the #28 stub (T4).
-
-## Tasks
-
-### T1 — Add coverage reporting scoped to the Sprint-1 API routes (AC: coverage report)
-
-**Modify `jest.config.ts`** (existing unit config at repo root). Add these fields to
-the exported `config` object; keep everything already there unchanged:
+Add an `AvailabilityRow` type and register it under
+`Database.public.Tables.availability`, following the exact pattern of the other
+rows in this file (e.g. `member_profiles`, `service_weeks`).
 
 ```ts
-collectCoverageFrom: [
-  "app/api/church-group/**/*.ts",
-  "app/api/profile/**/*.ts",
-  "app/api/instruments/**/*.ts",
-  "lib/api/**/*.ts",
-],
-coveragePathIgnorePatterns: ["<rootDir>/node_modules/"],
-coverageDirectory: "<rootDir>/coverage",
-coverageReporters: ["text-summary", "lcov"],
+type AvailabilityRow = {
+  id: string;
+  user_id: string;
+  church_group_id: string;
+  date: string; // YYYY-MM-DD
+  is_available: boolean;
+  note: string | null;
+  created_at: string;
+};
 ```
 
-Do NOT add a `coverageThreshold`. A failing threshold would break unrelated PRs;
-report-only is the safe default for this issue.
-
-**Modify `package.json`** — add one script next to the existing `"test": "jest"`:
-
-```json
-"test:coverage": "jest --coverage"
-```
-
-Use Bun wording only; never reference npm/yarn/pnpm anywhere.
-
-**Modify `.github/workflows/ci.yml`** — in the `checks` job, change the existing step
-`- run: bun run test` to `- run: bun run test:coverage` so CI emits the coverage
-report (text-summary in the logs). Leave every other CI step and both other jobs
-(`check-secrets`, `rls-integration`) untouched.
-
-**Modify `.gitignore`** — add `/coverage` if not already ignored (check first; do not
-duplicate an existing entry).
-
-### T2 — Create the shared, reusable auth-matrix harness (AC: reusable harness)
-
-Create **`tests/support/api-auth.ts`**. This centralizes the Clerk-auth + role-lookup
-mock boilerplate currently copy-pasted across the per-route test files, so future
-sprints import instead of re-implement.
-
-It must export exactly:
+Registration (same `Insert` treatment for DB-defaulted columns as the existing
+rows):
 
 ```ts
-import type { NextRequest } from "next/server";
-import type { AuthContext, UserLookup } from "@/lib/api/auth";
-import type { UserRole } from "@/types/domain";
-
-// Injectable lookup returning a fixed AuthContext for the given role.
-// Mirrors the makeLookup() duplicated in the existing handler tests.
-export function makeLookup(role: UserRole, overrides?: Partial<AuthContext>): UserLookup;
-
-// Configure the module-mocked auth() (from "@clerk/nextjs/server") as a signed-in
-// Clerk user whose supabase JWT is `jwt` (default a non-empty string; pass null to
-// simulate "session present but no JWT issued"). The consuming test file MUST have
-// `jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }))` at top so the
-// auth import here resolves to that mock.
-export function mockClerkAuthed(jwt?: string | null): void;
-
-// Configure the module-mocked auth() as NO Clerk session (userId: null, getToken jest.fn()).
-export function mockClerkAnonymous(): void;
-
-// Build a NextRequest whose .json() resolves `body` (pass nothing / undefined to
-// simulate a malformed/empty body).
-export function makeJsonReq(body?: unknown): NextRequest;
+availability: {
+  Row: AvailabilityRow;
+  Insert: Omit<AvailabilityRow, "id" | "created_at" | "is_available"> & {
+    id?: string;
+    created_at?: string;
+    is_available?: boolean;
+  };
+  Update: Partial<AvailabilityRow>;
+  Relationships: [];
+};
 ```
 
-Implementation constraints:
-- Import `auth` from `@clerk/nextjs/server` and cast to `jest.Mock` internally; the
-  helpers call `.mockResolvedValue(...)` on it. Match the exact resolved shapes used
-  in `tests/unit/app/api/service-weeks-route.test.ts` (`setUpAuth`, `makeLookup`,
-  `makeReq`) so behavior is identical: authed = `{ userId: "clerk_test", getToken:
-  jest.fn().mockResolvedValue(jwt) }`; anonymous = `{ userId: null, getToken: jest.fn() }`.
-- Default fixed IDs: `userId: "user-1"`, `churchGroupId: "group-1"` (overridable via
-  `overrides`), matching the existing tests.
-- **Do NOT** rewrite, migrate, or delete any existing test file. This module is
-  additive.
-- No real JWT signing (see Open Question 2).
+### 2. `schemas/availability.ts` (replace the placeholder)
 
-### T3 — Add one consolidated auth-matrix pass that consumes the harness (AC: dedicated pass + real consumer)
+Define and export:
 
-Create **`tests/unit/app/api/auth-matrix.test.ts`**. This is the "dedicated test pass
-over everything built so far" the issue describes, written against the harness so the
-pattern is demonstrably reusable. It complements — does not replace — the deep
-per-route tests.
-
-Top of file (hoisted, required for the harness to bind the mock):
 ```ts
-jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }));
-jest.mock("@/lib/supabase/client", () => ({ getSupabaseClient: jest.fn() }));
+export const DATE_RE = /^\d{4}-\d{2}-\d{2}$/; // YYYY-MM-DD
+
+// GET /api/availability query params
+export const getAvailabilityQuerySchema = z.object({
+  user_id: z.string().uuid().optional(),
+});
+export type GetAvailabilityQuery = z.infer<typeof getAvailabilityQuerySchema>;
+
+// One PUT entry: EITHER a single `date` OR an inclusive `startDate`..`endDate`
+// range. isAvailable defaults true (applied in handler). note: trimmed; empty →
+// null.
+export const setAvailabilityEntrySchema = z.object({ ... });
+
+// PUT /api/availability body
+export const setAvailabilitySchema = z.object({
+  entries: z.array(setAvailabilityEntrySchema).min(1).max(400),
+});
+export type SetAvailabilityInput = z.infer<typeof setAvailabilitySchema>;
 ```
 
-Cover the **admin-only, handler-style** Sprint-1 routes (those exporting a testable
-handler that takes an injected `UserLookup`). For each, assert the applicable matrix
-cells using `mockClerkAuthed` / `mockClerkAnonymous` / `makeLookup` / `makeJsonReq`
-from `tests/support/api-auth.ts`:
+Entry validation rules (enforce with `.refine` / `.superRefine`):
+- Fields: `date?`, `startDate?`, `endDate?` (all optional strings),
+  `isAvailable: z.boolean().optional()`,
+  `note: z.string().trim().max(500).nullish().transform(v => (v && v.length > 0 ? v : null))`
+  (copy the bio normalization in `schemas/profile.ts`).
+- Exactly one form must be present: EITHER `date` alone, OR both `startDate` and
+  `endDate` together. Presence of `date` together with either range field, or
+  neither form, → validation error.
+- Every date string present must match `DATE_RE` AND be a real calendar date
+  (reject `2026-02-30`; validate by round-tripping, e.g. construct the date and
+  confirm it re-serializes to the same string, or check `!Number.isNaN(Date.parse(s))`
+  plus the regex).
+- For a range, `startDate <= endDate` (lexicographic compare is correct for
+  `YYYY-MM-DD`).
 
-- `patchMemberRole` — `@/app/api/church-group/members/[id]/role/handler` (#27)
-- `getAuditLog` — `@/app/api/church-group/audit-log/handler` (#29)
-- `addInstrument`, `promoteInstrument`, `deleteInstrument` — `@/app/api/instruments/handler` (#31)
-- `getChurchGroupMembers` — `@/app/api/church-group/members/handler` (#26, admin-vs-guest gating)
+Follow the zod style already used in `schemas/profile.ts` and
+`schemas/audit-log.ts`.
 
-Matrix cells per route (only those that apply to that route’s shape):
-- **unauth → 401 `UNAUTHENTICATED`**: `mockClerkAnonymous()`, then call the handler
-  with a lookup that must never be consulted (assert 401).
-- **disallowed role → 403 `FORBIDDEN`**: `mockClerkAuthed()`, `makeLookup("member")`
-  (use `"guest"` for `getChurchGroupMembers`), assert 403.
-- **malformed input → 400 `VALIDATION_FAILED`**: only for routes with a request body
-  (`patchMemberRole`, `addInstrument`). `mockClerkAuthed()`, `makeLookup("admin")`,
-  `makeJsonReq(null)`, assert 400.
-- **admin success**: `mockClerkAuthed()`, `makeLookup("admin")`, assert 2xx. Supply the
-  minimal Supabase mock the handler needs.
+### 3. `app/api/availability/handler.ts` (create)
 
-Critical: **call each handler with EXACTLY the argument arity its existing per-route
-test uses** (e.g. `promoteInstrument(req, id, lookup)`, `getAuditLog(req, lookup)`).
-Copy the argument order and the chainable/RPC Supabase mock shapes directly from the
-matching existing file listed in the table above — do not invent new mock shapes.
-Route-export routes (#24 `PUT`, #25 `POST /join`) are already fully covered by their
-existing files and are not admin-gated; do NOT duplicate them here.
+Copy the structure, auth flow, JWT/`getSupabaseClient` handling, and try/catch
+error mapping from `app/api/profile/handler.ts`. Query-param parsing follows
+`app/api/church-group/audit-log/handler.ts`
+(`Object.fromEntries(req.nextUrl.searchParams)`).
 
-`beforeEach` must `mockReset()` the `auth` and `getSupabaseClient` mocks, same as the
-existing files.
+Export a response type and two handlers:
 
-### T4 — Pin the #28 stub route under test
+```ts
+export type AvailabilityEntry = {
+  userId: string;
+  date: string;       // YYYY-MM-DD
+  isAvailable: boolean;
+  note: string | null;
+};
 
-Create **`tests/unit/app/api/church-group-members-id-route.test.ts`**.
+export async function getAvailability(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+export async function setAvailability(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+```
 
-- Import `{ DELETE }` from `@/app/api/church-group/members/[id]/route`.
-- The current handler takes only `_req` (no `params`). Call it as
-  `DELETE({} as unknown as NextRequest)` and assert the resolved `Response`:
-  - `res.status === 501`
-  - `(await res.json()).code === "NOT_IMPLEMENTED"`
-- Add a top-of-file comment: this route is issue #28 (Remove/archive member), still a
-  stub; replace with the full auth matrix (admin success / member→403 / unauth→401 /
-  malformed→400) once #28 is implemented.
-- No Clerk/Supabase mocking needed — the stub short-circuits before any auth.
-  `@/lib/api/response` imports `server-only`, which `jest.config.ts` already maps to
-  `tests/mocks/server-only.js`, so the import resolves under the node test env.
+**`getAvailability`:**
+1. `ctx = await requireAuth(req, lookup)`.
+2. Parse query with
+   `getAvailabilityQuerySchema.safeParse(Object.fromEntries(req.nextUrl.searchParams))`;
+   on failure → 400 `VALIDATION_FAILED`.
+3. Determine `targetUserId`:
+   - If `user_id` is present AND differs from `ctx.userId`:
+     `requireRole(ctx, ["admin", "set_leader"])` (throws 403 `FORBIDDEN` for a
+     plain member reading someone else's).
+   - Else `targetUserId = ctx.userId`.
+4. Get JWT (`auth()` → `getToken({ template: "supabase" })`); missing → 401
+   `UNAUTHENTICATED` (same as profile handler).
+5. `supabase.from("availability").select("user_id, date, is_available, note")
+   .eq("user_id", targetUserId).order("date", { ascending: true })`.
+   RLS already restricts to the caller's group; no explicit `church_group_id`
+   filter needed.
+6. On error → 500 `INTERNAL`.
+7. Map rows → `AvailabilityEntry[]`, return `ok({ availability })`.
+   Absence of a row for a date means "available"; this endpoint returns only
+   stored rows and does NOT synthesize future dates — the "defaults to true if
+   unset" semantic belongs to the consumer (e.g. the #36 grid).
 
-## Edge cases / invariants the implementation MUST hold
+**`setAvailability`:**
+1. `ctx = await requireAuth(req, lookup)`. Scope is the caller's OWN availability
+   only (the AC does not ask for leaders setting others via PUT). No extra role gate.
+2. `body = await req.json().catch(() => null)`; `setAvailabilitySchema.safeParse(body)`;
+   failure → 400 `VALIDATION_FAILED`.
+3. Expand every entry into concrete dates:
+   - single-date entry → `[date]`.
+   - range entry → each date from `startDate` to `endDate` inclusive.
+   - Enforce a total expanded-date cap of **366**; if exceeded → 400
+     `VALIDATION_FAILED` (guards against a member blocking years by accident).
+4. **Dedupe by date, last-entry-wins.** A single Postgres upsert cannot touch the
+   same conflict target `(user_id, date)` twice in one statement, so collapse
+   duplicates into a `Map<string /* date */, { isAvailable; note }>` before
+   building rows. This is a required edge case.
+5. Get JWT; missing → 401 `UNAUTHENTICATED`.
+6. Build one row per resolved date:
+   `{ user_id: ctx.userId, church_group_id: ctx.churchGroupId, date, is_available: isAvailable ?? true, note }`.
+   Use the same narrow cast the profile handler uses for the DB-defaulted-column
+   mismatch:
+   `... as unknown as Database["public"]["Tables"]["availability"]["Insert"][]`.
+7. `supabase.from("availability").upsert(rows, { onConflict: "user_id,date" })
+   .select("user_id, date, is_available, note")`.
+8. On error → 500 `INTERNAL`.
+9. Map returned rows → `AvailabilityEntry[]`, return `ok({ availability })`.
+10. Wrap everything in the same try/catch that maps
+    `ApiException` → `fail(err.message, err.code, err.status)` and anything else → 500 `INTERNAL`.
 
-- `bun run test` and `bun run test:coverage` must both pass locally and in CI.
-- The coverage report must list all eight #24–#31 route files (plus `lib/api/*`) with
-  non-zero coverage. T4 is what makes `members/[id]/route.ts` register.
-- Do NOT weaken, delete, or rewrite any assertion in the existing test files.
-- Do NOT introduce real network calls or real JWT signing (Open Question 2).
-- The new consolidated test (T3) must not reduce or contradict existing coverage; if a
-  handler's real arity/behavior differs from an assumption here, follow the existing
-  per-route test as the source of truth and adjust.
-- `bun run typecheck` and `bun run lint` must stay green — new test + config + support
-  files must be typed and lint-clean (no unused exports/vars).
+### 4. `app/api/availability/route.ts` (modify)
 
-## Patterns to copy (name the file)
+Replace the `notImplemented` stubs with thin delegators, exactly like
+`app/api/profile/route.ts`:
 
-- Harness mock shapes (`setUpAuth`, `makeLookup`, `makeReq`, chainable Supabase mock):
-  `tests/unit/app/api/service-weeks-route.test.ts` and
-  `tests/unit/app/api/instruments-route.test.ts` (most complete references).
-- Route-export test that mocks `auth()` + `getSupabaseClient` directly:
-  `tests/unit/app/api/church-group-route.test.ts`.
-- Auth seam (`AuthContext`, `UserLookup`, `requireAuth`, `requireRole`): `lib/api/auth.ts`.
-- Response/error contract (`ok`, `fail`, `notImplemented`): `lib/api/response.ts`;
-  error codes incl. `NOT_IMPLEMENTED`: `lib/api/errors.ts`.
-- Jest config shape (`roots`, `testMatch`, `moduleNameMapper` for `server-only` and
-  `@/`): `jest.config.ts`.
+```ts
+import { NextRequest } from "next/server";
+import { getAvailability, setAvailability } from "./handler";
 
-## Files touched (summary)
+export async function GET(req: NextRequest): Promise<Response> {
+  return getAvailability(req);
+}
 
-- Modify: `jest.config.ts` — coverage config (T1)
-- Modify: `package.json` — add `test:coverage` script (T1)
-- Modify: `.github/workflows/ci.yml` — `checks` job: `bun run test` → `bun run test:coverage` (T1)
-- Modify: `.gitignore` — ignore `/coverage` if not already (T1)
-- Create: `tests/support/api-auth.ts` — reusable harness (T2)
-- Create: `tests/unit/app/api/auth-matrix.test.ts` — consolidated matrix pass (T3)
-- Create: `tests/unit/app/api/church-group-members-id-route.test.ts` — pin #28 stub (T4)
+export async function PUT(req: NextRequest): Promise<Response> {
+  return setAvailability(req);
+}
+```
 
----
+## Edge cases the implementation MUST handle
 
-# Spec — Issue #28: Remove/archive member with PII anonymization
+- Clerk `userId` null → 401 `UNAUTHENTICATED`, lookup never consulted (handled by `requireAuth`).
+- Missing supabase JWT → 401 `UNAUTHENTICATED`, `getSupabaseClient` never called.
+- GET with `user_id` = another member, caller is a plain `member` → 403 `FORBIDDEN`.
+- GET with `user_id` equal to the caller's own id → allowed for any role.
+- GET with malformed `user_id` (not a uuid) → 400 `VALIDATION_FAILED`.
+- PUT empty `entries: []` → 400 `VALIDATION_FAILED`.
+- PUT entry with both `date` and a range field, or neither → 400.
+- PUT range with `startDate > endDate` → 400.
+- PUT invalid calendar date (e.g. `2026-02-30`) → 400.
+- PUT expanded total > 366 dates → 400.
+- PUT duplicate dates across entries → deduped, last wins, single successful upsert.
+- PUT `isAvailable` omitted → row stored/returned with `isAvailable: true`.
+- PUT `note` empty/whitespace → stored as `null`.
+- PUT re-setting an existing `(user_id, date)` → updates in place (upsert), no duplicate-key error.
+- Any DB error on select/upsert → 500 `INTERNAL`.
 
-Implements `DELETE /api/church-group/members/:id` (Admin only): a right-to-erasure
-pattern, not a hard delete. PII is anonymized in place; historical setlist/scheduling
-participation is retained in anonymized form (PRD §25.6); BR-12 (never leave a church
-group with zero admins) is extended to removal; the action is written to the audit log.
+## Response envelope
 
-This spec replaces the stale carryover from the prior pipeline run, which described
-the already-merged Issue #37 (Service Week CRUD) and produced no code for #28. See
-the approved plan at `.claude/plans/issue-28-description-fancy-beacon.md` for full
-exploration/design rationale; this file summarizes the resulting implementation.
+Use `ok(...)` / `fail(...)` from `lib/api/response.ts`. Success bodies:
+- GET: `{ data: { availability: AvailabilityEntry[] } }`
+- PUT: `{ data: { availability: AvailabilityEntry[] } }`
 
-## Key finding
+## Patterns to copy (named)
 
-`invitations.user_id` and `event_attendees.user_id` are `ON DELETE CASCADE` to
-`users`. A real `DELETE FROM users` would destroy exactly the historical
-participation data the issue requires to survive. Removal must be an UPDATE that
-anonymizes the row in place (same `users.id`), never a DB-level delete.
+- Handler skeleton, auth+JWT flow, try/catch error mapping, DB-default `Insert`
+  cast: `app/api/profile/handler.ts`.
+- Route delegator: `app/api/profile/route.ts`.
+- Role gating with `requireRole`: `app/api/church-group/members/handler.ts`.
+- Query-param parsing: `app/api/church-group/audit-log/handler.ts`.
+- Zod schema style + note/bio normalization: `schemas/profile.ts`.
+- `lib/supabase/types.ts` table registration: existing `member_profiles` entry.
 
-Several tables that need clearing for another user (`notification_preferences`,
-`notifications`, `google_calendar_tokens`) have RLS policies scoped to the row's
-own user only — an admin's plain RLS-scoped client cannot clear them for someone
-else. Combined with BR-12 needing an atomic last-admin check (to avoid a TOCTOU
-race between two concurrent admin removals), the whole operation runs as one
-atomic `SECURITY DEFINER` RPC, `remove_church_group_member`, mirroring the shape
-already used by `POST /api/church-group/join` (`join_church_group`).
+## Tests (tester stage — for reference, not written by planner)
 
-## Design decisions
+Add `tests/unit/app/api/availability-route.test.ts` mirroring
+`tests/unit/app/api/profile-route.test.ts` (mock `@clerk/nextjs/server` and
+`@/lib/supabase/client`; mock the `.select().eq().order()` and
+`.upsert().select()` chains). Cover every edge case above. An RLS integration
+test already exists at `tests/integration/rls/tables/availability.test.ts` — do
+not duplicate RLS coverage in the unit test.
 
-- **Access revocation lever**: every RLS policy resolves identity via
-  `clerk_id = auth.jwt()->>'sub'`, so `clerk_id` (not `role`) is what actually
-  gates access. Set to a unique non-matchable placeholder: `'deleted-' || id`.
-- **Anonymized fields**: `name = 'Deleted User'`, `email = NULL`, `phone = NULL`,
-  `sms_opted_in = false`, `role = 'guest'`, `anonymized_at = now()` (new marker
-  column).
-- **`member_profiles`**: hard-deleted (cascades `member_instruments`).
-- **Future-schedule cleanup**: `availability`, `notification_preferences`,
-  `notifications`, `google_calendar_tokens` rows deleted for the user.
-  `invitations`, `event_attendees`, `setlists.created_by`, `events.created_by`,
-  `service_weeks.created_by`, `conflicts.*` are left untouched — these point at
-  the now-anonymized `users.id` and are the "historical participation" the
-  issue requires to retain.
-- **BR-12 for removal**: checked only when the target's current role is
-  `'admin'`; implemented independently inside the RPC (not shared with
-  `role/handler.ts`'s TS-side demote guard — different execution boundary).
-  Locking uses a single `ORDER BY id FOR UPDATE` query over `{target} ∪
-  {current admins in the group}` to avoid a cross-lock deadlock between two
-  concurrent admin removals while still closing the TOCTOU race that a bare
-  `COUNT(*)` would leave open.
-- **Directory listing**: `app/api/church-group/members/handler.ts`'s roster
-  query adds `.is("anonymized_at", null)`.
-- **Idempotency**: re-DELETE on an already-anonymized member returns 404, not
-  a no-op 200 (confirmed with the user).
-- **Response**: `200` with `ok({ id: targetUserId })`.
-- **Audit log**: `{ action: "member.removed", entityType: "user", entityId,
-  metadata: {} }` — metadata deliberately empty so the removed member's
-  pre-anonymization PII isn't captured into the (append-only, long-retained)
-  audit log.
-- **Out of scope**: Clerk Backend API identity deletion (breaking `clerk_id`
-  is sufficient to revoke app access; no code elsewhere calls the Clerk
-  Backend API).
+## Explicitly out of scope (do NOT implement)
 
-## Files changed
-
-1. `supabase/migrations/20260710000001_member_removal_rpc.sql` — `anonymized_at`
-   column + `remove_church_group_member` RPC.
-2. `lib/supabase/types.ts` — `sms_opted_in`, `anonymized_at` on `UsersRow`;
-   `remove_church_group_member` RPC entry.
-3. `app/api/church-group/members/[id]/route.ts` — DELETE wrapper (was a stub).
-4. `app/api/church-group/members/[id]/handler.ts` — new `deleteMember`.
-5. `app/api/church-group/members/handler.ts` — roster query excludes
-   anonymized users.
-6. `tests/unit/app/api/church-group-members-id-route.test.ts` — new.
-7. `tests/unit/app/api/church-group-members-route.test.ts` — new assertion for
-   the `anonymized_at` filter.
-8. `tests/integration/rls/tables/member-removal.test.ts` — new; first RPC
-   integration test in the repo, including a real concurrent-removal race
-   test against a live Postgres instance.
+- Conflict detection on availability change (#46).
+- DELETE `/api/availability/[date]` unset (#35) — leave stub untouched.
+- Team availability grid / `GET /api/availability/team` (#36) — leave stub untouched.
+- Leaders/admins setting *another* member's availability via PUT (not in the AC).
