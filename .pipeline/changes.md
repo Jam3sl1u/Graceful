@@ -1,136 +1,126 @@
-# Changes — Issue #39: Service week cancel/reactivate (BR-17)
+# Changes: Issue #40 — Send set invitation (POST /api/invitations, BR-05)
 
-## Open questions — human resolutions applied
+## Human-resolved open question applied
 
-1. **Notification enum value.** Dedicated enum values added via migration
-   (`service_week_cancelled`, `service_week_reactivated`), NOT a reuse of
-   `scheduling_conflict`.
-2. **Chat-room archive (AC bullet 3).** Left as a no-op with an inline
-   `// TODO(Phase 2 chat): ...` comment inside the cancel path — no
-   `chat_rooms` table exists yet.
-3. **GCal event removal (AC bullet 4).** Left as a no-op with an inline
-   `// TODO(#62 GCal sync): ...` comment inside the cancel path — no GCal sync
-   service exists; `deleteEvent` is not called.
+The planner's spec defaulted `response_token` generation to
+`randomBytes(32).toString("hex")`. The human override for this run instead
+specifies: two `crypto.randomUUID()` calls, hyphens stripped, concatenated
+into a 64-char hex string. Implemented as such in
+`app/api/invitations/handler.ts` (`generateResponseToken()`), using the
+`crypto` global (available in the Next.js/Node route-handler runtime) rather
+than `import { randomBytes } from "node:crypto"`. The BR-05
+warn-then-proceed/cancel flow (via `acknowledgeConflict`) matched the spec as
+written, so no change was needed there.
 
 ## Files created
 
-### `supabase/migrations/20260711000001_service_week_notification_types.sql`
-Adds `service_week_cancelled` and `service_week_reactivated` to the
-`notification_type` enum via two `ALTER TYPE ... ADD VALUE IF NOT EXISTS`
-statements. Includes a commented `DOWN` section noting enum-value removal
-isn't straightforward in Postgres (mirrors the cluster migrations' style).
+- `lib/supabase/types.ts` — replaced the incomplete hand-rolled
+  `InvitationsRow` (only had `id/church_group_id/service_week_id/user_id/status/created_at`)
+  with the full column set matching the migration: adds `role_note`,
+  `response_token`, `responded_at`, `denial_reason`, `denial_count`,
+  `response_deadline`, `invited_by`. Updated the `invitations` table entry's
+  `Insert` type to omit DB-defaulted/server-generated columns
+  (`id`, `created_at`, `status`, `responded_at`, `denial_reason`,
+  `denial_count`, `response_deadline`), mirroring the `service_weeks` pattern.
 
-### `tests/unit/app/api/service-weeks-cancel-route.test.ts` (new)
-### `tests/unit/app/api/service-weeks-reactivate-route.test.ts` (new)
-Modeled on `tests/unit/app/api/service-weeks-delete-route.test.ts` (same
-Clerk/Supabase mock harness pattern: `makeChain`, `makeSupabaseClient`,
-`makeLookup`, `setUpAuth`). The mock chain was extended to support:
-- `.update(patch).eq().eq().select().maybeSingle()` for the `service_weeks`
-  update.
-- `.select().eq().in()` for the pending/accepted invitations recipient
-  query (resolves via the chain's `then`).
-- `.insert(payload)` on `notifications` (resolves via `then`; the payload is
-  captured via an `onInsert` hook for assertions).
+- `schemas/invitations.ts` — added `createInvitationSchema` /
+  `CreateInvitationInput` (serviceWeekId/userId as UUIDs, optional roleNote
+  1-500 chars trimmed, optional `acknowledgeConflict` boolean). Left the
+  existing placeholder `invitationsSchema`/`InvitationsInput` export
+  untouched since other stubs may reference it.
 
-Each file covers: 401 (no Clerk userId / no JWT), 403 for `member`,
-`set_leader`, `guest` (admin-only), 404 when the update matches no row, 500
-on update/invitations-query/notifications-insert errors, the 200 happy path
-(correct `is_cancelled` flip, one notification per unique pending/accepted
-invitee with the correct `type`/`title`/`link_entity_*`), 200 with zero
-recipients (no insert attempted), de-dup of repeated `user_id`s into a single
-notification row, and tenant-scoped `eq` call ordering
-(`["id", WEEK_ID]` then `["church_group_id", CHURCH_GROUP_ID]`).
+- `app/api/invitations/handler.ts` (new file) — `createInvitation(req, lookup?)`:
+  1. `requireAuth` + `requireRole(ctx, ["admin", "set_leader"])`.
+  2. Parses body with `createInvitationSchema.safeParse`; 400
+     VALIDATION_FAILED on failure (including non-JSON body).
+  3. Resolves the Supabase JWT client; 401 UNAUTHENTICATED if missing.
+  4. Looks up the target `service_weeks` row scoped to
+     `id = serviceWeekId AND church_group_id = ctx.churchGroupId`; 404
+     NOT_FOUND if missing (wrong-group and missing are indistinguishable by
+     design — never 403), 500 INTERNAL on DB error.
+  5. BR-05 double-booking check: queries the target user's `accepted`
+     invitations in the group, then checks whether any of those weeks
+     (excluding the current `serviceWeekId`) share the same `service_date`.
+     500 INTERNAL on DB error in either query.
+  6. If a collision is found and `acknowledgeConflict !== true`: returns
+     `fail(..., ErrorCode.CONFLICT, 409)` without inserting anything. If
+     `acknowledgeConflict === true` (or no collision), proceeds.
+  7. Generates `response_token` (two concatenated stripped UUIDs, 64 hex
+     chars) and `response_deadline` (now + 72h ISO string), inserts the
+     invitation (status left unset so the DB default `'pending'` applies),
+     narrowly cast to `Database["public"]["Tables"]["invitations"]["Insert"]`
+     per the service-weeks pattern. 500 INTERNAL on error/null row.
+  8. Writes an audit log entry (`action: "invitation.sent"`,
+     `entityType: "invitation"`, metadata includes
+     `acknowledged_conflict: parsed.acknowledgeConflict === true`).
+  9. Leaves a `// TODO(#67/#68)` comment marking the notification dispatch
+     seam — no stub module created, no call made.
+  10. Returns `ok({ invitation: toInvitationResponse(invitation) }, 201)`.
+  11. Whole body wrapped in the same `try/catch` as `service-weeks/handler.ts`
+      (`ApiException` → its status/code; anything else → 500 INTERNAL).
+  Also exports `toInvitationResponse` (row → camelCase response DTO) and the
+  `InvitationResponse` type.
 
-## Files modified
+- `app/api/invitations/route.ts` — POST now delegates to
+  `createInvitation`; GET is untouched (`notImplemented` stub, out of scope
+  for #40).
 
-### `types/domain.ts`
-Added `NotificationType` union (mirrors the DB enum, including the two new
-values), following the existing string-literal-union comment style.
-
-### `lib/supabase/types.ts`
-- Extended the `@/types/domain` import to include `NotificationType`.
-- Added `NotificationsRow` (`id, church_group_id, user_id, type, title, body,
-  link_entity_type, link_entity_id, is_read, created_at`).
-- Registered `notifications` under `Database.public.Tables`, following the
-  `is_cancelled`/`created_at`-optional `Insert` pattern already used for
-  `service_weeks` (`id`, `created_at`, `is_read` optional on `Insert`).
-
-### `app/api/service-weeks/[id]/handler.ts`
-Added `cancelServiceWeek` and `reactivateServiceWeek`, both thin wrappers
-around a new private `setServiceWeekCancelled(req, id, lookup, isCancelled,
-notificationType, notificationTitle)` helper that implements the shared
-auth → role-guard → JWT → update → notify flow (mirrors `deleteServiceWeek`'s
-structure but factored once since the two routes are otherwise identical):
-1. `requireAuth` then `requireRole(ctx, ["admin"])` — admin only.
-2. JWT via `auth()` → `getToken({ template: "supabase" })`; missing → 401.
-3. `service_weeks.update({ is_cancelled })` scoped by
-   `.eq("id", id).eq("church_group_id", ctx.churchGroupId)`,
-   `.select("*").maybeSingle()`. Error → 500; null data → 404.
-4. `invitations.select("user_id").eq("service_week_id", id).in("status",
-   ["pending", "accepted"])`. Error → 500. De-duplicated via `Set`.
-5. If there are recipients, bulk-insert one `notifications` row per unique
-   `user_id` (`church_group_id`, `user_id`, `type`, `title`, `body: null`,
-   `link_entity_type: "service_week"`, `link_entity_id: id`), using the
-   narrow `as unknown as Database[...]["notifications"]["Insert"][]` cast
-   (same trick as `createServiceWeek`). Insert error → 500. Zero recipients
-   → insert skipped entirely.
-6. Inline TODO comments for the chat-room archive and GCal event removal
-   no-ops (open questions 2 and 3), placed after the notification insert.
-7. Returns `ok({ serviceWeek: toServiceWeekResponse(data) })` (200).
-8. Same `catch (err)` → `ApiException` passthrough / 500 `INTERNAL` fallback
-   as the other handlers.
-
-No 409 short-circuit for the already-in-state case — cancelling an
-already-cancelled week (or reactivating an already-active one) is allowed
-and re-notifies, per the spec's idempotency note.
-
-### `app/api/service-weeks/[id]/cancel/route.ts` (replaced 501 stub)
-### `app/api/service-weeks/[id]/reactivate/route.ts` (replaced 501 stub)
-Thin `POST` delegators to `cancelServiceWeek`/`reactivateServiceWeek`,
-matching the wiring style of `app/api/service-weeks/[id]/route.ts`. The
-`notImplemented` import was removed from both.
+- `tests/unit/app/api/invitations-route.test.ts` (new file) — mock
+  scaffolding copied from `tests/unit/app/api/service-weeks-route.test.ts`
+  (`makeChain`/`makeSupabaseClient`/`setUpAuth`/`makeLookup`), extended with
+  an `rpc` mock (`writeAuditLog` calls `supabase.rpc("write_audit_log", ...)`)
+  and a `neq` chain method. Because the handler issues **two** sequential
+  `service_weeks` selects (the week lookup, then the BR-05 collision check
+  when the user has accepted invitations elsewhere), the fixture type gained
+  a `selectSecond` field and `makeSupabaseClient` now counts `select()` calls
+  per table to route the second `service_weeks` call to it. 14 tests cover:
+  401 (no Clerk user / no JWT), 403 (member, guest), 400 (non-JSON body,
+  missing serviceWeekId, missing userId, non-uuid userId, roleNote too long),
+  404 (service week not found), 201 happy path (asserts no `status` key in
+  the insert payload, 64-hex `response_token`, ~72h `response_deadline`,
+  `invited_by === USER_ID`, and the `write_audit_log` RPC call with
+  `action: "invitation.sent"`), 409 CONFLICT with no `acknowledgeConflict`
+  (asserts no invitation insert happened), 201 with
+  `acknowledgeConflict: true` on the same collision (asserts the insert did
+  happen), and 500 on invitation-insert DB error.
 
 ## Explicitly not touched (per spec's out-of-scope list)
-- Hard deletion (`DELETE`, #38 — already implemented).
-- Real chat-room archiving (Phase 2 — no table exists).
-- Real Google Calendar event removal (#62 — no sync service exists).
-- SMS/email dispatch — only the in-app `notifications` row is written.
-- Setlists, events, invitations, conflicts rows — never modified by these
-  handlers, only `service_weeks.is_cancelled` and new `notifications` rows.
-- Any RLS/migration change beyond the two new `notification_type` enum
-  values.
+
+- `GET /api/invitations` — left as the existing `notImplemented` stub.
+- Accept/deny/withdraw/token-lookup routes (#41-#45) — untouched.
+- Writing to the `conflicts` table — that happens at accept time (#41), not
+  in this handler.
+- SMS/email dispatch (#67/#68) — comment seam only, no stub module.
+- Any DB migration or RLS change — schema/RLS already support everything
+  this handler needs.
+- The `expired` status / DB enum — untouched.
 
 ## Verification
+
 - `bun run typecheck` — passes.
-- `bun run lint` — passes.
-- `bun run test` — full suite passes: **286 tests, 21 suites**, no
-  regressions (up from 206/16 before this change; +2 new suites,
-  +~40 tests for cancel/reactivate combined with the pre-existing 39 for
-  delete/get/update/list).
-- `bun run check:service-role` — passes (no service-role key references
-  introduced).
-- `bunx prettier --write` applied to the two new test files to match the
-  repo's formatting (some pre-existing files were already failing
-  `format:check` before this change and were left untouched, out of scope).
+- `bun run lint` — passes (0 errors, 0 warnings on touched files).
+- `bun run test` — full suite: 20 suites / 274 tests passing, including the
+  new 14-test file (`tests/unit/app/api/invitations-route.test.ts`).
+- `bunx prettier --check` on all touched/new files — all pass (repo-wide
+  `format:check` has pre-existing failures on unrelated files not touched by
+  this change).
+- `bun audit` — one pre-existing moderate advisory on a transitive
+  `next -> postcss` dependency, unrelated to this issue's scope.
 
 ## What the Tester should focus on
-- The shared `setServiceWeekCancelled` helper — confirm both
-  `cancelServiceWeek` and `reactivateServiceWeek` genuinely exercise every
-  branch (auth, role, 404, 500 x3, notify) independently, not just via the
-  happy path, since they share one implementation.
-- Recipient de-duplication: two `invitations` rows for the same `user_id`
-  must produce exactly one `notifications` row.
-- Only `pending`/`accepted` invitations are notified — `denied`,
-  `withdrawn`, `expired` must be excluded (enforced by the `.in("status",
-  ["pending", "accepted"])` filter in the recipient query).
-- Zero-recipient path must not call `.insert()` on `notifications` at all
-  (not even with an empty array).
-- Tenant scoping: the `update` call's `eq` sequence must be
-  `["id", id]` then `["church_group_id", ctx.churchGroupId]` — never leak
-  existence of another tenant's row (404 either way).
-- Non-admin roles (`member`, `set_leader`, `guest`) must get 403 before any
-  Supabase client is constructed.
-- Confirm the new migration's enum values (`service_week_cancelled`,
-  `service_week_reactivated`) actually apply cleanly against a real Postgres
-  instance if/when RLS integration tests (`bun run test:rls`) are run — this
-  was not exercised in this sandbox (no live DB available).
+
+- The BR-05 collision query logic in `app/api/invitations/handler.ts`
+  (two-query approach: accepted invitations for the user in-group, then
+  service_weeks with matching date excluding the current week) — verify the
+  "exclude current serviceWeekId" and "status = accepted only" conditions
+  are correct against real Supabase/RLS behavior, not just the mocked test.
+- `response_token` format: confirm 64 lowercase hex chars with no separators
+  (two `crypto.randomUUID()` outputs stripped of hyphens and concatenated) —
+  satisfies the DB `varchar(64) unique` column and matches the human-provided
+  override, not the original spec's `randomBytes` default.
+- The 409 vs 201-with-acknowledgeConflict two-step contract end-to-end (a
+  client integration/E2E test re-POSTing with `acknowledgeConflict: true`
+  after receiving 409 would be valuable, since unit tests only assert each
+  call path independently).
+- No `conflicts` table row is written anywhere in this handler (confirmed by
+  inspection — out of scope per spec, deferred to #41 accept flow).

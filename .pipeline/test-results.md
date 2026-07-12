@@ -1,124 +1,106 @@
-# Test Results — Issue #39: Service week cancel/reactivate (BR-17)
+# Test Results: Issue #40 — Send set invitation (POST /api/invitations, BR-05)
 
-## Verdict: PASS — ready for review.
+## Verdict: PASS
 
-All coder claims independently reproduced. No implementation failures found.
-One coverage gap identified in the coder's own tests was closed with an
-additional supplementary test file (all new tests pass, no code changes
-made).
+All coder claims independently re-verified. Added a supplemental test file with
+9 additional tests covering edge cases the spec named that the coder's own
+suite didn't directly exercise; all pass.
 
-## Commands re-run independently
+## Commands run (fresh, independently)
 
-| Command | Result |
-|---|---|
-| `bun install` | OK — no changes, 727 installs across 774 packages |
-| `bun run typecheck` (`tsc --noEmit`) | PASS — no errors |
-| `bun run lint` (`eslint .`) | PASS — no errors |
-| `bun run test` (`jest`) | PASS — **290 tests, 22 suites** (286/21 from the coder's baseline + 4/1 from my supplementary file) |
-| `bun run check:service-role` | PASS — "OK: no service-role key references found outside comments in app/ or lib/." |
-| `bunx prettier --check` (new supplement file) | PASS after `--write` (matched repo formatting) |
+- `bun install` — clean, no changes needed.
+- `bun run typecheck` (`tsc --noEmit`) — **passes**, 0 errors.
+- `bun run lint` (`eslint .`) — **passes**, 0 errors/warnings, repo-wide.
+- `bun run test` (full suite, before adding my tests) — **20 suites / 274
+  tests passing**, matches the coder's claim in `changes.md` exactly.
+- `bun run test` (full suite, after adding my supplemental test file) —
+  **21 suites / 283 tests passing** (274 + 9 new).
+- `bunx prettier --check` on all touched/new files, including my new test
+  file — all pass.
 
-Baseline before this issue was 206 tests / 16 suites per the coder's
-changes.md; the coder's own new suites (`service-weeks-cancel-route.test.ts`,
-`service-weeks-reactivate-route.test.ts`) brought it to 286/21, all green,
-matching their claim exactly. My supplementary file adds 4 more tests / 1
-more suite → 290/22, still all green.
+## Files independently read and cross-checked against spec.md
 
-## Code review against spec (`.pipeline/spec.md`)
+- `app/api/invitations/handler.ts` — logic matches spec step-by-step:
+  requireAuth → requireRole → body parse (400 on failure, including
+  non-JSON) → JWT/401 → service_weeks lookup scoped to
+  `id + church_group_id` (404 on miss, 500 on DB error, never 403) → BR-05
+  two-query collision check (accepted invitations for target user in-group,
+  then service_weeks matching date excluding current week via `.neq`) → 409
+  CONFLICT if collision and no `acknowledgeConflict`, else insert → insert
+  omits `status` (DB default applies) → `writeAuditLog` with
+  `action: "invitation.sent"` → `// TODO(#67/#68)` comment seam, no stub
+  module → `ok(..., 201)` → outer try/catch mirrors service-weeks pattern.
+- `app/api/invitations/route.ts` — POST delegates to `createInvitation`, GET
+  untouched `notImplemented` stub, matches spec exactly.
+- `schemas/invitations.ts` — `createInvitationSchema` matches spec's zod
+  shape exactly (uuid serviceWeekId/userId, optional trimmed roleNote
+  1-500, optional acknowledgeConflict boolean). Placeholder
+  `invitationsSchema` left in place as instructed.
+- `lib/supabase/types.ts` — `InvitationsRow` and the `invitations` table's
+  `Insert` omit-list match the spec's exact required shape.
+- `generateResponseToken()` — confirmed as the human-overridden format (two
+  `crypto.randomUUID()` calls, hyphens stripped, concatenated → 64 lowercase
+  hex chars), not the original spec's `randomBytes` default. Regex-verified
+  in both the coder's test and my supplemental token-uniqueness test.
+- `lib/api/auth.ts`, `lib/api/response.ts`, `lib/api/errors.ts`,
+  `lib/audit/write-audit-log.ts` — confirmed `requireAuth`/`requireRole`/
+  `ok`/`fail`/`ErrorCode.CONFLICT`(409)/`writeAuditLog` all behave as the
+  handler assumes; no surprises vs. the `service-weeks` reference handler.
 
-Verified by reading the diff directly, not just trusting changes.md:
+## Coder's own test file (`tests/unit/app/api/invitations-route.test.ts`)
 
-- `types/domain.ts` — `NotificationType` union added verbatim matching the
-  spec's exact literal list (including the two new values
-  `service_week_cancelled`, `service_week_reactivated`).
-- `lib/supabase/types.ts` — `NotificationsRow` and the `notifications` table
-  registration match the spec's row shape and Insert-optionality
-  (`id`, `created_at`, `is_read` optional) exactly.
-- `app/api/service-weeks/[id]/handler.ts` — shared private
-  `setServiceWeekCancelled` helper correctly implements: admin-only role
-  guard, JWT check, `service_weeks.update({is_cancelled}).eq("id",id)
-  .eq("church_group_id",...)` scoping, 404 on null data, 500 on each of the
-  three failure points (update, invitations select, notifications insert),
-  recipient de-dup via `Set`, skip-insert-when-zero-recipients, and the two
-  inline TODO no-op comments (chat archive / GCal removal) per the resolved
-  open questions. `cancelServiceWeek`/`reactivateServiceWeek` are thin
-  wrappers passing the correct `isCancelled`, `notificationType`, and
-  `notificationTitle` per direction. No 409 short-circuit for the
-  already-in-state case, matching the spec's idempotency note.
-- `app/api/service-weeks/[id]/cancel/route.ts` and
-  `.../reactivate/route.ts` — 501 stubs replaced with thin POST delegators,
-  matching the wiring style of the existing `route.ts`. `notImplemented`
-  import removed from both, confirmed by reading the files directly.
-- `supabase/migrations/20260711000001_service_week_notification_types.sql`
-  — two `ALTER TYPE ... ADD VALUE IF NOT EXISTS` statements, matches spec
-  verbatim, with a commented DOWN section as required. Not exercised
-  against a live Postgres instance — no DB available in this sandbox, same
-  limitation the coder flagged. `bun run test:rls`/live-DB verification is
-  out of scope for this unit-test pass.
+Ran in isolation: **14/14 passing**, matching the claimed count. Covers 401
+(x2), 403 (x2), 400 (x5), 404, 201 happy path (asserts no `status` key,
+64-hex token, ~72h deadline, `invited_by`, audit RPC call), 409 CONFLICT
+(asserts no insert), 201 with `acknowledgeConflict: true` (asserts insert
+did happen), 500 on insert error. Assertions inspected directly, not just
+trusted — they check the right things (e.g. `insertPayload).not.toHaveProperty("status")`,
+`response_token` regex, deadline within 60s of expected).
 
-## Independent test coverage added
+## Supplemental tests added by Tester (`tests/unit/app/api/invitations-route.supplemental.test.ts`)
 
-Wrote `tests/unit/app/api/service-weeks-cancel-reactivate-tester-supplement.test.ts`
-(4 new tests, all passing) to close a real gap in the coder's own test
-harness: `service-weeks-cancel-route.test.ts` and
-`service-weeks-reactivate-route.test.ts` use a mock chain where `.in(...)`
-is a no-op passthrough that never records or asserts on its arguments. That
-means a hypothetical handler bug (e.g. accidentally including `"denied"` in
-the status filter, or filtering on the wrong column entirely) would NOT have
-been caught by the existing suite — those tests only ever feed in
-already-filtered fixture data and never check what filter the handler
-actually asked the DB for.
+Independently written, not copied from the coder's file (fresh fixtures/mock
+scaffolding rebuilt from spec, same style as the existing suite). 9/9 passing:
 
-New tests added and their results (all PASS):
-1. **"filters the invitations recipient query on status IN ['pending',
-   'accepted'] (not all statuses)"** — asserts the exact `.in()` call
-   arguments captured via a recording mock chain. Confirms the handler
-   literally calls `.in("status", ["pending", "accepted"])`.
-2. **"does not notify recipients whose only invitations are
-   denied/withdrawn/expired"** — simulates the DB honoring that filter (an
-   all-denied/withdrawn/expired week resolves to zero recipients) and
-   confirms no `notifications.insert` is attempted.
-3. **"reactivate uses the same status filter as cancel"** — same argument
-   assertion for the reactivate path.
-4. **"cancel and reactivate are independent: cancelling never sets
-   is_cancelled false and vice versa"** — captures the literal `update()`
-   patches sent for each direction across two separate calls sharing the
-   `setServiceWeekCancelled` helper and asserts
-   `[{is_cancelled:true}, {is_cancelled:false}]` in order — directly
-   verifies the changes.md-flagged risk that the shared helper might
-   cross-contaminate state between the two thin wrappers.
+1. `roleNote` whitespace-only ("   ") → 400 VALIDATION_FAILED (spec names
+   this explicitly: "roleNote empty/whitespace ... → 400").
+2. Cross-group `serviceWeekId` → 404 NOT_FOUND, not 403 (spec: "wrong-group
+   and missing indistinguishable ... always 404, never 403").
+3. `service_weeks` lookup query DB error → 500 INTERNAL.
+4. BR-05 first query (accepted invitations) DB error → 500 INTERNAL.
+5. BR-05 second query (colliding service_weeks) DB error → 500 INTERNAL.
+6. **Self-exclusion correctness**: target user already has an *accepted*
+   invitation for the *same* `serviceWeekId` being re-invited to — must NOT
+   409, since the spec requires excluding the current week from the
+   collision set (models the real `.neq("id", serviceWeekId)` Supabase
+   filter behavior). This is the most important behavioral edge case named
+   in "What the Tester should focus on" in changes.md — verified correct.
+7. Audit log exact payload shape: `p_action: "invitation.sent"`,
+   `p_entity_type: "invitation"`, `p_entity_id`, and `p_metadata` containing
+   `service_week_id`, `user_id`, `acknowledged_conflict: false` — asserted
+   with a full object match, not just `objectContaining`.
+8. `writeAuditLog`'s RPC erroring → outer try/catch surfaces it as 500
+   INTERNAL (per spec: "writeAuditLog throwing ApiException is caught by
+   the outer try/catch and surfaces as 500").
+9. **Failure case / token uniqueness**: two sequential invitation creations
+   produce two distinct, correctly-formatted 64-hex tokens (guards against a
+   naive implementation that might reuse or derive predictable tokens).
 
-## Coverage already adequate in the coder's own tests (spot-checked, not
-duplicated)
+## Not independently re-verified (noted, not blocking)
 
-- 401 (no Clerk userId, no JWT) for both routes.
-- 403 for `member`/`set_leader`/`guest` via `it.each`, admin-only — and
-  confirmed `getSupabaseClient` is never called in these cases (role guard
-  fires before any DB access).
-- 404 on missing/other-tenant row.
-- 500 on each of update / invitations-select / notifications-insert errors.
-- 200 happy path with correct `isCancelled` in the response body and
-  correctly-shaped notification insert payload (`type`, `title`,
-  `link_entity_type`, `link_entity_id`).
-- Zero-recipient path skips the insert entirely.
-- De-dup of repeated `user_id`s into a single notification row.
-- Tenant-scoped `eq` call ordering (`["id", WEEK_ID]` then
-  `["church_group_id", CHURCH_GROUP_ID]`).
+- Real Supabase/RLS behavior (all tests are mocked, per the coder's own
+  "What the Tester should focus on" note) — no live DB available in this
+  environment to run an integration/E2E check of the two-query BR-05 logic
+  against actual Postgres semantics. The mock-level logic and exclusion
+  behavior were verified as thoroughly as unit tests allow (see item 6
+  above), but a live-DB or Supabase-local integration test would still be
+  valuable follow-up, as the coder itself flagged.
+- The 409 → re-POST-with-`acknowledgeConflict:true` end-to-end client flow
+  — both halves are independently unit-tested and both pass, but no
+  single test chains an actual two-request flow. Low risk since the
+  handler is stateless per-request and each half is verified correct.
 
-## Failure cases exercised
+## Conclusion
 
-401/403/404/500 paths in the coder's own suite plus the "zero recipients"
-negative case in my supplement satisfy the "at least one failure case"
-requirement. No test failures were found in either the coder's suite or my
-supplement; no code changes were made to the implementation — only a new
-test file was added.
-
-## Notes for the Reviewer
-
-- The migration's enum values were not applied against a live Postgres
-  instance (no DB available in sandbox) — matches the coder's own documented
-  limitation. Recommend a live/staging verification pass before merge if
-  `bun run test:rls` or an actual Supabase instance is reachable in CI.
-- No implementation defects found. The one gap found was in test coverage
-  (untested `.in()` filter arguments), not in the implementation itself, and
-  has now been closed by the supplementary test file.
+No failures found. Spec compliance confirmed by direct code reading, not
+just by trusting `changes.md`. Recommend proceeding to Reviewer.

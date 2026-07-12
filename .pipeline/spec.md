@@ -1,69 +1,48 @@
-# Spec — Issue #39: Service week cancel/reactivate (BR-17)
+# Spec: Issue #40 — Send set invitation (POST /api/invitations, BR-05 double-booking check)
 
-Implement `POST /api/service-weeks/:id/cancel` and `POST /api/service-weeks/:id/reactivate`.
-These are pure status-flag flips on `service_weeks.is_cancelled` plus notification fan-out.
-Do NOT touch setlists, events, invitations, conflicts, or any other child rows.
+## OPEN QUESTIONS
 
----
+None are blocking. Two design decisions are made below with defaults; proceed with them unless a human overrides.
 
-## OPEN QUESTIONS (non-blocking — defaults chosen below; change only if a human overrides)
+1. **BR-05 "warning, admin can proceed or cancel" is a two-step API contract.** This issue is the
+   API, not the UI. Implemented as: without an `acknowledgeConflict: true` flag in the request body,
+   a detected double-booking short-circuits and returns **409 CONFLICT** with the conflicting week
+   details so the client can prompt "proceed or cancel". With `acknowledgeConflict: true`, the
+   invitation is created despite the warning. This is the standard way to express "warn, then
+   allow override" over a stateless HTTP POST and matches the AC ("shows a warning, but admin can
+   proceed or cancel").
 
-1. **Notification enum value.** The `notification_type` Postgres enum
-   (`supabase/migrations/20260702000005_cluster_5_partial.sql`) has NO value for a
-   cancelled/reactivated service week. **Default chosen:** add two new enum values via a
-   new migration (`service_week_cancelled`, `service_week_reactivated`) — see "Files to
-   create" below. If you'd rather reuse an existing value, the closest is
-   `scheduling_conflict`, but it's semantically wrong; the migration path is the default.
+2. **`response_token` format.** DB column is `response_token varchar(64) not null unique`. Generate
+   a 64-char hex token in the handler using the Node `crypto` global (available in Next.js route
+   handlers): `crypto.randomBytes(32).toString("hex")`. Import `randomBytes` from `node:crypto`.
 
-2. **Chat-room archive flag (AC bullet 3).** There is NO `chat_rooms` table and NO chat
-   column on `service_weeks` — the cluster-5 migration explicitly defers all chat objects
-   to Phase 2. There is nowhere to set an "archived" flag today. **Default chosen:**
-   implement this AC as a no-op with an inline `// TODO(Phase 2 chat): archive chat room
-   placeholder for this week — no chat table exists yet` comment inside the cancel handler.
-   Do NOT invent a column or table for it.
+## Current state (already done — do NOT redo)
 
-3. **GCal event removal (AC bullet 4).** No GCal-sync service exists
-   (`lib/google-calendar/client.ts` throws "not implemented"). **Default chosen:**
-   implement as a no-op stub with an inline `// TODO(#62 GCal sync): remove synced Google
-   Calendar events for this week's events` comment. Do NOT call `deleteEvent` (it throws).
+- DB schema is complete. `supabase/migrations/20260702000003_cluster_3_scheduling_core.sql` already
+  defines the `invitations` table with ALL needed columns: `id, church_group_id, service_week_id,
+  user_id, role_note, status (default 'pending'), response_token (varchar(64) unique), responded_at,
+  denial_reason, denial_count, response_deadline, invited_by, created_at`. The `conflicts` table also
+  already exists. **No new migration is needed.**
+- RLS is complete (`supabase/migrations/20260704000001_rls_policies.sql`): `invitations_insert_leader_admin`
+  and `conflicts_insert_leader_admin` already gate INSERTs to leader/admin in the same group. The
+  `write_audit_log` RPC exists and is used via `lib/audit/write-audit-log.ts`.
 
----
+## What this issue implements
 
-## Current state (already true — do not redo)
+`POST /api/invitations` only. GET is out of scope for #40 — leave the `GET` export in
+`app/api/invitations/route.ts` as the existing `notImplemented` stub. Accept/deny/withdraw/token-lookup
+are separate issues (#41–#45) — do not touch those routes.
 
-- `service_weeks.is_cancelled boolean not null default false` already exists in the DB
-  (`supabase/migrations/20260702000003_cluster_3_scheduling_core.sql`) and in
-  `lib/supabase/types.ts` (`ServiceWeeksRow.is_cancelled`). No schema change to
-  `service_weeks` is needed.
-- Route files exist as 501 stubs and must be filled in:
-  - `app/api/service-weeks/[id]/cancel/route.ts`
-  - `app/api/service-weeks/[id]/reactivate/route.ts`
-- `notifications` table EXISTS in the DB
-  (`supabase/migrations/20260702000005_cluster_5_partial.sql`) but is NOT in
-  `lib/supabase/types.ts` — you must add it (see below).
-- RLS: `notifications_insert_leader_admin` allows INSERT only when
-  `church_group_id = auth_church_group_id() AND auth_is_leader_or_admin()`. Admin qualifies.
-  Rows inserted must set `church_group_id` to the caller's group.
+The `conflicts` INSERT ("conflict flag raised when member accepts both") happens at **accept** time
+(#41), NOT here. This issue only performs the *check* and records the warning. Do NOT write a
+`conflicts` row in this handler.
 
----
+## Files to modify
 
-## Files to create
+### 1. `lib/supabase/types.ts` — fix the incomplete `InvitationsRow`
 
-### 1. `supabase/migrations/20260711000001_service_week_notification_types.sql`
-Add two enum values for the cancel/reactivate notifications. Each `ADD VALUE` is its own
-statement.
-
-```sql
--- Issue #39 (BR-17): notification types for service week cancel/reactivate.
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'service_week_cancelled';
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'service_week_reactivated';
-```
-
-Include a commented `-- ============ DOWN ============` section noting enum-value removal
-is not straightforward in Postgres (mirror the DOWN-comment style used in the cluster
-migrations; a real down is not required).
-
----
+The hand-rolled `InvitationsRow` (around line 94) is missing columns the DB actually has. Replace it so
+it matches the migration. New shape:
 
 ## Files to modify
 
@@ -71,127 +50,169 @@ migrations; a real down is not required).
 Add a `NotificationType` union mirroring the DB enum (including the two new values). Keep
 the existing string-literal-union comment style:
 ```ts
-export type NotificationType =
-  | "set_invitation"
-  | "invitation_reminder"
-  | "invitation_accepted"
-  | "invitation_denied"
-  | "practice_reminder"
-  | "setlist_released"
-  | "scheduling_conflict"
-  | "chat_mention"
-  | "devotion_shared"
-  | "new_church_document"
-  | "google_calendar_event"
-  | "service_week_cancelled"
-  | "service_week_reactivated";
-```
-
-### 3. `lib/supabase/types.ts`
-Add a `NotificationsRow` type and register the `notifications` table in
-`Database["public"]["Tables"]`. Follow the exact style of the existing `InvitationsRow` /
-`invitations` entries. Import `NotificationType` from `@/types/domain` (extend the existing
-import line).
-
-Row shape (mirror the DB columns from the cluster-5 migration exactly):
-```ts
-type NotificationsRow = {
+type InvitationsRow = {
   id: string;
   church_group_id: string;
+  service_week_id: string;
   user_id: string;
-  type: NotificationType;
-  title: string;
-  body: string | null;
-  link_entity_type: string | null;
-  link_entity_id: string | null;
-  is_read: boolean;
+  role_note: string | null;
+  status: InvitationStatus;
+  response_token: string;
+  responded_at: string | null;
+  denial_reason: string | null;
+  denial_count: number;
+  response_deadline: string | null;
+  invited_by: string | null;
   created_at: string;
 };
 ```
-Table entry (match the `is_cancelled`/`created_at`-optional Insert style already used for
-`service_weeks`):
+
+Then update the `invitations` table entry in the `Database` type (around line 178) so `Insert` omits
+the DB-defaulted / server-generated columns, mirroring how `service_weeks` does it (see lines 152–161):
+
 ```ts
-notifications: {
-  Row: NotificationsRow;
-  Insert: Omit<NotificationsRow, "id" | "created_at" | "is_read"> & {
+invitations: {
+  Row: InvitationsRow;
+  Insert: Omit<
+    InvitationsRow,
+    "id" | "created_at" | "status" | "responded_at" | "denial_reason" | "denial_count" | "response_deadline"
+  > & {
     id?: string;
     created_at?: string;
-    is_read?: boolean;
+    status?: InvitationStatus;
+    responded_at?: string | null;
+    denial_reason?: string | null;
+    denial_count?: number;
+    response_deadline?: string | null;
   };
-  Update: Partial<NotificationsRow>;
+  Update: Partial<InvitationsRow>;
   Relationships: [];
 };
 ```
 
-### 4. `app/api/service-weeks/[id]/handler.ts` (add two exported functions)
-Add `cancelServiceWeek` and `reactivateServiceWeek` alongside the existing handlers.
-Copy the structure of the existing `deleteServiceWeek` in this same file (auth → role
-guard → JWT → fetch/mutate → notify). Signatures:
+`InvitationStatus` is already imported at the top of the file (line 9).
+
+### 2. `schemas/invitations.ts` — real create schema
+
+The file currently holds only an empty placeholder `invitationsSchema = z.object({})`. Add the create
+schema (keep the existing `invitationsSchema`/`InvitationsInput` export in place — other stubs may
+reference it). Follow the style of `schemas/service-weeks.ts`.
 
 ```ts
-export async function cancelServiceWeek(
-  req: NextRequest,
-  id: string,
-  lookup?: UserLookup,
-): Promise<Response>
-
-export async function reactivateServiceWeek(
-  req: NextRequest,
-  id: string,
-  lookup?: UserLookup,
-): Promise<Response>
+export const createInvitationSchema = z.object({
+  serviceWeekId: z.string().uuid(),
+  userId: z.string().uuid(),
+  roleNote: z.string().trim().min(1).max(500).optional(),
+  acknowledgeConflict: z.boolean().optional(),
+});
+export type CreateInvitationInput = z.infer<typeof createInvitationSchema>;
 ```
 
-Shared behavior for BOTH:
+`roleNote` is optional (DB column `role_note` is nullable). `acknowledgeConflict` defaults to
+undefined/false (the BR-05 override flag).
+
+### 3. `app/api/invitations/handler.ts` — NEW FILE (handler layer)
+
+Follow the exact structure of `app/api/service-weeks/handler.ts` and
+`app/api/church-group/members/[id]/role/handler.ts` (the latter for the `writeAuditLog` usage).
+
+Export a response mapper and a `createInvitation` function:
+
+```ts
+export type InvitationResponse = {
+  id: string;
+  serviceWeekId: string;
+  userId: string;
+  roleNote: string | null;
+  status: InvitationStatus;
+  responseToken: string;
+  responseDeadline: string | null;
+  invitedBy: string | null;
+  createdAt: string;
+};
+
+export function toInvitationResponse(row: InvitationsRow): InvitationResponse;
+
+export async function createInvitation(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+```
+
+`createInvitation` logic, in order:
+
 1. `const ctx = await requireAuth(req, lookup);`
-2. `requireRole(ctx, ["admin"]);` — admin only (matches DELETE; the issue frames this as an
-   admin action). Members/set_leaders/guests get 403 FORBIDDEN.
-3. Get supabase client via the `auth()` → `getToken({ template: "supabase" })` pattern
-   already used in `deleteServiceWeek`; missing JWT → 401 UNAUTHENTICATED.
-4. Update `service_weeks` scoped by `.eq("id", id).eq("church_group_id", ctx.churchGroupId)`,
-   setting `{ is_cancelled: true }` (cancel) or `{ is_cancelled: false }` (reactivate).
-   Use `.select("*").maybeSingle()`. If `error` → 500 INTERNAL. If `data` is null → 404
-   NOT_FOUND (row missing or wrong tenant — do not leak existence).
-5. Fetch affected recipients: query `invitations` with
-   `.select("user_id").eq("service_week_id", id).in("status", ["pending", "accepted"])`.
-   On error → 500 INTERNAL. De-duplicate `user_id`s.
-6. If there are recipients, bulk-insert one `notifications` row per unique `user_id`:
-   - `church_group_id: ctx.churchGroupId`
-   - `user_id`
-   - `type`: `"service_week_cancelled"` (cancel) / `"service_week_reactivated"` (reactivate)
-   - `title`: cancel → `"Service week cancelled"`; reactivate → `"Service week reactivated"`
-   - `body`: null (keep minimal; do not fabricate copy)
-   - `link_entity_type: "service_week"`, `link_entity_id: id`
-   - Use the same narrow-cast-to-Insert trick used in `createServiceWeek`
-     (`... as unknown as Database["public"]["Tables"]["notifications"]["Insert"]`) if the
-     hand-rolled Insert type complains.
-   - If the notifications insert `error` → 500 INTERNAL. (Notification is part of the AC,
-     so a failed insert is a real failure, not fire-and-forget.)
-   - If there are zero recipients, skip the insert entirely (do not insert an empty array).
-7. Chat-room archive: inline no-op TODO comment (see OPEN QUESTION 2). Cancel handler only.
-8. GCal removal: inline no-op TODO comment (see OPEN QUESTION 3). Cancel handler only.
-9. Return `ok({ serviceWeek: toServiceWeekResponse(data) })` (200) using
-   `toServiceWeekResponse` (already imported from `../handler` in this file). Reuse it.
-10. `catch (err)`: `if (err instanceof ApiException) return fail(err.message, err.code,
-    err.status); return fail("Internal error", ErrorCode.INTERNAL, 500);` — copy verbatim
-    from the other handlers.
+2. `requireRole(ctx, ["admin", "set_leader"]);` (Set Leaders send invitations; app-layer check even
+   though RLS also gates it — mirror the role/handler.ts comment rationale).
+3. Parse body with `createInvitationSchema.safeParse`; on failure return
+   `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)`. Handle non-JSON body via
+   `req.json().catch(() => null)` (same as service-weeks).
+4. Get the supabase JWT client exactly as service-weeks does (401 UNAUTHENTICATED if no JWT).
+5. **Validate the target service week exists in the caller's group.** Query `service_weeks` by
+   `id = serviceWeekId` and `church_group_id = ctx.churchGroupId`, `.maybeSingle()`. If DB error →
+   500 INTERNAL. If not found → `fail("Service week not found", ErrorCode.NOT_FOUND, 404)`. Keep the
+   `service_date` from this row for the BR-05 check.
+6. **BR-05 double-booking check.** Query for OTHER invitations that would collide on the same calendar
+   date with `status = 'accepted'`:
+   - Select `invitations` joined to `service_weeks` on the same `church_group_id` where
+     `invitations.user_id = userId`, `invitations.status = 'accepted'`, the joined
+     `service_weeks.service_date = <this week's service_date>`, and
+     `invitations.service_week_id <> serviceWeekId` (exclude the current week).
+   - Implementation approach (no cross-table join helper exists; do two queries): first select the
+     accepted invitations for this user in this group (`.eq("user_id", userId).eq("status",
+     "accepted").eq("church_group_id", ctx.churchGroupId)` selecting `service_week_id`), then select
+     `service_weeks` whose `id in (...those week ids)` AND `service_date = thisDate` AND `id <>
+     serviceWeekId`. A non-empty result = a double-booking on that date.
+   - On DB error in either query → 500 INTERNAL.
+   - If a collision is found AND `acknowledgeConflict !== true`: return
+     `fail("Member already confirmed for another week on this date", ErrorCode.CONFLICT, 409)` — the
+     response body's `error`/`code` follow the standard `fail` shape (there is no custom detail
+     envelope; `fail` only takes message+code+status). The client re-POSTs with
+     `acknowledgeConflict: true` to override.
+   - If a collision is found AND `acknowledgeConflict === true`: proceed (do not block).
+   - If no collision: proceed.
+7. **Insert the invitation.** Generate `response_token` = `randomBytes(32).toString("hex")` and
+   `response_deadline` = now + 72 hours as ISO string: `new Date(Date.now() + 72 * 60 * 60 *
+   1000).toISOString()`. Build the insert payload (cast narrowly with
+   `as unknown as Database["public"]["Tables"]["invitations"]["Insert"]`, mirroring service-weeks
+   line 124–132, because the hand-rolled Insert type still marks some columns required):
+   ```ts
+   {
+     church_group_id: ctx.churchGroupId,
+     service_week_id: parsed.serviceWeekId,
+     user_id: parsed.userId,
+     role_note: parsed.roleNote ?? null,
+     response_token: token,
+     response_deadline: deadlineIso,
+     invited_by: ctx.userId,
+   }
+   ```
+   Do NOT set `status` (DB defaults to `'pending'`). `.insert(payload).select("*").maybeSingle()`.
+   On error or null row → 500 INTERNAL.
+8. **Audit log.** `await writeAuditLog(supabase, { action: "invitation.sent", entityType:
+   "invitation", entityId: invitation.id, metadata: { service_week_id: parsed.serviceWeekId, user_id:
+   parsed.userId, acknowledged_conflict: parsed.acknowledgeConflict === true } });`
+9. **Notification stub.** SMS/email dispatch is #67/#68 and explicitly out of scope. Do NOT call any
+   notification service. Add a single comment marking the seam, e.g.
+   `// TODO(#67/#68): dispatch SMS/email invitation notification here.` Do not create a stub module.
+10. Return `ok({ invitation: toInvitationResponse(invitation) }, 201)`.
+11. Wrap the whole body in the same `try/catch` as service-weeks: `if (err instanceof ApiException)
+    return fail(err.message, err.code, err.status); return fail("Internal error", ErrorCode.INTERNAL,
+    500);`
 
-Idempotency note: cancelling an already-cancelled week (or reactivating an already-active
-one) is allowed and still returns 200 with the (re-)notification sent — the AC does not ask
-for a "no change" short-circuit, and re-notify on reactivate is explicitly desired. Do NOT
-add a 409 for the already-in-state case.
+### 4. `app/api/invitations/route.ts` — wire POST to the handler
 
-### 5. `app/api/service-weeks/[id]/cancel/route.ts` (replace stub)
-Mirror the wiring style of `app/api/service-weeks/[id]/route.ts`:
+Currently both GET and POST are `notImplemented` stubs. Change **only POST** to delegate, matching
+`app/api/service-weeks/route.ts`:
+
 ```ts
 import { NextRequest } from "next/server";
-import { cancelServiceWeek } from "../handler";
+import { notImplemented } from "@/lib/api/response";
+import { createInvitation } from "./handler";
 
-type Ctx = { params: Promise<{ id: string }> };
+export async function GET(_req: NextRequest) {
+  return notImplemented("GET /api/invitations");
+}
 
-export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
-  const { id } = await params;
-  return cancelServiceWeek(req, id);
+export async function POST(req: NextRequest): Promise<Response> {
+  return createInvitation(req);
 }
 ```
 Remove the `notImplemented` import.
@@ -241,29 +262,62 @@ pending/accepted invitees.
 ---
 
 ## Edge cases the implementation MUST handle
-- Missing/other-tenant week id → 404 NOT_FOUND (never leak existence).
-- Non-admin caller → 403 FORBIDDEN before any DB write.
-- Missing Clerk auth / missing supabase JWT → 401 UNAUTHENTICATED.
-- Zero pending/accepted invitations → succeed with no notification insert (do not error).
-- Duplicate `user_id` across multiple invitations for the same week → one notification each.
-- Only `pending` and `accepted` invitations are notified — `denied`, `withdrawn`, `expired`
-  are excluded.
-- Child rows (setlist, events, invitations, conflicts) are NEVER modified — only the
-  `is_cancelled` flag and new `notifications` rows are written.
-- DB errors at each step (update, invitations select, notifications insert) → 500 INTERNAL.
 
-## Patterns to follow (copy from these exact files)
-- Handler structure, auth/JWT/role guards, error handling: `deleteServiceWeek` in
-  `app/api/service-weeks/[id]/handler.ts`.
-- Narrow Insert cast: `createServiceWeek` in `app/api/service-weeks/handler.ts`.
-- Route → handler wiring: `app/api/service-weeks/[id]/route.ts`.
-- Response envelope: `ok`/`fail` from `lib/api/response.ts`; codes from `lib/api/errors.ts`.
-- Test harness: `tests/unit/app/api/service-weeks-delete-route.test.ts`.
-- `types.ts` table registration style: existing `invitations` / `service_weeks` entries.
+- No Clerk user / no Supabase JWT → 401 UNAUTHENTICATED (JWT check happens before any DB work).
+- `member` or `guest` caller → 403 FORBIDDEN, before any DB work (requireRole throws).
+- Malformed/non-JSON body, missing `serviceWeekId`/`userId`, non-uuid ids, `roleNote` empty/whitespace
+  or > 500 chars → 400 VALIDATION_FAILED.
+- `serviceWeekId` points to a week in another group or a non-existent week → 404 NOT_FOUND (RLS + the
+  explicit `church_group_id` filter make wrong-group and missing indistinguishable; always 404, never
+  403 — mirror the role/handler.ts comment).
+- Double-booking found without `acknowledgeConflict` → 409 CONFLICT (invitation NOT created).
+- Double-booking found WITH `acknowledgeConflict: true` → invitation created (201).
+- No double-booking → invitation created (201).
+- Any Supabase query/insert error → 500 INTERNAL. `writeAuditLog` throwing ApiException is caught by
+  the outer try/catch and surfaces as 500.
+- The BR-05 query must only count `status = 'accepted'` invitations and must exclude the current
+  `serviceWeekId` (selecting the same person for the same week is not a double-booking).
 
-## Out of scope (do not implement)
-- Hard deletion (#38 — already implemented via DELETE).
-- Real chat-room archiving (Phase 2 — no table exists).
-- Real Google Calendar event removal (#62 — no sync service exists).
-- SMS/email dispatch of the notification (only the in-app `notifications` row is required).
-- Any RLS/migration change beyond adding the two `notification_type` enum values.
+## Tests to add
+
+Create `tests/unit/app/api/invitations-route.test.ts`. Copy the mock scaffolding wholesale from
+`tests/unit/app/api/service-weeks-route.test.ts` (same `makeChain` / `makeSupabaseClient` /
+`setUpAuth` / `makeLookup` helpers, same `onInsert` hook to capture payloads). Cover:
+
+- 401 when Clerk userId null (lookup not consulted) and when getToken yields no JWT.
+- 403 for `member` and `guest` (before DB work).
+- 400 for: non-JSON body, missing `serviceWeekId`, missing `userId`, non-uuid `userId`, `roleNote`
+  too long.
+- 404 when the service week is not found.
+- 201 happy path with no double-booking: asserts status default is NOT set in the insert payload,
+  asserts `response_token` (64 hex chars) and `response_deadline` (~72h out) are present in the
+  payload, asserts `invited_by === USER_ID`, asserts `writeAuditLog`/`rpc("write_audit_log", ...)` was
+  invoked with `action: "invitation.sent"`.
+- 409 CONFLICT when a double-booking exists and `acknowledgeConflict` is absent (assert NO invitation
+  insert occurred).
+- 201 when the same double-booking exists but `acknowledgeConflict: true` (assert the insert DID
+  occur).
+- 500 when the invitation insert errors.
+
+Note the BR-05 check issues extra `invitations` and `service_weeks` SELECTs beyond what the
+service-weeks fixtures cover — extend the fixture defaults so those queries resolve, and add
+per-test overrides to simulate the "accepted invitation on the same date" collision. `writeAuditLog`
+calls `supabase.rpc("write_audit_log", ...)`, so the mock client needs an `rpc` method returning
+`{ error: null }` (add it to `makeSupabaseClient`).
+
+## Patterns to follow (named references)
+
+- Handler shape, JWT retrieval, `try/catch`, narrow Insert cast: `app/api/service-weeks/handler.ts`.
+- `writeAuditLog` usage + 404-not-403 rationale: `app/api/church-group/members/[id]/role/handler.ts`.
+- Route → handler delegation: `app/api/service-weeks/route.ts`.
+- Zod schema style: `schemas/service-weeks.ts`.
+- Unit-test mock scaffolding: `tests/unit/app/api/service-weeks-route.test.ts`.
+
+## Out of scope (do NOT implement)
+
+- SMS/email dispatch (#67/#68) — comment seam only.
+- Writing to the `conflicts` table (that happens at accept time, #41).
+- GET/accept/deny/withdraw/token-lookup routes (#41–#45).
+- Any new DB migration or RLS change (schema already supports everything here).
+- The `expired` status (domain.ts lists it but the DB enum does not include it; irrelevant to this
+  issue — do not touch the enum).
