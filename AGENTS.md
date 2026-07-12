@@ -17,6 +17,12 @@ This repo uses Bun for package management and scripts:
 - Use `bun audit` for dependency scanning.
 - Do not use npm, yarn, or pnpm, and do not reference them in specs, code, or
   commit messages.
+- If an issue, linked documentation, or any other source material gives
+  commands in terms of npm or npx (e.g. `npm install <pkg>`, `npx <tool>`,
+  `npm run <script>`), translate them to the Bun equivalent (`bun add <pkg>`,
+  `bunx <tool>`, `bun run <script>`) and proceed — this is not a blocking
+  ambiguity, don't raise it as an OPEN QUESTION. Never actually invoke
+  npm/npx, even if the source material explicitly instructs it.
 
 ## Pipeline contract
 
