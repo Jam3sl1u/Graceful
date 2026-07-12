@@ -19,3 +19,6 @@ next-env.d.ts
 
 # misc
 .DS_Store
+
+# ephemeral orchestration state (NOT the .pipeline/*.md audit trail, which stays tracked)
+/.claude/state/
