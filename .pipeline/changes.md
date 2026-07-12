@@ -12,7 +12,7 @@ than `import { randomBytes } from "node:crypto"`. The BR-05
 warn-then-proceed/cancel flow (via `acknowledgeConflict`) matched the spec as
 written, so no change was needed there.
 
-## Files changed
+## Files created
 
 - `lib/supabase/types.ts` — replaced the incomplete hand-rolled
   `InvitationsRow` (only had `id/church_group_id/service_week_id/user_id/status/created_at`)

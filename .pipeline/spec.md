@@ -44,6 +44,11 @@ The `conflicts` INSERT ("conflict flag raised when member accepts both") happens
 The hand-rolled `InvitationsRow` (around line 94) is missing columns the DB actually has. Replace it so
 it matches the migration. New shape:
 
+## Files to modify
+
+### 2. `types/domain.ts`
+Add a `NotificationType` union mirroring the DB enum (including the two new values). Keep
+the existing string-literal-union comment style:
 ```ts
 type InvitationsRow = {
   id: string;
@@ -210,6 +215,51 @@ export async function POST(req: NextRequest): Promise<Response> {
   return createInvitation(req);
 }
 ```
+Remove the `notImplemented` import.
+
+### 6. `app/api/service-weeks/[id]/reactivate/route.ts` (replace stub)
+Same shape, calling `reactivateServiceWeek`.
+
+---
+
+## Tests to create
+
+### 7. `tests/unit/app/api/service-weeks-cancel-route.test.ts`
+Model closely on `tests/unit/app/api/service-weeks-delete-route.test.ts` (same
+Clerk/supabase mock harness: `makeChain`, `makeSupabaseClient`, `makeLookup`, `setUpAuth`).
+Import `cancelServiceWeek` from `@/app/api/service-weeks/[id]/handler`.
+
+Extend the mock chain to support the new call shapes:
+- `.update(...).eq().eq().select().maybeSingle()` (add an `update` fixture/branch).
+- `.select(...).eq().in(...)` (add `in: jest.fn(() => chain)` to the chain; it resolves via
+  `then`).
+- `.insert(...)` on the `notifications` table (add an `insert` branch that resolves via
+  `then`, capturing the inserted payload for assertions).
+
+Cover:
+- 401 when Clerk userId is null (lookup not consulted).
+- 401 when getToken yields no JWT.
+- 403 for each of `member`, `set_leader`, `guest` (admin-only).
+- 404 when the update matches no row (`update` returns `{ data: null, error: null }`).
+- 500 when the update errors.
+- 500 when the invitations recipient query errors.
+- 500 when the notifications insert errors.
+- 200 happy path: `is_cancelled` set true, response body
+  `data.serviceWeek.isCancelled === true`; one notification row inserted per unique
+  pending/accepted invitee with `type: "service_week_cancelled"`,
+  `link_entity_type: "service_week"`, `link_entity_id: WEEK_ID`.
+- 200 with zero pending/accepted invitations → no notifications insert attempted.
+- De-dup: two invitations for the same `user_id` produce a single notification row.
+- Tenant scoping: the update is scoped to `["id", WEEK_ID]` then
+  `["church_group_id", CHURCH_GROUP_ID]` (assert the eq-call sequence, mirroring the delete
+  test's "scopes the delete" case).
+
+### 8. `tests/unit/app/api/service-weeks-reactivate-route.test.ts`
+Same as above for `reactivateServiceWeek`: `is_cancelled` set false,
+`type: "service_week_reactivated"`, `data.serviceWeek.isCancelled === false`, re-notify
+pending/accepted invitees.
+
+---
 
 ## Edge cases the implementation MUST handle
 
