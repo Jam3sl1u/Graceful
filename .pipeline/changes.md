@@ -1,105 +1,136 @@
-# Changes — Issue #34: Implement availability set/get
+# Changes — Issue #39: Service week cancel/reactivate (BR-17)
 
-## Open question — resolution applied
+## Open questions — human resolutions applied
 
-The spec's one open question ("how are weekly/monthly blocks expressed in the
-`PUT` body?") was resolved by a human decision: **option (b)** — the `PUT`
-body accepts either a single `date` or an inclusive `startDate`..`endDate`
-range per entry, expanded server-side into per-date upserts. This is what's
-implemented below (the `setAvailabilityEntrySchema` range branch and the
-expansion loop in the handler were kept, not dropped).
+1. **Notification enum value.** Dedicated enum values added via migration
+   (`service_week_cancelled`, `service_week_reactivated`), NOT a reuse of
+   `scheduling_conflict`.
+2. **Chat-room archive (AC bullet 3).** Left as a no-op with an inline
+   `// TODO(Phase 2 chat): ...` comment inside the cancel path — no
+   `chat_rooms` table exists yet.
+3. **GCal event removal (AC bullet 4).** Left as a no-op with an inline
+   `// TODO(#62 GCal sync): ...` comment inside the cancel path — no GCal sync
+   service exists; `deleteEvent` is not called.
 
-## Files changed
+## Files created
 
-### `lib/supabase/types.ts` (modified)
-Added `AvailabilityRow` (mirrors the DB `availability` table:
-`id, user_id, church_group_id, date, is_available, note, created_at`) and
-registered it under `Database.public.Tables.availability`, following the same
-`Insert` treatment as `member_profiles`/`service_weeks` (DB-defaulted columns
-`id`, `created_at`, `is_available` made optional on `Insert`).
+### `supabase/migrations/20260711000001_service_week_notification_types.sql`
+Adds `service_week_cancelled` and `service_week_reactivated` to the
+`notification_type` enum via two `ALTER TYPE ... ADD VALUE IF NOT EXISTS`
+statements. Includes a commented `DOWN` section noting enum-value removal
+isn't straightforward in Postgres (mirrors the cluster migrations' style).
 
-### `schemas/availability.ts` (replaced placeholder)
-- `DATE_RE` — `YYYY-MM-DD` regex.
-- `isValidDateString` (private helper) — round-trips a date string through
-  UTC `Date` construction/`toISOString()` to reject non-existent calendar
-  dates like `2026-02-30` while accepting real ones.
-- `getAvailabilityQuerySchema` — `{ user_id?: uuid }` for `GET`.
-- `setAvailabilityEntrySchema` — one `PUT` entry: `date?`, `startDate?`,
-  `endDate?`, `isAvailable?: boolean`, `note` (trimmed/capped-500/nullish,
-  empty → `null`, same pattern as `schemas/profile.ts`'s bio). A
-  `superRefine` enforces: exactly one of "`date` alone" or "`startDate` AND
-  `endDate` together" is present (both forms together, or neither, is
-  rejected); every present date string must be a real calendar date; for a
-  range, `startDate <= endDate`.
-- `setAvailabilitySchema` — `{ entries: [...].min(1).max(400) }` for the `PUT`
-  body.
+### `tests/unit/app/api/service-weeks-cancel-route.test.ts` (new)
+### `tests/unit/app/api/service-weeks-reactivate-route.test.ts` (new)
+Modeled on `tests/unit/app/api/service-weeks-delete-route.test.ts` (same
+Clerk/Supabase mock harness pattern: `makeChain`, `makeSupabaseClient`,
+`makeLookup`, `setUpAuth`). The mock chain was extended to support:
+- `.update(patch).eq().eq().select().maybeSingle()` for the `service_weeks`
+  update.
+- `.select().eq().in()` for the pending/accepted invitations recipient
+  query (resolves via the chain's `then`).
+- `.insert(payload)` on `notifications` (resolves via `then`; the payload is
+  captured via an `onInsert` hook for assertions).
 
-### `app/api/availability/handler.ts` (new)
-- `AvailabilityEntry` response type: `{ userId, date, isAvailable, note }`.
-- `getAvailability(req, lookup?)` — `requireAuth` → parse `?user_id=` query
-  → if `user_id` is present and differs from the caller,
-  `requireRole(ctx, ["admin", "set_leader"])` (else 403 `FORBIDDEN`), else
-  target is the caller's own id → JWT/`getSupabaseClient` → `select("user_id,
-  date, is_available, note").eq("user_id", targetUserId).order("date")` →
-  maps rows → `ok({ availability })`. No `church_group_id` filter (RLS already
-  scopes it); returns only stored rows, does not synthesize "available"
-  defaults for unset dates.
-- `expandEntryDates(entry)` (private helper) — single-date entry → `[date]`;
-  range entry → every date from `startDate` to `endDate` inclusive
-  (UTC-day-stepped to avoid DST issues).
-- `setAvailability(req, lookup?)` — `requireAuth` (caller's own availability
-  only, no role gate) → parse body with `setAvailabilitySchema` → expand every
-  entry into concrete dates, enforcing a running total cap of **366** expanded
-  dates (400 `VALIDATION_FAILED` if exceeded) → dedupe into a `Map<date, {
-  isAvailable, note }>`, **last-entry-wins**, since a single upsert can't hit
-  the same `(user_id, date)` conflict target twice → JWT/`getSupabaseClient`
-  → build one row per resolved date (`isAvailable` defaults to `true` when
-  omitted) with the same narrow `as unknown as
-  Database[...]["availability"]["Insert"][]` cast the profile handler uses
-  for the DB-defaulted-column mismatch → `upsert(rows, { onConflict:
-  "user_id,date" }).select(...)` → maps rows → `ok({ availability })`.
-- Both handlers wrap everything in the same try/catch pattern as
-  `app/api/profile/handler.ts`: `ApiException` → `fail(err.message, err.code,
-  err.status)`, anything else → 500 `INTERNAL`.
+Each file covers: 401 (no Clerk userId / no JWT), 403 for `member`,
+`set_leader`, `guest` (admin-only), 404 when the update matches no row, 500
+on update/invitations-query/notifications-insert errors, the 200 happy path
+(correct `is_cancelled` flip, one notification per unique pending/accepted
+invitee with the correct `type`/`title`/`link_entity_*`), 200 with zero
+recipients (no insert attempted), de-dup of repeated `user_id`s into a single
+notification row, and tenant-scoped `eq` call ordering
+(`["id", WEEK_ID]` then `["church_group_id", CHURCH_GROUP_ID]`).
 
-### `app/api/availability/route.ts` (modified)
-Replaced the two `notImplemented` stubs with thin `GET`/`PUT` delegators to
-`getAvailability`/`setAvailability`, matching `app/api/profile/route.ts`.
+## Files modified
+
+### `types/domain.ts`
+Added `NotificationType` union (mirrors the DB enum, including the two new
+values), following the existing string-literal-union comment style.
+
+### `lib/supabase/types.ts`
+- Extended the `@/types/domain` import to include `NotificationType`.
+- Added `NotificationsRow` (`id, church_group_id, user_id, type, title, body,
+  link_entity_type, link_entity_id, is_read, created_at`).
+- Registered `notifications` under `Database.public.Tables`, following the
+  `is_cancelled`/`created_at`-optional `Insert` pattern already used for
+  `service_weeks` (`id`, `created_at`, `is_read` optional on `Insert`).
+
+### `app/api/service-weeks/[id]/handler.ts`
+Added `cancelServiceWeek` and `reactivateServiceWeek`, both thin wrappers
+around a new private `setServiceWeekCancelled(req, id, lookup, isCancelled,
+notificationType, notificationTitle)` helper that implements the shared
+auth → role-guard → JWT → update → notify flow (mirrors `deleteServiceWeek`'s
+structure but factored once since the two routes are otherwise identical):
+1. `requireAuth` then `requireRole(ctx, ["admin"])` — admin only.
+2. JWT via `auth()` → `getToken({ template: "supabase" })`; missing → 401.
+3. `service_weeks.update({ is_cancelled })` scoped by
+   `.eq("id", id).eq("church_group_id", ctx.churchGroupId)`,
+   `.select("*").maybeSingle()`. Error → 500; null data → 404.
+4. `invitations.select("user_id").eq("service_week_id", id).in("status",
+   ["pending", "accepted"])`. Error → 500. De-duplicated via `Set`.
+5. If there are recipients, bulk-insert one `notifications` row per unique
+   `user_id` (`church_group_id`, `user_id`, `type`, `title`, `body: null`,
+   `link_entity_type: "service_week"`, `link_entity_id: id`), using the
+   narrow `as unknown as Database[...]["notifications"]["Insert"][]` cast
+   (same trick as `createServiceWeek`). Insert error → 500. Zero recipients
+   → insert skipped entirely.
+6. Inline TODO comments for the chat-room archive and GCal event removal
+   no-ops (open questions 2 and 3), placed after the notification insert.
+7. Returns `ok({ serviceWeek: toServiceWeekResponse(data) })` (200).
+8. Same `catch (err)` → `ApiException` passthrough / 500 `INTERNAL` fallback
+   as the other handlers.
+
+No 409 short-circuit for the already-in-state case — cancelling an
+already-cancelled week (or reactivating an already-active one) is allowed
+and re-notifies, per the spec's idempotency note.
+
+### `app/api/service-weeks/[id]/cancel/route.ts` (replaced 501 stub)
+### `app/api/service-weeks/[id]/reactivate/route.ts` (replaced 501 stub)
+Thin `POST` delegators to `cancelServiceWeek`/`reactivateServiceWeek`,
+matching the wiring style of `app/api/service-weeks/[id]/route.ts`. The
+`notImplemented` import was removed from both.
 
 ## Explicitly not touched (per spec's out-of-scope list)
-- `app/api/availability/[date]/route.ts` (DELETE, #35) — left as a stub.
-- `app/api/availability/team/route.ts` (GET, #36) — left as a stub.
-- Conflict detection on availability change (#46).
-- Leaders/admins setting *another* member's availability via `PUT` — GET-only
-  cross-member access, gated to admin/set_leader.
+- Hard deletion (`DELETE`, #38 — already implemented).
+- Real chat-room archiving (Phase 2 — no table exists).
+- Real Google Calendar event removal (#62 — no sync service exists).
+- SMS/email dispatch — only the in-app `notifications` row is written.
+- Setlists, events, invitations, conflicts rows — never modified by these
+  handlers, only `service_weeks.is_cancelled` and new `notifications` rows.
+- Any RLS/migration change beyond the two new `notification_type` enum
+  values.
 
 ## Verification
 - `bun run typecheck` — passes.
 - `bun run lint` — passes.
-- `bun run test` — full existing suite passes (206 tests, 16 suites); no
-  regressions. No dedicated `availability-route.test.ts` was added — per the
-  pipeline split, unit tests for this handler are the tester stage's job (see
-  spec's "Tests" section for what to mirror from
-  `tests/unit/app/api/profile-route.test.ts`). I additionally hand-verified
-  `schemas/availability.ts`'s edge cases (valid single date, invalid calendar
-  date, valid/reversed range, date+range together, neither present,
-  range-with-only-one-field, empty `entries`, whitespace `note` → `null`)
-  with a throwaway test file that was run and then deleted — it is not part
-  of this commit.
+- `bun run test` — full suite passes: **286 tests, 21 suites**, no
+  regressions (up from 206/16 before this change; +2 new suites,
+  +~40 tests for cancel/reactivate combined with the pre-existing 39 for
+  delete/get/update/list).
+- `bun run check:service-role` — passes (no service-role key references
+  introduced).
+- `bunx prettier --write` applied to the two new test files to match the
+  repo's formatting (some pre-existing files were already failing
+  `format:check` before this change and were left untouched, out of scope).
 
 ## What the Tester should focus on
-- The `setAvailabilityEntrySchema` `superRefine` branches (see edge-case list
-  in the spec) — especially "date + range together", "neither form", and
-  "only one of startDate/endDate".
-- `expandEntryDates` for a range spanning a month boundary and the 366-date
-  cap (both under and over, and exactly at the boundary via total across
-  multiple entries).
-- Dedup/last-entry-wins when two entries in the same `PUT` body resolve to the
-  same date (e.g. an explicit `date` inside an overlapping range from an
-  earlier entry).
-- Auth matrix for `GET`: own-id (any role) vs. other-id (member → 403,
-  set_leader/admin → 200), malformed `user_id` → 400.
-- `isAvailable` omitted → stored/returned as `true`; `note` empty/whitespace
-  → `null`.
-- 401 paths (no Clerk `userId`, missing Supabase JWT) mirroring
-  `profile-route.test.ts`'s structure.
+- The shared `setServiceWeekCancelled` helper — confirm both
+  `cancelServiceWeek` and `reactivateServiceWeek` genuinely exercise every
+  branch (auth, role, 404, 500 x3, notify) independently, not just via the
+  happy path, since they share one implementation.
+- Recipient de-duplication: two `invitations` rows for the same `user_id`
+  must produce exactly one `notifications` row.
+- Only `pending`/`accepted` invitations are notified — `denied`,
+  `withdrawn`, `expired` must be excluded (enforced by the `.in("status",
+  ["pending", "accepted"])` filter in the recipient query).
+- Zero-recipient path must not call `.insert()` on `notifications` at all
+  (not even with an empty array).
+- Tenant scoping: the `update` call's `eq` sequence must be
+  `["id", id]` then `["church_group_id", ctx.churchGroupId]` — never leak
+  existence of another tenant's row (404 either way).
+- Non-admin roles (`member`, `set_leader`, `guest`) must get 403 before any
+  Supabase client is constructed.
+- Confirm the new migration's enum values (`service_week_cancelled`,
+  `service_week_reactivated`) actually apply cleanly against a real Postgres
+  instance if/when RLS integration tests (`bun run test:rls`) are run — this
+  was not exercised in this sandbox (no live DB available).
