@@ -1,92 +1,108 @@
-# Changes — Issue #43: Withdraw invitation (`DELETE /api/invitations/:id`)
+# Changes — Issue #44: Token-based public invitation lookup
+
+## Summary
+
+Implemented `GET /api/invitations/respond/:token`, a no-session, no-Clerk-auth
+read-only endpoint that returns an invitation's details (plus its service week
+and events) to someone tapping an SMS/email link. Token possession is the only
+credential. Follows the exact pattern the accept-invitation flow (#41) uses for
+its no-session path: a `SECURITY DEFINER` RPC authenticated by the token,
+invoked through `getAnonSupabaseClient()`.
 
 ## Files changed
 
-1. **`supabase/migrations/20260712000002_invitation_withdrawn_notification_type.sql`** (new)
-   Adds `'invitation_withdrawn'` to the `notification_type` enum
-   (`ALTER TYPE ... ADD VALUE IF NOT EXISTS`), copying the shape of
-   `20260711000001_service_week_notification_types.sql`. Sorts after
-   `20260712000001_accept_invitation_rpc.sql`.
+- **`supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql`** (new)
+  — `public.get_invitation_by_token(p_response_token text)`, a `STABLE`
+  (read-only) `SECURITY DEFINER` function. Looks up the invitation by
+  `response_token`, raises `NOT_FOUND` (`P0001`) if no row matches, and
+  otherwise returns a jsonb payload with the invitation, its service week, and
+  its events (empty array via `coalesce` when the week has no events yet).
+  Computes an API-only `"expired"` status when a still-`pending` invitation is
+  past its `response_deadline`; already-responded rows (accepted/denied/
+  withdrawn) keep their real status. Granted to `anon` and `authenticated`.
+  Includes the commented `DROP FUNCTION` DOWN line matching the
+  `accept_invitation` migration's style.
 
-2. **`types/domain.ts`**
-   Added `"invitation_withdrawn"` to the `NotificationType` union, placed
-   right after `"invitation_denied"`.
+- **`lib/supabase/types.ts`** — added `EventType` to the existing
+  `@/types/domain` import, and added a `get_invitation_by_token` entry to
+  `Database["public"]["Functions"]` alongside `accept_invitation`, typed with
+  the RPC's snake_case `Args`/`Returns` shape.
 
-3. **`app/api/invitations/handler.ts`**
-   Added `withdrawInvitation(req, id, lookup?)`, placed after
-   `denyInvitation`. Behavior:
-   - `requireAuth` then `requireRole(ctx, ["admin", "set_leader"])` — 403 for
-     any other role (e.g. `member`).
-   - Fetches the Supabase JWT the same way `denyInvitation` does; 401 if
-     missing.
-   - Looks up the invitation scoped by `id` + `church_group_id` only (NOT
-     `user_id` — the actor is withdrawing someone else's invitation). Query
-     error → 500; not found → 404.
-   - Non-`pending` status (accepted/denied/withdrawn/expired) → 409 CONFLICT,
-     no side effects.
-   - Updates the row to `{ status: "withdrawn" }` only — does **not** set
-     `responded_at` (withdrawal is a leader action, not a member response).
-     Update error → 500; missing row post-update → 404.
-   - Inserts a `notifications` row targeting `inv.user_id` (the invited
-     member, not the actor) with `type: "invitation_withdrawn"`. Insert
-     error → 500 (not swallowed).
-   - Writes an audit log via `writeAuditLog` with action
-     `"invitation.withdrawn"` and metadata `{ service_week_id, user_id }`.
-   - Leaves `// TODO(#45/#36): cancel any pending 24h reminders for this
-     invitation.` — does not call `cancelReminder` (still a throwing stub).
-   - Returns `ok({ invitation: toInvitationResponse(updated) })`.
-   - Same `try/catch` → `ApiException` mapping pattern as the other handlers
-     in this file.
+- **`schemas/invitations.ts`** — added `respondTokenParamSchema`, the same
+  64-char-hex `z.string().length(64).regex(/^[0-9a-f]{64}$/)` shape as
+  `acceptInvitationParamSchema`'s token, used to validate the route param
+  before ever calling the RPC.
 
-4. **`app/api/invitations/[id]/route.ts`**
-   Replaced the `notImplemented(...)` stub with a `DELETE` handler that
-   awaits `params` and calls `withdrawInvitation(req, id)`, mirroring
-   `app/api/invitations/[id]/deny/route.ts`. Note: the import is
-   `from "../handler"` (one level up, matching this file's actual location),
-   not `"../../handler"` as literally written in spec.md's code sample —
-   the two-levels-up path does not resolve (`app/api/handler.ts` does not
-   exist) and fails `tsc --noEmit`. Verified against `deny/route.ts`, which
-   is one directory deeper and correctly uses `"../../handler"`.
+- **`app/api/invitations/handler.ts`** — added `EventType` to the existing
+  `@/types/domain` type import and `respondTokenParamSchema` to the existing
+  `@/schemas/invitations` import block. Added:
+  - `export type PublicInvitationLookup` — the camelCase response shape
+    (`invitationId`, `status`, `roleNote`, `responseDeadline`, `serviceWeek`,
+    `events[]`).
+  - `export async function getInvitationByToken(token: string): Promise<Response>`
+    — validates the token format first (anti-enumeration: a malformed token
+    returns the byte-identical 404 as an unknown-but-well-formed one, without
+    ever calling the RPC or `getAnonSupabaseClient`); on valid format, calls
+    `get_invitation_by_token` via `getAnonSupabaseClient()`, maps `NOT_FOUND`
+    RPC errors to 404, any other RPC error to 500 `INTERNAL`, and on success
+    maps the snake_case RPC payload to `PublicInvitationLookup`. Does **not**
+    call `requireAuth`, `auth()`, or `getSupabaseClient` — no session by
+    design.
 
-5. **`tests/unit/app/api/invitations-withdraw-route.test.ts`** (new)
-   Copies the mock scaffolding from `invitations-deny-route.test.ts`
-   (`jest.mock` of `@clerk/nextjs/server` + `@/lib/supabase/client`,
-   `makeReq`, `makeLookup`, `setUpAuth`, `makeChain`, `makeSupabaseClient`,
-   `pendingInvitationRow`), extended with an `onInsert` hook to capture the
-   notifications insert payload. Cases:
-   - 403 FORBIDDEN for `member` role.
-   - 401 UNAUTHENTICATED when no JWT.
-   - 404 NOT_FOUND when invitation lookup returns null.
-   - 409 CONFLICT for `accepted` status and for `denied` status (two cases).
-   - 500 INTERNAL when the invitation lookup query errors.
-   - Happy path: `pending` → `withdrawn`; asserts the update payload is
-     exactly `{ status: "withdrawn" }` (`responded_at` explicitly asserted
-     `undefined`); asserts the `notifications` insert targets
-     `TARGET_USER_ID` with `type: "invitation_withdrawn"`; asserts the
-     `write_audit_log` RPC call has `p_action: "invitation.withdrawn"` and
-     the expected metadata.
-   - 500 INTERNAL when the notification insert errors (not swallowed).
+- **`app/api/invitations/respond/[token]/route.ts`** — replaced the
+  `notImplemented` stub with a thin `GET` handler that awaits `params` and
+  delegates to `getInvitationByToken`.
+
+- **`tests/unit/app/api/invitations-respond-route.test.ts`** (new) — mirrors
+  `invitations-accept-route.test.ts`'s mocking style (`jest.mock` on
+  `@/lib/supabase/client`, a `makeRpcClient({ data, error })` helper). No
+  Clerk/`auth()` mocking (this route never touches it). Covers every edge case
+  from the spec:
+  1. Happy path (pending) — 200, full camelCase body, asserts
+     `getAnonSupabaseClient` was called with the right RPC args.
+  2. Expired (still-pending, RPC-computed `status: "expired"`) — 200, not an
+     error code.
+  3. Already responded — parameterized over `accepted`/`denied`/`withdrawn` —
+     200 with the real status.
+  4. Unknown token (valid format, RPC raises `NOT_FOUND`) — 404
+     `{ error: "Not found", code: "NOT_FOUND" }`.
+  5. Malformed token, two variants (wrong length; non-hex) — asserts the
+     **identical** 404 body as case 4, and that `getAnonSupabaseClient` is
+     never called.
+  6. Empty events (`events: []` from RPC) — still 200, `events: []` in the
+     response.
+  7. Unexpected RPC error message — 500 `INTERNAL`.
+
+- **`.pipeline/spec.md`** — carried forward as-is from the Planning stage's
+  output for issue #44 (not authored by this stage).
+
+## Out of scope (per spec, not touched)
+
+- No changes to `acceptInvitation`/`denyInvitation` (#41/#42).
+- No Clerk/session handling added to this route.
+- Did not add `events` to `Database["public"]["Tables"]` — the RPC returns
+  events as jsonb, so only the `Functions` entry was needed.
+- No notification/SMS dispatch.
 
 ## Verification
 
-- `bun run lint` — clean.
-- `bun run typecheck` — clean (after fixing the route.ts import path noted
-  above).
-- `bun run test` — 28 suites / 361 tests passed, including the 8 new cases
-  in `invitations-withdraw-route.test.ts`.
+- `bun run lint` — clean, no errors.
+- `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
+- `bun run test` (Jest) — full suite: **28 suites / 363 tests passed**,
+  including the new 10-test file for this route. Per the spec, the RPC body
+  itself has no live-DB test harness in this repo (same as
+  `accept_invitation`) — correctness is verified via the route tests that
+  mock its return values.
 
-## Notes for the Tester
+## What the Tester should focus on
 
-- The migration file cannot be applied/verified against a live Postgres
-  instance in this environment; it was checked structurally against the
-  precedent migration (`20260711000001_service_week_notification_types.sql`)
-  only. Confirm the enum value name and ordering if a DB is available.
-- Out of scope, per spec: bulk withdrawal, reminder cancellation wiring
-  (deferred to #45/#36 — comment only, `cancelReminder` not called), and
-  unwinding `event_attendees` for accepted invitations (not applicable —
-  withdrawal is only valid on `pending` invitations, which have no
-  `event_attendees` rows yet).
-- `.pipeline/spec.md` had unrelated leftover unstaged content in the working
-  tree from a prior run (stale issue #42 spec) when this stage started; it
-  now reflects the current issue #43 spec and is included in this commit
-  for consistency with the rest of the pipeline artifacts.
+- The anti-enumeration guarantee: cases 4 and 5 in the new test file assert
+  byte-identical response bodies (`{ error: "Not found", code: "NOT_FOUND" }`,
+  status 404) for both a well-formed-but-unknown token and a malformed one —
+  worth double-checking this holds if the route or handler is touched again.
+- The `"expired"` status is intentionally HTTP 200, not a 4xx/5xx — confirm no
+  downstream assumption treats it as an error.
+- The RPC's own logic (expiry computation, `coalesce` to `'[]'` for no events,
+  `SECURITY DEFINER`/`STABLE`/`search_path` hardening) is not exercised by any
+  automated test in this repo — it was checked by direct code review against
+  the `accept_invitation` migration's established pattern.

@@ -1,55 +1,52 @@
-# Review — Issue #43: Withdraw invitation (`DELETE /api/invitations/:id`)
+# Review — Issue #44: Token-based public invitation lookup
 
 VERDICT: SHIP
 
-## Basis for verdict
+Reviewed the actual diff for commit `8563bbb` (not just the summaries), re-ran
+`bun run typecheck` (clean) and `bun run test` (29 suites / 368 tests pass), and
+cross-checked correctness beyond green tests.
 
-Reviewed the actual implementation commit `af03ca6` (not just the summaries),
-re-ran `bun run lint`, `bun run typecheck`, and `bun run test` independently in
-this worktree, and read the handler, route, migration, types, and test file
-line-by-line against the spec.
+## What was verified
 
-- Lint: clean. Typecheck: clean. Tests: 29 suites / 365 passed.
-- `withdrawInvitation` matches spec section 3 step-for-step: auth → role gate
-  (`admin`/`set_leader`) → JWT/401 → lookup scoped by `church_group_id` ONLY
-  (not `user_id`, correct — leader withdraws someone else's invite) → 404 on
-  miss → 409 on non-pending (no side effects) → update to `{ status:
-  "withdrawn" }` with NO `responded_at` → member notification to
-  `inv.user_id` with `type: "invitation_withdrawn"` (not swallowed on error) →
-  audit `invitation.withdrawn` → `TODO(#45/#36)` comment, `cancelReminder` not
-  imported/called → `ok({ invitation })`. try/catch mirrors the sibling
-  handlers.
-- Verified independently that the types support the change: `InvitationStatus`
-  includes `"withdrawn"`, `NotificationType` now includes
-  `"invitation_withdrawn"`, and every notification insert column
-  (`link_entity_type`/`link_entity_id`/etc.) exists on `NotificationsRow`.
-- Route wiring is correct: `../handler` resolves from
-  `app/api/invitations/[id]/route.ts` (the spec sample's `../../handler` was
-  wrong for this depth; the coder's deviation is justified and tsc confirms it).
-- Migration `20260712000002_...` copies the precedent enum-add migration shape
-  and sorts after `20260712000001`.
-- Tests are meaningful, not superficial: they assert status/error codes, the
-  exact update payload (and that `responded_at` is absent), the notification
-  target/type, the audit RPC action+metadata, and that no Supabase client is
-  even constructed on the 403/401 short-circuits. Failure branches
-  (lookup error, notify-insert error) are exercised and return 500.
-- Scanned the commit for network/exec/beacon patterns (given prior repo
-  incidents) — none present. Diff is scoped to issue #43.
+- **Matches spec.** All six files match the spec's code samples near-verbatim:
+  the `get_invitation_by_token` RPC (STABLE / SECURITY DEFINER / `search_path=''`,
+  `P0001` NOT_FOUND raise, `coalesce` to `'[]'` for events, computed `expired`
+  only for still-pending past-deadline rows, GRANT to anon+authenticated,
+  commented DOWN line), the `lib/supabase/types.ts` Functions entry, the schema,
+  the handler, and the thin route wrapper.
+- **Security / anti-enumeration is real, not superficial.** Malformed tokens
+  return the byte-identical `{ error: "Not found", code: "NOT_FOUND" }` 404 as
+  unknown-but-valid tokens, and the RPC / `getAnonSupabaseClient` are never
+  reached on a malformed token. Confirmed by the route tests (two malformed
+  variants asserting `not.toHaveBeenCalled()`) and the supplemental deep-equal
+  test. No Clerk/session/`requireAuth` on this path, by design (#40).
+- **No false-404 risk on real tokens.** `respondTokenParamSchema`
+  (`.length(64).regex(/^[0-9a-f]{64}$/)`) is the exact shape the already-shipped
+  #41 no-session accept path uses to validate `responseToken`, so genuine
+  lowercase-hex `response_token` values pass validation. The lowercase-only
+  regex is intentional and consistent with the existing path.
+- **Tests are meaningful.** The route test covers all 7 spec edge cases (happy,
+  expired→200, already-responded parameterized over accepted/denied/withdrawn,
+  unknown→404, two malformed variants, empty events, unexpected error→500) and
+  asserts the actual camelCase mapping, not just status codes. The Tester's
+  supplemental file adds genuine gaps (deep-equal anti-enumeration, uppercase-hex
+  404, client-construction throw → 500, promise-rejection → 500, null
+  pass-through).
+- **Scope is clean.** The #44 commit touches only the intended files plus the
+  pipeline artifacts; no scope creep, no unrelated refactors. (The deny-route and
+  async-agent-flow docs appearing in a `main...HEAD` three-dot diff are from
+  already-merged PRs #128/#129, not this issue's commit.)
 
-## Non-blocking notes for the human / orchestration
+## Notes (non-blocking)
 
-1. The Testing stage's supplement file
-   `tests/unit/app/api/invitations-withdraw-route-tester-supplement.test.ts`
-   is UNTRACKED and not part of commit `af03ca6`. It currently runs green
-   (it is picked up by Jest from the working tree), but it will NOT ship with
-   the PR unless committed. Its coverage (guest→403, update-query-error→500,
-   update-no-row→404, and a `.eq(...)` scoping regression guard that asserts no
-   `user_id` filter is applied) is valuable — recommend committing it before the
-   PR is opened. The committed suite already covers the core paths, so this is
-   an enhancement, not a correctness gap.
-2. `writeAuditLog`'s result is awaited but not error-checked (audit failure
-   would not 500). This is consistent with the spec (step 8 does not require it)
-   and with the sibling handlers, so it is intentional and not a defect.
-3. Withdrawing an already-`withdrawn`/`denied`/`accepted`/`expired` invitation
-   returns 409 rather than being idempotent — a documented, deliberate
-   divergence from `denyInvitation` (spec Decision 1). Correct as specified.
+- The RPC body itself has no live-DB test harness in this repo — consistent with
+  the `accept_invitation` precedent and explicitly out of scope per spec. RPC
+  correctness rests on code review against the established pattern, which holds.
+- Handler does not null-guard `data` before `data.invitation_id`; the RPC never
+  returns null on success (it raises on not-found), and any surprise null would
+  fall through to the outer `try/catch` → 500. Acceptable.
+- Malformed-vs-unknown paths differ in latency (malformed short-circuits before
+  the DB round-trip). The spec's acceptance criterion is body-identity only,
+  which is met; a timing side-channel is out of scope.
+
+Ship it. Human still owns the final PR-diff sign-off and merge.

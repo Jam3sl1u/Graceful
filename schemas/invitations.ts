@@ -37,3 +37,10 @@ export const acceptInvitationSchema = z.object({
     .optional(),
 });
 export type AcceptInvitationInput = z.infer<typeof acceptInvitationSchema>;
+
+// GET /api/invitations/respond/:token param (#44). Same 64-char hex shape as the
+// response_token. On mismatch the route returns 404 (NOT 400) — see handler note.
+export const respondTokenParamSchema = z
+  .string()
+  .length(64)
+  .regex(/^[0-9a-f]{64}$/);

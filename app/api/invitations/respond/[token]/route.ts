@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { getInvitationByToken } from "../../handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/invitations/respond/[token]");
+type Ctx = { params: Promise<{ token: string }> };
+
+export async function GET(_req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { token } = await params;
+  return getInvitationByToken(token);
 }
