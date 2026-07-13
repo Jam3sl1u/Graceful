@@ -6,10 +6,12 @@ import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import {
+  availabilityDateParamSchema,
   getAvailabilityQuerySchema,
   setAvailabilitySchema,
   type SetAvailabilityEntry,
 } from "@/schemas/availability";
+import { recordAvailabilityConflict } from "@/lib/scheduling/conflict-detection";
 
 export type AvailabilityEntry = {
   userId: string;
@@ -159,6 +161,69 @@ export async function setAvailability(req: NextRequest, lookup?: UserLookup): Pr
     }));
 
     return ok({ availability });
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
+export type DeleteAvailabilityResult = {
+  date: string;
+  conflictTriggered: boolean;
+};
+
+// DELETE /api/availability/:date — clears the caller's OWN availability
+// declaration for a date, reverting it to unset/unknown. This is NOT the
+// same as explicitly marking available (is_available: true): unset is the
+// absence of a row, distinguishable from both is_available: true and
+// is_available: false. Scope is always the caller (mirrors setAvailability
+// — no admin-deletes-for-another-member path exists here).
+//
+// BR-15 (#35, PRD §8): a quiet deletion of an availability declaration is
+// functionally identical to the member becoming unavailable. If the caller
+// has an accepted invitation for a service on this date, deletion must
+// trigger the same conflict-detection flow as explicitly marking
+// unavailable (#46) — never a silent no-op. recordAvailabilityConflict is
+// the shared trigger point both paths call.
+export async function deleteAvailability(
+  req: NextRequest,
+  date: string,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+
+    const parsedDate = availabilityDateParamSchema.safeParse(date);
+    if (!parsedDate.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    // Clearing an already-unset date is a no-op delete (0 rows affected),
+    // not an error — DELETE is idempotent.
+    const { error: deleteError } = await supabase
+      .from("availability")
+      .delete()
+      .eq("user_id", ctx.userId)
+      .eq("date", parsedDate.data);
+
+    if (deleteError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    const conflictTriggered = await recordAvailabilityConflict(
+      supabase,
+      parsedDate.data,
+      "availability_deleted",
+    );
+
+    return ok<DeleteAvailabilityResult>({ date: parsedDate.data, conflictTriggered });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);

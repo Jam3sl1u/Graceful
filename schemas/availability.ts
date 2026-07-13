@@ -19,6 +19,11 @@ export const getAvailabilityQuerySchema = z.object({
 });
 export type GetAvailabilityQuery = z.infer<typeof getAvailabilityQuerySchema>;
 
+// DELETE /api/availability/:date route param.
+export const availabilityDateParamSchema = z
+  .string()
+  .refine(isValidDateString, { message: "date param must be a valid YYYY-MM-DD calendar date" });
+
 // One PUT entry: EITHER a single `date` OR an inclusive `startDate`..`endDate`
 // range. isAvailable defaults true (applied in the handler, not here).
 // note: trimmed; empty -> null (mirrors the bio normalization in schemas/profile.ts).

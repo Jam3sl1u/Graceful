@@ -5,6 +5,7 @@ import { auth } from "@clerk/nextjs/server";
 import type { NextRequest } from "next/server";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import {
+  deleteAvailability,
   getAvailability,
   setAvailability,
   type AvailabilityEntry,
@@ -65,6 +66,20 @@ function makeSupabaseClientForPut(
   });
   const from = jest.fn(() => ({ upsert }));
   return { from, upsert, select };
+}
+
+// Mocks the two calls deleteAvailability makes: .from("availability").delete()
+// .eq("user_id", ...).eq("date", ...), then a separate .rpc("record_availability_conflict", ...).
+function makeSupabaseClientForDelete(
+  deleteResult: { error: unknown },
+  rpcResult: { data: unknown; error: unknown },
+) {
+  const eq2 = jest.fn().mockResolvedValue(deleteResult);
+  const eq1 = jest.fn(() => ({ eq: eq2 }));
+  const del = jest.fn(() => ({ eq: eq1 }));
+  const from = jest.fn(() => ({ delete: del }));
+  const rpc = jest.fn().mockResolvedValue(rpcResult);
+  return { from, delete: del, eq1, eq2, rpc };
 }
 
 const rowA = {
@@ -508,5 +523,135 @@ describe("PUT /api/availability", () => {
       note: null,
     });
     expect(capturedRows?.[0]?.user_id).not.toBe(OTHER_USER_ID);
+  });
+});
+
+describe("DELETE /api/availability/:date", () => {
+  beforeEach(() => {
+    mockAuth.mockReset();
+    mockGetSupabaseClient.mockReset();
+  });
+
+  it("returns 401 UNAUTHENTICATED when Clerk userId is null (lookup never consulted)", async () => {
+    mockAuth.mockResolvedValue({ userId: null, getToken: jest.fn() });
+    const lookup = jest.fn();
+
+    const res = await deleteAvailability(makeReq(), "2026-01-05", lookup as unknown as UserLookup);
+    expect(res.status).toBe(401);
+
+    const body = await res.json();
+    expect(body.code).toBe("UNAUTHENTICATED");
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 UNAUTHENTICATED when getToken yields no JWT", async () => {
+    setUpAuth(null);
+
+    const res = await deleteAvailability(makeReq(), "2026-01-05", makeLookup());
+    expect(res.status).toBe(401);
+
+    const body = await res.json();
+    expect(body.code).toBe("UNAUTHENTICATED");
+    expect(mockGetSupabaseClient).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 VALIDATION_FAILED for a malformed date param", async () => {
+    setUpAuth();
+
+    const res = await deleteAvailability(makeReq(), "not-a-date", makeLookup());
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.code).toBe("VALIDATION_FAILED");
+    expect(mockGetSupabaseClient).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 VALIDATION_FAILED for an invalid calendar date (2026-02-30)", async () => {
+    setUpAuth();
+
+    const res = await deleteAvailability(makeReq(), "2026-02-30", makeLookup());
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.code).toBe("VALIDATION_FAILED");
+  });
+
+  // Core BR-15 acceptance criterion (#35): deleting an availability row for a
+  // date with an accepted invitation must fire the same conflict-detection
+  // flow as explicitly toggling unavailable — not be silently ignored.
+  it("BR-15: triggers the conflict-detection flow when an accepted invitation exists for the deleted date", async () => {
+    setUpAuth();
+    const client = makeSupabaseClientForDelete({ error: null }, { data: true, error: null });
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await deleteAvailability(makeReq(), "2026-01-05", makeLookup());
+    expect(res.status).toBe(200);
+
+    expect(client.delete).toHaveBeenCalledTimes(1);
+    expect(client.eq1).toHaveBeenCalledWith("user_id", USER_ID);
+    expect(client.eq2).toHaveBeenCalledWith("date", "2026-01-05");
+
+    expect(client.rpc).toHaveBeenCalledTimes(1);
+    expect(client.rpc).toHaveBeenCalledWith("record_availability_conflict", {
+      p_date: "2026-01-05",
+      p_trigger_reason: "availability_deleted",
+    });
+
+    const body = await res.json();
+    expect(body.data).toEqual({ date: "2026-01-05", conflictTriggered: true });
+  });
+
+  it("is a no-op beyond clearing the record when no accepted invitation exists for the date", async () => {
+    setUpAuth();
+    const client = makeSupabaseClientForDelete({ error: null }, { data: false, error: null });
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await deleteAvailability(makeReq(), "2026-01-05", makeLookup());
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.data).toEqual({ date: "2026-01-05", conflictTriggered: false });
+  });
+
+  it("returns 500 INTERNAL when the delete returns an error (conflict RPC never called)", async () => {
+    setUpAuth();
+    const client = makeSupabaseClientForDelete(
+      { error: { message: "connection refused" } },
+      { data: false, error: null },
+    );
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await deleteAvailability(makeReq(), "2026-01-05", makeLookup());
+    expect(res.status).toBe(500);
+
+    const body = await res.json();
+    expect(body.code).toBe("INTERNAL");
+    expect(client.rpc).not.toHaveBeenCalled();
+  });
+
+  it("returns 500 INTERNAL when the conflict-detection RPC returns an error", async () => {
+    setUpAuth();
+    const client = makeSupabaseClientForDelete(
+      { error: null },
+      { data: null, error: { message: "connection refused" } },
+    );
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await deleteAvailability(makeReq(), "2026-01-05", makeLookup());
+    expect(res.status).toBe(500);
+
+    const body = await res.json();
+    expect(body.code).toBe("INTERNAL");
+  });
+
+  it("scopes the delete to the caller's own user id regardless of role", async () => {
+    setUpAuth();
+    const client = makeSupabaseClientForDelete({ error: null }, { data: false, error: null });
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await deleteAvailability(makeReq(), "2026-01-05", makeLookup("member"));
+    expect(res.status).toBe(200);
+    expect(client.eq1).toHaveBeenCalledWith("user_id", USER_ID);
+    expect(client.eq1).not.toHaveBeenCalledWith("user_id", OTHER_USER_ID);
   });
 });

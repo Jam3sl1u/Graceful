@@ -1,6 +1,10 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { deleteAvailability } from "../handler";
 
-export async function DELETE(_req: NextRequest) {
-  return notImplemented("DELETE /api/availability/[date]");
+export async function DELETE(
+  req: NextRequest,
+  { params }: { params: Promise<{ date: string }> },
+): Promise<Response> {
+  const { date } = await params;
+  return deleteAvailability(req, date);
 }
