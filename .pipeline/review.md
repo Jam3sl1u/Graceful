@@ -1,35 +1,58 @@
-# Review — Issue #41: Implement accept invitation flow
+# Review: Issue #42 — Deny invitation with reason (POST /api/invitations/:id/deny, BR-08 denial cap)
 
 ## VERDICT: SHIP
 
-## Scope check vs. issue #41 Acceptance Criteria
-- POST via response_token (no session) OR authenticated session (in-app) — done; dual path converges on one RPC.
-- Token validated for expiry and "already responded" before accepting — done (already-responded returns gracefully, expiry raises EXPIRED, ordering matches AC/#51 intent).
-- Status -> accepted; admin notified in-app — done (single atomic RPC; invited_by notified, or all admin/set_leader in group when null).
-- Member added to event_attendees for the week's events (no-op/queued when none exist) — done (ON CONFLICT DO NOTHING; GET DIAGNOSTICS row count surfaced as attendeesAdded).
-- Audit log with timestamp and time-to-respond — done (time_to_respond_seconds + via in metadata).
-All five AC satisfied.
+## Basis
+Read spec.md, changes.md, test-results.md; read the actual source
+(`app/api/invitations/handler.ts`, `schemas/invitations.ts`,
+`app/api/invitations/[id]/deny/route.ts`, the new test file); re-ran
+`bun run lint` (clean), `bun run typecheck` (clean), `bun run test`
+(26 suites / 339 tests pass). Did not trust the summaries.
 
-## Verification (run independently by review, not trusted from test-results.md)
-- `bun run typecheck` — clean.
-- `bun run lint` — clean.
-- `bun run test` — 26 suites / 340 tests pass (14 new in invitations-accept-route.test.ts).
-- `bun run check:service-role` — clean (getAnonSupabaseClient uses anon key, not service-role).
+## Spec conformance — verified line by line
+- `denyInvitationSchema`: `reason` optional, `.trim().max(200)`, no `.min(1)` —
+  empty/whitespace-only accepted, coerced to null in handler. Matches.
+- `denyInvitation`: no `requireRole` (per OPEN QUESTION 1); ownership scoping via
+  `id` + `church_group_id` + `user_id` → cross-user/cross-group/missing all 404,
+  never leaking existence. Tolerant body parse (`body ?? {}`). Idempotency
+  short-circuit on `status !== "pending"` returns 200 with no update/count/audit.
+  `denial_count` derived from prior denied rows + 1 (not the row's default 0).
+  Audit `invitation.denied` logs only `reason_provided: boolean`, never the raw
+  reason text (PII handled correctly). `TODO(#67/#68)` for deferred dispatch.
+- BR-08 send guard in `createInvitation`: placed after the `!week` 404 and before
+  the BR-05 check; counts `status='denied'` rows for `(userId, serviceWeekId)`;
+  `>= 3` → 409 CONFLICT. Purely additive; no existing branch reordered.
+- Route file wired to `denyInvitation` with the `params: Promise<{id}>` pattern;
+  stub removed.
 
-## SQL correctness (RPC can't be executed in-sandbox; verified by code review)
-Every table/column the migration touches was checked against the real migrations:
-- notifications(church_group_id, user_id, type, title, body, link_entity_type, link_entity_id) — matches 20260702000005.
-- event_attendees unique(event_id, user_id) — matches 20260702000003; ON CONFLICT target correct.
-- audit_logs(church_group_id, user_id, action, entity_type, entity_id, metadata) — matches 20260702000006.
-- users(clerk_id, church_group_id, role, name) and invitations(response_token, response_deadline, responded_at, invited_by, service_week_id, user_id, status) — all present.
-- notification_type enum contains 'invitation_accepted' — confirmed.
-- SECURITY DEFINER + SET search_path='' with schema-qualified auth.jwt()/public.* — correct; GRANT to anon+authenticated; DOWN block and TODO(#62) present.
+## Test quality — meaningful, not superficial
+Tests inspect the real `.update()` payload the handler builds (via `onUpdate`
+hook) and the exact `write_audit_log` RPC shape, not stubbed return values. The
+idempotency test wires only select/update on `from()` so it would fail loudly if
+the handler tried the priorDenied query or update — it doesn't. Covers 401 (both
+no-JWT and null-Clerk-user), 404, 400 (too long + non-string), happy path
+(count=1), empty/whitespace body → null, idempotent already-denied (no
+update/rpc), count=2 with a prior denied row, 500 on lookup error, and the BR-08
+send guard both firing at 3 and not over-triggering at 2.
 
-## Tests are meaningful, not superficial
-Cover both happy paths (asserting the CORRECT client factory is used and the exact rpc args incl. p_response_token null vs token), already-responded pass-through, 400 (non-uuid id, wrong-length token, non-hex token), 401 (no session, and session-but-no-JWT with negative assertions that lookup/client are never called), and full error-message mapping 404/403/403-session/410/500, plus a BR-05 non-regression check (exactly one rpc call, no conflicts write).
+## Critical checks
+- Regression risk on existing `invitations-route.test.ts` from the new
+  `deniedForWeek` select in `createInvitation`: the shared fixture returns
+  `{data: [], error: null}` (length 0 < 3), so the guard passes through and the
+  pre-existing BR-05 logic is unchanged. All 12 pre-existing tests still pass.
+- `deniedForWeek` query intentionally omits `church_group_id` — matches the
+  spec's exact query and is safe because `service_week_id` is group-unique.
+- Reason text is never written to the audit log. Confirmed.
 
-## Advisory (non-blocking, does NOT hold up this PR)
-- BR-05 conflict-on-accept is intentionally deferred (not in #41's AC or Out-of-Scope; conflict handling tracked separately). This is correctly scoped. HOWEVER a pre-existing comment in `app/api/invitations/handler.ts:52-53` states the `conflicts` row "is written at accept time (#41)", which is now stale/misleading against this implementation. It was not introduced by this diff, but a human should either fold BR-05 in or update that comment in a follow-up so it doesn't misdirect future work.
-- The RPC and RLS/anon-role behavior were verified by review only; no live Postgres/test:rls run was possible in this sandbox (same limitation as coding/testing stages). Recommend running test:rls in an environment with SUPABASE_TEST_* creds before/after merge as defense-in-depth.
+## Non-blocking notes (not defects, no action required to ship)
+- denial_count is computed read-then-write (two queries), so it's theoretically
+  racy under concurrent denials of the same member+week. In practice a member
+  denies their own single pending invitation, so this is not exploitable; out of
+  scope for this issue.
+- No deadline/expiry check on a still-`pending` row past its response_deadline;
+  spec does not require it (expiry is handled by status transitions elsewhere).
+- `.claude/workflows/handle-issues.js` shows as locally modified in this worktree
+  but is not part of commit 0e7d263 and is unrelated to issue #42 — correctly
+  left out of the diff.
 
-Non-blocking. Ship it.
+Green tests here reflect correct behavior. Ship it.
