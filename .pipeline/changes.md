@@ -1,108 +1,116 @@
-# Changes — Issue #44: Token-based public invitation lookup
+# Changes — Issue #45: 24-hour dual-party invitation reminder scheduler
 
-## Summary
-
-Implemented `GET /api/invitations/respond/:token`, a no-session, no-Clerk-auth
-read-only endpoint that returns an invitation's details (plus its service week
-and events) to someone tapping an SMS/email link. Token possession is the only
-credential. Follows the exact pattern the accept-invitation flow (#41) uses for
-its no-session path: a `SECURITY DEFINER` RPC authenticated by the token,
-invoked through `getAnonSupabaseClient()`.
+Implemented exactly per `.pipeline/spec.md`. No scope creep beyond the 8
+files it names.
 
 ## Files changed
 
-- **`supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql`** (new)
-  — `public.get_invitation_by_token(p_response_token text)`, a `STABLE`
-  (read-only) `SECURITY DEFINER` function. Looks up the invitation by
-  `response_token`, raises `NOT_FOUND` (`P0001`) if no row matches, and
-  otherwise returns a jsonb payload with the invitation, its service week, and
-  its events (empty array via `coalesce` when the week has no events yet).
-  Computes an API-only `"expired"` status when a still-`pending` invitation is
-  past its `response_deadline`; already-responded rows (accepted/denied/
-  withdrawn) keep their real status. Granted to `anon` and `authenticated`.
-  Includes the commented `DROP FUNCTION` DOWN line matching the
-  `accept_invitation` migration's style.
+1. **`supabase/migrations/20260713000001_invitation_reminder_scheduler.sql`** (new)
+   - Adds `invitations.last_reminded_at timestamptz` + partial index
+     `idx_invitations_pending_reminder` (`WHERE status = 'pending'`).
+   - Adds `public.send_invitation_reminders()` — `SECURITY DEFINER`,
+     `SET search_path = ''`, mirrors the `accept_invitation` RPC's shape.
+     Selects due invitations (`status = 'pending'` AND
+     `coalesce(last_reminded_at, created_at) <= now() - 24h` AND parent
+     `service_weeks.is_cancelled = false`) into a temp table, builds and
+     returns the JSON member-reminder array, inserts one admin/set_leader
+     notification per affected service week (D2 aggregation — lists ALL
+     currently-pending members for that week by name, not just the due
+     ones), and stamps `last_reminded_at = now()` only on the due rows.
+     `GRANT EXECUTE ... TO anon, authenticated` + commented DOWN block.
+   - `invitation_reminder` notification type already existed
+     (`20260702000005_cluster_5_partial.sql`) — not re-added.
 
-- **`lib/supabase/types.ts`** — added `EventType` to the existing
-  `@/types/domain` import, and added a `get_invitation_by_token` entry to
-  `Database["public"]["Functions"]` alongside `accept_invitation`, typed with
-  the RPC's snake_case `Args`/`Returns` shape.
+2. **`lib/supabase/types.ts`** (modified)
+   - `InvitationsRow` gains `last_reminded_at: string | null`.
+   - `invitations` table `Insert` type: added `last_reminded_at` to the
+     `Omit<...>` union and as an optional `last_reminded_at?: string | null`
+     override (DB-defaulted to NULL).
+   - `Database["public"]["Functions"]` gains `send_invitation_reminders`
+     with `Args: Record<string, never>` and the `Returns` array shape from
+     the spec.
 
-- **`schemas/invitations.ts`** — added `respondTokenParamSchema`, the same
-  64-char-hex `z.string().length(64).regex(/^[0-9a-f]{64}$/)` shape as
-  `acceptInvitationParamSchema`'s token, used to validate the route param
-  before ever calling the RPC.
+3. **`lib/scheduling/reminder.ts`** (new) — pure, unit-testable helpers:
+   - `REMINDER_INTERVAL_MS` (24h in ms).
+   - `isReminderDue(invitation, now)` — mirrors the SQL selector exactly
+     (comment cross-references the migration so the two stay in sync).
+   - `buildMemberReminderSms(memberName, weekLabel)` — short SMS copy.
+   - `formatWeekLabel(title, serviceDate)` — title if present, else
+     `serviceDate` formatted as `Mon DD, YYYY` (UTC), matching the SQL's
+     `to_char(week.service_date, 'Mon DD, YYYY')` used in the admin body.
 
-- **`app/api/invitations/handler.ts`** — added `EventType` to the existing
-  `@/types/domain` type import and `respondTokenParamSchema` to the existing
-  `@/schemas/invitations` import block. Added:
-  - `export type PublicInvitationLookup` — the camelCase response shape
-    (`invitationId`, `status`, `roleNote`, `responseDeadline`, `serviceWeek`,
-    `events[]`).
-  - `export async function getInvitationByToken(token: string): Promise<Response>`
-    — validates the token format first (anti-enumeration: a malformed token
-    returns the byte-identical 404 as an unknown-but-well-formed one, without
-    ever calling the RPC or `getAnonSupabaseClient`); on valid format, calls
-    `get_invitation_by_token` via `getAnonSupabaseClient()`, maps `NOT_FOUND`
-    RPC errors to 404, any other RPC error to 500 `INTERNAL`, and on success
-    maps the snake_case RPC payload to `PublicInvitationLookup`. Does **not**
-    call `requireAuth`, `auth()`, or `getSupabaseClient` — no session by
-    design.
+4. **`app/api/cron/invitation-reminders/route.ts`** (new) — `GET` only
+   (Vercel Cron). Contract exactly as spec'd:
+   - `CRON_SECRET` unset → 500 `INTERNAL` (checked before any DB call).
+   - `Authorization` header not exactly `Bearer ${CRON_SECRET}` → 401
+     `UNAUTHENTICATED`.
+   - Calls `send_invitation_reminders` via `getAnonSupabaseClient()`; RPC
+     error → 500 `INTERNAL`.
+   - For each reminder: dispatches `sendSms` (from `lib/pingram/client.ts`,
+     currently a throwing stub) only when `phone` is non-null AND
+     `sms_opted_in === true`; failures are caught per-reminder
+     (`smsFailed` counter + `console.error`) and never fail the job.
+     Members without phone/opt-in are counted as `smsSkipped`, not
+     `smsFailed`.
+   - Returns `ok({ processed, smsSent, smsSkipped, smsFailed })`.
 
-- **`app/api/invitations/respond/[token]/route.ts`** — replaced the
-  `notImplemented` stub with a thin `GET` handler that awaits `params` and
-  delegates to `getInvitationByToken`.
+5. **`vercel.json`** (new) — registers the cron:
+   `{ "crons": [{ "path": "/api/cron/invitation-reminders", "schedule": "0 * * * *" }] }`.
 
-- **`tests/unit/app/api/invitations-respond-route.test.ts`** (new) — mirrors
-  `invitations-accept-route.test.ts`'s mocking style (`jest.mock` on
-  `@/lib/supabase/client`, a `makeRpcClient({ data, error })` helper). No
-  Clerk/`auth()` mocking (this route never touches it). Covers every edge case
-  from the spec:
-  1. Happy path (pending) — 200, full camelCase body, asserts
-     `getAnonSupabaseClient` was called with the right RPC args.
-  2. Expired (still-pending, RPC-computed `status: "expired"`) — 200, not an
-     error code.
-  3. Already responded — parameterized over `accepted`/`denied`/`withdrawn` —
-     200 with the real status.
-  4. Unknown token (valid format, RPC raises `NOT_FOUND`) — 404
-     `{ error: "Not found", code: "NOT_FOUND" }`.
-  5. Malformed token, two variants (wrong length; non-hex) — asserts the
-     **identical** 404 body as case 4, and that `getAnonSupabaseClient` is
-     never called.
-  6. Empty events (`events: []` from RPC) — still 200, `events: []` in the
-     response.
-  7. Unexpected RPC error message — 500 `INTERNAL`.
+6. **`app/api/invitations/handler.ts`** (modified — comment only) —
+   replaced the `TODO(#45/#36)` in `withdrawInvitation` with a comment
+   explaining cancellation is automatic (D1: the reminder selector filters
+   `status = 'pending'`, so the withdraw's status flip already stops future
+   reminders). No logic changed in this file.
 
-- **`.pipeline/spec.md`** — carried forward as-is from the Planning stage's
-  output for issue #44 (not authored by this stage).
+7. **`tests/unit/lib/scheduling/reminder.test.ts`** (new) — mocked-time
+   (`Date` fixtures, no real waiting) coverage of `isReminderDue`'s 6 cases
+   from the spec (first reminder at exactly 24h, just-under-threshold,
+   over-threshold, recent repeat-reminder not due, repeat-reminder due,
+   and all three non-pending statuses never due — D1), plus
+   `buildMemberReminderSms` and `formatWeekLabel` (title vs. formatted
+   date).
+
+8. **`tests/unit/app/api/cron-invitation-reminders-route.test.ts`** (new)
+   — mirrors the `invitations-withdraw-route.test.ts` mock-scaffolding
+   style, mocking `@/lib/supabase/client` and `@/lib/pingram/client`.
+   Covers: 401 on missing/wrong Authorization header (RPC never called),
+   500 on unset `CRON_SECRET`, 500 on RPC error, happy path (2 reminders,
+   1 dispatched/1 skipped, correct counts), `sendSms` rejection isolated
+   (still 200, `smsFailed: 1`), and the empty/no-due-invitations case
+   (`processed: 0`, no SMS calls).
 
 ## Out of scope (per spec, not touched)
 
-- No changes to `acceptInvitation`/`denyInvitation` (#41/#42).
-- No Clerk/session handling added to this route.
-- Did not add `events` to `Database["public"]["Tables"]` — the RPC returns
-  events as jsonb, so only the `Functions` entry was needed.
-- No notification/SMS dispatch.
+- No real SMS/email dispatch — `sendSms` stub only.
+- No configurable per-week response deadlines.
+- No cancellation table / scheduler-state store (D1: automatic).
+- No changes to accept/deny/withdraw logic beyond the one comment in §6.
 
-## Verification
+## Verification run
 
-- `bun run lint` — clean, no errors.
-- `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
-- `bun run test` (Jest) — full suite: **28 suites / 363 tests passed**,
-  including the new 10-test file for this route. Per the spec, the RPC body
-  itself has no live-DB test harness in this repo (same as
-  `accept_invitation`) — correctness is verified via the route tests that
-  mock its return values.
+- `bun run lint` — clean.
+- `bun run typecheck` — clean.
+- `bun run test` — 33 suites / 398 tests passed (all pre-existing tests
+  still pass; the 2 new suites above pass).
+- `bun run check:service-role` — clean (the new cron route/RPC caller use
+  `getAnonSupabaseClient()`, never the service-role key).
+- `bun run check:workflows` — clean (no orchestration scripts touched).
+- Migration SQL itself has no live-DB harness in this repo (same as
+  `accept_invitation`); its correctness is covered by the route/helper unit
+  tests that mock the RPC's return value, per the spec's instruction not to
+  add a live-DB test.
 
 ## What the Tester should focus on
 
-- The anti-enumeration guarantee: cases 4 and 5 in the new test file assert
-  byte-identical response bodies (`{ error: "Not found", code: "NOT_FOUND" }`,
-  status 404) for both a well-formed-but-unknown token and a malformed one —
-  worth double-checking this holds if the route or handler is touched again.
-- The `"expired"` status is intentionally HTTP 200, not a 4xx/5xx — confirm no
-  downstream assumption treats it as an error.
-- The RPC's own logic (expiry computation, `coalesce` to `'[]'` for no events,
-  `SECURITY DEFINER`/`STABLE`/`search_path` hardening) is not exercised by any
-  automated test in this repo — it was checked by direct code review against
-  the `accept_invitation` migration's established pattern.
+- `lib/scheduling/reminder.ts`'s `isReminderDue` boundary conditions
+  (exactly-24h, just-under, non-pending statuses) since the SQL selector in
+  the migration can't be exercised directly in this repo's test harness —
+  the unit tests here are the primary correctness signal for that logic.
+- The cron route's auth ordering (`CRON_SECRET`-unset check happens before
+  any DB call) and that a `sendSms` rejection never surfaces as a non-200
+  response.
+- D2 aggregation (one admin notification per admin per affected week,
+  listing all currently-pending members) is implemented only in the SQL
+  RPC body, which has no live-DB test in this repo — review the migration
+  SQL directly for correctness (temp table + `string_agg` + per-week loop).

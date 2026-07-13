@@ -113,6 +113,7 @@ type InvitationsRow = {
   response_deadline: string | null;
   invited_by: string | null;
   created_at: string;
+  last_reminded_at: string | null;
 };
 
 type AvailabilityRow = {
@@ -226,6 +227,7 @@ export type Database = {
           | "denial_reason"
           | "denial_count"
           | "response_deadline"
+          | "last_reminded_at"
         > & {
           id?: string;
           created_at?: string;
@@ -234,6 +236,7 @@ export type Database = {
           denial_reason?: string | null;
           denial_count?: number;
           response_deadline?: string | null;
+          last_reminded_at?: string | null;
         };
         Update: Partial<InvitationsRow>;
         Relationships: [];
@@ -353,6 +356,19 @@ export type Database = {
             end_time: string;
           }>;
         };
+      };
+      send_invitation_reminders: {
+        Args: Record<string, never>;
+        Returns: Array<{
+          invitation_id: string;
+          user_id: string;
+          member_name: string;
+          phone: string | null;
+          sms_opted_in: boolean;
+          service_week_id: string;
+          service_date: string;
+          week_title: string | null;
+        }>;
       };
     };
     Enums: {
