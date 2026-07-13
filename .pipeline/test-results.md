@@ -1,106 +1,63 @@
-# Test Results: Issue #40 — Send set invitation (POST /api/invitations, BR-05)
+# Test Results: Issue #42 — Deny invitation with reason (BR-08, denial cap)
 
-## Verdict: PASS
+## VERDICT: FAIL (pipeline mismatch — nothing to test)
 
-All coder claims independently re-verified. Added a supplemental test file with
-9 additional tests covering edge cases the spec named that the coder's own
-suite didn't directly exercise; all pass.
+## Finding
 
-## Commands run (fresh, independently)
+The `.pipeline/changes.md` and `.pipeline/spec.md` handed to this stage do **not**
+describe this branch's task. They describe **issue #40** ("Send set invitation,
+POST /api/invitations, BR-05 double-booking check"), which was already
+implemented, reviewed, and merged to `main` in a prior run (commit `0dee8d0`,
+merged via PR #124, `5b8544f`/`de2058f`). The pre-existing `.pipeline/review.md`
+and `.pipeline/test-results.md` on disk (now overwritten by this file) were
+likewise leftover artifacts from that #40 run (titled "Review: Issue #40 —
+POST /api/invitations" and "Test Results: Issue #40", verdict PASS/SHIP).
 
-- `bun install` — clean, no changes needed.
-- `bun run typecheck` (`tsc --noEmit`) — **passes**, 0 errors.
-- `bun run lint` (`eslint .`) — **passes**, 0 errors/warnings, repo-wide.
-- `bun run test` (full suite, before adding my tests) — **20 suites / 274
-  tests passing**, matches the coder's claim in `changes.md` exactly.
-- `bun run test` (full suite, after adding my supplemental test file) —
-  **21 suites / 283 tests passing** (274 + 9 new).
-- `bunx prettier --check` on all touched/new files, including my new test
-  file — all pass.
+This branch/worktree
+(`issue-42-sprint-2-implement-deny-invitation-with-reason-br-08-denial-cap`)
+is for a **different** issue: implementing deny-with-reason for
+`POST /api/invitations/[id]/deny` (BR-08 denial cap), per the branch name.
 
-## Files independently read and cross-checked against spec.md
+Verified directly:
 
-- `app/api/invitations/handler.ts` — logic matches spec step-by-step:
-  requireAuth → requireRole → body parse (400 on failure, including
-  non-JSON) → JWT/401 → service_weeks lookup scoped to
-  `id + church_group_id` (404 on miss, 500 on DB error, never 403) → BR-05
-  two-query collision check (accepted invitations for target user in-group,
-  then service_weeks matching date excluding current week via `.neq`) → 409
-  CONFLICT if collision and no `acknowledgeConflict`, else insert → insert
-  omits `status` (DB default applies) → `writeAuditLog` with
-  `action: "invitation.sent"` → `// TODO(#67/#68)` comment seam, no stub
-  module → `ok(..., 201)` → outer try/catch mirrors service-weeks pattern.
-- `app/api/invitations/route.ts` — POST delegates to `createInvitation`, GET
-  untouched `notImplemented` stub, matches spec exactly.
-- `schemas/invitations.ts` — `createInvitationSchema` matches spec's zod
-  shape exactly (uuid serviceWeekId/userId, optional trimmed roleNote
-  1-500, optional acknowledgeConflict boolean). Placeholder
-  `invitationsSchema` left in place as instructed.
-- `lib/supabase/types.ts` — `InvitationsRow` and the `invitations` table's
-  `Insert` omit-list match the spec's exact required shape.
-- `generateResponseToken()` — confirmed as the human-overridden format (two
-  `crypto.randomUUID()` calls, hyphens stripped, concatenated → 64 lowercase
-  hex chars), not the original spec's `randomBytes` default. Regex-verified
-  in both the coder's test and my supplemental token-uniqueness test.
-- `lib/api/auth.ts`, `lib/api/response.ts`, `lib/api/errors.ts`,
-  `lib/audit/write-audit-log.ts` — confirmed `requireAuth`/`requireRole`/
-  `ok`/`fail`/`ErrorCode.CONFLICT`(409)/`writeAuditLog` all behave as the
-  handler assumes; no surprises vs. the `service-weeks` reference handler.
+- `git rev-parse HEAD` == `git rev-parse origin/main` (`5140d72`) — this branch
+  has **zero** commits beyond `main`.
+- `git diff origin/main --stat` — empty, no changes at all.
+- `git status --short` — clean working tree, nothing uncommitted either.
+- `app/api/invitations/[id]/deny/route.ts` is still the original
+  `notImplemented("POST /api/invitations/[id]/deny")` stub — no deny logic,
+  no denial-count/cap handling, no schema changes, no tests exist for it
+  anywhere in the tree.
+- `app/api/invitations/handler.ts` on disk is the **#40** create-invitation
+  handler (already merged on `main`), not a deny handler.
 
-## Coder's own test file (`tests/unit/app/api/invitations-route.test.ts`)
+In short: the Coding stage for issue #42 has not run (or its output was never
+committed/persisted to this branch), and the `.pipeline/` files in this
+worktree were stale copies from the #40 pipeline run, never overwritten for
+#42.
 
-Ran in isolation: **14/14 passing**, matching the claimed count. Covers 401
-(x2), 403 (x2), 400 (x5), 404, 201 happy path (asserts no `status` key,
-64-hex token, ~72h deadline, `invited_by`, audit RPC call), 409 CONFLICT
-(asserts no insert), 201 with `acknowledgeConflict: true` (asserts insert
-did happen), 500 on insert error. Assertions inspected directly, not just
-trusted — they check the right things (e.g. `insertPayload).not.toHaveProperty("status")`,
-`response_token` regex, deadline within 60s of expected).
+## What was NOT run and why
 
-## Supplemental tests added by Tester (`tests/unit/app/api/invitations-route.supplemental.test.ts`)
+Per the pipeline contract, Testing verifies the Coding stage's claims in
+`changes.md` against the actual diff. Since there is no diff, no new files,
+and no behavior change to independently verify for issue #42, running
+`bun run lint` / `bun run typecheck` / `bun run test` against `HEAD` would
+only re-validate `main`'s pre-existing state (issue #40's already-shipped
+work) — that would not constitute testing of this issue and would be
+misleading if reported as "passing" for #42. No tests were fabricated for a
+feature that does not exist in this tree.
 
-Independently written, not copied from the coder's file (fresh fixtures/mock
-scaffolding rebuilt from spec, same style as the existing suite). 9/9 passing:
+## Required action (blocking)
 
-1. `roleNote` whitespace-only ("   ") → 400 VALIDATION_FAILED (spec names
-   this explicitly: "roleNote empty/whitespace ... → 400").
-2. Cross-group `serviceWeekId` → 404 NOT_FOUND, not 403 (spec: "wrong-group
-   and missing indistinguishable ... always 404, never 403").
-3. `service_weeks` lookup query DB error → 500 INTERNAL.
-4. BR-05 first query (accepted invitations) DB error → 500 INTERNAL.
-5. BR-05 second query (colliding service_weeks) DB error → 500 INTERNAL.
-6. **Self-exclusion correctness**: target user already has an *accepted*
-   invitation for the *same* `serviceWeekId` being re-invited to — must NOT
-   409, since the spec requires excluding the current week from the
-   collision set (models the real `.neq("id", serviceWeekId)` Supabase
-   filter behavior). This is the most important behavioral edge case named
-   in "What the Tester should focus on" in changes.md — verified correct.
-7. Audit log exact payload shape: `p_action: "invitation.sent"`,
-   `p_entity_type: "invitation"`, `p_entity_id`, and `p_metadata` containing
-   `service_week_id`, `user_id`, `acknowledged_conflict: false` — asserted
-   with a full object match, not just `objectContaining`.
-8. `writeAuditLog`'s RPC erroring → outer try/catch surfaces it as 500
-   INTERNAL (per spec: "writeAuditLog throwing ApiException is caught by
-   the outer try/catch and surfaces as 500").
-9. **Failure case / token uniqueness**: two sequential invitation creations
-   produce two distinct, correctly-formatted 64-hex tokens (guards against a
-   naive implementation that might reuse or derive predictable tokens).
+This is not a code defect to fix — per the Testing stage's mandate, a
+pipeline mismatch like this pauses the pipeline rather than being patched
+around. The Coding stage needs to be (re-)run for issue #42 on this branch
+so that:
 
-## Not independently re-verified (noted, not blocking)
+1. `app/api/invitations/[id]/deny/route.ts` and its handler actually
+   implement deny-with-reason + BR-08 denial cap.
+2. `.pipeline/spec.md` and `.pipeline/changes.md` are regenerated to reflect
+   issue #42, not issue #40.
 
-- Real Supabase/RLS behavior (all tests are mocked, per the coder's own
-  "What the Tester should focus on" note) — no live DB available in this
-  environment to run an integration/E2E check of the two-query BR-05 logic
-  against actual Postgres semantics. The mock-level logic and exclusion
-  behavior were verified as thoroughly as unit tests allow (see item 6
-  above), but a live-DB or Supabase-local integration test would still be
-  valuable follow-up, as the coder itself flagged.
-- The 409 → re-POST-with-`acknowledgeConflict:true` end-to-end client flow
-  — both halves are independently unit-tested and both pass, but no
-  single test chains an actual two-request flow. Low risk since the
-  handler is stateless per-request and each half is verified correct.
-
-## Conclusion
-
-No failures found. Spec compliance confirmed by direct code reading, not
-just by trusting `changes.md`. Recommend proceeding to Reviewer.
+Only once real #42 code changes land on this branch can this stage
+meaningfully write tests and a pass/fail report.
