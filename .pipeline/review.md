@@ -1,52 +1,55 @@
-# Review — Issue #44: Token-based public invitation lookup
+# Review — Issue #45: 24-hour dual-party invitation reminder scheduler
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-Reviewed the actual diff for commit `8563bbb` (not just the summaries), re-ran
-`bun run typecheck` (clean) and `bun run test` (29 suites / 368 tests pass), and
-cross-checked correctness beyond green tests.
+Reviewed the actual issue-45 commit (`88e2541`) — not `main...HEAD`, which is
+noisy because the local `main` ref is stale (behind merged PRs #42/#43/#44). The
+issue-45 commit touches exactly the 8 code files named in the spec plus the
+pipeline artifacts. No scope creep.
 
-## What was verified
+## What I verified firsthand (not just trusting the summaries)
 
-- **Matches spec.** All six files match the spec's code samples near-verbatim:
-  the `get_invitation_by_token` RPC (STABLE / SECURITY DEFINER / `search_path=''`,
-  `P0001` NOT_FOUND raise, `coalesce` to `'[]'` for events, computed `expired`
-  only for still-pending past-deadline rows, GRANT to anon+authenticated,
-  commented DOWN line), the `lib/supabase/types.ts` Functions entry, the schema,
-  the handler, and the thin route wrapper.
-- **Security / anti-enumeration is real, not superficial.** Malformed tokens
-  return the byte-identical `{ error: "Not found", code: "NOT_FOUND" }` 404 as
-  unknown-but-valid tokens, and the RPC / `getAnonSupabaseClient` are never
-  reached on a malformed token. Confirmed by the route tests (two malformed
-  variants asserting `not.toHaveBeenCalled()`) and the supplemental deep-equal
-  test. No Clerk/session/`requireAuth` on this path, by design (#40).
-- **No false-404 risk on real tokens.** `respondTokenParamSchema`
-  (`.length(64).regex(/^[0-9a-f]{64}$/)`) is the exact shape the already-shipped
-  #41 no-session accept path uses to validate `responseToken`, so genuine
-  lowercase-hex `response_token` values pass validation. The lowercase-only
-  regex is intentional and consistent with the existing path.
-- **Tests are meaningful.** The route test covers all 7 spec edge cases (happy,
-  expired→200, already-responded parameterized over accepted/denied/withdrawn,
-  unknown→404, two malformed variants, empty events, unexpected error→500) and
-  asserts the actual camelCase mapping, not just status codes. The Tester's
-  supplemental file adds genuine gaps (deep-equal anti-enumeration, uppercase-hex
-  404, client-construction throw → 500, promise-rejection → 500, null
-  pass-through).
-- **Scope is clean.** The #44 commit touches only the intended files plus the
-  pipeline artifacts; no scope creep, no unrelated refactors. (The deny-route and
-  async-agent-flow docs appearing in a `main...HEAD` three-dot diff are from
-  already-merged PRs #128/#129, not this issue's commit.)
+- **Spec fidelity.** Migration, `lib/scheduling/reminder.ts`, cron route,
+  `vercel.json`, `types.ts`, and the `handler.ts` comment-only change all match
+  `spec.md` §1–§6 verbatim, including the D1 (automatic cancellation) and D2
+  (per-week admin aggregation) design decisions.
+- **SQL schema references.** Independently cross-checked every table/column the
+  RPC reads or writes:
+  - `notifications` INSERT columns (`church_group_id, user_id, type, title,
+    body, link_entity_type, link_entity_id`) all exist; all NOT NULL columns are
+    supplied; `title` fits `varchar(200)`.
+  - `notification_type` enum already contains `invitation_reminder`
+    (`20260702000005`) — correctly not re-added.
+  - `users.name/phone/sms_opted_in/role/church_group_id` and
+    `service_weeks.is_cancelled/title/service_date/church_group_id` all confirmed.
+  - Selector, per-week member re-query (includes pending-but-not-yet-due),
+    and stamp-only-due-rows logic all match the spec's edge cases 5–8.
+- **`isReminderDue`** mirrors the SQL selector exactly and is the correct pure
+  analogue of the DB threshold.
+- **Tests are meaningful, not superficial.** Ran the 3 relevant suites: 21/21
+  pass. They cover real boundaries (exact-24h, 23h59m under, 25h over, repeat,
+  all 3 non-pending statuses) and real failure paths (401 missing/wrong bearer
+  with RPC never called, 500 on unset secret, 500 on RPC error, sendSms
+  rejection isolated → still 200). The tester supplement legitimately closes the
+  OR-vs-AND skip-condition gap and the `data: null` shape gap.
+- **Guards.** `bun run typecheck` clean; `bun run check:service-role` clean (cron
+  route/RPC caller use `getAnonSupabaseClient()`, never the service-role key).
 
-## Notes (non-blocking)
+## Non-blocking notes (do not need to fix for this ship)
 
-- The RPC body itself has no live-DB test harness in this repo — consistent with
-  the `accept_invitation` precedent and explicitly out of scope per spec. RPC
-  correctness rests on code review against the established pattern, which holds.
-- Handler does not null-guard `data` before `data.invitation_id`; the RPC never
-  returns null on success (it raises on not-found), and any surprise null would
-  fall through to the outer `try/catch` → 500. Acceptable.
-- Malformed-vs-unknown paths differ in latency (malformed short-circuits before
-  the DB round-trip). The spec's acceptance criterion is body-identity only,
-  which is met; a timing side-channel is out of scope.
-
-Ship it. Human still owns the final PR-diff sign-off and merge.
+1. The tester's supplemental test file
+   (`tests/unit/app/api/cron-invitation-reminders-route-tester-supplement.test.ts`)
+   and the updated `.pipeline/test-results.md` are currently **untracked/uncommitted**
+   in the worktree — they are not part of commit `88e2541`. The orchestration
+   verify-gate must commit them before the worktree is torn down, or that
+   coverage and the test report are lost. Flagging because it is easy to drop.
+2. The `CRON_SECRET` bearer check uses a plain `!==` string comparison
+   (non-constant-time). This is exactly what the spec prescribed and matches the
+   conventional Vercel Cron pattern; acceptable for a shared cron token. Noted
+   only for completeness.
+3. Correctness of the SQL RPC body (temp table + `string_agg` + per-week loop)
+   is verified by static read-through against the schema, as the repo has no
+   live-DB harness for RPC bodies — same standard applied to the
+   `accept_invitation` RPC it copies. Recommend a manual sanity check of the
+   admin-notification body once a preview DB is available, but this is not a
+   blocker under the established convention.
