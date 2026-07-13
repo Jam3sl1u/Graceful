@@ -324,6 +324,17 @@ export type Database = {
         };
         Returns: boolean;
       };
+      accept_invitation: {
+        Args: {
+          p_invitation_id: string;
+          p_response_token: string | null;
+        };
+        Returns: {
+          status: InvitationStatus;
+          already_responded: boolean;
+          attendees_added: number;
+        };
+      };
     };
     Enums: {
       user_role: UserRole;

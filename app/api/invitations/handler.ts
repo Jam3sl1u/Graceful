@@ -3,10 +3,15 @@ import { auth } from "@clerk/nextjs/server";
 import { requireAuth, requireRole, type UserLookup } from "@/lib/api/auth";
 import { ok, fail } from "@/lib/api/response";
 import { ApiException, ErrorCode } from "@/lib/api/errors";
-import { getSupabaseClient } from "@/lib/supabase/client";
+import { getSupabaseClient, getAnonSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import { writeAuditLog } from "@/lib/audit/write-audit-log";
-import { createInvitationSchema, denyInvitationSchema } from "@/schemas/invitations";
+import {
+  createInvitationSchema,
+  denyInvitationSchema,
+  acceptInvitationParamSchema,
+  acceptInvitationSchema,
+} from "@/schemas/invitations";
 import type { InvitationStatus } from "@/types/domain";
 
 type InvitationsRow = Database["public"]["Tables"]["invitations"]["Row"];
@@ -283,6 +288,82 @@ export async function denyInvitation(
     // TODO(#67/#68): dispatch SMS + email to invited_by (admin) with member name and reason.
 
     return ok({ invitation: toInvitationResponse(updated) });
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
+// POST /api/invitations/:id/accept (#41) — works two ways:
+//   1. No-session (SMS/email link): body carries a `responseToken`, no Clerk
+//      session; runs as the anon role, authenticated via the token itself.
+//   2. In-app (authenticated member): no token; identity comes from the
+//      Clerk session, and the RPC requires the caller be the invitation's
+//      own user.
+// Both paths converge on the accept_invitation SECURITY DEFINER RPC, which
+// does all validation and mutation atomically (status flip, event_attendees
+// insert, admin notify, audit log).
+export async function acceptInvitation(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const parsedId = acceptInvitationParamSchema.safeParse(id);
+    if (!parsedId.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+
+    const body = await req.json().catch(() => null);
+    const parsedBody = acceptInvitationSchema.safeParse(body ?? {});
+    if (!parsedBody.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+    const { responseToken } = parsedBody.data;
+
+    let supabase: ReturnType<typeof getSupabaseClient>;
+    let pResponseToken: string | null;
+
+    if (responseToken !== undefined) {
+      supabase = getAnonSupabaseClient();
+      pResponseToken = responseToken;
+    } else {
+      await requireAuth(req, lookup);
+
+      const { getToken } = await auth();
+      const jwt = await getToken({ template: "supabase" });
+      if (!jwt) {
+        return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+      }
+      supabase = getSupabaseClient(jwt);
+      pResponseToken = null;
+    }
+
+    const { data, error } = await supabase.rpc("accept_invitation", {
+      p_invitation_id: parsedId.data,
+      p_response_token: pResponseToken,
+    });
+
+    if (error) {
+      const message = error.message ?? "";
+      if (message.includes("NOT_FOUND")) {
+        return fail("Not found", ErrorCode.NOT_FOUND, 404);
+      }
+      if (message.includes("FORBIDDEN")) {
+        return fail("Forbidden", ErrorCode.FORBIDDEN, 403);
+      }
+      if (message.includes("EXPIRED")) {
+        return fail("Invitation expired", ErrorCode.EXPIRED, 410);
+      }
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    return ok({
+      invitationId: parsedId.data,
+      status: data.status,
+      alreadyResponded: data.already_responded,
+      attendeesAdded: data.attendees_added,
+    });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);
