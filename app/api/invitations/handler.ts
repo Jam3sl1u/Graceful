@@ -6,7 +6,7 @@ import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import { writeAuditLog } from "@/lib/audit/write-audit-log";
-import { createInvitationSchema } from "@/schemas/invitations";
+import { createInvitationSchema, denyInvitationSchema } from "@/schemas/invitations";
 import type { InvitationStatus } from "@/types/domain";
 
 type InvitationsRow = Database["public"]["Tables"]["invitations"]["Row"];
@@ -81,6 +81,23 @@ export async function createInvitation(req: NextRequest, lookup?: UserLookup): P
     // app/api/church-group/members/[id]/role/handler.ts).
     if (!week) {
       return fail("Service week not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    // BR-08 (PRD §8): a member who has denied 3 invitations for this service week
+    // cannot be re-invited for it.
+    const { data: deniedForWeek, error: deniedError } = await supabase
+      .from("invitations")
+      .select("id")
+      .eq("user_id", parsed.userId)
+      .eq("service_week_id", parsed.serviceWeekId)
+      .eq("status", "denied");
+    if (deniedError) return fail("Internal error", ErrorCode.INTERNAL, 500);
+    if ((deniedForWeek ?? []).length >= 3) {
+      return fail(
+        "Member has denied 3 invitations for this week and cannot be re-invited (BR-08)",
+        ErrorCode.CONFLICT,
+        409,
+      );
     }
 
     // BR-05 double-booking check: does this user already have an accepted
@@ -164,6 +181,108 @@ export async function createInvitation(req: NextRequest, lookup?: UserLookup): P
     // TODO(#67/#68): dispatch SMS/email invitation notification here.
 
     return ok({ invitation: toInvitationResponse(invitation) }, 201);
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
+// POST /api/invitations/:id/deny — any authenticated user, scoped to their
+// own invitation (BR-08, PRD §6.3/§8/§12). Never leaks existence of another
+// user's invitation: not-owned/not-found/wrong-group all resolve to 404.
+export async function denyInvitation(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+
+    const body = await req.json().catch(() => null);
+    const parsedResult = denyInvitationSchema.safeParse(body ?? {});
+    if (!parsedResult.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+    const rawReason = parsedResult.data.reason;
+    const reason = rawReason && rawReason.length > 0 ? rawReason : null;
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data: inv, error: invError } = await supabase
+      .from("invitations")
+      .select("*")
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .eq("user_id", ctx.userId)
+      .maybeSingle();
+
+    if (invError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if (!inv) {
+      return fail("Not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    // Idempotency (PRD §12): a link used after already responding returns the
+    // current status with no side effects.
+    if (inv.status !== "pending") {
+      return ok({ invitation: toInvitationResponse(inv) });
+    }
+
+    // BR-08 denial_count is per member+week, counted across invitation rows
+    // (incremented on each new invitation+deny pair, not globally per member).
+    const { data: priorDenied, error: priorError } = await supabase
+      .from("invitations")
+      .select("id")
+      .eq("user_id", inv.user_id)
+      .eq("service_week_id", inv.service_week_id)
+      .eq("status", "denied");
+    if (priorError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    const denialCount = (priorDenied ?? []).length + 1;
+
+    const patch: Database["public"]["Tables"]["invitations"]["Update"] = {
+      status: "denied",
+      denial_reason: reason,
+      denial_count: denialCount,
+      responded_at: new Date().toISOString(),
+    };
+    const { data: updated, error: updateError } = await supabase
+      .from("invitations")
+      .update(patch)
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .eq("user_id", ctx.userId)
+      .select("*")
+      .maybeSingle();
+
+    if (updateError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if (!updated) {
+      return fail("Not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    await writeAuditLog(supabase, {
+      action: "invitation.denied",
+      entityType: "invitation",
+      entityId: id,
+      metadata: {
+        service_week_id: inv.service_week_id,
+        denial_count: denialCount,
+        reason_provided: reason !== null,
+      },
+    });
+
+    // TODO(#67/#68): dispatch SMS + email to invited_by (admin) with member name and reason.
+
+    return ok({ invitation: toInvitationResponse(updated) });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);

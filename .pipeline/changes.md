@@ -1,126 +1,75 @@
-# Changes: Issue #40 — Send set invitation (POST /api/invitations, BR-05)
+# Changes: Issue #42 — Deny invitation with reason (BR-08 denial cap)
 
-## Human-resolved open question applied
+## Files changed
 
-The planner's spec defaulted `response_token` generation to
-`randomBytes(32).toString("hex")`. The human override for this run instead
-specifies: two `crypto.randomUUID()` calls, hyphens stripped, concatenated
-into a 64-char hex string. Implemented as such in
-`app/api/invitations/handler.ts` (`generateResponseToken()`), using the
-`crypto` global (available in the Next.js/Node route-handler runtime) rather
-than `import { randomBytes } from "node:crypto"`. The BR-05
-warn-then-proceed/cancel flow (via `acknowledgeConflict`) matched the spec as
-written, so no change was needed there.
+- `schemas/invitations.ts` — added `denyInvitationSchema` (`reason` optional string, trimmed,
+  max 200 chars, no `.min(1)` so empty/whitespace-only is valid) and its inferred
+  `DenyInvitationInput` type, alongside the existing `createInvitationSchema`.
 
-## Files created
+- `app/api/invitations/handler.ts` — two changes:
+  1. Added `denyInvitation(req, id, lookup?)`, copying `createInvitation`'s structure
+     (`requireAuth` → tolerant body parse → `auth()`/`getToken({template:"supabase"})` →
+     `getSupabaseClient(jwt)` → try/catch tail). Logic: fetch the caller's own invitation
+     (`id` + `church_group_id` + `user_id` scoped, so a wrong owner/group/id is
+     indistinguishable → 404); if `status !== "pending"` return the current invitation as-is
+     (200, no side effects — idempotent re-response per PRD §12); otherwise count prior
+     `status = 'denied'` rows for that member+service_week, set this row's
+     `denial_count = count + 1`, update `status/denial_reason/denial_count/responded_at`,
+     write an `invitation.denied` audit log (metadata omits the raw reason text, only
+     `reason_provided: boolean`), and return the updated invitation. Left a
+     `TODO(#67/#68)` comment for the deferred SMS/email dispatch to the inviting admin, per
+     spec's precedent from `createInvitation`.
+  2. Added the BR-08 send-guard inside `createInvitation`, immediately after the existing
+     `!week` 404 check and before the BR-05 double-booking check: counts
+     `status = 'denied'` invitations for `(userId, serviceWeekId)`; if `>= 3`, returns
+     409 CONFLICT ("Member has denied 3 invitations for this week and cannot be
+     re-invited (BR-08)") without touching any later branch. Purely additive — no existing
+     `createInvitation` behavior/branch order changed.
 
-- `lib/supabase/types.ts` — replaced the incomplete hand-rolled
-  `InvitationsRow` (only had `id/church_group_id/service_week_id/user_id/status/created_at`)
-  with the full column set matching the migration: adds `role_note`,
-  `response_token`, `responded_at`, `denial_reason`, `denial_count`,
-  `response_deadline`, `invited_by`. Updated the `invitations` table entry's
-  `Insert` type to omit DB-defaulted/server-generated columns
-  (`id`, `created_at`, `status`, `responded_at`, `denial_reason`,
-  `denial_count`, `response_deadline`), mirroring the `service_weeks` pattern.
+- `app/api/invitations/[id]/deny/route.ts` — replaced the `notImplemented(...)` stub with a
+  real `POST` handler wired to `denyInvitation`, following the `params: Promise<{id:string}>`
+  pattern from `app/api/service-weeks/[id]/cancel/route.ts`.
 
-- `schemas/invitations.ts` — added `createInvitationSchema` /
-  `CreateInvitationInput` (serviceWeekId/userId as UUIDs, optional roleNote
-  1-500 chars trimmed, optional `acknowledgeConflict` boolean). Left the
-  existing placeholder `invitationsSchema`/`InvitationsInput` export
-  untouched since other stubs may reference it.
-
-- `app/api/invitations/handler.ts` (new file) — `createInvitation(req, lookup?)`:
-  1. `requireAuth` + `requireRole(ctx, ["admin", "set_leader"])`.
-  2. Parses body with `createInvitationSchema.safeParse`; 400
-     VALIDATION_FAILED on failure (including non-JSON body).
-  3. Resolves the Supabase JWT client; 401 UNAUTHENTICATED if missing.
-  4. Looks up the target `service_weeks` row scoped to
-     `id = serviceWeekId AND church_group_id = ctx.churchGroupId`; 404
-     NOT_FOUND if missing (wrong-group and missing are indistinguishable by
-     design — never 403), 500 INTERNAL on DB error.
-  5. BR-05 double-booking check: queries the target user's `accepted`
-     invitations in the group, then checks whether any of those weeks
-     (excluding the current `serviceWeekId`) share the same `service_date`.
-     500 INTERNAL on DB error in either query.
-  6. If a collision is found and `acknowledgeConflict !== true`: returns
-     `fail(..., ErrorCode.CONFLICT, 409)` without inserting anything. If
-     `acknowledgeConflict === true` (or no collision), proceeds.
-  7. Generates `response_token` (two concatenated stripped UUIDs, 64 hex
-     chars) and `response_deadline` (now + 72h ISO string), inserts the
-     invitation (status left unset so the DB default `'pending'` applies),
-     narrowly cast to `Database["public"]["Tables"]["invitations"]["Insert"]`
-     per the service-weeks pattern. 500 INTERNAL on error/null row.
-  8. Writes an audit log entry (`action: "invitation.sent"`,
-     `entityType: "invitation"`, metadata includes
-     `acknowledged_conflict: parsed.acknowledgeConflict === true`).
-  9. Leaves a `// TODO(#67/#68)` comment marking the notification dispatch
-     seam — no stub module created, no call made.
-  10. Returns `ok({ invitation: toInvitationResponse(invitation) }, 201)`.
-  11. Whole body wrapped in the same `try/catch` as `service-weeks/handler.ts`
-      (`ApiException` → its status/code; anything else → 500 INTERNAL).
-  Also exports `toInvitationResponse` (row → camelCase response DTO) and the
-  `InvitationResponse` type.
-
-- `app/api/invitations/route.ts` — POST now delegates to
-  `createInvitation`; GET is untouched (`notImplemented` stub, out of scope
-  for #40).
-
-- `tests/unit/app/api/invitations-route.test.ts` (new file) — mock
-  scaffolding copied from `tests/unit/app/api/service-weeks-route.test.ts`
-  (`makeChain`/`makeSupabaseClient`/`setUpAuth`/`makeLookup`), extended with
-  an `rpc` mock (`writeAuditLog` calls `supabase.rpc("write_audit_log", ...)`)
-  and a `neq` chain method. Because the handler issues **two** sequential
-  `service_weeks` selects (the week lookup, then the BR-05 collision check
-  when the user has accepted invitations elsewhere), the fixture type gained
-  a `selectSecond` field and `makeSupabaseClient` now counts `select()` calls
-  per table to route the second `service_weeks` call to it. 14 tests cover:
-  401 (no Clerk user / no JWT), 403 (member, guest), 400 (non-JSON body,
-  missing serviceWeekId, missing userId, non-uuid userId, roleNote too long),
-  404 (service week not found), 201 happy path (asserts no `status` key in
-  the insert payload, 64-hex `response_token`, ~72h `response_deadline`,
-  `invited_by === USER_ID`, and the `write_audit_log` RPC call with
-  `action: "invitation.sent"`), 409 CONFLICT with no `acknowledgeConflict`
-  (asserts no invitation insert happened), 201 with
-  `acknowledgeConflict: true` on the same collision (asserts the insert did
-  happen), and 500 on invitation-insert DB error.
-
-## Explicitly not touched (per spec's out-of-scope list)
-
-- `GET /api/invitations` — left as the existing `notImplemented` stub.
-- Accept/deny/withdraw/token-lookup routes (#41-#45) — untouched.
-- Writing to the `conflicts` table — that happens at accept time (#41), not
-  in this handler.
-- SMS/email dispatch (#67/#68) — comment seam only, no stub module.
-- Any DB migration or RLS change — schema/RLS already support everything
-  this handler needs.
-- The `expired` status / DB enum — untouched.
+- `tests/unit/app/api/invitations-deny-route.test.ts` (new) — unit tests, mock scaffolding
+  copied in style from `tests/unit/app/api/invitations-route.test.ts` (jest.mock of
+  `@clerk/nextjs/server` + `@/lib/supabase/client`, `makeReq`/`makeLookup`/`setUpAuth`/
+  `makeChain`/`makeSupabaseClient` helpers). Covers:
+  - 401 (no JWT; Clerk userId null with lookup never consulted)
+  - 404 (invitation not found / not owned by caller)
+  - 400 (`reason` > 200 chars; `reason` not a string)
+  - happy path pending → denied: `status`/`denial_reason`/`denial_count=1` set, and
+    `invitation.denied` audit rpc call asserted with expected metadata shape
+  - empty-body and whitespace-only-reason deny → `denial_reason` stored as `null`, not a 400
+  - idempotent already-denied invitation → 200, no `update`/`rpc` call at all
+  - `denial_count` becomes 2 when one prior denied row exists for the same member+week
+  - 500 when the invitation lookup query errors
+  - BR-08 send guard on `createInvitation`: 409 when 3 denied rows already exist for
+    member+week, and 201 when only 2 exist (guard does not over-trigger)
 
 ## Verification
 
-- `bun run typecheck` — passes.
-- `bun run lint` — passes (0 errors, 0 warnings on touched files).
-- `bun run test` — full suite: 20 suites / 274 tests passing, including the
-  new 14-test file (`tests/unit/app/api/invitations-route.test.ts`).
-- `bunx prettier --check` on all touched/new files — all pass (repo-wide
-  `format:check` has pre-existing failures on unrelated files not touched by
-  this change).
-- `bun audit` — one pre-existing moderate advisory on a transitive
-  `next -> postcss` dependency, unrelated to this issue's scope.
+- `bun run lint` — clean (no errors/warnings).
+- `bun run typecheck` — clean (`tsc --noEmit`, no errors).
+- `bun run test` — all 26 suites / 339 tests pass, including the new tests in
+  `invitations-deny-route.test.ts`. No existing tests (e.g. `invitations-route.test.ts`,
+  `invitations-route.supplemental.test.ts`) were modified or broken by the new BR-08 guard
+  query added to `createInvitation` — their default fixture (`invitations.select` returns
+  `{ data: [], error: null }`) satisfies both the new deniedForWeek check and the
+  pre-existing acceptedInvitations check.
 
-## What the Tester should focus on
+## Notes for the Tester
 
-- The BR-05 collision query logic in `app/api/invitations/handler.ts`
-  (two-query approach: accepted invitations for the user in-group, then
-  service_weeks with matching date excluding the current week) — verify the
-  "exclude current serviceWeekId" and "status = accepted only" conditions
-  are correct against real Supabase/RLS behavior, not just the mocked test.
-- `response_token` format: confirm 64 lowercase hex chars with no separators
-  (two `crypto.randomUUID()` outputs stripped of hyphens and concatenated) —
-  satisfies the DB `varchar(64) unique` column and matches the human-provided
-  override, not the original spec's `randomBytes` default.
-- The 409 vs 201-with-acknowledgeConflict two-step contract end-to-end (a
-  client integration/E2E test re-POSTing with `acknowledgeConflict: true`
-  after receiving 409 would be valuable, since unit tests only assert each
-  call path independently).
-- No `conflicts` table row is written anywhere in this handler (confirmed by
-  inspection — out of scope per spec, deferred to #41 accept flow).
+- The spec's OPEN QUESTIONS section documents non-blocking design decisions already baked
+  into this implementation (no `requireRole` on deny; deferred notification dispatch;
+  "slot reopens" needs no extra code since there's no `slots` table). These are not gaps —
+  verify behavior matches, not that they were left undone.
+- Worth double-checking against real Supabase behavior (not just mocks): the BR-08
+  denial-count query is scoped to `(user_id, service_week_id)` across all invitation rows
+  regardless of `church_group_id`/`id`, matching the spec's exact query; and the deny
+  handler's ownership scoping (`id` + `church_group_id` + `user_id`) really does make
+  cross-user/cross-group/nonexistent ids indistinguishable (all 404).
+- Two unrelated files (`.claude/workflows/handle-issues.js`, `.pipeline/test-results.md`)
+  show as modified/stale in `git status` in this worktree but were **not touched by this
+  stage** and are intentionally left out of the commit — they predate this session and are
+  orchestration/pipeline-history artifacts, not part of issue #42's scope. `.pipeline/spec.md`
+  is the Planning stage's own output and is committed as-is (unmodified by this stage).

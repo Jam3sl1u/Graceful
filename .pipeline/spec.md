@@ -1,323 +1,233 @@
-# Spec: Issue #40 — Send set invitation (POST /api/invitations, BR-05 double-booking check)
+# Spec: Issue #42 — Deny invitation with reason (POST /api/invitations/:id/deny, BR-08 denial cap)
 
 ## OPEN QUESTIONS
 
-None are blocking. Two design decisions are made below with defaults; proceed with them unless a human overrides.
+None are blocking. Design decisions made below (proceed with these unless a human overrides):
 
-1. **BR-05 "warning, admin can proceed or cancel" is a two-step API contract.** This issue is the
-   API, not the UI. Implemented as: without an `acknowledgeConflict: true` flag in the request body,
-   a detected double-booking short-circuits and returns **409 CONFLICT** with the conflicting week
-   details so the client can prompt "proceed or cancel". With `acknowledgeConflict: true`, the
-   invitation is created despite the warning. This is the standard way to express "warn, then
-   allow override" over a stateless HTTP POST and matches the AC ("shows a warning, but admin can
-   proceed or cancel").
+1. **Who may deny.** PRD §22 lists this endpoint's role as "Member / Guest" and §6.3 frames it as
+   the *invited* member responding to their *own* invitation (in-app path, PRD "In-app response").
+   Decision: any authenticated user may call it, but the query is scoped to the caller's own
+   invitation (`user_id = ctx.userId`). A non-owner (including a set_leader/admin acting on someone
+   else's invitation) simply matches no row → **404 NOT_FOUND**, matching this repo's existing
+   "never leak existence, always 404" convention (see `app/api/service-weeks/[id]/handler.ts`).
+   No `requireRole` call — an invited admin can deny "as any member would" (PRD §11).
 
-2. **`response_token` format.** DB column is `response_token varchar(64) not null unique`. Generate
-   a 64-char hex token in the handler using the Node `crypto` global (available in Next.js route
-   handlers): `crypto.randomBytes(32).toString("hex")`. Import `randomBytes` from `node:crypto`.
+2. **Notification dispatch is deferred.** AC says admin gets SMS + email "once #67/#68 exist"; they
+   do not exist yet. Mirror the precedent set by `createInvitation` (issue #40), which left this as
+   a `TODO(#67/#68)` comment and created **no** notification row. This issue does the same: audit
+   log is written, actual SMS/email/in-app fan-out is a `TODO(#67/#68)`. Do not invent a
+   notification insert.
 
-## Current state (already done — do NOT redo)
+3. **"Slot reopens" requires no new code.** There is no `slots` table; roster/slot status is derived
+   from the `invitations` rows (a denied invitation no longer holds the slot). Setting
+   `status = 'denied'` fully satisfies "slot reopens." Likewise "no event_attendees or calendar
+   entries created on denial" is satisfied by simply not creating any — there is nothing to delete.
 
-- DB schema is complete. `supabase/migrations/20260702000003_cluster_3_scheduling_core.sql` already
-  defines the `invitations` table with ALL needed columns: `id, church_group_id, service_week_id,
-  user_id, role_note, status (default 'pending'), response_token (varchar(64) unique), responded_at,
-  denial_reason, denial_count, response_deadline, invited_by, created_at`. The `conflicts` table also
-  already exists. **No new migration is needed.**
-- RLS is complete (`supabase/migrations/20260704000001_rls_policies.sql`): `invitations_insert_leader_admin`
-  and `conflicts_insert_leader_admin` already gate INSERTs to leader/admin in the same group. The
-  `write_audit_log` RPC exists and is used via `lib/audit/write-audit-log.ts`.
+## Current state (already in place — do NOT recreate)
 
-## What this issue implements
+- `app/api/invitations/[id]/deny/route.ts` exists but is a `notImplemented("...")` stub.
+- `app/api/invitations/handler.ts` already implements `createInvitation` and exports
+  `toInvitationResponse(row)` + the `InvitationResponse` type — reuse both.
+- DB columns already exist (migration `20260702000003_cluster_3_scheduling_core.sql`):
+  `invitations.status`, `denial_reason text`, `denial_count integer not null default 0`,
+  `responded_at timestamptz`. The Update type `Database["public"]["Tables"]["invitations"]["Update"]`
+  is `Partial<InvitationsRow>`, so all these fields are assignable.
+- `InvitationStatus` union (`types/domain.ts`) already includes `"denied"`.
+- `schemas/invitations.ts` already has `createInvitationSchema`; add the new deny schema alongside it.
 
-`POST /api/invitations` only. GET is out of scope for #40 — leave the `GET` export in
-`app/api/invitations/route.ts` as the existing `notImplemented` stub. Accept/deny/withdraw/token-lookup
-are separate issues (#41–#45) — do not touch those routes.
+## Files to change
 
-The `conflicts` INSERT ("conflict flag raised when member accepts both") happens at **accept** time
-(#41), NOT here. This issue only performs the *check* and records the warning. Do NOT write a
-`conflicts` row in this handler.
+### 1. `schemas/invitations.ts` — add deny body schema
 
-## Files to modify
-
-### 1. `lib/supabase/types.ts` — fix the incomplete `InvitationsRow`
-
-The hand-rolled `InvitationsRow` (around line 94) is missing columns the DB actually has. Replace it so
-it matches the migration. New shape:
-
-## Files to modify
-
-### 2. `types/domain.ts`
-Add a `NotificationType` union mirroring the DB enum (including the two new values). Keep
-the existing string-literal-union comment style:
-```ts
-type InvitationsRow = {
-  id: string;
-  church_group_id: string;
-  service_week_id: string;
-  user_id: string;
-  role_note: string | null;
-  status: InvitationStatus;
-  response_token: string;
-  responded_at: string | null;
-  denial_reason: string | null;
-  denial_count: number;
-  response_deadline: string | null;
-  invited_by: string | null;
-  created_at: string;
-};
-```
-
-Then update the `invitations` table entry in the `Database` type (around line 178) so `Insert` omits
-the DB-defaulted / server-generated columns, mirroring how `service_weeks` does it (see lines 152–161):
+Add (follow the style/comments of `createInvitationSchema` in the same file):
 
 ```ts
-invitations: {
-  Row: InvitationsRow;
-  Insert: Omit<
-    InvitationsRow,
-    "id" | "created_at" | "status" | "responded_at" | "denial_reason" | "denial_count" | "response_deadline"
-  > & {
-    id?: string;
-    created_at?: string;
-    status?: InvitationStatus;
-    responded_at?: string | null;
-    denial_reason?: string | null;
-    denial_count?: number;
-    response_deadline?: string | null;
-  };
-  Update: Partial<InvitationsRow>;
-  Relationships: [];
-};
-```
-
-`InvitationStatus` is already imported at the top of the file (line 9).
-
-### 2. `schemas/invitations.ts` — real create schema
-
-The file currently holds only an empty placeholder `invitationsSchema = z.object({})`. Add the create
-schema (keep the existing `invitationsSchema`/`InvitationsInput` export in place — other stubs may
-reference it). Follow the style of `schemas/service-weeks.ts`.
-
-```ts
-export const createInvitationSchema = z.object({
-  serviceWeekId: z.string().uuid(),
-  userId: z.string().uuid(),
-  roleNote: z.string().trim().min(1).max(500).optional(),
-  acknowledgeConflict: z.boolean().optional(),
+// POST /api/invitations/:id/deny body (#42). reason is optional (max 200 chars,
+// PRD §6.3 / BR-08). An absent body or empty/whitespace-only reason both mean
+// "no reason" and are valid (NOT a 400) — the handler coerces them to null.
+export const denyInvitationSchema = z.object({
+  reason: z.string().trim().max(200).optional(),
 });
-export type CreateInvitationInput = z.infer<typeof createInvitationSchema>;
+export type DenyInvitationInput = z.infer<typeof denyInvitationSchema>;
 ```
 
-`roleNote` is optional (DB column `role_note` is nullable). `acknowledgeConflict` defaults to
-undefined/false (the BR-05 override flag).
+Note: do NOT use `.min(1)` — an empty reason must be accepted, not rejected.
 
-### 3. `app/api/invitations/handler.ts` — NEW FILE (handler layer)
+### 2. `app/api/invitations/handler.ts` — add `denyInvitation`
 
-Follow the exact structure of `app/api/service-weeks/handler.ts` and
-`app/api/church-group/members/[id]/role/handler.ts` (the latter for the `writeAuditLog` usage).
-
-Export a response mapper and a `createInvitation` function:
+Add a new exported function. Copy the structure of `createInvitation` (same imports, same
+`try/catch` → `ApiException`/`fail` tail, same `auth()`→`getToken({template:"supabase"})`→
+`getSupabaseClient(jwt)` sequence). Signature:
 
 ```ts
-export type InvitationResponse = {
-  id: string;
-  serviceWeekId: string;
-  userId: string;
-  roleNote: string | null;
-  status: InvitationStatus;
-  responseToken: string;
-  responseDeadline: string | null;
-  invitedBy: string | null;
-  createdAt: string;
-};
-
-export function toInvitationResponse(row: InvitationsRow): InvitationResponse;
-
-export async function createInvitation(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+export async function denyInvitation(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response>
 ```
 
-`createInvitation` logic, in order:
+Import `denyInvitationSchema` from `@/schemas/invitations`.
 
-1. `const ctx = await requireAuth(req, lookup);`
-2. `requireRole(ctx, ["admin", "set_leader"]);` (Set Leaders send invitations; app-layer check even
-   though RLS also gates it — mirror the role/handler.ts comment rationale).
-3. Parse body with `createInvitationSchema.safeParse`; on failure return
-   `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)`. Handle non-JSON body via
-   `req.json().catch(() => null)` (same as service-weeks).
-4. Get the supabase JWT client exactly as service-weeks does (401 UNAUTHENTICATED if no JWT).
-5. **Validate the target service week exists in the caller's group.** Query `service_weeks` by
-   `id = serviceWeekId` and `church_group_id = ctx.churchGroupId`, `.maybeSingle()`. If DB error →
-   500 INTERNAL. If not found → `fail("Service week not found", ErrorCode.NOT_FOUND, 404)`. Keep the
-   `service_date` from this row for the BR-05 check.
-6. **BR-05 double-booking check.** Query for OTHER invitations that would collide on the same calendar
-   date with `status = 'accepted'`:
-   - Select `invitations` joined to `service_weeks` on the same `church_group_id` where
-     `invitations.user_id = userId`, `invitations.status = 'accepted'`, the joined
-     `service_weeks.service_date = <this week's service_date>`, and
-     `invitations.service_week_id <> serviceWeekId` (exclude the current week).
-   - Implementation approach (no cross-table join helper exists; do two queries): first select the
-     accepted invitations for this user in this group (`.eq("user_id", userId).eq("status",
-     "accepted").eq("church_group_id", ctx.churchGroupId)` selecting `service_week_id`), then select
-     `service_weeks` whose `id in (...those week ids)` AND `service_date = thisDate` AND `id <>
-     serviceWeekId`. A non-empty result = a double-booking on that date.
-   - On DB error in either query → 500 INTERNAL.
-   - If a collision is found AND `acknowledgeConflict !== true`: return
-     `fail("Member already confirmed for another week on this date", ErrorCode.CONFLICT, 409)` — the
-     response body's `error`/`code` follow the standard `fail` shape (there is no custom detail
-     envelope; `fail` only takes message+code+status). The client re-POSTs with
-     `acknowledgeConflict: true` to override.
-   - If a collision is found AND `acknowledgeConflict === true`: proceed (do not block).
-   - If no collision: proceed.
-7. **Insert the invitation.** Generate `response_token` = `randomBytes(32).toString("hex")` and
-   `response_deadline` = now + 72 hours as ISO string: `new Date(Date.now() + 72 * 60 * 60 *
-   1000).toISOString()`. Build the insert payload (cast narrowly with
-   `as unknown as Database["public"]["Tables"]["invitations"]["Insert"]`, mirroring service-weeks
-   line 124–132, because the hand-rolled Insert type still marks some columns required):
+Logic, in order:
+
+1. `const ctx = await requireAuth(req, lookup);` (NO `requireRole` — see OPEN QUESTION 1).
+2. Parse body tolerantly:
    ```ts
-   {
-     church_group_id: ctx.churchGroupId,
-     service_week_id: parsed.serviceWeekId,
-     user_id: parsed.userId,
-     role_note: parsed.roleNote ?? null,
-     response_token: token,
-     response_deadline: deadlineIso,
-     invited_by: ctx.userId,
-   }
+   const body = await req.json().catch(() => null);
+   const parsedResult = denyInvitationSchema.safeParse(body ?? {});
+   if (!parsedResult.success) return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+   const rawReason = parsedResult.data.reason;
+   const reason = rawReason && rawReason.length > 0 ? rawReason : null;
    ```
-   Do NOT set `status` (DB defaults to `'pending'`). `.insert(payload).select("*").maybeSingle()`.
-   On error or null row → 500 INTERNAL.
-8. **Audit log.** `await writeAuditLog(supabase, { action: "invitation.sent", entityType:
-   "invitation", entityId: invitation.id, metadata: { service_week_id: parsed.serviceWeekId, user_id:
-   parsed.userId, acknowledged_conflict: parsed.acknowledgeConflict === true } });`
-9. **Notification stub.** SMS/email dispatch is #67/#68 and explicitly out of scope. Do NOT call any
-   notification service. Add a single comment marking the seam, e.g.
-   `// TODO(#67/#68): dispatch SMS/email invitation notification here.` Do not create a stub module.
-10. Return `ok({ invitation: toInvitationResponse(invitation) }, 201)`.
-11. Wrap the whole body in the same `try/catch` as service-weeks: `if (err instanceof ApiException)
-    return fail(err.message, err.code, err.status); return fail("Internal error", ErrorCode.INTERNAL,
-    500);`
+   (Passing `body ?? {}` makes a missing/empty POST body valid → reason `null`.)
+3. Get jwt; if none → `fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`. Build `supabase`.
+4. Fetch the caller's own invitation:
+   ```ts
+   const { data: inv, error: invError } = await supabase
+     .from("invitations")
+     .select("*")
+     .eq("id", id)
+     .eq("church_group_id", ctx.churchGroupId)
+     .eq("user_id", ctx.userId)
+     .maybeSingle();
+   ```
+   - `invError` → `fail("Internal error", ErrorCode.INTERNAL, 500)`.
+   - `!inv` → `fail("Not found", ErrorCode.NOT_FOUND, 404)`.
+5. **Idempotency** (PRD §12 "link used after already responding → return current status, no side
+   effects"): if `inv.status !== "pending"`, return `ok({ invitation: toInvitationResponse(inv) })`
+   (200) with NO update, NO count change, NO audit write. Covers already-denied, already-accepted,
+   withdrawn, and expired.
+6. **BR-08 denial_count** (per-week, across invitation rows — see Implementation Notes on the issue:
+   "increment on each new invitation+deny pair, not globally per member"): count prior denied
+   invitations for this member+week, then this one is `+1`:
+   ```ts
+   const { data: priorDenied, error: priorError } = await supabase
+     .from("invitations")
+     .select("id")
+     .eq("user_id", inv.user_id)
+     .eq("service_week_id", inv.service_week_id)
+     .eq("status", "denied");
+   if (priorError) return fail("Internal error", ErrorCode.INTERNAL, 500);
+   const denialCount = (priorDenied ?? []).length + 1;
+   ```
+7. Update this row to denied:
+   ```ts
+   const patch: Database["public"]["Tables"]["invitations"]["Update"] = {
+     status: "denied",
+     denial_reason: reason,
+     denial_count: denialCount,
+     responded_at: new Date().toISOString(),
+   };
+   const { data: updated, error: updateError } = await supabase
+     .from("invitations")
+     .update(patch)
+     .eq("id", id)
+     .eq("church_group_id", ctx.churchGroupId)
+     .eq("user_id", ctx.userId)
+     .select("*")
+     .maybeSingle();
+   ```
+   - `updateError` → 500 INTERNAL. `!updated` → 404 NOT_FOUND.
+8. Audit log (reuse `writeAuditLog`, mirror the `invitation.sent` call in `createInvitation`):
+   ```ts
+   await writeAuditLog(supabase, {
+     action: "invitation.denied",
+     entityType: "invitation",
+     entityId: id,
+     metadata: {
+       service_week_id: inv.service_week_id,
+       denial_count: denialCount,
+       reason_provided: reason !== null,
+     },
+   });
+   ```
+   Do NOT put the raw reason text in the audit metadata.
+9. `// TODO(#67/#68): dispatch SMS + email to invited_by (admin) with member name and reason.`
+10. Return `ok({ invitation: toInvitationResponse(updated) })` (200).
 
-### 4. `app/api/invitations/route.ts` — wire POST to the handler
+### 3. `app/api/invitations/[id]/deny/route.ts` — wire the route
 
-Currently both GET and POST are `notImplemented` stubs. Change **only POST** to delegate, matching
-`app/api/service-weeks/route.ts`:
+Replace the stub. Follow `app/api/service-weeks/[id]/cancel/route.ts` exactly:
 
 ```ts
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
-import { createInvitation } from "./handler";
+import { denyInvitation } from "../../handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/invitations");
-}
+type Ctx = { params: Promise<{ id: string }> };
 
-export async function POST(req: NextRequest): Promise<Response> {
-  return createInvitation(req);
+export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return denyInvitation(req, id);
 }
 ```
-Remove the `notImplemented` import.
 
-### 6. `app/api/service-weeks/[id]/reactivate/route.ts` (replace stub)
-Same shape, calling `reactivateServiceWeek`.
+(`../../handler` resolves from `app/api/invitations/[id]/deny/` to `app/api/invitations/handler.ts`.)
 
----
+### 4. `app/api/invitations/handler.ts` — enforce the BR-08 cap on the SEND path
 
-## Tests to create
+AC #3 requires that "after 3 denials for the same week, no further invites can be sent to that
+member for that week." That enforcement belongs in `createInvitation` (the send path). Add a guard
+**after** the service-week lookup (the `if (!week)` 404 block) and **before** the BR-05
+double-booking check:
 
-### 7. `tests/unit/app/api/service-weeks-cancel-route.test.ts`
-Model closely on `tests/unit/app/api/service-weeks-delete-route.test.ts` (same
-Clerk/supabase mock harness: `makeChain`, `makeSupabaseClient`, `makeLookup`, `setUpAuth`).
-Import `cancelServiceWeek` from `@/app/api/service-weeks/[id]/handler`.
+```ts
+// BR-08 (PRD §8): a member who has denied 3 invitations for this service week
+// cannot be re-invited for it.
+const { data: deniedForWeek, error: deniedError } = await supabase
+  .from("invitations")
+  .select("id")
+  .eq("user_id", parsed.userId)
+  .eq("service_week_id", parsed.serviceWeekId)
+  .eq("status", "denied");
+if (deniedError) return fail("Internal error", ErrorCode.INTERNAL, 500);
+if ((deniedForWeek ?? []).length >= 3) {
+  return fail(
+    "Member has denied 3 invitations for this week and cannot be re-invited (BR-08)",
+    ErrorCode.CONFLICT,
+    409,
+  );
+}
+```
 
-Extend the mock chain to support the new call shapes:
-- `.update(...).eq().eq().select().maybeSingle()` (add an `update` fixture/branch).
-- `.select(...).eq().in(...)` (add `in: jest.fn(() => chain)` to the chain; it resolves via
-  `then`).
-- `.insert(...)` on the `notifications` table (add an `insert` branch that resolves via
-  `then`, capturing the inserted payload for assertions).
+This is additive and must not alter any existing `createInvitation` behavior/branch above it.
 
-Cover:
-- 401 when Clerk userId is null (lookup not consulted).
-- 401 when getToken yields no JWT.
-- 403 for each of `member`, `set_leader`, `guest` (admin-only).
-- 404 when the update matches no row (`update` returns `{ data: null, error: null }`).
-- 500 when the update errors.
-- 500 when the invitations recipient query errors.
-- 500 when the notifications insert errors.
-- 200 happy path: `is_cancelled` set true, response body
-  `data.serviceWeek.isCancelled === true`; one notification row inserted per unique
-  pending/accepted invitee with `type: "service_week_cancelled"`,
-  `link_entity_type: "service_week"`, `link_entity_id: WEEK_ID`.
-- 200 with zero pending/accepted invitations → no notifications insert attempted.
-- De-dup: two invitations for the same `user_id` produce a single notification row.
-- Tenant scoping: the update is scoped to `["id", WEEK_ID]` then
-  `["church_group_id", CHURCH_GROUP_ID]` (assert the eq-call sequence, mirroring the delete
-  test's "scopes the delete" case).
+## Edge cases the implementation must handle
 
-### 8. `tests/unit/app/api/service-weeks-reactivate-route.test.ts`
-Same as above for `reactivateServiceWeek`: `is_cancelled` set false,
-`type: "service_week_reactivated"`, `data.serviceWeek.isCancelled === false`, re-notify
-pending/accepted invitees.
+- **No JSON / empty body** on deny → valid, `reason = null`, proceeds to deny.
+- **`reason` > 200 chars** (after trim) → 400 VALIDATION_FAILED. **`reason` present but not a string**
+  (e.g. `{ reason: 123 }`) → 400.
+- **Empty / whitespace-only reason** → accepted, stored as `null` (NOT 400).
+- **Unauthenticated** (no Clerk user, or no supabase JWT) → 401 UNAUTHENTICATED.
+- **Invitation id not found, in another group, or belonging to another user** → 404 NOT_FOUND
+  (indistinguishable by design; never 403, never leak existence).
+- **Already responded** (`status` is `denied`/`accepted`/`withdrawn`/`expired`) → 200 with the
+  current invitation, no side effects (no re-increment, no re-audit).
+- **denial_count accumulation** — 1st ever denial for member+week → `denial_count = 1`; a later new
+  invitation for the same member+week that is denied → `denial_count = 2`; then `3`. Count is derived
+  from existing `status = 'denied'` rows for that member+week, NOT from the row's own default 0.
+- **BR-08 cap on send** — the 4th send attempt (after 3 denials exist for member+week) → 409 CONFLICT
+  from `createInvitation`. The 1st–3rd sends still succeed.
+- **No `event_attendees` / calendar / `conflicts` rows** are created or touched on denial.
 
----
+## Patterns to copy (name the file)
 
-## Edge cases the implementation MUST handle
+- Single-resource status mutation + audit + `try/catch` tail: `app/api/service-weeks/[id]/handler.ts`
+  (`setServiceWeekCancelled`, `updateServiceWeek`).
+- Handler skeleton, `auth()`→jwt→`getSupabaseClient`, `writeAuditLog` usage, `toInvitationResponse`:
+  `app/api/invitations/handler.ts` (`createInvitation`).
+- Route file with `params: Promise<{ id: string }>`: `app/api/service-weeks/[id]/cancel/route.ts`.
+- Deny schema style: `createInvitationSchema` in `schemas/invitations.ts`.
 
-- No Clerk user / no Supabase JWT → 401 UNAUTHENTICATED (JWT check happens before any DB work).
-- `member` or `guest` caller → 403 FORBIDDEN, before any DB work (requireRole throws).
-- Malformed/non-JSON body, missing `serviceWeekId`/`userId`, non-uuid ids, `roleNote` empty/whitespace
-  or > 500 chars → 400 VALIDATION_FAILED.
-- `serviceWeekId` points to a week in another group or a non-existent week → 404 NOT_FOUND (RLS + the
-  explicit `church_group_id` filter make wrong-group and missing indistinguishable; always 404, never
-  403 — mirror the role/handler.ts comment).
-- Double-booking found without `acknowledgeConflict` → 409 CONFLICT (invitation NOT created).
-- Double-booking found WITH `acknowledgeConflict: true` → invitation created (201).
-- No double-booking → invitation created (201).
-- Any Supabase query/insert error → 500 INTERNAL. `writeAuditLog` throwing ApiException is caught by
-  the outer try/catch and surfaces as 500.
-- The BR-05 query must only count `status = 'accepted'` invitations and must exclude the current
-  `serviceWeekId` (selecting the same person for the same week is not a double-booking).
+## Tests
 
-## Tests to add
+Add a unit test file `tests/unit/app/api/invitations-deny-route.test.ts`, copying the mock
+scaffolding style of `tests/unit/app/api/invitations-route.test.ts` (the `makeReq`, `makeLookup`,
+`setUpAuth`, `makeChain`/`makeSupabaseClient` helpers, and `jest.mock` of `@clerk/nextjs/server` +
+`@/lib/supabase/client`). Cover at minimum: 401 (no JWT), 404 (not owner / not found), 400 (reason
+too long), happy path pending→denied sets `status='denied'`/`denial_reason`/`denial_count=1` and
+writes `invitation.denied` audit, empty-body deny (reason null), idempotent already-denied returns
+200 with no update/audit, `denial_count` becomes 2 when one prior denied row exists, and the BR-08
+send guard (`createInvitation` returns 409 when 3 denied rows already exist for member+week).
 
-Create `tests/unit/app/api/invitations-route.test.ts`. Copy the mock scaffolding wholesale from
-`tests/unit/app/api/service-weeks-route.test.ts` (same `makeChain` / `makeSupabaseClient` /
-`setUpAuth` / `makeLookup` helpers, same `onInsert` hook to capture payloads). Cover:
-
-- 401 when Clerk userId null (lookup not consulted) and when getToken yields no JWT.
-- 403 for `member` and `guest` (before DB work).
-- 400 for: non-JSON body, missing `serviceWeekId`, missing `userId`, non-uuid `userId`, `roleNote`
-  too long.
-- 404 when the service week is not found.
-- 201 happy path with no double-booking: asserts status default is NOT set in the insert payload,
-  asserts `response_token` (64 hex chars) and `response_deadline` (~72h out) are present in the
-  payload, asserts `invited_by === USER_ID`, asserts `writeAuditLog`/`rpc("write_audit_log", ...)` was
-  invoked with `action: "invitation.sent"`.
-- 409 CONFLICT when a double-booking exists and `acknowledgeConflict` is absent (assert NO invitation
-  insert occurred).
-- 201 when the same double-booking exists but `acknowledgeConflict: true` (assert the insert DID
-  occur).
-- 500 when the invitation insert errors.
-
-Note the BR-05 check issues extra `invitations` and `service_weeks` SELECTs beyond what the
-service-weeks fixtures cover — extend the fixture defaults so those queries resolve, and add
-per-test overrides to simulate the "accepted invitation on the same date" collision. `writeAuditLog`
-calls `supabase.rpc("write_audit_log", ...)`, so the mock client needs an `rpc` method returning
-`{ error: null }` (add it to `makeSupabaseClient`).
-
-## Patterns to follow (named references)
-
-- Handler shape, JWT retrieval, `try/catch`, narrow Insert cast: `app/api/service-weeks/handler.ts`.
-- `writeAuditLog` usage + 404-not-403 rationale: `app/api/church-group/members/[id]/role/handler.ts`.
-- Route → handler delegation: `app/api/service-weeks/route.ts`.
-- Zod schema style: `schemas/service-weeks.ts`.
-- Unit-test mock scaffolding: `tests/unit/app/api/service-weeks-route.test.ts`.
-
-## Out of scope (do NOT implement)
-
-- SMS/email dispatch (#67/#68) — comment seam only.
-- Writing to the `conflicts` table (that happens at accept time, #41).
-- GET/accept/deny/withdraw/token-lookup routes (#41–#45).
-- Any new DB migration or RLS change (schema already supports everything here).
-- The `expired` status (domain.ts lists it but the DB enum does not include it; irrelevant to this
-  issue — do not touch the enum).
+Verify with `bun run lint`, `bun run typecheck`, and `bun run test` before finishing.
