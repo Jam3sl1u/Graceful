@@ -1,69 +1,58 @@
-# Review: Issue #40 — POST /api/invitations (BR-05 double-booking check)
+# Review: Issue #42 — Deny invitation with reason (POST /api/invitations/:id/deny, BR-08 denial cap)
 
 ## VERDICT: SHIP
 
-## Scope of review
-Read spec.md, changes.md, test-results.md, then reviewed the actual diff
-(`git diff main...HEAD`) and read every touched file plus the reference
-handlers and helpers firsthand. Did NOT rely on the written summaries alone.
+## Basis
+Read spec.md, changes.md, test-results.md; read the actual source
+(`app/api/invitations/handler.ts`, `schemas/invitations.ts`,
+`app/api/invitations/[id]/deny/route.ts`, the new test file); re-ran
+`bun run lint` (clean), `bun run typecheck` (clean), `bun run test`
+(26 suites / 339 tests pass). Did not trust the summaries.
 
-## What was verified by direct code reading
+## Spec conformance — verified line by line
+- `denyInvitationSchema`: `reason` optional, `.trim().max(200)`, no `.min(1)` —
+  empty/whitespace-only accepted, coerced to null in handler. Matches.
+- `denyInvitation`: no `requireRole` (per OPEN QUESTION 1); ownership scoping via
+  `id` + `church_group_id` + `user_id` → cross-user/cross-group/missing all 404,
+  never leaking existence. Tolerant body parse (`body ?? {}`). Idempotency
+  short-circuit on `status !== "pending"` returns 200 with no update/count/audit.
+  `denial_count` derived from prior denied rows + 1 (not the row's default 0).
+  Audit `invitation.denied` logs only `reason_provided: boolean`, never the raw
+  reason text (PII handled correctly). `TODO(#67/#68)` for deferred dispatch.
+- BR-08 send guard in `createInvitation`: placed after the `!week` 404 and before
+  the BR-05 check; counts `status='denied'` rows for `(userId, serviceWeekId)`;
+  `>= 3` → 409 CONFLICT. Purely additive; no existing branch reordered.
+- Route file wired to `denyInvitation` with the `params: Promise<{id}>` pattern;
+  stub removed.
 
-- `app/api/invitations/handler.ts` — logic matches the spec step-by-step:
-  requireAuth -> requireRole(["admin","set_leader"]) -> body parse (400 incl.
-  non-JSON via `.catch(() => null)`) -> JWT/401 -> service_weeks lookup scoped
-  to `id + church_group_id` (.maybeSingle, 404 on miss / 500 on DB error /
-  never 403) -> BR-05 two-query collision check -> 409 when collision and
-  `acknowledgeConflict !== true` (no insert) -> insert omits `status` so DB
-  default 'pending' applies -> writeAuditLog(action "invitation.sent") ->
-  `// TODO(#67/#68)` seam only, no notification call -> ok(..., 201) -> outer
-  try/catch mirrors service-weeks (ApiException -> its status; else 500).
-- Ordering nuance confirmed correct: 403 (role) before 400 (body) before 401
-  (JWT), matching both the spec edge-case list and service-weeks/handler.ts.
-- BR-05 query correctness: de-dupes accepted week IDs, filters status
-  'accepted', matches on `service_date`, and excludes the current
-  `serviceWeekId` via `.neq("id", serviceWeekId)` — self-re-invite is not a
-  conflict (tester's supplemental test #6 confirms). Collision query only
-  runs when the user has accepted invitations (guards the second select).
-- No `conflicts` row is written (only a comment references it) — correct,
-  deferred to accept flow (#41).
-- Enum/schema alignment against migration 20260702000003: `invitation_status`
-  includes 'accepted'/'pending'; `service_date date`; `response_token
-  varchar(64) unique`; `response_deadline timestamptz`. Token generator emits
-  64 lowercase hex chars (two randomUUID() concatenated, hyphens stripped) —
-  matches the human override in changes.md and the DB column.
-- `lib/supabase/types.ts` InvitationsRow + invitations Insert omit-list match
-  the spec exactly and mirror the service_weeks pattern.
-- `schemas/invitations.ts` createInvitationSchema matches spec; placeholder
-  `invitationsSchema` left intact.
-- `route.ts` — POST delegates to createInvitation; GET untouched stub.
-- `writeAuditLog` throwing on RPC error is caught by the outer try/catch ->
-  500, as spec requires.
+## Test quality — meaningful, not superficial
+Tests inspect the real `.update()` payload the handler builds (via `onUpdate`
+hook) and the exact `write_audit_log` RPC shape, not stubbed return values. The
+idempotency test wires only select/update on `from()` so it would fail loudly if
+the handler tried the priorDenied query or update — it doesn't. Covers 401 (both
+no-JWT and null-Clerk-user), 404, 400 (too long + non-string), happy path
+(count=1), empty/whitespace body → null, idempotent already-denied (no
+update/rpc), count=2 with a prior denied row, 500 on lookup error, and the BR-08
+send guard both firing at 3 and not over-triggering at 2.
 
-## Tests
-Coder's 14 tests + tester's 9 supplemental tests are meaningful, not
-superficial: they assert insert payload has no `status` key, token regex
-`/^[0-9a-f]{64}$/`, deadline within 60s of now+72h, `invited_by === USER_ID`,
-audit RPC action, and (critically) that NO insert happens on 409 and that the
-insert DOES happen on `acknowledgeConflict: true`. Self-exclusion and
-per-query 500 paths are covered.
+## Critical checks
+- Regression risk on existing `invitations-route.test.ts` from the new
+  `deniedForWeek` select in `createInvitation`: the shared fixture returns
+  `{data: [], error: null}` (length 0 < 3), so the guard passes through and the
+  pre-existing BR-05 logic is unchanged. All 12 pre-existing tests still pass.
+- `deniedForWeek` query intentionally omits `church_group_id` — matches the
+  spec's exact query and is safe because `service_week_id` is group-unique.
+- Reason text is never written to the audit log. Confirmed.
 
-## Non-blocking notes (no action required for ship)
-- The BR-05 collision query does not exclude `is_cancelled` weeks. If a member
-  accepted a week later cancelled that shares a date with the new week, a
-  conflict would still be flagged. The spec does not require excluding
-  cancelled weeks, so this is spec-compliant; flag for a possible future
-  refinement in the accept-flow issue (#41).
-- All logic is unit-tested with mocks only; the two-query BR-05 behavior and
-  the 409 -> re-POST-with-acknowledgeConflict flow have no live-DB/E2E
-  coverage. Low risk (handler is stateless per request; each half verified),
-  but a Supabase-local integration test is worthwhile follow-up.
-- I could not re-run typecheck/lint/test myself this session (bash command
-  classifier was temporarily unavailable). Both the coder and the tester
-  independently ran all three: typecheck 0 errors, lint 0 errors/warnings,
-  283 tests passing. Code reading found no reason to doubt those results.
+## Non-blocking notes (not defects, no action required to ship)
+- denial_count is computed read-then-write (two queries), so it's theoretically
+  racy under concurrent denials of the same member+week. In practice a member
+  denies their own single pending invitation, so this is not exploitable; out of
+  scope for this issue.
+- No deadline/expiry check on a still-`pending` row past its response_deadline;
+  spec does not require it (expiry is handled by status transitions elsewhere).
+- `.claude/workflows/handle-issues.js` shows as locally modified in this worktree
+  but is not part of commit 0e7d263 and is unrelated to issue #42 — correctly
+  left out of the diff.
 
-## Conclusion
-Code matches the spec, follows the established handler/schema/types/test
-patterns faithfully, handles every named edge case, and the tests exercise
-real behavior rather than rubber-stamping. Ship it.
+Green tests here reflect correct behavior. Ship it.
