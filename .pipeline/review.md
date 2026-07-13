@@ -1,6 +1,6 @@
 # Review — Issue #44: Token-based public invitation lookup
 
-## VERDICT: SHIP
+VERDICT: SHIP
 
 Reviewed the actual diff for commit `8563bbb` (not just the summaries), re-ran
 `bun run typecheck` (clean) and `bun run test` (29 suites / 368 tests pass), and

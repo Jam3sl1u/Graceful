@@ -295,6 +295,97 @@ export async function denyInvitation(
   }
 }
 
+// DELETE /api/invitations/:id (#43) — set_leader/admin only. Withdraws a
+// pending invitation: flips status to `withdrawn`, notifies the invited
+// member in-app, and writes an audit log. Only valid while `pending` — an
+// accepted invitation has event_attendees side-effects a plain status flip
+// would not unwind (see .pipeline/spec.md Decision 1), so any other status
+// is a 409 CONFLICT with no side effects.
+export async function withdrawInvitation(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+    requireRole(ctx, ["admin", "set_leader"]);
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data: inv, error: invError } = await supabase
+      .from("invitations")
+      .select("*")
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .maybeSingle();
+
+    if (invError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if (!inv) {
+      return fail("Not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    if (inv.status !== "pending") {
+      return fail("Invitation is not pending", ErrorCode.CONFLICT, 409);
+    }
+
+    const patch: Database["public"]["Tables"]["invitations"]["Update"] = {
+      status: "withdrawn",
+    };
+    const { data: updated, error: updateError } = await supabase
+      .from("invitations")
+      .update(patch)
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .select("*")
+      .maybeSingle();
+
+    if (updateError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if (!updated) {
+      return fail("Not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    const { error: notifyError } = await supabase.from("notifications").insert({
+      church_group_id: inv.church_group_id,
+      user_id: inv.user_id,
+      type: "invitation_withdrawn",
+      title: "Invitation withdrawn",
+      body: "Your set invitation was withdrawn",
+      link_entity_type: "invitation",
+      link_entity_id: inv.id,
+    } as Database["public"]["Tables"]["notifications"]["Insert"]);
+
+    if (notifyError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    await writeAuditLog(supabase, {
+      action: "invitation.withdrawn",
+      entityType: "invitation",
+      entityId: id,
+      metadata: {
+        service_week_id: inv.service_week_id,
+        user_id: inv.user_id,
+      },
+    });
+
+    // TODO(#45/#36): cancel any pending 24h reminders for this invitation.
+
+    return ok({ invitation: toInvitationResponse(updated) });
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
 // POST /api/invitations/:id/accept (#41) — works two ways:
 //   1. No-session (SMS/email link): body carries a `responseToken`, no Clerk
 //      session; runs as the anon role, authenticated via the token itself.

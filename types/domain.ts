@@ -24,6 +24,7 @@ export type NotificationType =
   | "invitation_reminder"
   | "invitation_accepted"
   | "invitation_denied"
+  | "invitation_withdrawn"
   | "practice_reminder"
   | "setlist_released"
   | "scheduling_conflict"
