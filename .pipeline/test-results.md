@@ -1,131 +1,104 @@
-# Test Results: Issue #42 — Deny invitation with reason (BR-08 denial cap)
+# Test Results — Issue #44: Token-based public invitation lookup
 
-## VERDICT: PASS
+## Verdict: PASS
 
-## Context vs. the prior run
+All checks re-run independently in the pinned worktree
+(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-44`, branch
+`issue-44-token-based-public-invitation-lookup`), confirmed clean, and
+cross-checked against `.pipeline/spec.md` line by line (RPC SQL,
+`lib/supabase/types.ts`, `schemas/invitations.ts`,
+`app/api/invitations/handler.ts`, `app/api/invitations/respond/[token]/route.ts`).
+Implementation matches the spec's code samples closely (near-verbatim in
+several places). This file overwrites a stale leftover from a prior issue
+(#42) that was still sitting at this path.
 
-The previous version of this file recorded a FAIL because, at that time, this branch had
-zero commits beyond `main` and the deny route was still the `notImplemented(...)` stub. That
-is no longer the case: commit `0e7d263` ("Implement POST /api/invitations/:id/deny with
-BR-08 denial cap (#42)") is now on `HEAD`. This run independently re-verified the Coding
-stage's claims in `.pipeline/changes.md` against the actual diff and fresh command runs,
-rather than trusting the summary.
+## Commands re-run
 
-Working directory confirmed: `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-42`
-(branch `issue-42-sprint-2-implement-deny-invitation-with-reason-br-08-denial-cap`, HEAD
-`0e7d263`).
+- `bun run lint` — clean, no errors/warnings.
+- `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
+- `bun run test` (Jest, full suite) — **29 suites / 368 tests passed** (the
+  coder's 28 suites / 363 tests, plus this stage's new supplemental file with
+  5 additional tests; no failures, no skips).
 
-## Checks run
+## Independent verification performed
 
-- `bun run lint` → clean, no errors/warnings.
-- `bun run typecheck` (`tsc --noEmit`) → clean, no errors.
-- `bun run test` (Jest) → **26 suites / 339 tests, all pass**, including all 13 tests in
-  `tests/unit/app/api/invitations-deny-route.test.ts` (this new file contains both the
-  11-test `describe("POST /api/invitations/:id/deny")` block and a second, 2-test
-  `describe("POST /api/invitations — BR-08 send guard")` block exercising the
-  `createInvitation` guard). `tests/unit/app/api/invitations-route.test.ts` itself was not
-  modified — its 12 pre-existing tests still pass unmodified against the additive
-  `createInvitation` change.
+Read the actual diff (not just `changes.md`'s description) for every file
+listed:
+- `supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql` —
+  matches spec's SQL sample verbatim; `STABLE`/`SECURITY DEFINER`/
+  `SET search_path = ''`, `P0001` NOT_FOUND raise, coalesce to `'[]'` for
+  events, computed `expired` only for still-pending + past-deadline rows,
+  `GRANT ... TO anon, authenticated`, commented DOWN line present.
+- `lib/supabase/types.ts` — `EventType` added to the domain import,
+  `get_invitation_by_token` entry added to `Database["public"]["Functions"]`
+  with the spec's exact `Args`/`Returns` shape.
+- `schemas/invitations.ts` — `respondTokenParamSchema` added with the same
+  64-char lowercase-hex shape as `acceptInvitationParamSchema`'s token.
+- `app/api/invitations/handler.ts` — `getInvitationByToken` added exactly per
+  spec: validates format first (anti-enumeration), never calls `requireAuth`/
+  `auth()`/`getSupabaseClient`, uses `getAnonSupabaseClient()`, maps
+  `NOT_FOUND` → 404, other RPC errors → 500, success → camelCase
+  `PublicInvitationLookup`.
+- `app/api/invitations/respond/[token]/route.ts` — thin `GET` wrapper,
+  awaits `params`, delegates to the handler; `notImplemented` stub removed.
 
-## Independent code review against the spec (not just trusting changes.md)
+## New test file written by this stage (Tester)
 
-Read `app/api/invitations/handler.ts`, `schemas/invitations.ts`,
-`app/api/invitations/[id]/deny/route.ts`, `lib/api/auth.ts`, and both test files in full, and
-cross-checked against `.pipeline/spec.md`:
+`tests/unit/app/api/invitations-respond-route.supplemental.test.ts` (5 tests,
+all passing) — closes gaps not exercised by the coder's own test file:
 
-- `denyInvitationSchema` (`schemas/invitations.ts`): `reason` optional, `.trim().max(200)`,
-  no `.min(1)` — matches spec exactly (empty/whitespace-only reason is valid, not a 400).
-- `denyInvitation` (`app/api/invitations/handler.ts`): no `requireRole` call (per spec's OPEN
-  QUESTION 1 — any authenticated user, scoped to their own row via
-  `id` + `church_group_id` + `user_id`); confirmed `requireAuth` (`lib/api/auth.ts`) performs
-  no role filtering on its own, so this design decision actually works as written. Tolerant
-  body parse (`body ?? {}`); idempotency short-circuit on `status !== "pending"` returns 200
-  with **no** update/count/audit call; `denialCount` computed from a prior-denied-rows count
-  (not the row's own default 0), `+1`; patch sets
-  `status`/`denial_reason`/`denial_count`/`responded_at`; audit log `invitation.denied`
-  written with `reason_provided: boolean` only (raw reason text is not logged — confirmed by
-  reading the `metadata` object literal directly); `TODO(#67/#68)` comment left for deferred
-  notification dispatch, matching precedent in `createInvitation`.
-- BR-08 send-guard added to `createInvitation`: correctly placed after the `!week` 404 check
-  and before the BR-05 double-booking check; counts `status = 'denied'` rows for
-  `(userId, serviceWeekId)`; `>= 3` → 409 CONFLICT (`ErrorCode.CONFLICT`); does not touch any
-  code path below it. Confirmed by reading the diff line-by-line — branch order and every
-  other line of `createInvitation` (auth, role check, week lookup, BR-05 check, insert, audit,
-  response) is unchanged apart from the new guard block.
-- Route file `app/api/invitations/[id]/deny/route.ts`: real `POST` handler wired to
-  `denyInvitation`, `params: Promise<{id:string}>` pattern matches
-  `app/api/service-weeks/[id]/cancel/route.ts` — no more `notImplemented(...)` stub.
+1. **Anti-enumeration, strengthened**: asserts the unknown-token response and
+   a malformed-token response are deep-equal *to each other* (status + body),
+   not just each separately matching a literal object. This is what the
+   acceptance criterion in the spec actually requires and is a stronger check
+   than the coder's two independent literal-equality assertions.
+2. **Case-sensitivity edge case**: an uppercase-hex token of the correct
+   length (`"A".repeat(64)`) is malformed under the regex
+   (`^[0-9a-f]{64}$`, lowercase only) and must 404 without ever calling
+   `getAnonSupabaseClient` — not in the spec's enumerated edge cases or the
+   coder's tests, but a real gap in the anti-enumeration surface if a caller
+   relied on case-insensitive matching.
+3. **Failure case A**: `getAnonSupabaseClient()` itself throwing
+   synchronously (e.g. missing env var) is caught by the handler's outer
+   `try/catch` and maps to 500 `INTERNAL`. Not covered by the coder's suite,
+   which only exercises RPC-level `{ error }` responses, not client
+   construction failures.
+4. **Failure case B**: the RPC call's promise *rejecting* (simulating a
+   network failure) rather than resolving with `{ data: null, error }` is
+   also caught and maps to 500 `INTERNAL`. Also not covered by the coder's
+   suite.
+5. **Null pass-through**: `roleNote`, `responseDeadline`, and
+   `serviceWeek.title` all pass through as `null` unchanged rather than being
+   coerced or dropped, confirming the mapping function's null-safety for
+   every nullable field in `PublicInvitationLookup`.
 
-## Test coverage vs. spec's required edge cases — traced, not just skimmed
+## Spec edge cases re-verified as covered (by the coder's own test file, independently read and confirmed correct)
 
-Read every test in `tests/unit/app/api/invitations-deny-route.test.ts` and traced each
-fixture against the handler logic to confirm the assertions actually exercise what they
-claim to:
+1. Happy path (pending) — 200, full camelCase body, `getAnonSupabaseClient`
+   called with correct RPC args. Confirmed.
+2. Expired (still-pending, RPC-computed `status: "expired"`) — 200, not an
+   error code. Confirmed.
+3. Already responded (`accepted`/`denied`/`withdrawn`, parameterized) — 200
+   with the real status. Confirmed.
+4. Unknown token (valid format, RPC `NOT_FOUND`) — 404
+   `{ error: "Not found", code: "NOT_FOUND" }`. Confirmed.
+5. Malformed token (wrong length; non-hex) — identical 404 body to case 4,
+   RPC never called. Confirmed, and strengthened by this stage's byte-
+   identical deep-equal test above.
+6. Empty events (`events: []`) — 200, `events: []` in response. Confirmed.
+7. Unexpected RPC error — 500 `INTERNAL`. Confirmed.
 
-- 401 (no JWT) and 401 (Clerk userId null, lookup never consulted) — both present, both
-  assert `getSupabaseClient`/`lookup` was never called (verifies short-circuit, not just
-  status code).
-- 404 (invitation not found / not owned) — present.
-- 400 (`reason` > 200 chars) and 400 (`reason` not a string, `{reason: 123}`) — both present.
-- Happy path pending → denied: asserts `status`, `denial_reason`, `denial_count: 1`,
-  `responded_at` is a string, and the exact `rpc("write_audit_log", ...)` call shape
-  (`p_action: "invitation.denied"`, metadata `denial_count`/`reason_provided`, no raw reason
-  text in the payload) — traced the mock's `onUpdate` hook and confirmed it captures the real
-  `.update()` payload the handler builds, not a stubbed value.
-- Empty-body deny and whitespace-only-reason deny — both assert `denial_reason` stored as
-  `null`, matching the schema's optional-no-`.min(1)` contract.
-- Idempotent already-denied invitation — asserts 200, `updateCalled === false`, and `rpc`
-  never called; the mock's `from()` only wires `select`/`update` for this test, so it would
-  fail loudly if the handler tried to re-run the priorDenied count query or the update — it
-  doesn't, by design (early return before either).
-- `denial_count` becomes 2 with one prior denied row for the same member+week — present,
-  matches spec's accumulation requirement.
-- 500 when the invitation lookup query errors — present (this is the failure case).
-- BR-08 send guard on `createInvitation`: 409 at 3 denied rows, 201 at 2 — both present in
-  the same file's second `describe` block, confirming the guard both fires and does not
-  over-trigger.
+## Not independently verifiable in this environment
 
-## Regression check on existing invitations tests (the part most likely to silently break)
+- The RPC SQL body itself (`get_invitation_by_token`) has no live-DB test
+  harness in this repo, consistent with `accept_invitation`'s precedent and
+  explicitly out of scope per spec ("do not add a live-DB test"). Correctness
+  was checked by direct line-by-line comparison against the spec's SQL
+  sample and the `accept_invitation` migration's established pattern
+  (`SECURITY DEFINER`, `STABLE`, `search_path` hardening, `P0001` error
+  code), not by execution.
 
-Manually traced `tests/unit/app/api/invitations-route.test.ts`'s `makeSupabaseClient`: for
-the `invitations` table it returns the **same** `tableFixture.select` result on every
-`.select()` call regardless of call count (unlike `service_weeks`, which has an explicit
-`selectSecond` branch for its second call). Since `createInvitation` now issues two
-`invitations` selects (the new BR-08 `deniedForWeek` count, then the pre-existing BR-05
-`acceptedInvitations` count) before the insert, both consume the identical fixture value in
-every existing test:
+## Failure cases
 
-- Default fixture `{ data: [], error: null }` → `deniedForWeek.length === 0 < 3`, guard
-  passes through silently, then feeds the pre-existing BR-05 logic unchanged. Confirmed
-  against the 401/403×2/400×5/404/201-happy-path/500-insert-error tests, none of which
-  override the `invitations.select` fixture with anything of length >= 3.
-- The one pair of tests that does override it
-  (`{ data: [{service_week_id: "other-week"}], error: null }`, used for both the
-  409-double-booking and the 201-acknowledged-conflict tests) yields
-  `deniedForWeek.length === 1 < 3` too — guard still passes through; BR-05 logic (reading the
-  same array for a different purpose) is what actually decides those two tests' outcomes,
-  exactly as before this change.
-
-Ran the full suite (not just the new file) to confirm this empirically rather than resting
-on static analysis alone: all 12 pre-existing tests in `invitations-route.test.ts` still pass
-unmodified, and the 2 new BR-08 guard tests (in the new `invitations-deny-route.test.ts` file,
-exercising `createInvitation` directly) both pass too.
-
-## Failure case explicitly verified
-
-Beyond the coder's own suite: manually re-derived the 500 path by reading `denyInvitation`'s
-`invError`/`priorError`/`updateError` branches and confirming each maps to
-`fail("Internal error", ErrorCode.INTERNAL, 500)`. The test suite directly exercises the
-`invError` branch; the `priorError` and `updateError` branches are structurally identical
-(`if (x) return fail(...)`, same `ErrorCode.INTERNAL` constant used and verified elsewhere in
-the file), so this was confirmed via direct code read rather than an untested assumption.
-
-## Notes / non-blocking observations for the Reviewer
-
-- `.claude/workflows/handle-issues.js` shows as locally modified in `git status` in this
-  worktree. Per `changes.md`'s own note, this predates the Coding stage's work for issue #42
-  and was not touched by either the Coding or this Testing stage — confirmed via
-  `git show --stat HEAD` (it is not part of commit `0e7d263`). Flagging so the Reviewer knows
-  it's an unrelated pre-existing artifact, not part of this issue's diff.
-- No code was modified by this Testing stage. No test failures were found; nothing was
-  patched around.
+None. No test failures encountered in this run — original suite, and the
+5 new supplemental tests, all pass. Lint and typecheck are both clean.
