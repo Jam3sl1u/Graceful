@@ -1,126 +1,121 @@
-# Changes: Issue #40 — Send set invitation (POST /api/invitations, BR-05)
+# Changes — Issue #41: Implement accept invitation flow
 
-## Human-resolved open question applied
+Implements `POST /api/invitations/:id/accept` for both the no-session
+(SMS/email `responseToken`) and in-app (Clerk session) paths, converging on a
+single `SECURITY DEFINER` Postgres RPC that does all validation/mutation
+atomically.
 
-The planner's spec defaulted `response_token` generation to
-`randomBytes(32).toString("hex")`. The human override for this run instead
-specifies: two `crypto.randomUUID()` calls, hyphens stripped, concatenated
-into a 64-char hex string. Implemented as such in
-`app/api/invitations/handler.ts` (`generateResponseToken()`), using the
-`crypto` global (available in the Next.js/Node route-handler runtime) rather
-than `import { randomBytes } from "node:crypto"`. The BR-05
-warn-then-proceed/cancel flow (via `acknowledgeConflict`) matched the spec as
-written, so no change was needed there.
+## Files changed
 
-## Files created
+- **`supabase/migrations/20260712000001_accept_invitation_rpc.sql`** (new)
+  `public.accept_invitation(p_invitation_id uuid, p_response_token text)`:
+  - Looks up the invitation; `NOT_FOUND` if missing.
+  - Authorizes via token match (no-session) or Clerk JWT `sub` resolved to
+    `users.id` matching `invitations.user_id` (in-app); otherwise `FORBIDDEN`.
+  - If already responded (not `pending`), returns gracefully
+    `{status, already_responded: true, attendees_added: 0}` — not an error.
+  - If `pending` but past `response_deadline`, raises `EXPIRED`.
+  - Otherwise: flips `status` to `accepted`, sets `responded_at`; inserts
+    `event_attendees` rows for every event of the service week
+    (`ON CONFLICT DO NOTHING`, so a week with no events yet is a no-op);
+    notifies `invited_by` (or, if null, every `admin`/`set_leader` in the
+    group) via a `notifications` row (`type = 'invitation_accepted'`);
+    appends an `audit_logs` row with `time_to_respond_seconds` and `via`
+    (`'token'` or `'session'`) in `metadata`.
+  - `GRANT EXECUTE ... TO anon, authenticated` (anon needed for the no-session
+    path). Has the `-- TODO(#62)` GCal-sync stub comment and a commented DOWN
+    block, matching `20260711000001_availability_conflict_rpc.sql` /
+    `20260707000001_audit_log_write_rpc.sql`.
 
-- `lib/supabase/types.ts` — replaced the incomplete hand-rolled
-  `InvitationsRow` (only had `id/church_group_id/service_week_id/user_id/status/created_at`)
-  with the full column set matching the migration: adds `role_note`,
-  `response_token`, `responded_at`, `denial_reason`, `denial_count`,
-  `response_deadline`, `invited_by`. Updated the `invitations` table entry's
-  `Insert` type to omit DB-defaulted/server-generated columns
-  (`id`, `created_at`, `status`, `responded_at`, `denial_reason`,
-  `denial_count`, `response_deadline`), mirroring the `service_weeks` pattern.
+- **`lib/supabase/client.ts`** — added `getAnonSupabaseClient()`, identical
+  env-var resolution/guard to `getSupabaseClient` but with no `Authorization`
+  header, so it runs as the `anon` Postgres role. Used only by the
+  no-session accept path.
 
-- `schemas/invitations.ts` — added `createInvitationSchema` /
-  `CreateInvitationInput` (serviceWeekId/userId as UUIDs, optional roleNote
-  1-500 chars trimmed, optional `acknowledgeConflict` boolean). Left the
-  existing placeholder `invitationsSchema`/`InvitationsInput` export
-  untouched since other stubs may reference it.
+- **`lib/supabase/types.ts`** — added `accept_invitation` to
+  `public.Functions` (`Args: { p_invitation_id, p_response_token }`,
+  `Returns: { status: InvitationStatus; already_responded: boolean;
+  attendees_added: number }`).
 
-- `app/api/invitations/handler.ts` (new file) — `createInvitation(req, lookup?)`:
-  1. `requireAuth` + `requireRole(ctx, ["admin", "set_leader"])`.
-  2. Parses body with `createInvitationSchema.safeParse`; 400
-     VALIDATION_FAILED on failure (including non-JSON body).
-  3. Resolves the Supabase JWT client; 401 UNAUTHENTICATED if missing.
-  4. Looks up the target `service_weeks` row scoped to
-     `id = serviceWeekId AND church_group_id = ctx.churchGroupId`; 404
-     NOT_FOUND if missing (wrong-group and missing are indistinguishable by
-     design — never 403), 500 INTERNAL on DB error.
-  5. BR-05 double-booking check: queries the target user's `accepted`
-     invitations in the group, then checks whether any of those weeks
-     (excluding the current `serviceWeekId`) share the same `service_date`.
-     500 INTERNAL on DB error in either query.
-  6. If a collision is found and `acknowledgeConflict !== true`: returns
-     `fail(..., ErrorCode.CONFLICT, 409)` without inserting anything. If
-     `acknowledgeConflict === true` (or no collision), proceeds.
-  7. Generates `response_token` (two concatenated stripped UUIDs, 64 hex
-     chars) and `response_deadline` (now + 72h ISO string), inserts the
-     invitation (status left unset so the DB default `'pending'` applies),
-     narrowly cast to `Database["public"]["Tables"]["invitations"]["Insert"]`
-     per the service-weeks pattern. 500 INTERNAL on error/null row.
-  8. Writes an audit log entry (`action: "invitation.sent"`,
-     `entityType: "invitation"`, metadata includes
-     `acknowledged_conflict: parsed.acknowledgeConflict === true`).
-  9. Leaves a `// TODO(#67/#68)` comment marking the notification dispatch
-     seam — no stub module created, no call made.
-  10. Returns `ok({ invitation: toInvitationResponse(invitation) }, 201)`.
-  11. Whole body wrapped in the same `try/catch` as `service-weeks/handler.ts`
-      (`ApiException` → its status/code; anything else → 500 INTERNAL).
-  Also exports `toInvitationResponse` (row → camelCase response DTO) and the
-  `InvitationResponse` type.
+- **`lib/api/errors.ts`** — added `EXPIRED: "EXPIRED"` to `ErrorCode` (used
+  for the 410 expired-invitation response).
 
-- `app/api/invitations/route.ts` — POST now delegates to
-  `createInvitation`; GET is untouched (`notImplemented` stub, out of scope
-  for #40).
+- **`schemas/invitations.ts`** — added `acceptInvitationParamSchema`
+  (`z.string().uuid()`) and `acceptInvitationSchema` (optional
+  `responseToken`: 64-char lowercase hex string) plus the
+  `AcceptInvitationInput` type export.
 
-- `tests/unit/app/api/invitations-route.test.ts` (new file) — mock
-  scaffolding copied from `tests/unit/app/api/service-weeks-route.test.ts`
-  (`makeChain`/`makeSupabaseClient`/`setUpAuth`/`makeLookup`), extended with
-  an `rpc` mock (`writeAuditLog` calls `supabase.rpc("write_audit_log", ...)`)
-  and a `neq` chain method. Because the handler issues **two** sequential
-  `service_weeks` selects (the week lookup, then the BR-05 collision check
-  when the user has accepted invitations elsewhere), the fixture type gained
-  a `selectSecond` field and `makeSupabaseClient` now counts `select()` calls
-  per table to route the second `service_weeks` call to it. 14 tests cover:
-  401 (no Clerk user / no JWT), 403 (member, guest), 400 (non-JSON body,
-  missing serviceWeekId, missing userId, non-uuid userId, roleNote too long),
-  404 (service week not found), 201 happy path (asserts no `status` key in
-  the insert payload, 64-hex `response_token`, ~72h `response_deadline`,
-  `invited_by === USER_ID`, and the `write_audit_log` RPC call with
-  `action: "invitation.sent"`), 409 CONFLICT with no `acknowledgeConflict`
-  (asserts no invitation insert happened), 201 with
-  `acknowledgeConflict: true` on the same collision (asserts the insert did
-  happen), and 500 on invitation-insert DB error.
+- **`app/api/invitations/handler.ts`** — added `acceptInvitation(req, id,
+  lookup?)`:
+  1. Validates `id` (400 on non-uuid) and body (400 on malformed
+     `responseToken`).
+  2. If `responseToken` present → `getAnonSupabaseClient()`, no `requireAuth`
+     call, `p_response_token = responseToken`. Else → `requireAuth` (401 if
+     no session), then the same `getToken({template:"supabase"})` JWT guard
+     used elsewhere (401 if missing), `getSupabaseClient(jwt)`,
+     `p_response_token = null`.
+  3. Calls `supabase.rpc("accept_invitation", {...})`.
+  4. Maps RPC error messages: `NOT_FOUND`→404, `FORBIDDEN`→403,
+     `EXPIRED`→410, anything else→500 INTERNAL.
+  5. On success: `ok({ invitationId, status, alreadyResponded,
+     attendeesAdded })`, 200.
+  Same `try/catch (err) { ApiException ? ... : INTERNAL }` envelope as
+  `createInvitation`.
 
-## Explicitly not touched (per spec's out-of-scope list)
+- **`app/api/invitations/[id]/accept/route.ts`** — replaced the
+  `notImplemented` stub with the real route, mirroring
+  `app/api/service-weeks/[id]/cancel/route.ts` (async `params` extraction,
+  delegates to the handler).
 
-- `GET /api/invitations` — left as the existing `notImplemented` stub.
-- Accept/deny/withdraw/token-lookup routes (#41-#45) — untouched.
-- Writing to the `conflicts` table — that happens at accept time (#41), not
-  in this handler.
-- SMS/email dispatch (#67/#68) — comment seam only, no stub module.
-- Any DB migration or RLS change — schema/RLS already support everything
-  this handler needs.
-- The `expired` status / DB enum — untouched.
+- **`middleware.ts`** — added `"/api/invitations/(.*)/accept"` to
+  `isPublicRoute`'s matcher array so the no-session SMS/email link reaches
+  the handler without Clerk blocking it at the middleware layer. The in-app
+  path is unaffected — Clerk still populates `auth()` from the session
+  cookie on public routes, and the handler itself calls `requireAuth`
+  whenever no `responseToken` is supplied.
 
-## Verification
-
-- `bun run typecheck` — passes.
-- `bun run lint` — passes (0 errors, 0 warnings on touched files).
-- `bun run test` — full suite: 20 suites / 274 tests passing, including the
-  new 14-test file (`tests/unit/app/api/invitations-route.test.ts`).
-- `bunx prettier --check` on all touched/new files — all pass (repo-wide
-  `format:check` has pre-existing failures on unrelated files not touched by
-  this change).
-- `bun audit` — one pre-existing moderate advisory on a transitive
-  `next -> postcss` dependency, unrelated to this issue's scope.
+- **`.pipeline/spec.md`** — carried forward as committed by the Planning
+  stage (regenerated from scratch, scoped correctly to #41; superseded the
+  prior run's stale/blocked artifacts — see `.pipeline/test-results.md`'s
+  "BLOCKED" note from the pipeline run immediately before this one).
 
 ## What the Tester should focus on
 
-- The BR-05 collision query logic in `app/api/invitations/handler.ts`
-  (two-query approach: accepted invitations for the user in-group, then
-  service_weeks with matching date excluding the current week) — verify the
-  "exclude current serviceWeekId" and "status = accepted only" conditions
-  are correct against real Supabase/RLS behavior, not just the mocked test.
-- `response_token` format: confirm 64 lowercase hex chars with no separators
-  (two `crypto.randomUUID()` outputs stripped of hyphens and concatenated) —
-  satisfies the DB `varchar(64) unique` column and matches the human-provided
-  override, not the original spec's `randomBytes` default.
-- The 409 vs 201-with-acknowledgeConflict two-step contract end-to-end (a
-  client integration/E2E test re-POSTing with `acknowledgeConflict: true`
-  after receiving 409 would be valuable, since unit tests only assert each
-  call path independently).
-- No `conflicts` table row is written anywhere in this handler (confirmed by
-  inspection — out of scope per spec, deferred to #41 accept flow).
+- Both accept paths (token vs. session) and that the right Supabase client
+  (`getAnonSupabaseClient` vs `getSupabaseClient`) is used for each, per the
+  test plan in `.pipeline/spec.md`'s "Tests" section
+  (`tests/unit/app/api/invitations-accept-route.test.ts`, mocking both
+  client factories and Clerk `auth`).
+- RPC error-message-substring mapping (`NOT_FOUND`/`FORBIDDEN`/`EXPIRED` →
+  404/403/410; anything else → 500).
+- 400 for non-uuid `id` and for a malformed `responseToken` (wrong length or
+  non-hex).
+- 401 when there's no token and no session (`requireAuth` throws before the
+  RPC is ever called).
+- The "already responded" graceful 200 path (`already_responded: true`,
+  whatever `status` the RPC returns).
+- This spec deliberately does NOT implement BR-05 conflict-row creation on
+  accept (see spec.md's "Deferred / explicitly out of scope") — no test
+  should expect a `conflicts` insert here.
+
+## Verification run
+
+- `bun run lint` — clean.
+- `bun run typecheck` — clean.
+- `bun run test` — all 25 suites / 326 tests pass (existing suite; no new
+  test file was added by this stage per the pipeline split — the spec
+  assigns `tests/unit/app/api/invitations-accept-route.test.ts` to the
+  Testing stage).
+- `bun run check:service-role` — clean (no service-role key references in
+  `app/`/`lib/`).
+
+## Not touched (out of scope per spec)
+
+- Deny flow (#42).
+- Google Calendar sync on accept (#62) — left a `TODO(#62)` comment only in
+  the RPC.
+- "Already responded" edge-case UI copy (#51).
+- BR-05 conflict-on-accept row creation — explicitly deferred per spec's
+  "Deferred / explicitly out of scope" section; flagged there as a
+  conscious decision for a human to fold in later if desired, not an
+  omission.

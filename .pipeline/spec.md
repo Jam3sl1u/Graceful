@@ -1,323 +1,326 @@
-# Spec: Issue #40 — Send set invitation (POST /api/invitations, BR-05 double-booking check)
+# Spec — Issue #41: Implement accept invitation flow
 
 ## OPEN QUESTIONS
 
-None are blocking. Two design decisions are made below with defaults; proceed with them unless a human overrides.
-
-1. **BR-05 "warning, admin can proceed or cancel" is a two-step API contract.** This issue is the
-   API, not the UI. Implemented as: without an `acknowledgeConflict: true` flag in the request body,
-   a detected double-booking short-circuits and returns **409 CONFLICT** with the conflicting week
-   details so the client can prompt "proceed or cancel". With `acknowledgeConflict: true`, the
-   invitation is created despite the warning. This is the standard way to express "warn, then
-   allow override" over a stateless HTTP POST and matches the AC ("shows a warning, but admin can
-   proceed or cancel").
-
-2. **`response_token` format.** DB column is `response_token varchar(64) not null unique`. Generate
-   a 64-char hex token in the handler using the Node `crypto` global (available in Next.js route
-   handlers): `crypto.randomBytes(32).toString("hex")`. Import `randomBytes` from `node:crypto`.
-
-## Current state (already done — do NOT redo)
-
-- DB schema is complete. `supabase/migrations/20260702000003_cluster_3_scheduling_core.sql` already
-  defines the `invitations` table with ALL needed columns: `id, church_group_id, service_week_id,
-  user_id, role_note, status (default 'pending'), response_token (varchar(64) unique), responded_at,
-  denial_reason, denial_count, response_deadline, invited_by, created_at`. The `conflicts` table also
-  already exists. **No new migration is needed.**
-- RLS is complete (`supabase/migrations/20260704000001_rls_policies.sql`): `invitations_insert_leader_admin`
-  and `conflicts_insert_leader_admin` already gate INSERTs to leader/admin in the same group. The
-  `write_audit_log` RPC exists and is used via `lib/audit/write-audit-log.ts`.
-
-## What this issue implements
-
-`POST /api/invitations` only. GET is out of scope for #40 — leave the `GET` export in
-`app/api/invitations/route.ts` as the existing `notImplemented` stub. Accept/deny/withdraw/token-lookup
-are separate issues (#41–#45) — do not touch those routes.
-
-The `conflicts` INSERT ("conflict flag raised when member accepts both") happens at **accept** time
-(#41), NOT here. This issue only performs the *check* and records the warning. Do NOT write a
-`conflicts` row in this handler.
-
-## Files to modify
-
-### 1. `lib/supabase/types.ts` — fix the incomplete `InvitationsRow`
-
-The hand-rolled `InvitationsRow` (around line 94) is missing columns the DB actually has. Replace it so
-it matches the migration. New shape:
-
-## Files to modify
-
-### 2. `types/domain.ts`
-Add a `NotificationType` union mirroring the DB enum (including the two new values). Keep
-the existing string-literal-union comment style:
-```ts
-type InvitationsRow = {
-  id: string;
-  church_group_id: string;
-  service_week_id: string;
-  user_id: string;
-  role_note: string | null;
-  status: InvitationStatus;
-  response_token: string;
-  responded_at: string | null;
-  denial_reason: string | null;
-  denial_count: number;
-  response_deadline: string | null;
-  invited_by: string | null;
-  created_at: string;
-};
-```
-
-Then update the `invitations` table entry in the `Database` type (around line 178) so `Insert` omits
-the DB-defaulted / server-generated columns, mirroring how `service_weeks` does it (see lines 152–161):
-
-```ts
-invitations: {
-  Row: InvitationsRow;
-  Insert: Omit<
-    InvitationsRow,
-    "id" | "created_at" | "status" | "responded_at" | "denial_reason" | "denial_count" | "response_deadline"
-  > & {
-    id?: string;
-    created_at?: string;
-    status?: InvitationStatus;
-    responded_at?: string | null;
-    denial_reason?: string | null;
-    denial_count?: number;
-    response_deadline?: string | null;
-  };
-  Update: Partial<InvitationsRow>;
-  Relationships: [];
-};
-```
-
-`InvitationStatus` is already imported at the top of the file (line 9).
-
-### 2. `schemas/invitations.ts` — real create schema
-
-The file currently holds only an empty placeholder `invitationsSchema = z.object({})`. Add the create
-schema (keep the existing `invitationsSchema`/`InvitationsInput` export in place — other stubs may
-reference it). Follow the style of `schemas/service-weeks.ts`.
-
-```ts
-export const createInvitationSchema = z.object({
-  serviceWeekId: z.string().uuid(),
-  userId: z.string().uuid(),
-  roleNote: z.string().trim().min(1).max(500).optional(),
-  acknowledgeConflict: z.boolean().optional(),
-});
-export type CreateInvitationInput = z.infer<typeof createInvitationSchema>;
-```
-
-`roleNote` is optional (DB column `role_note` is nullable). `acknowledgeConflict` defaults to
-undefined/false (the BR-05 override flag).
-
-### 3. `app/api/invitations/handler.ts` — NEW FILE (handler layer)
-
-Follow the exact structure of `app/api/service-weeks/handler.ts` and
-`app/api/church-group/members/[id]/role/handler.ts` (the latter for the `writeAuditLog` usage).
-
-Export a response mapper and a `createInvitation` function:
-
-```ts
-export type InvitationResponse = {
-  id: string;
-  serviceWeekId: string;
-  userId: string;
-  roleNote: string | null;
-  status: InvitationStatus;
-  responseToken: string;
-  responseDeadline: string | null;
-  invitedBy: string | null;
-  createdAt: string;
-};
-
-export function toInvitationResponse(row: InvitationsRow): InvitationResponse;
-
-export async function createInvitation(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-```
-
-`createInvitation` logic, in order:
-
-1. `const ctx = await requireAuth(req, lookup);`
-2. `requireRole(ctx, ["admin", "set_leader"]);` (Set Leaders send invitations; app-layer check even
-   though RLS also gates it — mirror the role/handler.ts comment rationale).
-3. Parse body with `createInvitationSchema.safeParse`; on failure return
-   `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)`. Handle non-JSON body via
-   `req.json().catch(() => null)` (same as service-weeks).
-4. Get the supabase JWT client exactly as service-weeks does (401 UNAUTHENTICATED if no JWT).
-5. **Validate the target service week exists in the caller's group.** Query `service_weeks` by
-   `id = serviceWeekId` and `church_group_id = ctx.churchGroupId`, `.maybeSingle()`. If DB error →
-   500 INTERNAL. If not found → `fail("Service week not found", ErrorCode.NOT_FOUND, 404)`. Keep the
-   `service_date` from this row for the BR-05 check.
-6. **BR-05 double-booking check.** Query for OTHER invitations that would collide on the same calendar
-   date with `status = 'accepted'`:
-   - Select `invitations` joined to `service_weeks` on the same `church_group_id` where
-     `invitations.user_id = userId`, `invitations.status = 'accepted'`, the joined
-     `service_weeks.service_date = <this week's service_date>`, and
-     `invitations.service_week_id <> serviceWeekId` (exclude the current week).
-   - Implementation approach (no cross-table join helper exists; do two queries): first select the
-     accepted invitations for this user in this group (`.eq("user_id", userId).eq("status",
-     "accepted").eq("church_group_id", ctx.churchGroupId)` selecting `service_week_id`), then select
-     `service_weeks` whose `id in (...those week ids)` AND `service_date = thisDate` AND `id <>
-     serviceWeekId`. A non-empty result = a double-booking on that date.
-   - On DB error in either query → 500 INTERNAL.
-   - If a collision is found AND `acknowledgeConflict !== true`: return
-     `fail("Member already confirmed for another week on this date", ErrorCode.CONFLICT, 409)` — the
-     response body's `error`/`code` follow the standard `fail` shape (there is no custom detail
-     envelope; `fail` only takes message+code+status). The client re-POSTs with
-     `acknowledgeConflict: true` to override.
-   - If a collision is found AND `acknowledgeConflict === true`: proceed (do not block).
-   - If no collision: proceed.
-7. **Insert the invitation.** Generate `response_token` = `randomBytes(32).toString("hex")` and
-   `response_deadline` = now + 72 hours as ISO string: `new Date(Date.now() + 72 * 60 * 60 *
-   1000).toISOString()`. Build the insert payload (cast narrowly with
-   `as unknown as Database["public"]["Tables"]["invitations"]["Insert"]`, mirroring service-weeks
-   line 124–132, because the hand-rolled Insert type still marks some columns required):
-   ```ts
-   {
-     church_group_id: ctx.churchGroupId,
-     service_week_id: parsed.serviceWeekId,
-     user_id: parsed.userId,
-     role_note: parsed.roleNote ?? null,
-     response_token: token,
-     response_deadline: deadlineIso,
-     invited_by: ctx.userId,
-   }
-   ```
-   Do NOT set `status` (DB defaults to `'pending'`). `.insert(payload).select("*").maybeSingle()`.
-   On error or null row → 500 INTERNAL.
-8. **Audit log.** `await writeAuditLog(supabase, { action: "invitation.sent", entityType:
-   "invitation", entityId: invitation.id, metadata: { service_week_id: parsed.serviceWeekId, user_id:
-   parsed.userId, acknowledged_conflict: parsed.acknowledgeConflict === true } });`
-9. **Notification stub.** SMS/email dispatch is #67/#68 and explicitly out of scope. Do NOT call any
-   notification service. Add a single comment marking the seam, e.g.
-   `// TODO(#67/#68): dispatch SMS/email invitation notification here.` Do not create a stub module.
-10. Return `ok({ invitation: toInvitationResponse(invitation) }, 201)`.
-11. Wrap the whole body in the same `try/catch` as service-weeks: `if (err instanceof ApiException)
-    return fail(err.message, err.code, err.status); return fail("Internal error", ErrorCode.INTERNAL,
-    500);`
-
-### 4. `app/api/invitations/route.ts` — wire POST to the handler
-
-Currently both GET and POST are `notImplemented` stubs. Change **only POST** to delegate, matching
-`app/api/service-weeks/route.ts`:
-
-```ts
-import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
-import { createInvitation } from "./handler";
-
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/invitations");
-}
-
-export async function POST(req: NextRequest): Promise<Response> {
-  return createInvitation(req);
-}
-```
-Remove the `notImplemented` import.
-
-### 6. `app/api/service-weeks/[id]/reactivate/route.ts` (replace stub)
-Same shape, calling `reactivateServiceWeek`.
+None blocking. See "Deferred / explicitly out of scope" for one design tension
+(BR-05 conflict-on-accept) that is intentionally NOT implemented here.
 
 ---
 
-## Tests to create
+## Summary
 
-### 7. `tests/unit/app/api/service-weeks-cancel-route.test.ts`
-Model closely on `tests/unit/app/api/service-weeks-delete-route.test.ts` (same
-Clerk/supabase mock harness: `makeChain`, `makeSupabaseClient`, `makeLookup`, `setUpAuth`).
-Import `cancelServiceWeek` from `@/app/api/service-weeks/[id]/handler`.
+Implement `POST /api/invitations/:id/accept`. It must work two ways:
 
-Extend the mock chain to support the new call shapes:
-- `.update(...).eq().eq().select().maybeSingle()` (add an `update` fixture/branch).
-- `.select(...).eq().in(...)` (add `in: jest.fn(() => chain)` to the chain; it resolves via
-  `then`).
-- `.insert(...)` on the `notifications` table (add an `insert` branch that resolves via
-  `then`, capturing the inserted payload for assertions).
+1. **No-session** (SMS/email link): the request carries a `responseToken` in the
+   body and there is no Clerk session.
+2. **In-app** (authenticated member): no token; identity comes from the Clerk
+   session.
 
-Cover:
-- 401 when Clerk userId is null (lookup not consulted).
-- 401 when getToken yields no JWT.
-- 403 for each of `member`, `set_leader`, `guest` (admin-only).
-- 404 when the update matches no row (`update` returns `{ data: null, error: null }`).
-- 500 when the update errors.
-- 500 when the invitations recipient query errors.
-- 500 when the notifications insert errors.
-- 200 happy path: `is_cancelled` set true, response body
-  `data.serviceWeek.isCancelled === true`; one notification row inserted per unique
-  pending/accepted invitee with `type: "service_week_cancelled"`,
-  `link_entity_type: "service_week"`, `link_entity_id: WEEK_ID`.
-- 200 with zero pending/accepted invitations → no notifications insert attempted.
-- De-dup: two invitations for the same `user_id` produce a single notification row.
-- Tenant scoping: the update is scoped to `["id", WEEK_ID]` then
-  `["church_group_id", CHURCH_GROUP_ID]` (assert the eq-call sequence, mirroring the delete
-  test's "scopes the delete" case).
+Both paths converge on a single Postgres `SECURITY DEFINER` RPC that does all
+validation and mutation atomically. This mirrors the existing pattern
+(`record_availability_conflict`, `write_audit_log`) and is required because:
 
-### 8. `tests/unit/app/api/service-weeks-reactivate-route.test.ts`
-Same as above for `reactivateServiceWeek`: `is_cancelled` set false,
-`type: "service_week_reactivated"`, `data.serviceWeek.isCancelled === false`, re-notify
-pending/accepted invitees.
+- The service-role key is banned in `app/`/`lib/` (`scripts/check-service-role.mjs`),
+  so the no-session path has no JWT and must run as the `anon` role through a
+  `SECURITY DEFINER` function that authenticates via the token itself.
+- Acceptance must INSERT into `notifications` (admin notify), `event_attendees`,
+  and `audit_logs` — none of which a plain `member` may write under RLS
+  (`20260704000001_rls_policies.sql`): `notifications_insert_leader_admin` is
+  leader/admin only, and `audit_logs` has no authenticated INSERT policy.
+
+Doing the whole operation in one RPC keeps it atomic and satisfies "within 5
+seconds" trivially.
+
+---
+
+## Current state (verified)
+
+- `app/api/invitations/[id]/accept/route.ts` — stub returning `notImplemented`.
+- `app/api/invitations/handler.ts` — exports `createInvitation`,
+  `toInvitationResponse`, `InvitationResponse`. Add the accept handler here.
+- `invitations` table (`20260702000003_cluster_3_scheduling_core.sql`) already
+  has: `status invitation_status`, `response_token`, `responded_at`,
+  `response_deadline`, `invited_by`, `created_at`, `service_week_id`, `user_id`,
+  `church_group_id`. Enum `invitation_status` = `('pending','accepted','denied','withdrawn')`
+  — there is **no** `'expired'` value in the DB, so expiry is computed, never stored.
+- `events` and `event_attendees` tables exist (same migration). `event_attendees`
+  columns: `id, event_id, user_id, created_at`, `unique (event_id, user_id)`. No
+  `church_group_id` column. There are NO TypeScript types for `events`/`event_attendees`
+  in `lib/supabase/types.ts` — do not add them; all event_attendees writes happen
+  inside the RPC (SQL), not through the typed client.
+- `notifications` table exists; `notification_type` enum already contains
+  `'invitation_accepted'`. Insert shape used elsewhere: see
+  `app/api/service-weeks/[id]/handler.ts` `setServiceWeekCancelled`.
+- `getSupabaseClient(jwt)` (`lib/supabase/client.ts`) always sets an
+  `Authorization: Bearer` header. There is **no** anon (no-JWT) client helper yet.
+- `middleware.ts` — `/api/invitations/...` is NOT public; it is currently
+  Clerk-protected. The no-session path requires this route be made public.
+
+---
+
+## Files to create / modify
+
+### 1. NEW migration — `supabase/migrations/20260712000001_accept_invitation_rpc.sql`
+
+Create `public.accept_invitation(p_invitation_id uuid, p_response_token text)`:
+
+- `LANGUAGE plpgsql`, `SECURITY DEFINER`, `VOLATILE`, `SET search_path = ''`.
+- `RETURNS jsonb`.
+- `GRANT EXECUTE ... TO anon, authenticated;` (both roles — anon for the SMS
+  link, authenticated for in-app).
+
+Logic, in order:
+
+1. `SELECT * INTO v_inv FROM public.invitations WHERE id = p_invitation_id`.
+   If not found → `RAISE EXCEPTION 'NOT_FOUND' USING ERRCODE = 'P0001';`.
+2. **Authorize:**
+   - If `p_response_token IS NOT NULL`: require `p_response_token = v_inv.response_token`,
+     else `RAISE EXCEPTION 'FORBIDDEN' USING ERRCODE = 'P0001';`. Acting user =
+     `v_inv.user_id`. Set `v_via := 'token'`.
+   - Else (session path): `v_clerk_id := auth.jwt() ->> 'sub'`. If null →
+     `RAISE 'FORBIDDEN'`. Resolve `v_caller_id := (SELECT id FROM public.users WHERE clerk_id = v_clerk_id)`.
+     Require `v_caller_id = v_inv.user_id` (member accepting their OWN invitation),
+     else `RAISE 'FORBIDDEN'`. Set `v_via := 'session'`.
+3. **Already responded (graceful, not an error):** if `v_inv.status <> 'pending'`,
+   `RETURN jsonb_build_object('status', v_inv.status, 'already_responded', true, 'attendees_added', 0);`.
+   (Covers accepted/denied/withdrawn — full edge UI is #51; here just don't error.)
+4. **Expiry:** if `v_inv.response_deadline IS NOT NULL AND now() > v_inv.response_deadline`
+   → `RAISE EXCEPTION 'EXPIRED' USING ERRCODE = 'P0001';`.
+5. `UPDATE public.invitations SET status = 'accepted', responded_at = now() WHERE id = p_invitation_id;`.
+6. **event_attendees** for every event of the week (idempotent; no-op when the
+   week has no events yet — queued for #59/#60):
+   ```sql
+   INSERT INTO public.event_attendees (event_id, user_id)
+   SELECT e.id, v_inv.user_id FROM public.events e
+   WHERE e.service_week_id = v_inv.service_week_id
+   ON CONFLICT (event_id, user_id) DO NOTHING;
+   GET DIAGNOSTICS v_attendees_added = ROW_COUNT;
+   ```
+7. **Notify admin in-app.** Notify `v_inv.invited_by` if not null; if null, fall
+   back to every `admin`/`set_leader` in `v_inv.church_group_id`. For each
+   recipient INSERT a `notifications` row:
+   `church_group_id = v_inv.church_group_id`, `user_id = <recipient>`,
+   `type = 'invitation_accepted'`, `title = 'Invitation accepted'`,
+   `body = <member name> || ' accepted their set invitation'`
+   (member name = `SELECT name FROM public.users WHERE id = v_inv.user_id`),
+   `link_entity_type = 'invitation'`, `link_entity_id = v_inv.id`.
+8. **Audit log** (insert directly — this is the no-session-safe equivalent of
+   `write_audit_log`, which cannot be used here because it derives identity from
+   the JWT):
+   ```sql
+   INSERT INTO public.audit_logs (church_group_id, user_id, action, entity_type, entity_id, metadata)
+   VALUES (v_inv.church_group_id, v_inv.user_id, 'invitation.accepted', 'invitation', v_inv.id,
+     jsonb_build_object(
+       'time_to_respond_seconds', floor(extract(epoch FROM (now() - v_inv.created_at)))::int,
+       'via', v_via));
+   ```
+9. `RETURN jsonb_build_object('status', 'accepted', 'already_responded', false, 'attendees_added', v_attendees_added);`.
+
+Add a `-- TODO(#62): Google Calendar sync on accept` comment (stubbed, not built).
+Include a commented `-- ============ DOWN ============` with
+`DROP FUNCTION IF EXISTS public.accept_invitation(uuid, text);` — follow the
+header-comment style of `20260711000001_availability_conflict_rpc.sql`.
+
+### 2. `lib/supabase/client.ts` — add anon client helper
+
+Add alongside `getSupabaseClient`:
+
+```ts
+export function getAnonSupabaseClient(): SupabaseClient<Database> {
+  // No Authorization header → runs as the Postgres `anon` role. Used only for
+  // the no-session invitation-accept path, which authenticates via response_token
+  // inside the accept_invitation SECURITY DEFINER RPC.
+  // (url/anonKey resolved and validated exactly as in getSupabaseClient.)
+  return createClient<Database>(url, anonKey);
+}
+```
+
+Reuse the same env-var resolution + missing-var guard as `getSupabaseClient`.
+
+### 3. `lib/supabase/types.ts` — type the new RPC
+
+Add to `public.Functions`:
+
+```ts
+accept_invitation: {
+  Args: { p_invitation_id: string; p_response_token: string | null };
+  Returns: {
+    status: InvitationStatus;
+    already_responded: boolean;
+    attendees_added: number;
+  };
+};
+```
+
+(`InvitationStatus` is already imported in this file.)
+
+### 4. `lib/api/errors.ts` — add one error code
+
+Add `EXPIRED: "EXPIRED",` to the `ErrorCode` object (the file's comment already
+invites extension). Used for the expired-invitation response (HTTP 410).
+
+### 5. `schemas/invitations.ts` — add accept body + id param schemas
+
+```ts
+export const acceptInvitationParamSchema = z.string().uuid();
+
+// Body is optional: absent/empty for the in-app path; { responseToken } for the
+// no-session SMS/email path. Token is the 64-char hex response_token.
+export const acceptInvitationSchema = z.object({
+  responseToken: z
+    .string()
+    .length(64)
+    .regex(/^[0-9a-f]{64}$/)
+    .optional(),
+});
+export type AcceptInvitationInput = z.infer<typeof acceptInvitationSchema>;
+```
+
+### 6. `app/api/invitations/handler.ts` — add `acceptInvitation`
+
+Signature (match the `lookup?` seam used across handlers for testability):
+
+```ts
+export async function acceptInvitation(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response>
+```
+
+Behavior:
+
+1. Validate `id` with `acceptInvitationParamSchema`; on failure → `fail("Validation failed", VALIDATION_FAILED, 400)`.
+2. `const body = await req.json().catch(() => null);` then
+   `acceptInvitationSchema.safeParse(body ?? {})`; on failure → 400 VALIDATION_FAILED.
+   Let `responseToken = parsed.data.responseToken`.
+3. **Choose client / path:**
+   - If `responseToken` is present → `supabase = getAnonSupabaseClient()`;
+     `p_response_token = responseToken`. (Do NOT call `requireAuth`.)
+   - Else → `ctx = await requireAuth(req, lookup)` (throws 401 if no session);
+     get the supabase JWT via `auth()`/`getToken({ template: "supabase" })`
+     (401 UNAUTHENTICATED if no JWT, mirroring the other handlers);
+     `supabase = getSupabaseClient(jwt)`; `p_response_token = null`.
+4. Call `supabase.rpc("accept_invitation", { p_invitation_id: id, p_response_token })`.
+5. **Map RPC errors** by matching `error.message` (Postgres RAISE message):
+   - contains `"NOT_FOUND"` → `fail("Not found", NOT_FOUND, 404)`
+   - contains `"FORBIDDEN"` → `fail("Forbidden", FORBIDDEN, 403)`
+   - contains `"EXPIRED"` → `fail("Invitation expired", EXPIRED, 410)`
+   - any other error → `fail("Internal error", INTERNAL, 500)`
+6. On success return
+   `ok({ invitationId: id, status: data.status, alreadyResponded: data.already_responded, attendeesAdded: data.attendees_added })`
+   (HTTP 200).
+7. Wrap in the same `try/catch (err) { if (err instanceof ApiException) ... }`
+   envelope used by `createInvitation`.
+
+Import `getAnonSupabaseClient` and the two new schema exports; keep existing imports.
+
+### 7. `app/api/invitations/[id]/accept/route.ts` — wire params + handler
+
+Replace the stub with (mirror `app/api/service-weeks/[id]/cancel/route.ts`):
+
+```ts
+import { NextRequest } from "next/server";
+import { acceptInvitation } from "../../handler";
+
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return acceptInvitation(req, id);
+}
+```
+
+### 8. `middleware.ts` — make the accept route public
+
+Add to the `isPublicRoute` matcher array so the no-session SMS/email link
+reaches the handler:
+
+```ts
+"/api/invitations/(.*)/accept",
+```
+
+The in-app authenticated path still works: Clerk still populates `auth()` from
+the session cookie on public routes; the handler enforces auth itself
+(`requireAuth`) whenever no `responseToken` is supplied.
 
 ---
 
 ## Edge cases the implementation MUST handle
 
-- No Clerk user / no Supabase JWT → 401 UNAUTHENTICATED (JWT check happens before any DB work).
-- `member` or `guest` caller → 403 FORBIDDEN, before any DB work (requireRole throws).
-- Malformed/non-JSON body, missing `serviceWeekId`/`userId`, non-uuid ids, `roleNote` empty/whitespace
-  or > 500 chars → 400 VALIDATION_FAILED.
-- `serviceWeekId` points to a week in another group or a non-existent week → 404 NOT_FOUND (RLS + the
-  explicit `church_group_id` filter make wrong-group and missing indistinguishable; always 404, never
-  403 — mirror the role/handler.ts comment).
-- Double-booking found without `acknowledgeConflict` → 409 CONFLICT (invitation NOT created).
-- Double-booking found WITH `acknowledgeConflict: true` → invitation created (201).
-- No double-booking → invitation created (201).
-- Any Supabase query/insert error → 500 INTERNAL. `writeAuditLog` throwing ApiException is caught by
-  the outer try/catch and surfaces as 500.
-- The BR-05 query must only count `status = 'accepted'` invitations and must exclude the current
-  `serviceWeekId` (selecting the same person for the same week is not a double-booking).
+- **No-session valid token** → 200, status `accepted`.
+- **In-app authenticated member (own invite), no token** → 200, status `accepted`.
+- **In-app member accepting someone else's invitation** (JWT user ≠ `invitation.user_id`)
+  → 403 FORBIDDEN (RPC raises `FORBIDDEN`).
+- **Wrong/mismatched token** → 403 FORBIDDEN.
+- **No token AND no session** → 401 UNAUTHENTICATED (from `requireAuth`; RPC not reached).
+- **Unknown invitation id** → 404 NOT_FOUND.
+- **Malformed id (non-uuid)** → 400 VALIDATION_FAILED.
+- **Malformed token in body (wrong length / non-hex)** → 400 VALIDATION_FAILED.
+- **Already responded** (`status` is `accepted`/`denied`/`withdrawn`) → 200 with
+  the current status and `alreadyResponded: true`. NOT an error. (#51 owns UI text.)
+- **Expired** (`response_deadline` passed, still `pending`) → 410 EXPIRED. Checked
+  AFTER the already-responded check, so a previously-accepted-but-now-past invite
+  still returns 200 accepted.
+- **Week has no events yet** → accept still succeeds; `attendeesAdded: 0` (queued
+  for #59/#60). Not an error.
+- **`invited_by` is null** → notify all admins/set_leaders in the group instead.
+- **event_attendees already present** → `ON CONFLICT DO NOTHING`, no error.
 
-## Tests to add
+---
 
-Create `tests/unit/app/api/invitations-route.test.ts`. Copy the mock scaffolding wholesale from
-`tests/unit/app/api/service-weeks-route.test.ts` (same `makeChain` / `makeSupabaseClient` /
-`setUpAuth` / `makeLookup` helpers, same `onInsert` hook to capture payloads). Cover:
+## Patterns to copy (name the file)
 
-- 401 when Clerk userId null (lookup not consulted) and when getToken yields no JWT.
-- 403 for `member` and `guest` (before DB work).
-- 400 for: non-JSON body, missing `serviceWeekId`, missing `userId`, non-uuid `userId`, `roleNote`
-  too long.
-- 404 when the service week is not found.
-- 201 happy path with no double-booking: asserts status default is NOT set in the insert payload,
-  asserts `response_token` (64 hex chars) and `response_deadline` (~72h out) are present in the
-  payload, asserts `invited_by === USER_ID`, asserts `writeAuditLog`/`rpc("write_audit_log", ...)` was
-  invoked with `action: "invitation.sent"`.
-- 409 CONFLICT when a double-booking exists and `acknowledgeConflict` is absent (assert NO invitation
-  insert occurred).
-- 201 when the same double-booking exists but `acknowledgeConflict: true` (assert the insert DID
-  occur).
-- 500 when the invitation insert errors.
+- RPC shape / header comment / GRANT / DOWN block:
+  `supabase/migrations/20260711000001_availability_conflict_rpc.sql` and
+  `supabase/migrations/20260707000001_audit_log_write_rpc.sql`.
+- Handler envelope (try/catch, `requireAuth`, `getToken` JWT guard, `ok`/`fail`):
+  `app/api/invitations/handler.ts` (`createInvitation`) and
+  `app/api/service-weeks/[id]/handler.ts`.
+- Notification INSERT shape: `setServiceWeekCancelled` in
+  `app/api/service-weeks/[id]/handler.ts`.
+- Route param extraction: `app/api/service-weeks/[id]/cancel/route.ts`.
+- Unit-test mocking (Clerk `auth`, `getSupabaseClient`, chainable client, `rpc`
+  mock): `tests/unit/app/api/invitations-route.test.ts`. The tester will also
+  need to mock `getAnonSupabaseClient` for the token path.
 
-Note the BR-05 check issues extra `invitations` and `service_weeks` SELECTs beyond what the
-service-weeks fixtures cover — extend the fixture defaults so those queries resolve, and add
-per-test overrides to simulate the "accepted invitation on the same date" collision. `writeAuditLog`
-calls `supabase.rpc("write_audit_log", ...)`, so the mock client needs an `rpc` method returning
-`{ error: null }` (add it to `makeSupabaseClient`).
+---
 
-## Patterns to follow (named references)
+## Tests (guidance for the testing stage)
 
-- Handler shape, JWT retrieval, `try/catch`, narrow Insert cast: `app/api/service-weeks/handler.ts`.
-- `writeAuditLog` usage + 404-not-403 rationale: `app/api/church-group/members/[id]/role/handler.ts`.
-- Route → handler delegation: `app/api/service-weeks/route.ts`.
-- Zod schema style: `schemas/service-weeks.ts`.
-- Unit-test mock scaffolding: `tests/unit/app/api/service-weeks-route.test.ts`.
+Create `tests/unit/app/api/invitations-accept-route.test.ts`, modelled on
+`tests/unit/app/api/invitations-route.test.ts`. Mock `@clerk/nextjs/server`
+`auth`, and BOTH `getSupabaseClient` and `getAnonSupabaseClient` from
+`@/lib/supabase/client`. The supabase mock only needs an `rpc` method returning
+`{ data, error }`. Cover at minimum:
 
-## Out of scope (do NOT implement)
+- Happy path, token: `acceptInvitation(req({responseToken}), id)` → 200,
+  `status: "accepted"`; assert `getAnonSupabaseClient` used and
+  `rpc("accept_invitation", { p_invitation_id: id, p_response_token: token })`.
+- Happy path, session: `acceptInvitation(req({}), id, makeLookup("member"))` → 200;
+  assert `getSupabaseClient` used and `p_response_token: null`.
+- Already responded: rpc returns `{ data: { status: "accepted", already_responded: true, attendees_added: 0 } }`
+  → 200, `alreadyResponded: true`.
+- 400 for non-uuid `id`; 400 for malformed `responseToken`.
+- 401 when no token and no session (`auth` returns `{ userId: null }`).
+- Failure mapping: rpc `error.message` `"NOT_FOUND"` → 404, `"FORBIDDEN"` → 403,
+  `"EXPIRED"` → 410, other → 500.
 
-- SMS/email dispatch (#67/#68) — comment seam only.
-- Writing to the `conflicts` table (that happens at accept time, #41).
-- GET/accept/deny/withdraw/token-lookup routes (#41–#45).
-- Any new DB migration or RLS change (schema already supports everything here).
-- The `expired` status (domain.ts lists it but the DB enum does not include it; irrelevant to this
-  issue — do not touch the enum).
+Run `bun run lint`, `bun run typecheck`, `bun run test` (NOT bare `bun test`).
+
+---
+
+## Deferred / explicitly out of scope (do NOT implement)
+
+- **Deny flow** (#42) — separate issue.
+- **Google Calendar sync on accept** (#62) — leave a `TODO(#62)` comment only.
+- **"Already responded" edge-case UI copy** (#51) — this spec only guarantees the
+  graceful 200 + current-status response; no UI text.
+- **BR-05 conflict-on-accept.** `createInvitation`'s comment says "the `conflicts`
+  row itself is written at accept time (#41)", but issue #41's own Acceptance
+  Criteria and Out-of-Scope do not list conflict recording, and conflict handling
+  is tracked separately. To avoid inventing scope, conflict-row creation on accept
+  is NOT implemented here. If a human wants it folded in, it belongs after step 5
+  of the RPC (insert a `conflicts` row when the accepting user already has another
+  `accepted` invitation for a service on the same `service_date`). Flagged so it
+  is a conscious decision, not an omission.
