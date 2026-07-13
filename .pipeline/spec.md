@@ -1,233 +1,217 @@
-# Spec: Issue #42 — Deny invitation with reason (POST /api/invitations/:id/deny, BR-08 denial cap)
+# Spec — Issue #43: Withdraw invitation (`DELETE /api/invitations/:id`)
 
 ## OPEN QUESTIONS
 
-None are blocking. Design decisions made below (proceed with these unless a human overrides):
+None. Two product decisions the issue left open were resolvable from the issue
+text + existing code conventions (documented under "Decisions" below), and the
+reminder-cancellation AC is explicitly a downstream dependency (#45) that is not
+buildable yet. Nothing is blocking.
 
-1. **Who may deny.** PRD §22 lists this endpoint's role as "Member / Guest" and §6.3 frames it as
-   the *invited* member responding to their *own* invitation (in-app path, PRD "In-app response").
-   Decision: any authenticated user may call it, but the query is scoped to the caller's own
-   invitation (`user_id = ctx.userId`). A non-owner (including a set_leader/admin acting on someone
-   else's invitation) simply matches no row → **404 NOT_FOUND**, matching this repo's existing
-   "never leak existence, always 404" convention (see `app/api/service-weeks/[id]/handler.ts`).
-   No `requireRole` call — an invited admin can deny "as any member would" (PRD §11).
+## Summary
 
-2. **Notification dispatch is deferred.** AC says admin gets SMS + email "once #67/#68 exist"; they
-   do not exist yet. Mirror the precedent set by `createInvitation` (issue #40), which left this as
-   a `TODO(#67/#68)` comment and created **no** notification row. This issue does the same: audit
-   log is written, actual SMS/email/in-app fan-out is a `TODO(#67/#68)`. Do not invent a
-   notification insert.
+Implement `DELETE /api/invitations/:id` so a Set Leader/Admin can withdraw a
+**pending** invitation: flip its status to `withdrawn`, notify the invited
+member in-app, and write an audit log. This mirrors the existing
+`denyInvitation` handler almost exactly (same file, same client, same
+audit/notify plumbing) — it does **not** need a new SECURITY DEFINER RPC,
+because the actor is a leader/admin whose RLS-scoped client is already permitted
+to UPDATE any invitation in the group and INSERT a notification for another user
+(see RLS analysis below).
 
-3. **"Slot reopens" requires no new code.** There is no `slots` table; roster/slot status is derived
-   from the `invitations` rows (a denied invitation no longer holds the slot). Setting
-   `status = 'denied'` fully satisfies "slot reopens." Likewise "no event_attendees or calendar
-   entries created on denial" is satisfied by simply not creating any — there is nothing to delete.
+## Decisions (resolved, not open questions)
 
-## Current state (already in place — do NOT recreate)
+1. **Non-pending invitations are rejected with `409 CONFLICT`**, not handled
+   idempotently. The issue says withdrawing an already-accepted/denied
+   invitation "should be rejected or redirected to the appropriate flow." An
+   accepted invitation has `event_attendees` side-effects that a plain status
+   flip would not unwind, so a clean withdraw is only correct while `pending`.
+   Applies to `accepted`, `denied`, `withdrawn`, and `expired` alike (any
+   status other than `pending` → 409). This deliberately differs from
+   `denyInvitation`'s idempotent-200 behavior.
+2. **A new `invitation_withdrawn` notification type is added.** No existing
+   `notification_type` enum value fits "your invitation was withdrawn"
+   (`set_invitation` is the original invite). Follows the precedent set by
+   `supabase/migrations/20260711000001_service_week_notification_types.sql`
+   (`ALTER TYPE ... ADD VALUE IF NOT EXISTS`).
+3. **AC "Cancels any pending 24h reminders" is deferred to #45.** The only
+   hook, `cancelReminder` in `lib/upstash/qstash.ts`, is a stub that throws
+   ("not implemented — see Sprint 2 #36"). Calling it now would break the
+   handler. Leave a `TODO(#45/#36)` comment at the withdraw point (mirrors the
+   `TODO(#67/#68)` dispatch comments already in `handler.ts`). Do NOT import or
+   call `cancelReminder`.
 
-- `app/api/invitations/[id]/deny/route.ts` exists but is a `notImplemented("...")` stub.
-- `app/api/invitations/handler.ts` already implements `createInvitation` and exports
-  `toInvitationResponse(row)` + the `InvitationResponse` type — reuse both.
-- DB columns already exist (migration `20260702000003_cluster_3_scheduling_core.sql`):
-  `invitations.status`, `denial_reason text`, `denial_count integer not null default 0`,
-  `responded_at timestamptz`. The Update type `Database["public"]["Tables"]["invitations"]["Update"]`
-  is `Partial<InvitationsRow>`, so all these fields are assignable.
-- `InvitationStatus` union (`types/domain.ts`) already includes `"denied"`.
-- `schemas/invitations.ts` already has `createInvitationSchema`; add the new deny schema alongside it.
+## Files to create / modify
 
-## Files to change
+### 1. `supabase/migrations/20260712000002_invitation_withdrawn_notification_type.sql` (CREATE)
+New migration adding the enum value. Copy the shape of
+`supabase/migrations/20260711000001_service_week_notification_types.sql`
+verbatim (header comment referencing #43, `-- ============ UP ============`,
+the `ALTER TYPE`, and a commented DOWN explaining Postgres can't drop enum
+values). Body:
 
-### 1. `schemas/invitations.ts` — add deny body schema
-
-Add (follow the style/comments of `createInvitationSchema` in the same file):
-
-```ts
-// POST /api/invitations/:id/deny body (#42). reason is optional (max 200 chars,
-// PRD §6.3 / BR-08). An absent body or empty/whitespace-only reason both mean
-// "no reason" and are valid (NOT a 400) — the handler coerces them to null.
-export const denyInvitationSchema = z.object({
-  reason: z.string().trim().max(200).optional(),
-});
-export type DenyInvitationInput = z.infer<typeof denyInvitationSchema>;
+```sql
+ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'invitation_withdrawn';
 ```
 
-Note: do NOT use `.min(1)` — an empty reason must be accepted, not rejected.
+Note the timestamp prefix `20260712000002` — it must sort AFTER the existing
+`20260712000001_accept_invitation_rpc.sql`.
 
-### 2. `app/api/invitations/handler.ts` — add `denyInvitation`
+### 2. `types/domain.ts` (MODIFY)
+Add `"invitation_withdrawn"` to the `NotificationType` union (line ~22–35).
+Place it right after `"invitation_denied"` to keep the invitation-family values
+grouped. No other type in this file changes. `lib/supabase/types.ts` needs NO
+change — its `NotificationsRow.type` already references this `NotificationType`
+alias.
 
-Add a new exported function. Copy the structure of `createInvitation` (same imports, same
-`try/catch` → `ApiException`/`fail` tail, same `auth()`→`getToken({template:"supabase"})`→
-`getSupabaseClient(jwt)` sequence). Signature:
+### 3. `app/api/invitations/handler.ts` (MODIFY)
+Add a new exported async function `withdrawInvitation`, placed after
+`denyInvitation`. Signature (mirror `denyInvitation`):
 
 ```ts
-export async function denyInvitation(
+export async function withdrawInvitation(
   req: NextRequest,
   id: string,
   lookup?: UserLookup,
 ): Promise<Response>
 ```
 
-Import `denyInvitationSchema` from `@/schemas/invitations`.
-
-Logic, in order:
-
-1. `const ctx = await requireAuth(req, lookup);` (NO `requireRole` — see OPEN QUESTION 1).
-2. Parse body tolerantly:
-   ```ts
-   const body = await req.json().catch(() => null);
-   const parsedResult = denyInvitationSchema.safeParse(body ?? {});
-   if (!parsedResult.success) return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
-   const rawReason = parsedResult.data.reason;
-   const reason = rawReason && rawReason.length > 0 ? rawReason : null;
-   ```
-   (Passing `body ?? {}` makes a missing/empty POST body valid → reason `null`.)
-3. Get jwt; if none → `fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`. Build `supabase`.
-4. Fetch the caller's own invitation:
-   ```ts
-   const { data: inv, error: invError } = await supabase
-     .from("invitations")
-     .select("*")
-     .eq("id", id)
-     .eq("church_group_id", ctx.churchGroupId)
-     .eq("user_id", ctx.userId)
-     .maybeSingle();
-   ```
-   - `invError` → `fail("Internal error", ErrorCode.INTERNAL, 500)`.
-   - `!inv` → `fail("Not found", ErrorCode.NOT_FOUND, 404)`.
-5. **Idempotency** (PRD §12 "link used after already responding → return current status, no side
-   effects"): if `inv.status !== "pending"`, return `ok({ invitation: toInvitationResponse(inv) })`
-   (200) with NO update, NO count change, NO audit write. Covers already-denied, already-accepted,
-   withdrawn, and expired.
-6. **BR-08 denial_count** (per-week, across invitation rows — see Implementation Notes on the issue:
-   "increment on each new invitation+deny pair, not globally per member"): count prior denied
-   invitations for this member+week, then this one is `+1`:
-   ```ts
-   const { data: priorDenied, error: priorError } = await supabase
-     .from("invitations")
-     .select("id")
-     .eq("user_id", inv.user_id)
-     .eq("service_week_id", inv.service_week_id)
-     .eq("status", "denied");
-   if (priorError) return fail("Internal error", ErrorCode.INTERNAL, 500);
-   const denialCount = (priorDenied ?? []).length + 1;
-   ```
-7. Update this row to denied:
+Behavior, in order:
+1. `const ctx = await requireAuth(req, lookup);`
+2. `requireRole(ctx, ["admin", "set_leader"]);` — this is the "Set Leader/Admin
+   only" gate. `requireRole` throws `ApiException(FORBIDDEN, 403)`, caught by
+   the existing `catch`.
+3. Get the Supabase JWT exactly as `denyInvitation` does; 401 if no JWT.
+   `const supabase = getSupabaseClient(jwt);`
+4. Fetch the invitation scoped by **`church_group_id` only** (NOT `user_id` —
+   the leader is withdrawing someone else's invitation):
+   `.from("invitations").select("*").eq("id", id).eq("church_group_id", ctx.churchGroupId).maybeSingle()`.
+   On query error → 500 INTERNAL. On `!inv` → 404 NOT_FOUND (missing /
+   wrong-group indistinguishable, per the repo's 404-not-403 convention).
+5. If `inv.status !== "pending"` → `fail("Invitation is not pending", ErrorCode.CONFLICT, 409)`
+   (Decision 1). No update, no notification, no audit.
+6. Update the row:
    ```ts
    const patch: Database["public"]["Tables"]["invitations"]["Update"] = {
-     status: "denied",
-     denial_reason: reason,
-     denial_count: denialCount,
-     responded_at: new Date().toISOString(),
+     status: "withdrawn",
    };
-   const { data: updated, error: updateError } = await supabase
-     .from("invitations")
-     .update(patch)
-     .eq("id", id)
-     .eq("church_group_id", ctx.churchGroupId)
-     .eq("user_id", ctx.userId)
-     .select("*")
-     .maybeSingle();
    ```
-   - `updateError` → 500 INTERNAL. `!updated` → 404 NOT_FOUND.
-8. Audit log (reuse `writeAuditLog`, mirror the `invitation.sent` call in `createInvitation`):
+   `.update(patch).eq("id", id).eq("church_group_id", ctx.churchGroupId).select("*").maybeSingle()`.
+   On error → 500. On `!updated` → 404.
+   (Do NOT set `responded_at` — withdrawal is a leader action, not a member
+   response. `denial`/`accept` set `responded_at` because the member responded;
+   withdrawal did not.)
+7. Insert the member notification (member = `inv.user_id`):
+   ```ts
+   const { error: notifyError } = await supabase.from("notifications").insert({
+     church_group_id: inv.church_group_id,
+     user_id: inv.user_id,
+     type: "invitation_withdrawn",
+     title: "Invitation withdrawn",
+     body: "Your set invitation was withdrawn",
+     link_entity_type: "invitation",
+     link_entity_id: inv.id,
+   } as Database["public"]["Tables"]["notifications"]["Insert"]);
+   ```
+   If `notifyError` → 500 INTERNAL (do not swallow; the notification is an
+   acceptance criterion). Follow the column set used by the `notifications`
+   insert inside `supabase/migrations/20260712000001_accept_invitation_rpc.sql`.
+8. Write the audit log via the existing helper:
    ```ts
    await writeAuditLog(supabase, {
-     action: "invitation.denied",
+     action: "invitation.withdrawn",
      entityType: "invitation",
      entityId: id,
      metadata: {
        service_week_id: inv.service_week_id,
-       denial_count: denialCount,
-       reason_provided: reason !== null,
+       user_id: inv.user_id,
      },
    });
    ```
-   Do NOT put the raw reason text in the audit metadata.
-9. `// TODO(#67/#68): dispatch SMS + email to invited_by (admin) with member name and reason.`
-10. Return `ok({ invitation: toInvitationResponse(updated) })` (200).
+9. `// TODO(#45/#36): cancel any pending 24h reminders for this invitation.`
+10. Return `ok({ invitation: toInvitationResponse(updated) });`
+11. Wrap the whole body in the same `try/catch` as `denyInvitation`
+    (`ApiException` → `fail(err.message, err.code, err.status)`, else 500).
 
-### 3. `app/api/invitations/[id]/deny/route.ts` — wire the route
+Reuse existing imports already in the file (`requireAuth`, `requireRole`,
+`ok`, `fail`, `ApiException`, `ErrorCode`, `getSupabaseClient`, `writeAuditLog`,
+`toInvitationResponse`, `Database`). No new imports needed.
 
-Replace the stub. Follow `app/api/service-weeks/[id]/cancel/route.ts` exactly:
+### 4. `app/api/invitations/[id]/route.ts` (MODIFY — replace the stub)
+Currently returns `notImplemented`. Replace with the wiring pattern used by
+`app/api/invitations/[id]/deny/route.ts`:
 
 ```ts
 import { NextRequest } from "next/server";
-import { denyInvitation } from "../../handler";
+import { withdrawInvitation } from "../../handler";
 
 type Ctx = { params: Promise<{ id: string }> };
 
-export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
+export async function DELETE(req: NextRequest, { params }: Ctx): Promise<Response> {
   const { id } = await params;
-  return denyInvitation(req, id);
+  return withdrawInvitation(req, id);
 }
 ```
 
-(`../../handler` resolves from `app/api/invitations/[id]/deny/` to `app/api/invitations/handler.ts`.)
+Drop the now-unused `notImplemented` import.
 
-### 4. `app/api/invitations/handler.ts` — enforce the BR-08 cap on the SEND path
-
-AC #3 requires that "after 3 denials for the same week, no further invites can be sent to that
-member for that week." That enforcement belongs in `createInvitation` (the send path). Add a guard
-**after** the service-week lookup (the `if (!week)` 404 block) and **before** the BR-05
-double-booking check:
-
-```ts
-// BR-08 (PRD §8): a member who has denied 3 invitations for this service week
-// cannot be re-invited for it.
-const { data: deniedForWeek, error: deniedError } = await supabase
-  .from("invitations")
-  .select("id")
-  .eq("user_id", parsed.userId)
-  .eq("service_week_id", parsed.serviceWeekId)
-  .eq("status", "denied");
-if (deniedError) return fail("Internal error", ErrorCode.INTERNAL, 500);
-if ((deniedForWeek ?? []).length >= 3) {
-  return fail(
-    "Member has denied 3 invitations for this week and cannot be re-invited (BR-08)",
-    ErrorCode.CONFLICT,
-    409,
-  );
-}
-```
-
-This is additive and must not alter any existing `createInvitation` behavior/branch above it.
+### 5. `tests/unit/app/api/invitations-withdraw-route.test.ts` (CREATE)
+The Coder should add this so `changes.md` reflects it; the Tester owns
+independent verification. Copy the entire mock scaffolding
+(`jest.mock` of `@clerk/nextjs/server` + `@/lib/supabase/client`, `makeReq`,
+`makeLookup`, `setUpAuth`, `makeChain`, `makeSupabaseClient`,
+`pendingInvitationRow`) from `tests/unit/app/api/invitations-deny-route.test.ts`.
+Cases (see Edge cases):
+- 403 FORBIDDEN when caller role is `member`.
+- 401 when no JWT.
+- 404 when invitation not found (null select).
+- 409 CONFLICT when status is `accepted` (and a second case for `denied`).
+- Happy path: `pending` → update payload `{ status: "withdrawn" }`, a
+  `notifications` insert targeting `inv.user_id` with `type:
+  "invitation_withdrawn"`, and a `write_audit_log` RPC call with action
+  `invitation.withdrawn`. Assert `responded_at` is NOT set on the update
+  payload.
+- 500 when the invitation lookup query errors.
 
 ## Edge cases the implementation must handle
 
-- **No JSON / empty body** on deny → valid, `reason = null`, proceeds to deny.
-- **`reason` > 200 chars** (after trim) → 400 VALIDATION_FAILED. **`reason` present but not a string**
-  (e.g. `{ reason: 123 }`) → 400.
-- **Empty / whitespace-only reason** → accepted, stored as `null` (NOT 400).
-- **Unauthenticated** (no Clerk user, or no supabase JWT) → 401 UNAUTHENTICATED.
-- **Invitation id not found, in another group, or belonging to another user** → 404 NOT_FOUND
-  (indistinguishable by design; never 403, never leak existence).
-- **Already responded** (`status` is `denied`/`accepted`/`withdrawn`/`expired`) → 200 with the
-  current invitation, no side effects (no re-increment, no re-audit).
-- **denial_count accumulation** — 1st ever denial for member+week → `denial_count = 1`; a later new
-  invitation for the same member+week that is denied → `denial_count = 2`; then `3`. Count is derived
-  from existing `status = 'denied'` rows for that member+week, NOT from the row's own default 0.
-- **BR-08 cap on send** — the 4th send attempt (after 3 denials exist for member+week) → 409 CONFLICT
-  from `createInvitation`. The 1st–3rd sends still succeed.
-- **No `event_attendees` / calendar / `conflicts` rows** are created or touched on denial.
+- **Role gate:** `member`/`guest` caller → 403 FORBIDDEN (via `requireRole`).
+- **Wrong group / missing id:** → 404 NOT_FOUND, never 403 (do not leak
+  cross-tenant existence). Achieved by the `church_group_id` filter + 404 on
+  empty.
+- **Non-pending status** (`accepted`, `denied`, `withdrawn`, `expired`) → 409
+  CONFLICT, no side effects.
+- **No JWT** from `getToken` → 401 UNAUTHENTICATED (before touching the DB).
+- **DB errors** on select / update / notification insert / audit RPC → 500
+  INTERNAL (none swallowed).
+- **Notification target is the member, not the actor:** `user_id = inv.user_id`
+  (the invited member), inserted by the leader/admin's RLS client.
 
-## Patterns to copy (name the file)
+## RLS / "no RPC needed" rationale (for the Coder's confidence)
 
-- Single-resource status mutation + audit + `try/catch` tail: `app/api/service-weeks/[id]/handler.ts`
-  (`setServiceWeekCancelled`, `updateServiceWeek`).
-- Handler skeleton, `auth()`→jwt→`getSupabaseClient`, `writeAuditLog` usage, `toInvitationResponse`:
-  `app/api/invitations/handler.ts` (`createInvitation`).
-- Route file with `params: Promise<{ id: string }>`: `app/api/service-weeks/[id]/cancel/route.ts`.
-- Deny schema style: `createInvitationSchema` in `schemas/invitations.ts`.
+From `supabase/migrations/20260704000001_rls_policies.sql`:
+- `invitations_update_leader_admin` lets a leader/admin UPDATE any invitation in
+  their group.
+- `notifications_insert_leader_admin` lets a leader/admin INSERT a notification
+  for ANY user in the group (WITH CHECK only requires group match + leader/admin
+  role, not `user_id = auth_user_id()`).
+- `write_audit_log` RPC already works for an authenticated leader/admin.
+This is why `acceptInvitation` needed a SECURITY DEFINER RPC (a *member* can't
+write notifications/audit rows) but `withdrawInvitation` does not.
 
-## Tests
+## "Slot reopens" note
 
-Add a unit test file `tests/unit/app/api/invitations-deny-route.test.ts`, copying the mock
-scaffolding style of `tests/unit/app/api/invitations-route.test.ts` (the `makeReq`, `makeLookup`,
-`setUpAuth`, `makeChain`/`makeSupabaseClient` helpers, and `jest.mock` of `@clerk/nextjs/server` +
-`@/lib/supabase/client`). Cover at minimum: 401 (no JWT), 404 (not owner / not found), 400 (reason
-too long), happy path pending→denied sets `status='denied'`/`denial_reason`/`denial_count=1` and
-writes `invitation.denied` audit, empty-body deny (reason null), idempotent already-denied returns
-200 with no update/audit, `denial_count` becomes 2 when one prior denied row exists, and the BR-08
-send guard (`createInvitation` returns 409 when 3 denied rows already exist for member+week).
+For a `pending` invitation there are no `event_attendees` rows yet (those are
+inserted only at accept time, per the `accept_invitation` RPC). So "the slot
+reopens" is satisfied by the status flip alone — there is nothing to delete from
+`event_attendees`. Do NOT add event_attendees cleanup.
 
-Verify with `bun run lint`, `bun run typecheck`, and `bun run test` before finishing.
+## Out of scope (do not implement)
+
+- Bulk withdrawal of multiple invitations.
+- Any reminder scheduling/cancellation wiring (deferred to #45/#36 — comment
+  only).
+- Withdrawing accepted invitations / unwinding `event_attendees`.
+
+## Verify before finishing
+
+`bun run lint`, `bun run typecheck`, `bun run test`.
