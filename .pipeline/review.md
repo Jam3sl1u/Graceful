@@ -1,58 +1,55 @@
-# Review: Issue #42 — Deny invitation with reason (POST /api/invitations/:id/deny, BR-08 denial cap)
+# Review — Issue #43: Withdraw invitation (`DELETE /api/invitations/:id`)
 
-## VERDICT: SHIP
+VERDICT: SHIP
 
-## Basis
-Read spec.md, changes.md, test-results.md; read the actual source
-(`app/api/invitations/handler.ts`, `schemas/invitations.ts`,
-`app/api/invitations/[id]/deny/route.ts`, the new test file); re-ran
-`bun run lint` (clean), `bun run typecheck` (clean), `bun run test`
-(26 suites / 339 tests pass). Did not trust the summaries.
+## Basis for verdict
 
-## Spec conformance — verified line by line
-- `denyInvitationSchema`: `reason` optional, `.trim().max(200)`, no `.min(1)` —
-  empty/whitespace-only accepted, coerced to null in handler. Matches.
-- `denyInvitation`: no `requireRole` (per OPEN QUESTION 1); ownership scoping via
-  `id` + `church_group_id` + `user_id` → cross-user/cross-group/missing all 404,
-  never leaking existence. Tolerant body parse (`body ?? {}`). Idempotency
-  short-circuit on `status !== "pending"` returns 200 with no update/count/audit.
-  `denial_count` derived from prior denied rows + 1 (not the row's default 0).
-  Audit `invitation.denied` logs only `reason_provided: boolean`, never the raw
-  reason text (PII handled correctly). `TODO(#67/#68)` for deferred dispatch.
-- BR-08 send guard in `createInvitation`: placed after the `!week` 404 and before
-  the BR-05 check; counts `status='denied'` rows for `(userId, serviceWeekId)`;
-  `>= 3` → 409 CONFLICT. Purely additive; no existing branch reordered.
-- Route file wired to `denyInvitation` with the `params: Promise<{id}>` pattern;
-  stub removed.
+Reviewed the actual implementation commit `af03ca6` (not just the summaries),
+re-ran `bun run lint`, `bun run typecheck`, and `bun run test` independently in
+this worktree, and read the handler, route, migration, types, and test file
+line-by-line against the spec.
 
-## Test quality — meaningful, not superficial
-Tests inspect the real `.update()` payload the handler builds (via `onUpdate`
-hook) and the exact `write_audit_log` RPC shape, not stubbed return values. The
-idempotency test wires only select/update on `from()` so it would fail loudly if
-the handler tried the priorDenied query or update — it doesn't. Covers 401 (both
-no-JWT and null-Clerk-user), 404, 400 (too long + non-string), happy path
-(count=1), empty/whitespace body → null, idempotent already-denied (no
-update/rpc), count=2 with a prior denied row, 500 on lookup error, and the BR-08
-send guard both firing at 3 and not over-triggering at 2.
+- Lint: clean. Typecheck: clean. Tests: 29 suites / 365 passed.
+- `withdrawInvitation` matches spec section 3 step-for-step: auth → role gate
+  (`admin`/`set_leader`) → JWT/401 → lookup scoped by `church_group_id` ONLY
+  (not `user_id`, correct — leader withdraws someone else's invite) → 404 on
+  miss → 409 on non-pending (no side effects) → update to `{ status:
+  "withdrawn" }` with NO `responded_at` → member notification to
+  `inv.user_id` with `type: "invitation_withdrawn"` (not swallowed on error) →
+  audit `invitation.withdrawn` → `TODO(#45/#36)` comment, `cancelReminder` not
+  imported/called → `ok({ invitation })`. try/catch mirrors the sibling
+  handlers.
+- Verified independently that the types support the change: `InvitationStatus`
+  includes `"withdrawn"`, `NotificationType` now includes
+  `"invitation_withdrawn"`, and every notification insert column
+  (`link_entity_type`/`link_entity_id`/etc.) exists on `NotificationsRow`.
+- Route wiring is correct: `../handler` resolves from
+  `app/api/invitations/[id]/route.ts` (the spec sample's `../../handler` was
+  wrong for this depth; the coder's deviation is justified and tsc confirms it).
+- Migration `20260712000002_...` copies the precedent enum-add migration shape
+  and sorts after `20260712000001`.
+- Tests are meaningful, not superficial: they assert status/error codes, the
+  exact update payload (and that `responded_at` is absent), the notification
+  target/type, the audit RPC action+metadata, and that no Supabase client is
+  even constructed on the 403/401 short-circuits. Failure branches
+  (lookup error, notify-insert error) are exercised and return 500.
+- Scanned the commit for network/exec/beacon patterns (given prior repo
+  incidents) — none present. Diff is scoped to issue #43.
 
-## Critical checks
-- Regression risk on existing `invitations-route.test.ts` from the new
-  `deniedForWeek` select in `createInvitation`: the shared fixture returns
-  `{data: [], error: null}` (length 0 < 3), so the guard passes through and the
-  pre-existing BR-05 logic is unchanged. All 12 pre-existing tests still pass.
-- `deniedForWeek` query intentionally omits `church_group_id` — matches the
-  spec's exact query and is safe because `service_week_id` is group-unique.
-- Reason text is never written to the audit log. Confirmed.
+## Non-blocking notes for the human / orchestration
 
-## Non-blocking notes (not defects, no action required to ship)
-- denial_count is computed read-then-write (two queries), so it's theoretically
-  racy under concurrent denials of the same member+week. In practice a member
-  denies their own single pending invitation, so this is not exploitable; out of
-  scope for this issue.
-- No deadline/expiry check on a still-`pending` row past its response_deadline;
-  spec does not require it (expiry is handled by status transitions elsewhere).
-- `.claude/workflows/handle-issues.js` shows as locally modified in this worktree
-  but is not part of commit 0e7d263 and is unrelated to issue #42 — correctly
-  left out of the diff.
-
-Green tests here reflect correct behavior. Ship it.
+1. The Testing stage's supplement file
+   `tests/unit/app/api/invitations-withdraw-route-tester-supplement.test.ts`
+   is UNTRACKED and not part of commit `af03ca6`. It currently runs green
+   (it is picked up by Jest from the working tree), but it will NOT ship with
+   the PR unless committed. Its coverage (guest→403, update-query-error→500,
+   update-no-row→404, and a `.eq(...)` scoping regression guard that asserts no
+   `user_id` filter is applied) is valuable — recommend committing it before the
+   PR is opened. The committed suite already covers the core paths, so this is
+   an enhancement, not a correctness gap.
+2. `writeAuditLog`'s result is awaited but not error-checked (audit failure
+   would not 500). This is consistent with the spec (step 8 does not require it)
+   and with the sibling handlers, so it is intentional and not a defect.
+3. Withdrawing an already-`withdrawn`/`denied`/`accepted`/`expired` invitation
+   returns 409 rather than being idempotent — a documented, deliberate
+   divergence from `denyInvitation` (spec Decision 1). Correct as specified.
