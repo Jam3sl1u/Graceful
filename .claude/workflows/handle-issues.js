@@ -36,7 +36,7 @@ const issueArgs = typeof args === 'string' ? JSON.parse(args) : args
 
 async function abandonStaleBranchIfEmpty(issueNumber, reasonLabel) {
   const result = await agent(
-    `A previous stage for issue #${issueNumber} did not complete normally (${reasonLabel} -- most likely a token/usage limit or transient failure, not a real blocker). Before this issue can be retried cleanly, in this repo's working directory:\n1. Find the local branch matching \`issue-${issueNumber}-*\` exactly (there should be at most one -- if none exists, there's nothing to clean up, report that and stop).\n2. Check how many commits it has beyond \`origin/main\`: \`git rev-list --count origin/main..<branch>\`.\n3. If that count is 0 (no real work committed yet -- e.g. only the empty branch-creation checkout happened before the stoppage): switch off the branch WITHOUT checking out local \`main\` (this working directory may be an isolated worktree where \`main\` is already checked out elsewhere) -- use \`git checkout --detach origin/main\`, then delete the stale branch: \`git branch -D <branch-name>\`. This lets the next run start completely fresh instead of resuming a half-done branch.\n4. If that count is greater than 0, DO NOT delete anything -- there is real committed work on the branch. Just report the branch name and commit count so a human can decide what to do with it.\n5. NEVER touch origin or any remote branch (no push, no remote delete, no force-push) -- only ever operate on the local branch.\nReport what you found and whether you deleted the branch.`,
+    `A previous stage for issue #${issueNumber} did not complete normally (${reasonLabel} -- likely a token/usage limit or transient failure, not a real blocker). Per AGENTS.md's git policy (detached checkout, never touch origin): find the local branch matching \`issue-${issueNumber}-*\` (at most one; if none, report and stop). Check \`git rev-list --count origin/main..<branch>\`. If 0, \`git checkout --detach origin/main\` then \`git branch -D <branch>\` so the next run starts fresh. If >0, leave it and just report the branch/count for a human. Never touch origin. Report what you found and whether you deleted the branch.`,
     {
       phase: 'Setup',
       label: `abandon:${issueNumber}`,
@@ -91,7 +91,7 @@ log(`Processing issue #${issue.number}: ${issue.title}`)
 // so the branch shows up as a linked branch in the issue's own GitHub "Development" sidebar,
 // not just associated by naming convention.
 await agent(
-  `Claim and set up GitHub issue #${issue.number} ("${issue.title}") for work, in this repo's working directory. Do this BEFORE any planning or implementation work -- this step is claiming and branch setup only:\n1. Assign the issue to yourself: \`gh issue edit ${issue.number} --add-assignee @me\`.\n2. \`git fetch origin main\`.\n3. Check for an existing linked branch first: \`gh issue develop ${issue.number} --list\`. If one already exists (e.g. from a prior interrupted run on this same issue), check it out as-is to resume it -- don't create a duplicate: \`git checkout <existing-branch-name>\`.\n4. Otherwise create a new branch that is both created AND linked to this issue in GitHub's UI (not just named to imply a link), based off \`origin/main\`, and check it out in one step: \`gh issue develop ${issue.number} --name issue-${issue.number}-<kebab-case-slug-of-title> --base origin/main --checkout\`. Do NOT use plain \`git checkout -b\` for this -- it would create a branch but not link it to the issue.\n5. Ensure a \`.pipeline/\` directory exists (create if needed).`,
+  `Claim and set up GitHub issue #${issue.number} ("${issue.title}") per AGENTS.md's git policy, before any planning/implementation:\n1. \`gh issue edit ${issue.number} --add-assignee @me\`.\n2. \`git fetch origin main\`.\n3. \`gh issue develop ${issue.number} --list\` -- if a linked branch already exists, \`git checkout <it>\` to resume.\n4. Otherwise: \`gh issue develop ${issue.number} --name issue-${issue.number}-<kebab-case-slug-of-title> --base origin/main --checkout\` (not plain \`git checkout -b\`, which wouldn't link it).\n5. Ensure \`.pipeline/\` exists (create if needed).`,
   { label: `setup:${issue.number}`, phase: 'Setup' }
 )
 
@@ -166,8 +166,14 @@ const review = await agent(
   }
 )
 
+if (!review) {
+  log(`Reviewer for issue #${issue.number} did not complete (agent-level failure, e.g. a session/usage limit). Stopping here rather than shipping without a real review. Re-invoke this workflow with the same issueNumber to retry.`)
+  await abandonStaleBranchIfEmpty(issue.number, 'reviewer did not complete')
+  return { status: 'reviewer-failed', issue: { number: issue.number, title: issue.title, url: issue.url } }
+}
+
 const ship = await agent(
-  `Open the PR for issue #${issue.number} yourself (not via a subagent). Confirm the working tree is clean on the current branch (commit anything outstanding), then \`git push -u origin <current-branch-name>\`. Open the PR with \`gh pr create --base main --head <branch> --title "..." --body "..."\` directly -- do NOT use the mcp__github create_pull_request tool, since that would attribute the PR to the Claude GitHub App instead of the repo owner's own gh auth. Do NOT request any reviewer on the PR -- GitHub rejects requesting the PR author as their own reviewer, and gh pr create authenticates as the repo owner who is also the author here, so skip --reviewer entirely. Title: "Fix #${issue.number}: ${issue.title}". Body must include "Closes #${issue.number}" on its own line, the reviewer's verdict (${review ? review.verdict : 'UNKNOWN'}) and summary (${review ? review.summary.replace(/"/g, '\\"') : ''}), whether the pipeline fully completed, and any problems hit. Never merge the PR, never push to main, never close the issue. Leave the current branch checked out after opening the PR -- do NOT check out \`main\` (this working directory may be an isolated worktree where \`main\` is already checked out elsewhere, and checking it out here would fail). Return the PR URL.`,
+  `Open the PR for issue #${issue.number} yourself, per AGENTS.md's git/PR policy. Confirm the working tree is clean on the current branch (commit anything outstanding), \`git push -u origin <current-branch-name>\`, then \`gh pr create --base main --head <branch> --title "Fix #${issue.number}: ${issue.title}" --body "..."\` directly (not the mcp__github tool, and no --reviewer). Body must include "Closes #${issue.number}" on its own line, the reviewer's verdict (${review.verdict}) and summary (${review.summary.replace(/"/g, '\\"')}), whether the pipeline fully completed, and any problems hit. Never merge/push-main/close the issue. Leave the current branch checked out (do not check out main). Return the PR URL.`,
   {
     label: `ship:${issue.number}`,
     phase: 'Ship',
@@ -179,12 +185,12 @@ const ship = await agent(
   }
 )
 
-log(`Issue #${issue.number} shipped: ${ship ? ship.prUrl : 'PR step failed'} (verdict: ${review ? review.verdict : 'unknown'})`)
+log(`Issue #${issue.number} shipped: ${ship ? ship.prUrl : 'PR step failed'} (verdict: ${review.verdict})`)
 
 return {
   status: 'shipped',
   issue: { number: issue.number, title: issue.title, url: issue.url },
   prUrl: ship ? ship.prUrl : null,
-  verdict: review ? review.verdict : null,
+  verdict: review.verdict,
   humanAnswerApplied: issueArgs.humanAnswer || null,
 }

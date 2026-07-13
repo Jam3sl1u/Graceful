@@ -8,6 +8,7 @@
 
 import type {
   InvitationStatus,
+  NotificationType,
   ResolutionType,
   SetlistStatus,
   UserRole,
@@ -102,7 +103,14 @@ type InvitationsRow = {
   church_group_id: string;
   service_week_id: string;
   user_id: string;
+  role_note: string | null;
   status: InvitationStatus;
+  response_token: string;
+  responded_at: string | null;
+  denial_reason: string | null;
+  denial_count: number;
+  response_deadline: string | null;
+  invited_by: string | null;
   created_at: string;
 };
 
@@ -125,6 +133,19 @@ type ConflictsRow = {
   replacement_suggestion_user_id: string | null;
   resolved_at: string | null;
   resolution_type: ResolutionType | null;
+  created_at: string;
+};
+
+type NotificationsRow = {
+  id: string;
+  church_group_id: string;
+  user_id: string;
+  type: NotificationType;
+  title: string;
+  body: string | null;
+  link_entity_type: string | null;
+  link_entity_id: string | null;
+  is_read: boolean;
   created_at: string;
 };
 
@@ -195,7 +216,24 @@ export type Database = {
       };
       invitations: {
         Row: InvitationsRow;
-        Insert: Omit<InvitationsRow, "id" | "created_at"> & { id?: string; created_at?: string };
+        Insert: Omit<
+          InvitationsRow,
+          | "id"
+          | "created_at"
+          | "status"
+          | "responded_at"
+          | "denial_reason"
+          | "denial_count"
+          | "response_deadline"
+        > & {
+          id?: string;
+          created_at?: string;
+          status?: InvitationStatus;
+          responded_at?: string | null;
+          denial_reason?: string | null;
+          denial_count?: number;
+          response_deadline?: string | null;
+        };
         Update: Partial<InvitationsRow>;
         Relationships: [];
       };
@@ -230,6 +268,16 @@ export type Database = {
           resolution_type?: ResolutionType | null;
         };
         Update: Partial<ConflictsRow>;
+        Relationships: [];
+      };
+      notifications: {
+        Row: NotificationsRow;
+        Insert: Omit<NotificationsRow, "id" | "created_at" | "is_read"> & {
+          id?: string;
+          created_at?: string;
+          is_read?: boolean;
+        };
+        Update: Partial<NotificationsRow>;
         Relationships: [];
       };
     };

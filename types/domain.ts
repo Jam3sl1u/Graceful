@@ -18,3 +18,18 @@ export type ChatPref = "sms" | "email" | "in_app";
 export type JobStatus = "queued" | "processing" | "succeeded" | "failed";
 
 export type AudioSource = "upload" | "spotify";
+
+export type NotificationType =
+  | "set_invitation"
+  | "invitation_reminder"
+  | "invitation_accepted"
+  | "invitation_denied"
+  | "practice_reminder"
+  | "setlist_released"
+  | "scheduling_conflict"
+  | "chat_mention"
+  | "devotion_shared"
+  | "new_church_document"
+  | "google_calendar_event"
+  | "service_week_cancelled"
+  | "service_week_reactivated";

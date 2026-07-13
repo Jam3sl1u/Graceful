@@ -1,0 +1,171 @@
+import { NextRequest } from "next/server";
+import { auth } from "@clerk/nextjs/server";
+import { requireAuth, requireRole, type UserLookup } from "@/lib/api/auth";
+import { ok, fail } from "@/lib/api/response";
+import { ApiException, ErrorCode } from "@/lib/api/errors";
+import { getSupabaseClient } from "@/lib/supabase/client";
+import type { Database } from "@/lib/supabase/types";
+import { writeAuditLog } from "@/lib/audit/write-audit-log";
+import { createInvitationSchema } from "@/schemas/invitations";
+import type { InvitationStatus } from "@/types/domain";
+
+type InvitationsRow = Database["public"]["Tables"]["invitations"]["Row"];
+
+export type InvitationResponse = {
+  id: string;
+  serviceWeekId: string;
+  userId: string;
+  roleNote: string | null;
+  status: InvitationStatus;
+  responseToken: string;
+  responseDeadline: string | null;
+  invitedBy: string | null;
+  createdAt: string;
+};
+
+export function toInvitationResponse(row: InvitationsRow): InvitationResponse {
+  return {
+    id: row.id,
+    serviceWeekId: row.service_week_id,
+    userId: row.user_id,
+    roleNote: row.role_note,
+    status: row.status,
+    responseToken: row.response_token,
+    responseDeadline: row.response_deadline,
+    invitedBy: row.invited_by,
+    createdAt: row.created_at,
+  };
+}
+
+// Generates a 64-char hex response token: two crypto.randomUUID() calls with
+// hyphens stripped, concatenated (32 hex chars each = 64 total). Matches the
+// DB column response_token varchar(64) not null unique.
+function generateResponseToken(): string {
+  return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+}
+
+// POST /api/invitations — set_leader/admin only (BR-05, PRD §22). Performs
+// the double-booking check and records the invitation; the `conflicts` row
+// itself is written at accept time (#41), not here.
+export async function createInvitation(req: NextRequest, lookup?: UserLookup): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+    requireRole(ctx, ["admin", "set_leader"]);
+
+    const body = await req.json().catch(() => null);
+    const parsedResult = createInvitationSchema.safeParse(body);
+    if (!parsedResult.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+    const parsed = parsedResult.data;
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data: week, error: weekError } = await supabase
+      .from("service_weeks")
+      .select("*")
+      .eq("id", parsed.serviceWeekId)
+      .eq("church_group_id", ctx.churchGroupId)
+      .maybeSingle();
+
+    if (weekError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    // Missing and wrong-group are indistinguishable by construction (RLS +
+    // the explicit church_group_id filter) — always 404, never 403 (mirrors
+    // app/api/church-group/members/[id]/role/handler.ts).
+    if (!week) {
+      return fail("Service week not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    // BR-05 double-booking check: does this user already have an accepted
+    // invitation for another service week on the same calendar date in this
+    // group? No cross-table join helper exists, so this is two queries.
+    const { data: acceptedInvitations, error: acceptedError } = await supabase
+      .from("invitations")
+      .select("service_week_id")
+      .eq("user_id", parsed.userId)
+      .eq("status", "accepted")
+      .eq("church_group_id", ctx.churchGroupId);
+
+    if (acceptedError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    const acceptedWeekIds = [...new Set((acceptedInvitations ?? []).map((i) => i.service_week_id))];
+
+    let hasConflict = false;
+    if (acceptedWeekIds.length > 0) {
+      const { data: collidingWeeks, error: collidingError } = await supabase
+        .from("service_weeks")
+        .select("id")
+        .in("id", acceptedWeekIds)
+        .eq("service_date", week.service_date)
+        .neq("id", parsed.serviceWeekId);
+
+      if (collidingError) {
+        return fail("Internal error", ErrorCode.INTERNAL, 500);
+      }
+
+      hasConflict = (collidingWeeks ?? []).length > 0;
+    }
+
+    if (hasConflict && parsed.acknowledgeConflict !== true) {
+      return fail(
+        "Member already confirmed for another week on this date",
+        ErrorCode.CONFLICT,
+        409,
+      );
+    }
+
+    const token = generateResponseToken();
+    const deadlineIso = new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString();
+
+    // The hand-rolled Insert types in lib/supabase/types.ts mark some
+    // DB-defaulted columns as required even though they have defaults —
+    // cast narrowly here rather than widening the shared type (mirrors
+    // app/api/service-weeks/handler.ts createServiceWeek).
+    const invitationInsertPayload = {
+      church_group_id: ctx.churchGroupId,
+      service_week_id: parsed.serviceWeekId,
+      user_id: parsed.userId,
+      role_note: parsed.roleNote ?? null,
+      response_token: token,
+      response_deadline: deadlineIso,
+      invited_by: ctx.userId,
+    } as unknown as Database["public"]["Tables"]["invitations"]["Insert"];
+
+    const { data: invitation, error: invitationError } = await supabase
+      .from("invitations")
+      .insert(invitationInsertPayload)
+      .select("*")
+      .maybeSingle();
+
+    if (invitationError || !invitation) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    await writeAuditLog(supabase, {
+      action: "invitation.sent",
+      entityType: "invitation",
+      entityId: invitation.id,
+      metadata: {
+        service_week_id: parsed.serviceWeekId,
+        user_id: parsed.userId,
+        acknowledged_conflict: parsed.acknowledgeConflict === true,
+      },
+    });
+
+    // TODO(#67/#68): dispatch SMS/email invitation notification here.
+
+    return ok({ invitation: toInvitationResponse(invitation) }, 201);
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
