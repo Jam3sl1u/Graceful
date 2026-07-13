@@ -135,6 +135,48 @@ if (!plan) {
   return { status: 'planner-failed', reason: 'planner agent call did not complete', issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
+// Independent, deliberately mechanical check -- mirrors the post-coder verify-gate below.
+// The #46 recurrence (2026-07-13) showed the planner can silently write .pipeline/spec.md
+// into the wrong checkout (e.g. the orchestrator's own main repo) despite the pin() prompt
+// instruction, while still returning a perfectly plausible hasOpenQuestion/summary -- the
+// #41/#42 failure mode, one stage earlier than where it was previously guarded. Left
+// uncaught, the coder two stages later reads a stale spec.md from an unrelated issue and
+// either fails opaquely or -- worse -- guesses. This asks for raw command output only, not
+// an opinion, so it can't rationalize past a wrong-directory write the way a second
+// "are you sure?" judgment call could.
+const planVerified = await agent(
+  pin(`Run exactly these commands in order and report their raw output, nothing else -- do not interpret, do not assess quality: \`pwd\`, then \`test -f .pipeline/spec.md && echo EXISTS || echo MISSING\`, then \`head -3 .pipeline/spec.md\`. Report: the exact pwd output, whether the file exists, and its first line of content verbatim.`),
+  {
+    label: `plan-verify:${issue.number}`,
+    phase: 'Plan',
+    schema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string' },
+        specExists: { type: 'boolean' },
+        firstLine: { type: 'string' },
+      },
+      required: ['cwd', 'specExists', 'firstLine'],
+    },
+  }
+)
+
+const planCwdCorrect = !worktreePath || (planVerified && planVerified.cwd === worktreePath)
+const planSpecMatchesIssue = planVerified && planVerified.firstLine.includes(`#${issue.number}`)
+
+if (!planVerified || !planVerified.specExists || !planCwdCorrect || !planSpecMatchesIssue) {
+  const reason = !planVerified
+    ? 'plan verification agent call did not complete'
+    : !planCwdCorrect
+      ? `verification ran from the wrong directory (expected ${worktreePath}, got ${planVerified.cwd}) -- spec.md was likely written to the wrong checkout`
+      : !planVerified.specExists
+        ? '.pipeline/spec.md does not exist in the pinned worktree after the planner stage'
+        : `.pipeline/spec.md's first line ("${planVerified.firstLine}") does not reference issue #${issue.number} -- likely stale content left over from a different issue`
+  log(`Independent verification found the planner's output does not match issue #${issue.number} in the pinned worktree (${reason}). Treating as a failure regardless of the planner's own report.`)
+  await abandonStaleBranchIfEmpty(issue.number, reason)
+  return { status: 'planner-verify-failed', reason, issue: { number: issue.number, title: issue.title, url: issue.url } }
+}
+
 if (plan.hasOpenQuestion && !issueArgs.humanAnswer) {
   log(`Issue #${issue.number} has a genuine open question -- stopping for human input instead of guessing.`)
   return { status: 'blocked-on-question', issue: { number: issue.number, title: issue.title, url: issue.url }, summary: plan.summary }
