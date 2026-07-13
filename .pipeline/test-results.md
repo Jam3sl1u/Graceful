@@ -1,131 +1,150 @@
-# Test Results: Issue #42 — Deny invitation with reason (BR-08 denial cap)
+# Test Results — Issue #43: Withdraw invitation (`DELETE /api/invitations/:id`)
 
-## VERDICT: PASS
+## Verdict: PASS
 
-## Context vs. the prior run
+All checks pass, including new tests written independently by this stage.
 
-The previous version of this file recorded a FAIL because, at that time, this branch had
-zero commits beyond `main` and the deny route was still the `notImplemented(...)` stub. That
-is no longer the case: commit `0e7d263` ("Implement POST /api/invitations/:id/deny with
-BR-08 denial cap (#42)") is now on `HEAD`. This run independently re-verified the Coding
-stage's claims in `.pipeline/changes.md` against the actual diff and fresh command runs,
-rather than trusting the summary.
+Working directory confirmed: `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-43`
+(branch `issue-43-implement-withdraw-invitation`, HEAD `af03ca6` — "Implement DELETE
+/api/invitations/:id (withdraw invitation, #43)").
 
-Working directory confirmed: `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-42`
-(branch `issue-42-sprint-2-implement-deny-invitation-with-reason-br-08-denial-cap`, HEAD
-`0e7d263`).
+## Commands run (independently, not just trusting changes.md)
 
-## Checks run
+- `bun run lint` — clean, no errors/warnings.
+- `bun run typecheck` (`tsc --noEmit`) — clean.
+- `bun run test` (Jest) — **29 suites / 365 tests passed** (0 failed), including:
+  - the coder's `tests/unit/app/api/invitations-withdraw-route.test.ts` (8 cases)
+  - this stage's new `tests/unit/app/api/invitations-withdraw-route-tester-supplement.test.ts`
+    (4 cases, added below)
 
-- `bun run lint` → clean, no errors/warnings.
-- `bun run typecheck` (`tsc --noEmit`) → clean, no errors.
-- `bun run test` (Jest) → **26 suites / 339 tests, all pass**, including all 13 tests in
-  `tests/unit/app/api/invitations-deny-route.test.ts` (this new file contains both the
-  11-test `describe("POST /api/invitations/:id/deny")` block and a second, 2-test
-  `describe("POST /api/invitations — BR-08 send guard")` block exercising the
-  `createInvitation` guard). `tests/unit/app/api/invitations-route.test.ts` itself was not
-  modified — its 12 pre-existing tests still pass unmodified against the additive
-  `createInvitation` change.
+This matches the coder's claimed 28 suites / 361 tests, plus the one new
+suite / four new tests added by this stage (29 / 365 total).
 
-## Independent code review against the spec (not just trusting changes.md)
+## Coverage review of the coder's own test file
 
-Read `app/api/invitations/handler.ts`, `schemas/invitations.ts`,
-`app/api/invitations/[id]/deny/route.ts`, `lib/api/auth.ts`, and both test files in full, and
-cross-checked against `.pipeline/spec.md`:
+`tests/unit/app/api/invitations-withdraw-route.test.ts` covers, and I
+independently confirmed by reading `app/api/invitations/handler.ts`
+(`withdrawInvitation`) line-by-line against `.pipeline/spec.md`:
 
-- `denyInvitationSchema` (`schemas/invitations.ts`): `reason` optional, `.trim().max(200)`,
-  no `.min(1)` — matches spec exactly (empty/whitespace-only reason is valid, not a 400).
-- `denyInvitation` (`app/api/invitations/handler.ts`): no `requireRole` call (per spec's OPEN
-  QUESTION 1 — any authenticated user, scoped to their own row via
-  `id` + `church_group_id` + `user_id`); confirmed `requireAuth` (`lib/api/auth.ts`) performs
-  no role filtering on its own, so this design decision actually works as written. Tolerant
-  body parse (`body ?? {}`); idempotency short-circuit on `status !== "pending"` returns 200
-  with **no** update/count/audit call; `denialCount` computed from a prior-denied-rows count
-  (not the row's own default 0), `+1`; patch sets
-  `status`/`denial_reason`/`denial_count`/`responded_at`; audit log `invitation.denied`
-  written with `reason_provided: boolean` only (raw reason text is not logged — confirmed by
-  reading the `metadata` object literal directly); `TODO(#67/#68)` comment left for deferred
-  notification dispatch, matching precedent in `createInvitation`.
-- BR-08 send-guard added to `createInvitation`: correctly placed after the `!week` 404 check
-  and before the BR-05 double-booking check; counts `status = 'denied'` rows for
-  `(userId, serviceWeekId)`; `>= 3` → 409 CONFLICT (`ErrorCode.CONFLICT`); does not touch any
-  code path below it. Confirmed by reading the diff line-by-line — branch order and every
-  other line of `createInvitation` (auth, role check, week lookup, BR-05 check, insert, audit,
-  response) is unchanged apart from the new guard block.
-- Route file `app/api/invitations/[id]/deny/route.ts`: real `POST` handler wired to
-  `denyInvitation`, `params: Promise<{id:string}>` pattern matches
-  `app/api/service-weeks/[id]/cancel/route.ts` — no more `notImplemented(...)` stub.
+- 403 FORBIDDEN for `member` role (role gate via `requireRole`).
+- 401 UNAUTHENTICATED when `getToken` yields no JWT.
+- 404 NOT_FOUND when the invitation lookup returns `null`.
+- 409 CONFLICT for `status: "accepted"` and `status: "denied"` (two cases;
+  Decision 1 — non-pending is a hard reject, not idempotent-200 like
+  `denyInvitation`).
+- 500 INTERNAL when the invitation lookup query errors.
+- Happy path (`pending` -> `withdrawn`): asserts the update payload is
+  exactly `{ status: "withdrawn" }` with `responded_at` explicitly
+  `undefined` (confirms the spec's "leader action, not a member response"
+  distinction from `denyInvitation`); asserts the `notifications` insert
+  targets `TARGET_USER_ID` (the invited member, not the actor) with
+  `type: "invitation_withdrawn"`; asserts the `write_audit_log` RPC call
+  carries `p_action: "invitation.withdrawn"` and the expected metadata.
+- 500 INTERNAL when the notification insert errors (confirms the insert
+  error is not silently swallowed, per spec).
 
-## Test coverage vs. spec's required edge cases — traced, not just skimmed
+This is solid coverage. I found four gaps and closed them independently
+rather than trusting the coder's summary at face value (see next section).
 
-Read every test in `tests/unit/app/api/invitations-deny-route.test.ts` and traced each
-fixture against the handler logic to confirm the assertions actually exercise what they
-claim to:
+## New tests added by this stage
 
-- 401 (no JWT) and 401 (Clerk userId null, lookup never consulted) — both present, both
-  assert `getSupabaseClient`/`lookup` was never called (verifies short-circuit, not just
-  status code).
-- 404 (invitation not found / not owned) — present.
-- 400 (`reason` > 200 chars) and 400 (`reason` not a string, `{reason: 123}`) — both present.
-- Happy path pending → denied: asserts `status`, `denial_reason`, `denial_count: 1`,
-  `responded_at` is a string, and the exact `rpc("write_audit_log", ...)` call shape
-  (`p_action: "invitation.denied"`, metadata `denial_count`/`reason_provided`, no raw reason
-  text in the payload) — traced the mock's `onUpdate` hook and confirmed it captures the real
-  `.update()` payload the handler builds, not a stubbed value.
-- Empty-body deny and whitespace-only-reason deny — both assert `denial_reason` stored as
-  `null`, matching the schema's optional-no-`.min(1)` contract.
-- Idempotent already-denied invitation — asserts 200, `updateCalled === false`, and `rpc`
-  never called; the mock's `from()` only wires `select`/`update` for this test, so it would
-  fail loudly if the handler tried to re-run the priorDenied count query or the update — it
-  doesn't, by design (early return before either).
-- `denial_count` becomes 2 with one prior denied row for the same member+week — present,
-  matches spec's accumulation requirement.
-- 500 when the invitation lookup query errors — present (this is the failure case).
-- BR-08 send guard on `createInvitation`: 409 at 3 denied rows, 201 at 2 — both present in
-  the same file's second `describe` block, confirming the guard both fires and does not
-  over-trigger.
+`tests/unit/app/api/invitations-withdraw-route-tester-supplement.test.ts`
+(untracked, not yet committed — for the Reviewer/human to pick up):
 
-## Regression check on existing invitations tests (the part most likely to silently break)
+1. **`guest` role -> 403 FORBIDDEN.** The coder's suite only tries `member`
+   for the role gate; the spec explicitly names "member/guest" together as
+   the excluded roles. Confirms `requireRole` rejects `guest` too, not just
+   `member`.
+2. **500 INTERNAL when the invitations `UPDATE` query itself errors**
+   (distinct from the initial `SELECT` erroring, which is the only error
+   path the coder's suite exercises). Closes a real gap — the handler has a
+   separate `updateError` branch (line ~348 of `handler.ts`) that had zero
+   test coverage.
+3. **404 NOT_FOUND when the `UPDATE` matches no row** (e.g. a row that
+   passed the initial `pending` check but was concurrently modified/deleted
+   before the update). Exercises the handler's second, distinct `!updated`
+   404 branch (line ~351), also previously uncovered.
+4. **Scoping regression guard:** asserts the invitation lookup's `.eq(...)`
+   calls include `["id", INVITATION_ID]` and
+   `["church_group_id", CHURCH_GROUP_ID]` but never a `user_id` filter (on
+   either the actor's or the target member's id). This is the specific,
+   deliberate behavioral difference from `denyInvitation` per the spec ("the
+   leader is withdrawing someone else's invitation" — scoped by
+   `church_group_id` only, NOT `user_id`). None of the coder's fixtures
+   record `.eq(...)` arguments, so a regression here (e.g. copy-pasting
+   `denyInvitation`'s `.eq("user_id", ctx.userId)` filter, which would
+   silently break withdrawal for every invitation the actor didn't
+   themselves create) would have gone undetected by the existing suite
+   while still returning green.
 
-Manually traced `tests/unit/app/api/invitations-route.test.ts`'s `makeSupabaseClient`: for
-the `invitations` table it returns the **same** `tableFixture.select` result on every
-`.select()` call regardless of call count (unlike `service_weeks`, which has an explicit
-`selectSecond` branch for its second call). Since `createInvitation` now issues two
-`invitations` selects (the new BR-08 `deniedForWeek` count, then the pre-existing BR-05
-`acceptedInvitations` count) before the insert, both consume the identical fixture value in
-every existing test:
+All 4 new tests pass against the current implementation.
 
-- Default fixture `{ data: [], error: null }` → `deniedForWeek.length === 0 < 3`, guard
-  passes through silently, then feeds the pre-existing BR-05 logic unchanged. Confirmed
-  against the 401/403×2/400×5/404/201-happy-path/500-insert-error tests, none of which
-  override the `invitations.select` fixture with anything of length >= 3.
-- The one pair of tests that does override it
-  (`{ data: [{service_week_id: "other-week"}], error: null }`, used for both the
-  409-double-booking and the 201-acknowledged-conflict tests) yields
-  `deniedForWeek.length === 1 < 3` too — guard still passes through; BR-05 logic (reading the
-  same array for a different purpose) is what actually decides those two tests' outcomes,
-  exactly as before this change.
+## Manual verification against the spec
 
-Ran the full suite (not just the new file) to confirm this empirically rather than resting
-on static analysis alone: all 12 pre-existing tests in `invitations-route.test.ts` still pass
-unmodified, and the 2 new BR-08 guard tests (in the new `invitations-deny-route.test.ts` file,
-exercising `createInvitation` directly) both pass too.
+- **`supabase/migrations/20260712000002_invitation_withdrawn_notification_type.sql`**
+  — read and compared structurally against the precedent
+  `20260711000001_service_week_notification_types.sql`: same header/UP/DOWN
+  shape, correct `ALTER TYPE notification_type ADD VALUE IF NOT EXISTS
+  'invitation_withdrawn'` body, timestamp prefix `20260712000002` correctly
+  sorts after `20260712000001_accept_invitation_rpc.sql`. Cannot be applied
+  against a live Postgres instance in this environment (same limitation the
+  coder flagged) — structurally correct, not run.
+- **`types/domain.ts`** — confirmed `"invitation_withdrawn"` was added to
+  `NotificationType` immediately after `"invitation_denied"`, no other
+  values touched.
+- **`app/api/invitations/handler.ts`** (`withdrawInvitation`) — read in full
+  and checked against every numbered step in spec.md section 3: auth ->
+  role gate -> JWT check -> scoped lookup (`church_group_id` only) -> 409 on
+  non-pending -> update to `{ status: "withdrawn" }` only (no
+  `responded_at`) -> notify `inv.user_id` with the exact payload shape
+  specified (verified column names against `lib/supabase/types.ts`'s
+  `NotificationsRow`) -> audit log with the specified action/metadata ->
+  `TODO(#45/#36)` comment present, `cancelReminder` not imported or called
+  -> `ok({ invitation: toInvitationResponse(updated) })`. Matches the spec
+  exactly.
+- **`app/api/invitations/[id]/route.ts`** — confirmed the `DELETE` handler
+  matches the wiring pattern in `deny/route.ts` (awaits `params`, calls
+  `withdrawInvitation(req, id)`); confirmed the import path is
+  `"../handler"` (one level up), which is correct for this file's actual
+  location (`app/api/invitations/[id]/route.ts`) — the coder's changes.md
+  note about `spec.md`'s literal `"../../handler"` sample being wrong for
+  this file (as opposed to the one-level-deeper `deny/route.ts`, where
+  `"../../handler"` is correct) checks out; `tsc --noEmit` passing on the
+  actual `"../handler"` import confirms it.
+- **RLS rationale** — spot-checked against
+  `supabase/migrations/20260704000001_rls_policies.sql` per spec's citation;
+  did not attempt to run RLS policies live (no DB in this environment), but
+  the policy names/shapes cited in spec.md's rationale section are present
+  in that migration file.
 
-## Failure case explicitly verified
+## Failure case explicitly exercised
 
-Beyond the coder's own suite: manually re-derived the 500 path by reading `denyInvitation`'s
-`invError`/`priorError`/`updateError` branches and confirming each maps to
-`fail("Internal error", ErrorCode.INTERNAL, 500)`. The test suite directly exercises the
-`invError` branch; the `priorError` and `updateError` branches are structurally identical
-(`if (x) return fail(...)`, same `ErrorCode.INTERNAL` constant used and verified elsewhere in
-the file), so this was confirmed via direct code read rather than an untested assumption.
+Per the pipeline contract's requirement of "at least one failure case":
+this stage's new update-query-error test (#2 above) and the update-returns-
+no-row test (#3 above), plus the coder's own notification-insert-error and
+lookup-query-error tests, together cover every DB-error/failure branch in
+the handler (select error, update error, update-no-row, notify error). All
+return 500/404 as specified, none silently swallow the error, and no side
+effects occur beyond the point of failure.
 
-## Notes / non-blocking observations for the Reviewer
+## Out-of-scope items (correctly not implemented, confirmed by reading the diff)
 
-- `.claude/workflows/handle-issues.js` shows as locally modified in `git status` in this
-  worktree. Per `changes.md`'s own note, this predates the Coding stage's work for issue #42
-  and was not touched by either the Coding or this Testing stage — confirmed via
-  `git show --stat HEAD` (it is not part of commit `0e7d263`). Flagging so the Reviewer knows
-  it's an unrelated pre-existing artifact, not part of this issue's diff.
-- No code was modified by this Testing stage. No test failures were found; nothing was
-  patched around.
+- No bulk withdrawal endpoint added.
+- `cancelReminder` (`lib/upstash/qstash.ts`) is not imported or called;
+  only a `TODO(#45/#36)` comment marks the deferred work, consistent with
+  the spec (the stub still throws if called, which would have broken the
+  handler).
+- No `event_attendees` cleanup — confirmed unreachable in practice since the
+  handler 409s before the update whenever `status !== "pending"`, and
+  `event_attendees` rows only exist for accepted invitations.
+
+## Notes for the Reviewer
+
+- The new supplement test file
+  (`tests/unit/app/api/invitations-withdraw-route-tester-supplement.test.ts`)
+  is currently **untracked** in this worktree — it was not committed by this
+  stage (Testing does not commit; that's outside this stage's role per
+  AGENTS.md). It needs to be picked up/committed by a later step for it to
+  ship with the PR.
+- No code was modified by this Testing stage. No test failures were found;
+  nothing was patched around.
