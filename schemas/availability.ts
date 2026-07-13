@@ -19,6 +19,11 @@ export const getAvailabilityQuerySchema = z.object({
 });
 export type GetAvailabilityQuery = z.infer<typeof getAvailabilityQuerySchema>;
 
+// DELETE /api/availability/:date route param.
+export const availabilityDateParamSchema = z
+  .string()
+  .refine(isValidDateString, { message: "date param must be a valid YYYY-MM-DD calendar date" });
+
 // Guards against pathologically large team-range queries (e.g. a year-long
 // range) while still comfortably covering a month-view calendar with a few
 // months of forward/back paging.

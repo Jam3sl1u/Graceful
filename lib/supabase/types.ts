@@ -9,6 +9,7 @@
 import type {
   InvitationStatus,
   NotificationType,
+  ResolutionType,
   SetlistStatus,
   UserRole,
   VocalCapability,
@@ -123,6 +124,18 @@ type AvailabilityRow = {
   created_at: string;
 };
 
+type ConflictsRow = {
+  id: string;
+  church_group_id: string;
+  invitation_id: string;
+  triggered_by: string | null;
+  trigger_reason: string | null;
+  replacement_suggestion_user_id: string | null;
+  resolved_at: string | null;
+  resolution_type: ResolutionType | null;
+  created_at: string;
+};
+
 type NotificationsRow = {
   id: string;
   church_group_id: string;
@@ -234,6 +247,29 @@ export type Database = {
         Update: Partial<AvailabilityRow>;
         Relationships: [];
       };
+      conflicts: {
+        Row: ConflictsRow;
+        Insert: Omit<
+          ConflictsRow,
+          | "id"
+          | "created_at"
+          | "triggered_by"
+          | "trigger_reason"
+          | "replacement_suggestion_user_id"
+          | "resolved_at"
+          | "resolution_type"
+        > & {
+          id?: string;
+          created_at?: string;
+          triggered_by?: string | null;
+          trigger_reason?: string | null;
+          replacement_suggestion_user_id?: string | null;
+          resolved_at?: string | null;
+          resolution_type?: ResolutionType | null;
+        };
+        Update: Partial<ConflictsRow>;
+        Relationships: [];
+      };
       notifications: {
         Row: NotificationsRow;
         Insert: Omit<NotificationsRow, "id" | "created_at" | "is_read"> & {
@@ -280,6 +316,13 @@ export type Database = {
           p_target_user_id: string;
         };
         Returns: UsersRow;
+      };
+      record_availability_conflict: {
+        Args: {
+          p_date: string;
+          p_trigger_reason: string;
+        };
+        Returns: boolean;
       };
     };
     Enums: {

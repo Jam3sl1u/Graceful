@@ -13,7 +13,7 @@
     "format:check": "prettier --check .",
     "test": "jest",
     "test:coverage": "jest --coverage",
-    "test:rls": "jest --config jest.config.integration.ts",
+    "test:rls": "jest --config jest.config.integration.js",
     "test:e2e": "playwright test",
     "check:service-role": "node scripts/check-service-role.mjs"
   },

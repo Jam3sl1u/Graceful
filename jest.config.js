@@ -1,6 +1,10 @@
-import type { Config } from "jest";
-
-const config: Config = {
+// Plain CommonJS (not .ts) is deliberate: Jest auto-bootstraps `ts-node` to
+// load a `.ts` config file, and `ts-node`'s bundled `@cspotcode/source-map-support`
+// crashes at startup on Bun for macOS ("TypeError: Attempted to assign to
+// readonly property") when it tries to monkey-patch Error.prepareStackTrace.
+// The config object itself is unaffected either way — only the loader differs.
+/** @type {import("jest").Config} */
+const config = {
   testEnvironment: "node",
   roots: ["<rootDir>/tests", "<rootDir>/lib", "<rootDir>/app"],
   testPathIgnorePatterns: [
@@ -30,4 +34,4 @@ const config: Config = {
   coverageReporters: ["text-summary", "lcov"],
 };
 
-export default config;
+module.exports = config;
