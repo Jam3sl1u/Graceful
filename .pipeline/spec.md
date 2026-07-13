@@ -1,286 +1,193 @@
-# Spec — Issue #44: Token-based public invitation lookup
+# Spec — Issue #46: Conflict detection on availability change
 
-`GET /api/invitations/respond/:token` — a **no-session, no-Clerk-auth** read-only
-endpoint that returns an invitation's details to someone tapping an SMS/email
-link. Token possession is the only credential (per #40).
+Surface a conflict to admins/set_leaders **the moment** a confirmed member becomes
+unavailable for a date they have an accepted invitation on. Two trigger points feed
+**one** shared implementation (BR-15): the explicit "mark unavailable" PUT (#34) and
+the delete-to-unset DELETE (#35).
 
 ## No OPEN QUESTIONS
 
-The design is fully determined by existing patterns. In particular the "clear
-expired state, not a generic error" criterion is satisfied by returning HTTP 200
-with a computed `status: "expired"` (the `expired` value already exists in the
-`InvitationStatus` union in `types/domain.ts` even though it is not a DB enum
-value — it is an API-only, derived state). Do not invent a new error code for it.
+Two decisions were resolved from existing repo state/convention rather than escalated —
+the Coder must NOT re-litigate them:
 
-## Background the coder must know
+1. **SMS + email are not dispatched in this issue.** AC2 says "SMS + email", but the
+   dispatch primitives throw `not implemented — see Sprint 4` (`lib/pingram/client.ts`
+   `sendSms`, `lib/resend/client.ts` `sendEmail`). Every shipped notify path in this repo
+   does the same thing: create the **in-app** notification now and leave a `TODO` for the
+   Sprint 4 SMS/email fan-out (see `app/api/invitations/handler.ts` `createInvitation`
+   `// TODO(#67/#68)` and `denyInvitation`, and the accept RPC which notifies in-app only).
+   Follow that convention exactly: implement the in-app notification + a TODO comment
+   referencing `#58` (SMS) / `#59` (email). Do NOT import or call `sendSms`/`sendEmail`.
+2. **Recipients = every `admin`/`set_leader` in the church group, excluding the triggering
+   user.** The `conflicts` table and its RLS are leader/admin-scoped, and the goal is to
+   surface to "the Set Leader"; notifying all leaders/admins is the robust choice.
 
-- Direct table reads are impossible here: RLS on `invitations`, `service_weeks`,
-  and `events` grants SELECT only `TO authenticated`, tenant-scoped
-  (`supabase/migrations/20260704000001_rls_policies.sql`). A no-session caller is
-  the Postgres `anon` role and can read none of it.
-- The accept path solved the identical problem: a `SECURITY DEFINER` RPC
-  authenticated by the token, invoked through `getAnonSupabaseClient()`. Copy that
-  pattern. Reference files:
-  - RPC to copy from: `supabase/migrations/20260712000001_accept_invitation_rpc.sql`
-  - Handler to copy from: `acceptInvitation` in `app/api/invitations/handler.ts`
-    (the `responseToken !== undefined` / `getAnonSupabaseClient()` branch and the
-    RPC-error-message → HTTP mapping).
-  - Route to copy from: `app/api/invitations/[id]/accept/route.ts`.
-  - Test to copy from: `tests/unit/app/api/invitations-accept-route.test.ts`.
+## What already exists (do NOT rebuild)
+
+- The shared trigger primitive is already built and already satisfies AC1 (record created)
+  and AC4 (links `invitation_id`):
+  - `lib/scheduling/conflict-detection.ts` → `recordAvailabilityConflict(supabase, date, reason)`
+    calls the `record_availability_conflict` RPC; `reason: ConflictTriggerReason =
+    "availability_deleted" | "marked_unavailable"`.
+  - `supabase/migrations/20260711000001_availability_conflict_rpc.sql` — the SECURITY
+    DEFINER RPC that, for the caller's own user+group (derived from the JWT), inserts one
+    `conflicts` row (`church_group_id, invitation_id, triggered_by, trigger_reason`) per
+    accepted invitation to a service on `p_date`; returns `true` iff ≥1 was recorded.
+  - `record_availability_conflict` is already typed in `lib/supabase/types.ts` `Functions`
+    (`Args: { p_date, p_trigger_reason }`, `Returns: boolean`). **Its signature/return type
+    do not change in this issue, so `types.ts` needs no edit.**
+- The **#35 DELETE trigger point is already wired**: `app/api/availability/handler.ts`
+  `deleteAvailability` calls `recordAvailabilityConflict(..., "availability_deleted")`.
+- The `scheduling_conflict` value already exists in the `notification_type` enum
+  (`supabase/migrations/20260702000005_cluster_5_partial.sql`) — **no new enum value needed.**
+
+So exactly two gaps remain: (A) the **#34 PUT trigger point is not wired**, and (B) the RPC
+records the conflict but **sends no notification**.
 
 ## Files to create / modify
 
-### 1. `supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql` (CREATE)
+### 1. `app/api/availability/handler.ts` (MODIFY — wire the #34 trigger point)
 
-A new `SECURITY DEFINER` function, structured exactly like
-`accept_invitation` (same header comment style, `SET search_path = ''`, `P0001`
-error via `RAISE EXCEPTION 'NOT_FOUND'`, and a matching `-- ============ DOWN`
-section). Differences: it is read-only, so mark it `STABLE` (not `VOLATILE`) and
-do NOT mutate anything.
+In `setAvailability`, **after** the upsert succeeds (after the `if (error) return fail(...)`
+INTERNAL check, before building the response), fire conflict detection for every date the
+member set to **unavailable**. Marking a date available must NOT trigger anything.
 
-```sql
-CREATE OR REPLACE FUNCTION public.get_invitation_by_token(p_response_token text)
-  RETURNS jsonb
-  LANGUAGE plpgsql
-  SECURITY DEFINER
-  STABLE
-  SET search_path = ''
-AS $$
-DECLARE
-  v_inv    public.invitations%ROWTYPE;
-  v_week   public.service_weeks%ROWTYPE;
-  v_events jsonb;
-  v_status text;
-BEGIN
-  SELECT * INTO v_inv FROM public.invitations WHERE response_token = p_response_token;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'NOT_FOUND' USING ERRCODE = 'P0001';
-  END IF;
+- Iterate the `byDate` map (already built above) and collect dates where `isAvailable === false`.
+- For each such date, `await recordAvailabilityConflict(supabase, date, "marked_unavailable")`.
+  `supabase` is the RLS-scoped client already created in this function. Use the exact literal
+  `"marked_unavailable"` (it is the second `ConflictTriggerReason` value).
+- Track whether any call returned `true`.
+- `recordAvailabilityConflict` throws `ApiException(INTERNAL, 500)` on RPC error; the existing
+  `try/catch` at the end of the function already maps that to a 500 — do not add new handling,
+  just let it propagate (mirrors how `deleteAvailability` relies on the same catch).
+- Extend the PUT success response to report it. Change the return to include a new field
+  alongside `availability`:
 
-  SELECT * INTO v_week FROM public.service_weeks WHERE id = v_inv.service_week_id;
+  ```ts
+  return ok({ availability, conflictTriggered });
+  ```
 
-  SELECT coalesce(
-    jsonb_agg(
-      jsonb_build_object(
-        'id',         e.id,
-        'type',       e.type,
-        'name',       e.name,
-        'location',   e.location,
-        'start_time', e.start_time,
-        'end_time',   e.end_time
-      ) ORDER BY e.start_time
-    ),
-    '[]'::jsonb
-  )
-  INTO v_events
-  FROM public.events e
-  WHERE e.service_week_id = v_inv.service_week_id;
+  where `conflictTriggered: boolean` is `true` iff at least one `recordAvailabilityConflict`
+  call returned `true`. (Mirrors `DeleteAvailabilityResult.conflictTriggered` on the DELETE path.)
 
-  -- Computed "expired" state: only a still-pending invitation past its deadline.
-  -- Already-responded rows keep their real status (accepted/denied/withdrawn).
-  IF v_inv.status = 'pending'
-     AND v_inv.response_deadline IS NOT NULL
-     AND now() > v_inv.response_deadline THEN
-    v_status := 'expired';
-  ELSE
-    v_status := v_inv.status;
-  END IF;
+Order matters: the upsert writes the `is_available: false` row (and its `note`) BEFORE the RPC
+runs, so the RPC can read that note for the notification (see file 2). Keep this ordering.
 
-  RETURN jsonb_build_object(
-    'invitation_id',     v_inv.id,
-    'status',            v_status,
-    'role_note',         v_inv.role_note,
-    'response_deadline', v_inv.response_deadline,
-    'service_week', jsonb_build_object(
-      'id',           v_week.id,
-      'service_date', v_week.service_date,
-      'title',        v_week.title
-    ),
-    'events', v_events
-  );
-END;
-$$;
+Do NOT change GET, DELETE, validation, expansion, or the dedupe logic.
 
-GRANT EXECUTE ON FUNCTION public.get_invitation_by_token(text) TO anon, authenticated;
-```
+### 2. `supabase/migrations/20260713000001_conflict_notification.sql` (CREATE)
 
-Include the commented DOWN line:
-`-- DROP FUNCTION IF EXISTS public.get_invitation_by_token(text);`
+A new migration that `CREATE OR REPLACE`s `public.record_availability_conflict` (append-only
+migration convention — see how `20260711000001_service_week_notification_types.sql` and
+`20260712000002_invitation_withdrawn_notification_type.sql` extend prior objects in fresh
+migrations; do NOT edit the original `20260711000001_availability_conflict_rpc.sql`).
 
-### 2. `lib/supabase/types.ts` (MODIFY)
+Keep the **exact same signature** `(p_date date, p_trigger_reason text) RETURNS boolean`,
+`LANGUAGE plpgsql SECURITY DEFINER VOLATILE SET search_path = ''`, and the same
+JWT-derivation / UNAUTHENTICATED guard and accepted-invitation loop. The only behavioral
+change: inside the per-invitation loop, after each `INSERT INTO public.conflicts (...)`, also
+insert the admin notification(s). Copy the notify pattern from `accept_invitation`
+(`supabase/migrations/20260712000001_accept_invitation_rpc.sql`, lines ~103–123).
 
-Add one entry to `Database["public"]["Functions"]` (alongside `accept_invitation`).
-The RPC returns `jsonb`; type its `Returns` as the snake_case shape above:
+Required additions inside the RPC:
 
-```ts
-get_invitation_by_token: {
-  Args: { p_response_token: string };
-  Returns: {
-    invitation_id: string;
-    status: InvitationStatus;
-    role_note: string | null;
-    response_deadline: string | null;
-    service_week: { id: string; service_date: string; title: string | null };
-    events: Array<{
-      id: string;
-      type: EventType;
-      name: string;
-      location: string | null;
-      start_time: string;
-      end_time: string;
-    }>;
-  };
-};
-```
+- Capture the newly inserted conflict id: change the conflicts insert to
+  `INSERT INTO public.conflicts (...) VALUES (...) RETURNING id INTO v_conflict_id;`
+  (declare `v_conflict_id uuid;`).
+- Look up the triggering member's name once (before or inside the loop):
+  `SELECT name INTO v_member_name FROM public.users WHERE id = v_user_id;`
+  (declare `v_member_name text;`).
+- Read the reason from the member's own availability row for the date (present on the
+  `marked_unavailable` path; NULL on the `availability_deleted` path because the row was
+  already deleted before the RPC runs — that is correct, "reason if provided"):
+  `SELECT note INTO v_reason FROM public.availability WHERE user_id = v_user_id AND date = p_date;`
+  (declare `v_reason text;`).
+- Build a service label from the joined service week (the loop already joins
+  `service_weeks sw`): also select `sw.title` and `sw.service_date` into the loop record so a
+  human-readable label is available. Prefer `sw.title`; fall back to `'the service on ' ||
+  sw.service_date`.
+- For each conflict, `FOR v_recipient IN SELECT id FROM public.users WHERE church_group_id =
+  v_group_id AND role IN ('admin','set_leader') AND id <> v_user_id LOOP ... END LOOP`,
+  inserting one notification per recipient:
+  ```sql
+  INSERT INTO public.notifications
+    (church_group_id, user_id, type, title, body, link_entity_type, link_entity_id)
+  VALUES
+    (v_group_id, v_recipient.id, 'scheduling_conflict', 'Scheduling conflict',
+     v_member_name || ' can no longer make ' || <service label>
+       || CASE WHEN v_reason IS NOT NULL THEN ' — reason: ' || v_reason ELSE '' END,
+     'conflict', v_conflict_id);
+  ```
+  `title` must be ≤ 200 chars (`notifications.title varchar(200)`); the constant above is fine.
+- Add a `-- TODO(#58/#59): dispatch SMS + email to these recipients (Sprint 4).` comment where
+  the notifications are inserted, matching the repo's deferred-dispatch convention.
+- Keep `RETURN v_triggered;` and `GRANT EXECUTE ON FUNCTION public.record_availability_conflict(date, text) TO authenticated;`.
+- Include a header comment (issue #46, why notifications belong in the SECURITY DEFINER RPC:
+  `notifications_insert_leader_admin` is leader/admin-only, so a plain member marking
+  unavailable cannot insert notifications under plain RLS — same reason the conflicts insert
+  lives here) and a commented `-- ============ DOWN ============` /
+  `-- DROP FUNCTION IF EXISTS public.record_availability_conflict(date, text);` section,
+  matching the sibling migrations.
 
-`InvitationStatus` is already imported at the top of this file. Add `EventType`
-to that same import from `@/types/domain`.
+### 3. `tests/unit/app/api/availability-route.test.ts` (MODIFY — cover the #34 wiring)
 
-### 3. `app/api/invitations/handler.ts` (MODIFY — add one exported function)
+Add tests to the existing `describe("PUT /api/availability")` block. The PUT mock helper
+`makeSupabaseClientForPut` returns an object with `from`/`upsert`/`select` but **no `rpc`** —
+extend it (or add a variant) so the mocked client also exposes
+`rpc: jest.fn().mockResolvedValue({ data: <bool>, error: null })`, since `setAvailability`
+now calls `supabase.rpc("record_availability_conflict", ...)` on unavailable dates. Follow the
+existing `makeSupabaseClientForDelete` shape for the `rpc` mock. Cover:
 
-Add a response type and handler. Do NOT call `requireAuth`, `auth()`, or
-`getSupabaseClient` — this path has no session by design.
+- Setting a date `isAvailable: false` calls `rpc` with exactly
+  `("record_availability_conflict", { p_date: <date>, p_trigger_reason: "marked_unavailable" })`,
+  and the 200 body includes `conflictTriggered: true` when the RPC returns `{ data: true }`.
+- Setting a date `isAvailable: true` (or omitted → default true) does NOT call `rpc`, and the
+  body reports `conflictTriggered: false`.
+- A range/multi-date PUT mixing available and unavailable dates calls `rpc` once per
+  **unavailable** date only.
+- When the RPC returns `{ data: null, error: {...} }`, PUT returns 500 `INTERNAL`
+  (propagated via the existing catch).
+- Existing PUT tests that assert `body.data` equality must be updated to include the new
+  `conflictTriggered` field (or assert on `body.data.availability` specifically).
 
-```ts
-export type PublicInvitationLookup = {
-  invitationId: string;
-  status: InvitationStatus;
-  roleNote: string | null;
-  responseDeadline: string | null;
-  serviceWeek: { id: string; serviceDate: string; title: string | null };
-  events: Array<{
-    id: string;
-    type: EventType;
-    name: string;
-    location: string | null;
-    startTime: string;
-    endTime: string;
-  }>;
-};
+### 4. `tests/unit/lib/scheduling/conflict-detection.test.ts` (MODIFY — minor)
 
-export async function getInvitationByToken(token: string): Promise<Response> {
-  // Anti-enumeration: a malformed token must return the SAME 404 as an unknown
-  // one, so an attacker cannot distinguish "wrong format" from "not found".
-  const parsed = respondTokenParamSchema.safeParse(token);
-  if (!parsed.success) {
-    return fail("Not found", ErrorCode.NOT_FOUND, 404);
-  }
-
-  try {
-    const supabase = getAnonSupabaseClient();
-    const { data, error } = await supabase.rpc("get_invitation_by_token", {
-      p_response_token: parsed.data,
-    });
-
-    if (error) {
-      if ((error.message ?? "").includes("NOT_FOUND")) {
-        return fail("Not found", ErrorCode.NOT_FOUND, 404);
-      }
-      return fail("Internal error", ErrorCode.INTERNAL, 500);
-    }
-
-    return ok<PublicInvitationLookup>({
-      invitationId: data.invitation_id,
-      status: data.status,
-      roleNote: data.role_note,
-      responseDeadline: data.response_deadline,
-      serviceWeek: {
-        id: data.service_week.id,
-        serviceDate: data.service_week.service_date,
-        title: data.service_week.title,
-      },
-      events: data.events.map((e) => ({
-        id: e.id,
-        type: e.type,
-        name: e.name,
-        location: e.location,
-        startTime: e.start_time,
-        endTime: e.end_time,
-      })),
-    });
-  } catch {
-    return fail("Internal error", ErrorCode.INTERNAL, 500);
-  }
-}
-```
-
-Add `EventType` to the existing `import type { InvitationStatus } from "@/types/domain"`
-line, and import `respondTokenParamSchema` from `@/schemas/invitations` (add it to
-the existing schema import block). `getAnonSupabaseClient`, `ok`, `fail`,
-`ErrorCode` are already imported in this file.
-
-### 4. `schemas/invitations.ts` (MODIFY)
-
-Add, next to `acceptInvitationParamSchema` (reuse its exact token shape):
-
-```ts
-// GET /api/invitations/respond/:token param (#44). Same 64-char hex shape as the
-// response_token. On mismatch the route returns 404 (NOT 400) — see handler note.
-export const respondTokenParamSchema = z
-  .string()
-  .length(64)
-  .regex(/^[0-9a-f]{64}$/);
-```
-
-### 5. `app/api/invitations/respond/[token]/route.ts` (REPLACE the stub)
-
-```ts
-import { NextRequest } from "next/server";
-import { getInvitationByToken } from "../../handler";
-
-type Ctx = { params: Promise<{ token: string }> };
-
-export async function GET(_req: NextRequest, { params }: Ctx): Promise<Response> {
-  const { token } = await params;
-  return getInvitationByToken(token);
-}
-```
-
-Remove the `notImplemented` import.
-
-### 6. `tests/unit/app/api/invitations-respond-route.test.ts` (CREATE)
-
-Mirror `invitations-accept-route.test.ts`: mock `@/lib/supabase/client`
-(`getAnonSupabaseClient`) and use a `makeRpcClient({ data, error })` helper.
-Import `getInvitationByToken` from `@/app/api/invitations/handler`. Do NOT mock
-or expect `@clerk/nextjs/server` auth to be called. Use a valid token
-`"a".repeat(64)`. Cover every edge case below.
+`recordAvailabilityConflict` is unchanged, but add one case asserting it forwards the
+`"marked_unavailable"` reason verbatim to the RPC (the existing cases only exercise
+`"availability_deleted"`). No behavior change beyond coverage.
 
 ## Edge cases the implementation MUST handle
 
-1. **Happy path (pending):** RPC returns `status: "pending"` with a populated
-   `service_week` and `events` array → 200; body maps to camelCase
-   (`serviceWeek.serviceDate`, `events[].startTime`, etc.); uses
-   `getAnonSupabaseClient`.
-2. **Expired (>72h, still pending):** RPC returns `status: "expired"` → HTTP 200
-   (NOT an error code), with the invitation details still present.
-3. **Already responded:** RPC returns the real `status` (`"accepted"` /
-   `"denied"` / `"withdrawn"`) → 200 with that status (per #51 semantics).
-4. **Unknown token (valid format, no row):** RPC raises `NOT_FOUND` →
-   404 `{ error: "Not found", code: "NOT_FOUND" }`.
-5. **Malformed token (bad length / non-hex):** handler returns the **identical**
-   404 `{ error: "Not found", code: "NOT_FOUND" }` WITHOUT calling the RPC or
-   `getAnonSupabaseClient`. The message/code/status must be byte-identical to
-   case 4 so format-validity is not leaked (acceptance criterion).
-6. **Empty events:** week with no events yet → `events: []` (RPC `coalesce` to
-   `'[]'`), still 200.
-7. **Unexpected RPC error:** any non-`NOT_FOUND` error message → 500
-   `INTERNAL`.
+1. **Marking available (or default true) is never a conflict** — no `rpc` call for those dates.
+2. **Multi-date PUT** — one `record_availability_conflict` call per unavailable date; a range
+   set unavailable fires per expanded date.
+3. **No accepted invitation on the date** — RPC returns `false`, no conflict row, no
+   notification; PUT still succeeds with `conflictTriggered: false`.
+4. **Reason present vs absent** — `marked_unavailable` carries the member's `note` into the
+   notification body; `availability_deleted` has no note (row already gone) → notification omits
+   the reason clause. Never error on a NULL note.
+5. **Multiple accepted invitations on one date** — the RPC loop records a conflict + notifies
+   per invitation (existing loop; unchanged control flow).
+6. **RPC/DB error** — surfaces as 500 `INTERNAL` on both PUT and DELETE; never a silent no-op.
+7. **Triggering user is themselves a leader/admin** — excluded from recipients (`id <> v_user_id`),
+   no self-notification.
+8. **Both trigger paths converge on the same RPC** (AC3) — DELETE (`availability_deleted`,
+   already wired) and PUT (`marked_unavailable`, new) both get identical conflict + notification
+   behavior because the logic lives only in the RPC + `recordAvailabilityConflict`.
 
 ## Explicitly OUT OF SCOPE (do not implement)
 
-- Accept/deny mutations (#41/#42 — already done in `acceptInvitation` /
-  `denyInvitation`; this issue is read-only).
-- Any Clerk/session handling on this route.
-- Adding the `events` table to `Database["public"]["Tables"]` — the RPC returns
-  events as JSON, so only the `Functions` entry is needed. Do not widen types
-  beyond what is specified.
-- Notification/SMS dispatch.
+- SMS/email dispatch (Sprint 4 #58/#59) — in-app notification + TODO only (see Decision 1).
+- Conflict **resolution** (#47) and the resolution UI (#50): `GET /api/conflicts`,
+  `POST /api/conflicts/[id]/resolve`, and `app/(app)/conflicts/page.tsx` stay stubs.
+- AI replacement suggestions (Phase 4).
+- Any new `notification_type` enum value (`scheduling_conflict` already exists).
+- Widening `lib/supabase/types.ts` (the RPC signature/return are unchanged).
+- Changing GET / team availability, or adding an admin-sets-another-member availability path.
 
 ## Verification before finishing (Coding stage)
 
-Run `bun run lint`, `bun run typecheck`, and `bun run test` (Jest). The RPC
-itself has no DB test harness in this repo (the `accept_invitation` RPC is
-likewise only exercised through mocked-client route tests), so RPC-body
-correctness is verified by review + the route tests that mock its return values —
-do not add a live-DB test.
+Run `bun run lint`, `bun run typecheck`, and `bun run test` (Jest). The RPC has no live-DB
+test harness in this repo (like `accept_invitation` / `record_availability_conflict`, it is
+exercised only through mocked-client route tests) — verify RPC-body correctness by review plus
+the route/unit tests that mock its return values; do not add a live-DB test.

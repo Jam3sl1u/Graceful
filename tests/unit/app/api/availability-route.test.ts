@@ -58,6 +58,7 @@ function makeSupabaseClientForGet(result: QueryResult) {
 function makeSupabaseClientForPut(
   result: QueryResult,
   onUpsert?: (payload: unknown, opts: unknown) => void,
+  rpcResult: { data: unknown; error: unknown } = { data: false, error: null },
 ) {
   const select = jest.fn().mockResolvedValue(result);
   const upsert = jest.fn((payload: unknown, opts: unknown) => {
@@ -65,7 +66,8 @@ function makeSupabaseClientForPut(
     return { select };
   });
   const from = jest.fn(() => ({ upsert }));
-  return { from, upsert, select };
+  const rpc = jest.fn().mockResolvedValue(rpcResult);
+  return { from, upsert, select, rpc };
 }
 
 // Mocks the two calls deleteAvailability makes: .from("availability").delete()
@@ -523,6 +525,95 @@ describe("PUT /api/availability", () => {
       note: null,
     });
     expect(capturedRows?.[0]?.user_id).not.toBe(OTHER_USER_ID);
+  });
+
+  // BR-15 (#46): the explicit "mark unavailable" PUT is the other trigger
+  // point that shares record_availability_conflict with the DELETE path.
+  it("BR-15: marking a date unavailable calls the conflict-detection RPC and reports conflictTriggered: true", async () => {
+    setUpAuth();
+    const client = makeSupabaseClientForPut({ data: [rowB], error: null }, undefined, {
+      data: true,
+      error: null,
+    });
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await setAvailability(
+      makeReq({ body: { entries: [{ date: "2026-01-10", isAvailable: false, note: "Out of town" }] } }),
+      makeLookup(),
+    );
+    expect(res.status).toBe(200);
+
+    expect(client.rpc).toHaveBeenCalledTimes(1);
+    expect(client.rpc).toHaveBeenCalledWith("record_availability_conflict", {
+      p_date: "2026-01-10",
+      p_trigger_reason: "marked_unavailable",
+    });
+
+    const body = await res.json();
+    expect(body.data.conflictTriggered).toBe(true);
+  });
+
+  it("marking a date available (or omitted, defaulting to true) does not call the conflict-detection RPC", async () => {
+    setUpAuth();
+    const client = makeSupabaseClientForPut({ data: [rowA], error: null });
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await setAvailability(
+      makeReq({ body: { entries: [{ date: "2026-01-05" }] } }),
+      makeLookup(),
+    );
+    expect(res.status).toBe(200);
+
+    expect(client.rpc).not.toHaveBeenCalled();
+
+    const body = await res.json();
+    expect(body.data.conflictTriggered).toBe(false);
+  });
+
+  it("a multi-date PUT calls the conflict-detection RPC once per unavailable date only", async () => {
+    setUpAuth();
+    const client = makeSupabaseClientForPut({ data: [rowA, rowB], error: null }, undefined, {
+      data: true,
+      error: null,
+    });
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await setAvailability(
+      makeReq({
+        body: {
+          entries: [
+            { date: "2026-01-05", isAvailable: true },
+            { date: "2026-01-10", isAvailable: false, note: "Out of town" },
+          ],
+        },
+      }),
+      makeLookup(),
+    );
+    expect(res.status).toBe(200);
+
+    expect(client.rpc).toHaveBeenCalledTimes(1);
+    expect(client.rpc).toHaveBeenCalledWith("record_availability_conflict", {
+      p_date: "2026-01-10",
+      p_trigger_reason: "marked_unavailable",
+    });
+  });
+
+  it("returns 500 INTERNAL when the conflict-detection RPC returns an error", async () => {
+    setUpAuth();
+    const client = makeSupabaseClientForPut({ data: [rowB], error: null }, undefined, {
+      data: null,
+      error: { message: "connection refused" },
+    });
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await setAvailability(
+      makeReq({ body: { entries: [{ date: "2026-01-10", isAvailable: false }] } }),
+      makeLookup(),
+    );
+    expect(res.status).toBe(500);
+
+    const body = await res.json();
+    expect(body.code).toBe("INTERNAL");
   });
 });
 

@@ -1,108 +1,92 @@
-# Changes — Issue #44: Token-based public invitation lookup
+# Changes — Issue #46: Conflict detection on availability change
 
 ## Summary
 
-Implemented `GET /api/invitations/respond/:token`, a no-session, no-Clerk-auth
-read-only endpoint that returns an invitation's details (plus its service week
-and events) to someone tapping an SMS/email link. Token possession is the only
-credential. Follows the exact pattern the accept-invitation flow (#41) uses for
-its no-session path: a `SECURITY DEFINER` RPC authenticated by the token,
-invoked through `getAnonSupabaseClient()`.
+Wired the second (PUT) trigger point for BR-15 conflict detection, and added the
+in-app admin/set_leader notification that was previously missing from the shared
+`record_availability_conflict` RPC. The DELETE trigger point (#35) was already
+wired before this change and is unmodified.
 
 ## Files changed
 
-- **`supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql`** (new)
-  — `public.get_invitation_by_token(p_response_token text)`, a `STABLE`
-  (read-only) `SECURITY DEFINER` function. Looks up the invitation by
-  `response_token`, raises `NOT_FOUND` (`P0001`) if no row matches, and
-  otherwise returns a jsonb payload with the invitation, its service week, and
-  its events (empty array via `coalesce` when the week has no events yet).
-  Computes an API-only `"expired"` status when a still-`pending` invitation is
-  past its `response_deadline`; already-responded rows (accepted/denied/
-  withdrawn) keep their real status. Granted to `anon` and `authenticated`.
-  Includes the commented `DROP FUNCTION` DOWN line matching the
-  `accept_invitation` migration's style.
+### `app/api/availability/handler.ts` (MODIFY)
+In `setAvailability`, after the upsert succeeds, iterate `byDate` and for every
+date where `isAvailable === false`, `await recordAvailabilityConflict(supabase,
+date, "marked_unavailable")`. Tracks whether any call returned `true` into a new
+`conflictTriggered` boolean, now included in the PUT 200 response body:
+`ok({ availability, conflictTriggered })`. No new error handling was added — RPC
+errors (`ApiException(INTERNAL, 500)`) propagate through the function's existing
+`try/catch`, exactly as `deleteAvailability` already relies on. GET, DELETE,
+validation, date expansion, and the dedupe logic are untouched.
 
-- **`lib/supabase/types.ts`** — added `EventType` to the existing
-  `@/types/domain` import, and added a `get_invitation_by_token` entry to
-  `Database["public"]["Functions"]` alongside `accept_invitation`, typed with
-  the RPC's snake_case `Args`/`Returns` shape.
+### `supabase/migrations/20260713000001_conflict_notification.sql` (CREATE)
+New append-only migration that `CREATE OR REPLACE`s
+`public.record_availability_conflict` (signature, language, security, and
+JWT/UNAUTHENTICATED guard unchanged from `20260711000001_availability_conflict_rpc.sql`,
+which is left untouched). Behavioral addition: after each `conflicts` insert
+(now capturing `RETURNING id INTO v_conflict_id`), the RPC inserts one
+`notifications` row per `admin`/`set_leader` in the church group, excluding the
+triggering user (`id <> v_user_id`). Notification body is
+`"<member name> can no longer make <service label>[ — reason: <note>]"`, where
+the service label prefers `service_weeks.title` and falls back to
+`'the service on ' || service_date`, and the reason clause is included only when
+the member's `availability.note` for that date is non-null (present on the
+`marked_unavailable` path, absent on `availability_deleted` since the row is
+already gone by the time the RPC runs). Notifications are inserted from this
+SECURITY DEFINER RPC (not the route handler) because
+`notifications_insert_leader_admin` RLS is leader/admin-only. Includes a
+`-- TODO(#58/#59): dispatch SMS + email...` comment per the repo's deferred-
+dispatch convention (no `sendSms`/`sendEmail` calls added), a header comment
+explaining the SECURITY DEFINER rationale, and a commented DOWN section
+matching sibling migrations. `record_availability_conflict`'s signature/return
+type in `lib/supabase/types.ts` is unchanged, so that file was not touched (per
+spec).
 
-- **`schemas/invitations.ts`** — added `respondTokenParamSchema`, the same
-  64-char-hex `z.string().length(64).regex(/^[0-9a-f]{64}$/)` shape as
-  `acceptInvitationParamSchema`'s token, used to validate the route param
-  before ever calling the RPC.
+### `tests/unit/app/api/availability-route.test.ts` (MODIFY)
+- `makeSupabaseClientForPut` now also returns a mocked `rpc` (defaulting to
+  `{ data: false, error: null }` when unspecified), mirroring
+  `makeSupabaseClientForDelete`'s shape.
+- Added four new tests to the `describe("PUT /api/availability")` block:
+  1. Marking a date unavailable calls `rpc("record_availability_conflict", { p_date, p_trigger_reason: "marked_unavailable" })` and the 200 body reports `conflictTriggered: true` when the RPC returns `true`.
+  2. Marking a date available (or omitted, defaulting to available) never calls `rpc`, and `conflictTriggered: false`.
+  3. A multi-date PUT mixing available/unavailable dates calls `rpc` exactly once, only for the unavailable date.
+  4. RPC returning `{ data: null, error: {...} }` yields a 500 `INTERNAL` response (propagated via the existing catch).
+- No existing PUT test needed updating for the new `conflictTriggered` field — all
+  existing assertions read `body.data.availability` specifically rather than
+  asserting `body.data` by full equality.
 
-- **`app/api/invitations/handler.ts`** — added `EventType` to the existing
-  `@/types/domain` type import and `respondTokenParamSchema` to the existing
-  `@/schemas/invitations` import block. Added:
-  - `export type PublicInvitationLookup` — the camelCase response shape
-    (`invitationId`, `status`, `roleNote`, `responseDeadline`, `serviceWeek`,
-    `events[]`).
-  - `export async function getInvitationByToken(token: string): Promise<Response>`
-    — validates the token format first (anti-enumeration: a malformed token
-    returns the byte-identical 404 as an unknown-but-well-formed one, without
-    ever calling the RPC or `getAnonSupabaseClient`); on valid format, calls
-    `get_invitation_by_token` via `getAnonSupabaseClient()`, maps `NOT_FOUND`
-    RPC errors to 404, any other RPC error to 500 `INTERNAL`, and on success
-    maps the snake_case RPC payload to `PublicInvitationLookup`. Does **not**
-    call `requireAuth`, `auth()`, or `getSupabaseClient` — no session by
-    design.
+### `tests/unit/lib/scheduling/conflict-detection.test.ts` (MODIFY — minor)
+Added one test asserting `recordAvailabilityConflict` forwards the
+`"marked_unavailable"` reason verbatim to the RPC call args (existing cases only
+covered `"availability_deleted"`). No behavior change to
+`recordAvailabilityConflict` itself.
 
-- **`app/api/invitations/respond/[token]/route.ts`** — replaced the
-  `notImplemented` stub with a thin `GET` handler that awaits `params` and
-  delegates to `getInvitationByToken`.
+## Explicitly not touched (per spec's "out of scope")
+- No SMS/email dispatch — TODO comment only.
+- `GET /api/conflicts`, `POST /api/conflicts/[id]/resolve`, `app/(app)/conflicts/page.tsx` — untouched stubs.
+- `lib/supabase/types.ts` — not widened (RPC signature/return unchanged).
+- GET /availability, team availability, admin-sets-another-member paths — untouched.
 
-- **`tests/unit/app/api/invitations-respond-route.test.ts`** (new) — mirrors
-  `invitations-accept-route.test.ts`'s mocking style (`jest.mock` on
-  `@/lib/supabase/client`, a `makeRpcClient({ data, error })` helper). No
-  Clerk/`auth()` mocking (this route never touches it). Covers every edge case
-  from the spec:
-  1. Happy path (pending) — 200, full camelCase body, asserts
-     `getAnonSupabaseClient` was called with the right RPC args.
-  2. Expired (still-pending, RPC-computed `status: "expired"`) — 200, not an
-     error code.
-  3. Already responded — parameterized over `accepted`/`denied`/`withdrawn` —
-     200 with the real status.
-  4. Unknown token (valid format, RPC raises `NOT_FOUND`) — 404
-     `{ error: "Not found", code: "NOT_FOUND" }`.
-  5. Malformed token, two variants (wrong length; non-hex) — asserts the
-     **identical** 404 body as case 4, and that `getAnonSupabaseClient` is
-     never called.
-  6. Empty events (`events: []` from RPC) — still 200, `events: []` in the
-     response.
-  7. Unexpected RPC error message — 500 `INTERNAL`.
-
-- **`.pipeline/spec.md`** — carried forward as-is from the Planning stage's
-  output for issue #44 (not authored by this stage).
-
-## Out of scope (per spec, not touched)
-
-- No changes to `acceptInvitation`/`denyInvitation` (#41/#42).
-- No Clerk/session handling added to this route.
-- Did not add `events` to `Database["public"]["Tables"]` — the RPC returns
-  events as jsonb, so only the `Functions` entry was needed.
-- No notification/SMS dispatch.
-
-## Verification
-
-- `bun run lint` — clean, no errors.
-- `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
-- `bun run test` (Jest) — full suite: **28 suites / 363 tests passed**,
-  including the new 10-test file for this route. Per the spec, the RPC body
-  itself has no live-DB test harness in this repo (same as
-  `accept_invitation`) — correctness is verified via the route tests that
-  mock its return values.
+## Verification run (Coding stage)
+- `bun run lint` — clean.
+- `bun run typecheck` — clean.
+- `bun run test` — 31 suites / 385 tests, all passing (includes the 4 new PUT
+  tests, 1 new conflict-detection unit test, and the full existing suite with no
+  regressions).
+- `bun run check:workflows` — OK (no workflow scripts were touched by this
+  change; ran only as a sanity check per repo convention).
 
 ## What the Tester should focus on
-
-- The anti-enumeration guarantee: cases 4 and 5 in the new test file assert
-  byte-identical response bodies (`{ error: "Not found", code: "NOT_FOUND" }`,
-  status 404) for both a well-formed-but-unknown token and a malformed one —
-  worth double-checking this holds if the route or handler is touched again.
-- The `"expired"` status is intentionally HTTP 200, not a 4xx/5xx — confirm no
-  downstream assumption treats it as an error.
-- The RPC's own logic (expiry computation, `coalesce` to `'[]'` for no events,
-  `SECURITY DEFINER`/`STABLE`/`search_path` hardening) is not exercised by any
-  automated test in this repo — it was checked by direct code review against
-  the `accept_invitation` migration's established pattern.
+- The RPC migration (`20260713000001_conflict_notification.sql`) has no live-DB
+  test harness in this repo (consistent with `accept_invitation` and the
+  original `record_availability_conflict` migration) — it is only exercised via
+  mocked-client route/unit tests. The Tester should review the SQL body closely
+  for correctness (recipient exclusion, NULL-note handling, service label
+  fallback, `RETURNING id INTO v_conflict_id` wiring) rather than expecting a
+  live-DB test.
+- Confirm the PUT response shape change (`conflictTriggered` added alongside
+  `availability`) doesn't break any caller outside the files touched here (a
+  repo-wide grep for consumers of the PUT response was not in scope for this
+  spec, but worth a quick check).
+- Multi-date / range PUT with a mix of available and unavailable dates — verify
+  only unavailable dates trigger the RPC (edge case 2 in the spec).
