@@ -1,286 +1,311 @@
-# Spec — Issue #44: Token-based public invitation lookup
+# Spec — Issue #49: Invitation Response screen (mobile, no-login)
 
-`GET /api/invitations/respond/:token` — a **no-session, no-Clerk-auth** read-only
-endpoint that returns an invitation's details to someone tapping an SMS/email
-link. Token possession is the only credential (per #40).
+## OPEN QUESTION (BLOCKING — human decision required)
 
-## No OPEN QUESTIONS
+**The no-session DECLINE path does not exist in the backend, so "decline
+without login" cannot be wired as the issue asks.**
 
-The design is fully determined by existing patterns. In particular the "clear
-expired state, not a generic error" criterion is satisfied by returning HTTP 200
-with a computed `status: "expired"` (the `expired` value already exists in the
-`InvitationStatus` union in `types/domain.ts` even though it is not a DB enum
-value — it is an API-only, derived state). Do not invent a new error code for it.
+- Accept already supports no-session: `POST /api/invitations/[id]/accept`
+  accepts a `{ responseToken }` body and runs as the anon role through the
+  `accept_invitation` SECURITY DEFINER RPC. (`app/api/invitations/handler.ts`
+  lines 398-463; `supabase/migrations/20260712000001_accept_invitation_rpc.sql`).
+- Deny does **not**: `denyInvitation` (`app/api/invitations/handler.ts` lines
+  199-296) calls `requireAuth` + `getSupabaseClient(jwt)` and has no token
+  branch. `denyInvitationSchema` (`schemas/invitations.ts`) has no
+  `responseToken` field. There is **no `deny_invitation` RPC** in
+  `supabase/migrations/`. The deny route is also absent from the middleware
+  public allowlist.
+- Issue #49 says "wire directly to #42 (deny)" and lists #42 as a resolved
+  dependency, but #42 as merged is authenticated-only. AC "Tapping Decline
+  reveals an optional reason field and a confirm button ... works with no
+  session" and "On success: checkmark state" cannot be met without a new
+  no-session deny backend.
 
-## Background the coder must know
+**Decision needed:** does #49 build the no-session deny backend (new RPC +
+handler token branch + schema field + middleware entry — Section 5 below), or
+is that split back into #42 and #49 blocked until it lands?
 
-- Direct table reads are impossible here: RLS on `invitations`, `service_weeks`,
-  and `events` grants SELECT only `TO authenticated`, tenant-scoped
-  (`supabase/migrations/20260704000001_rls_policies.sql`). A no-session caller is
-  the Postgres `anon` role and can read none of it.
-- The accept path solved the identical problem: a `SECURITY DEFINER` RPC
-  authenticated by the token, invoked through `getAnonSupabaseClient()`. Copy that
-  pattern. Reference files:
-  - RPC to copy from: `supabase/migrations/20260712000001_accept_invitation_rpc.sql`
-  - Handler to copy from: `acceptInvitation` in `app/api/invitations/handler.ts`
-    (the `responseToken !== undefined` / `getAnonSupabaseClient()` branch and the
-    RPC-error-message → HTTP mapping).
-  - Route to copy from: `app/api/invitations/[id]/accept/route.ts`.
-  - Test to copy from: `tests/unit/app/api/invitations-accept-route.test.ts`.
+Everything in Sections 1-4 (the screen itself, the accept wiring, the
+middleware fix for the token lookup) is unblocked and correct regardless.
+Section 5 (decline submission) is contingent on the answer above. Per the
+pipeline contract, downstream stages stop until this is resolved — but the
+spec is written so a one-line answer unblocks the coder immediately.
 
-## Files to create / modify
+**Recommended resolution:** Option A — build the no-session deny in this issue
+(Section 5). It is small, mirrors accept exactly, and the screen is dead
+without it.
 
-### 1. `supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql` (CREATE)
+---
 
-A new `SECURITY DEFINER` function, structured exactly like
-`accept_invitation` (same header comment style, `SET search_path = ''`, `P0001`
-error via `RAISE EXCEPTION 'NOT_FOUND'`, and a matching `-- ============ DOWN`
-section). Differences: it is read-only, so mark it `STABLE` (not `VOLATILE`) and
-do NOT mutate anything.
+## 1. Summary
 
-```sql
-CREATE OR REPLACE FUNCTION public.get_invitation_by_token(p_response_token text)
-  RETURNS jsonb
-  LANGUAGE plpgsql
-  SECURITY DEFINER
-  STABLE
-  SET search_path = ''
-AS $$
-DECLARE
-  v_inv    public.invitations%ROWTYPE;
-  v_week   public.service_weeks%ROWTYPE;
-  v_events jsonb;
-  v_status text;
-BEGIN
-  SELECT * INTO v_inv FROM public.invitations WHERE response_token = p_response_token;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'NOT_FOUND' USING ERRCODE = 'P0001';
-  END IF;
+Replace the placeholder invite-response page with a real mobile-first screen
+that: loads invitation details by `response_token` with no session, shows the
+service date / role note / event list, offers a large Accept (green) and
+Decline (outlined) button, reveals an optional reason + confirm on Decline,
+shows a checkmark success state with a link into the app, and gracefully
+handles expired / already-used / unknown tokens by showing a friendly state
+with a link into the app instead of a raw error (#51).
 
-  SELECT * INTO v_week FROM public.service_weeks WHERE id = v_inv.service_week_id;
+The backend read + accept endpoints already exist. This issue is primarily
+frontend, plus one required middleware fix (Section 4) and — pending the OPEN
+QUESTION — the no-session deny backend (Section 5).
 
-  SELECT coalesce(
-    jsonb_agg(
-      jsonb_build_object(
-        'id',         e.id,
-        'type',       e.type,
-        'name',       e.name,
-        'location',   e.location,
-        'start_time', e.start_time,
-        'end_time',   e.end_time
-      ) ORDER BY e.start_time
-    ),
-    '[]'::jsonb
-  )
-  INTO v_events
-  FROM public.events e
-  WHERE e.service_week_id = v_inv.service_week_id;
+## 2. Files
 
-  -- Computed "expired" state: only a still-pending invitation past its deadline.
-  -- Already-responded rows keep their real status (accepted/denied/withdrawn).
-  IF v_inv.status = 'pending'
-     AND v_inv.response_deadline IS NOT NULL
-     AND now() > v_inv.response_deadline THEN
-    v_status := 'expired';
-  ELSE
-    v_status := v_inv.status;
-  END IF;
+Create:
+- `app/(public)/invite/[token]/invite-response.tsx` — client component (the UI).
+- `app/(public)/invite/[token]/invite-response.module.css` — styles (green
+  accept button, layout, spacing, ≥44px targets).
 
-  RETURN jsonb_build_object(
-    'invitation_id',     v_inv.id,
-    'status',            v_status,
-    'role_note',         v_inv.role_note,
-    'response_deadline', v_inv.response_deadline,
-    'service_week', jsonb_build_object(
-      'id',           v_week.id,
-      'service_date', v_week.service_date,
-      'title',        v_week.title
-    ),
-    'events', v_events
-  );
-END;
-$$;
+Modify:
+- `app/(public)/invite/[token]/page.tsx` — replace placeholder body; render the
+  client component with the token.
+- `middleware.ts` — add the token-lookup route to `isPublicRoute` (Section 4).
+- `jest.config.js` — allow component tests (Section 6).
 
-GRANT EXECUTE ON FUNCTION public.get_invitation_by_token(text) TO anon, authenticated;
+Modify only if OPEN QUESTION resolves to Option A (Section 5):
+- `schemas/invitations.ts`, `app/api/invitations/handler.ts`, `middleware.ts`
+  (deny route), and a new `supabase/migrations/<timestamp>_deny_invitation_rpc.sql`.
+
+## 3. Frontend
+
+### 3.1 `page.tsx` (server component)
+
+Follow the exact shape of `app/(public)/join/[code]/page.tsx`:
+
+```tsx
+import InviteResponse from "./invite-response";
+
+export default async function InviteResponsePage({
+  params,
+}: {
+  params: Promise<{ token: string }>;
+}) {
+  const { token } = await params;
+  return <InviteResponse token={token} />;
+}
 ```
 
-Include the commented DOWN line:
-`-- DROP FUNCTION IF EXISTS public.get_invitation_by_token(text);`
+### 3.2 `invite-response.tsx` (`"use client"`)
 
-### 2. `lib/supabase/types.ts` (MODIFY)
+Follow `app/(public)/join/[code]/join-form.tsx` for the fetch/state style.
 
-Add one entry to `Database["public"]["Functions"]` (alongside `accept_invitation`).
-The RPC returns `jsonb`; type its `Returns` as the snake_case shape above:
+Signature: `export default function InviteResponse({ token }: { token: string })`.
 
-```ts
-get_invitation_by_token: {
-  Args: { p_response_token: string };
-  Returns: {
-    invitation_id: string;
-    status: InvitationStatus;
-    role_note: string | null;
-    response_deadline: string | null;
-    service_week: { id: string; service_date: string; title: string | null };
-    events: Array<{
-      id: string;
-      type: EventType;
-      name: string;
-      location: string | null;
-      start_time: string;
-      end_time: string;
-    }>;
-  };
-};
-```
-
-`InvitationStatus` is already imported at the top of this file. Add `EventType`
-to that same import from `@/types/domain`.
-
-### 3. `app/api/invitations/handler.ts` (MODIFY — add one exported function)
-
-Add a response type and handler. Do NOT call `requireAuth`, `auth()`, or
-`getSupabaseClient` — this path has no session by design.
+Data shape returned by the lookup (from `PublicInvitationLookup` in
+`app/api/invitations/handler.ts` lines 465-479, wrapped in `{ data }` per
+`types/api.ts`):
 
 ```ts
-export type PublicInvitationLookup = {
+type Lookup = {
   invitationId: string;
-  status: InvitationStatus;
+  status: "pending" | "accepted" | "denied" | "withdrawn" | "expired";
   roleNote: string | null;
   responseDeadline: string | null;
   serviceWeek: { id: string; serviceDate: string; title: string | null };
   events: Array<{
     id: string;
-    type: EventType;
+    type: "pre_practice" | "rehearsal" | "sound_check" | "service";
     name: string;
     location: string | null;
-    startTime: string;
-    endTime: string;
+    startTime: string; // ISO
+    endTime: string;   // ISO
   }>;
 };
-
-export async function getInvitationByToken(token: string): Promise<Response> {
-  // Anti-enumeration: a malformed token must return the SAME 404 as an unknown
-  // one, so an attacker cannot distinguish "wrong format" from "not found".
-  const parsed = respondTokenParamSchema.safeParse(token);
-  if (!parsed.success) {
-    return fail("Not found", ErrorCode.NOT_FOUND, 404);
-  }
-
-  try {
-    const supabase = getAnonSupabaseClient();
-    const { data, error } = await supabase.rpc("get_invitation_by_token", {
-      p_response_token: parsed.data,
-    });
-
-    if (error) {
-      if ((error.message ?? "").includes("NOT_FOUND")) {
-        return fail("Not found", ErrorCode.NOT_FOUND, 404);
-      }
-      return fail("Internal error", ErrorCode.INTERNAL, 500);
-    }
-
-    return ok<PublicInvitationLookup>({
-      invitationId: data.invitation_id,
-      status: data.status,
-      roleNote: data.role_note,
-      responseDeadline: data.response_deadline,
-      serviceWeek: {
-        id: data.service_week.id,
-        serviceDate: data.service_week.service_date,
-        title: data.service_week.title,
-      },
-      events: data.events.map((e) => ({
-        id: e.id,
-        type: e.type,
-        name: e.name,
-        location: e.location,
-        startTime: e.start_time,
-        endTime: e.end_time,
-      })),
-    });
-  } catch {
-    return fail("Internal error", ErrorCode.INTERNAL, 500);
-  }
-}
 ```
 
-Add `EventType` to the existing `import type { InvitationStatus } from "@/types/domain"`
-line, and import `respondTokenParamSchema` from `@/schemas/invitations` (add it to
-the existing schema import block). `getAnonSupabaseClient`, `ok`, `fail`,
-`ErrorCode` are already imported in this file.
+Reuse types where possible: import `InvitationStatus`, `EventType` from
+`@/types/domain` rather than re-declaring the unions.
 
-### 4. `schemas/invitations.ts` (MODIFY)
+Behavior:
 
-Add, next to `acceptInvitationParamSchema` (reuse its exact token shape):
+1. On mount (`useEffect`), `GET /api/invitations/respond/${token}`. Track a
+   view state: `loading | ready | unavailable | accepted-success |
+   declined-success`.
+2. Parse `res.json()`; success body is `{ data: Lookup }`, error body is
+   `{ error, code }` (`types/api.ts`).
+3. Branch on the result:
+   - HTTP 404 or network error → `unavailable` view (Section 3.4).
+   - `data.status === "pending"` → `ready` view: render the card + Accept/Decline.
+   - `data.status` is `expired`, `accepted`, `denied`, or `withdrawn` →
+     `unavailable` view with a status-appropriate message (#51 — expired /
+     already-used never shows a raw error).
+4. Store `invitationId` and keep `token` for the accept/decline POSTs.
 
-```ts
-// GET /api/invitations/respond/:token param (#44). Same 64-char hex shape as the
-// response_token. On mismatch the route returns 404 (NOT 400) — see handler note.
-export const respondTokenParamSchema = z
-  .string()
-  .length(64)
-  .regex(/^[0-9a-f]{64}$/);
+Card contents (`ready` view):
+- Service date: format `serviceWeek.serviceDate` (a `YYYY-MM-DD` date string)
+  as a human date. Show `serviceWeek.title` if non-null.
+- Role note: `roleNote` if non-null (label it, e.g. "Your role").
+- Events list: one row per `events[]`, showing time (format `startTime`–
+  `endTime`) and `location` (omit location line when null). Events already
+  arrive ordered by start time. If `events` is empty, render a neutral
+  "Details coming soon" line — do not crash (the week may have no events yet;
+  see the RPC note at `accept_invitation_rpc.sql` line 94).
+
+Buttons (`ready` view): use the existing `Button` component
+(`components/ui/Button.tsx`), which already enforces `min-height`/`min-width`
+44px (satisfies A-08 / AC touch-target sizing — verify in the CSS module you
+do not shrink below 44px).
+- Accept: `variant="primary"`, but must render **green** (AC). The shared
+  `--color-accent` is indigo (`app/globals.css`), so add a green background in
+  `invite-response.module.css` and pass it via `className` (the `Button`
+  component appends `className` after its variant class). Do not change the
+  global token.
+- Decline: `variant="secondary"` (already outlined).
+- The two buttons must be visually large and clearly separated (AC "two
+  large, separated buttons").
+
+### 3.3 Accept + Decline actions
+
+Accept:
+- `POST /api/invitations/${invitationId}/accept`, headers
+  `{ "Content-Type": "application/json" }`, body
+  `JSON.stringify({ responseToken: token })`.
+- Disable both buttons while the request is in flight.
+- HTTP 200: read `{ data: { status, alreadyResponded } }`. If `status ===
+  "accepted"` → `accepted-success` view. If `alreadyResponded` is true with a
+  terminal non-accepted status (`denied`/`withdrawn`) → `unavailable` view.
+- HTTP 410 (`code: "EXPIRED"`) or 404 → `unavailable` view (#51: into the app,
+  not a raw error).
+- Other/network error → inline retryable error message (`role="alert"`), stay
+  on `ready`.
+
+Decline (reveal-then-confirm):
+- Tapping Decline does NOT submit. It reveals: an optional reason
+  `<textarea>` (maxLength 200 — matches `denyInvitationSchema` max) and a
+  "Confirm decline" button, plus a way to back out (e.g. a "Keep it" /
+  cancel control returning to the two-button state).
+- Confirm submits (endpoint/body per Section 5; blocked by OPEN QUESTION).
+  On success → `declined-success` view. On expired/used → `unavailable`.
+
+### 3.4 Success + unavailable views
+
+- `accepted-success` / `declined-success`: a checkmark/confirmation message
+  ("You're on the schedule" / "Response recorded") plus a prominent link into
+  the full app: link to `/dashboard`. Use `next/link` or a plain anchor as in
+  `join-form.tsx`.
+- `unavailable`: a friendly message keyed to why (expired, already responded,
+  or not found) and the same link into the app (`/dashboard`). Never surface
+  the raw `error`/`code` string or an HTTP status to the user (#51).
+
+Mobile-first: single-column, generous padding (mirror `join-form.tsx`'s
+`padding: "3rem 1.5rem"` container), full-width stacked buttons. Wrap the page
+in a `<main>`.
+
+## 4. Middleware fix (REQUIRED, unblocked)
+
+`middleware.ts` `isPublicRoute` currently lists `/invite(.*)` and
+`/api/invitations/(.*)/accept` but NOT the token-lookup route. A no-session
+user's `GET /api/invitations/respond/<token>` is therefore blocked by
+`auth.protect()` before it reaches the (correctly anon-capable) handler — the
+screen cannot load its data. Add:
+
+```
+"/api/invitations/respond/(.*)",
 ```
 
-### 5. `app/api/invitations/respond/[token]/route.ts` (REPLACE the stub)
+to the `createRouteMatcher([...])` list. (This is a latent #44 bug; it is a
+required part of making #49 function no-session, with an unambiguous fix.)
 
-```ts
-import { NextRequest } from "next/server";
-import { getInvitationByToken } from "../../handler";
+## 5. No-session DECLINE backend — CONTINGENT on OPEN QUESTION (Option A)
 
-type Ctx = { params: Promise<{ token: string }> };
+Only implement if the human resolves the OPEN QUESTION to "build it here."
+Mirror the accept path exactly; do NOT touch the existing authenticated deny
+logic — add the token path alongside it so existing deny tests stay green.
 
-export async function GET(_req: NextRequest, { params }: Ctx): Promise<Response> {
-  const { token } = await params;
-  return getInvitationByToken(token);
-}
-```
+1. New migration `supabase/migrations/<YYYYMMDDHHMMSS>_deny_invitation_rpc.sql`.
+   Copy the structure of `20260712000001_accept_invitation_rpc.sql`. Signature
+   `public.deny_invitation(p_invitation_id uuid, p_response_token text,
+   p_reason text)`, SECURITY DEFINER, `SET search_path = ''`,
+   `GRANT EXECUTE ... TO anon, authenticated`. Logic:
+   - Load invitation; not found → `RAISE EXCEPTION 'NOT_FOUND'`.
+   - Authorize: if `p_response_token` non-null, it must equal
+     `response_token` else `FORBIDDEN`; else derive caller from
+     `auth.jwt()->>'sub'` and require `= user_id` else `FORBIDDEN`.
+   - If `status <> 'pending'`: return current status gracefully
+     (`already_responded: true`), matching accept's idempotency (handler lines
+     239-241 today already do this for the auth path).
+   - Expiry: if pending and past `response_deadline` → `RAISE EXCEPTION 'EXPIRED'`.
+   - Compute `denial_count` = existing denied rows for (user, service_week) + 1
+     (same as handler lines 245-254).
+   - `UPDATE ... SET status='denied', denial_reason=<coalesced null>,
+     denial_count=..., responded_at=now()`.
+   - Insert an `invitation_denied` notification to `invited_by` if set, else to
+     all admins/set_leaders in the group (mirror accept's notify block).
+   - Insert an `audit_logs` row `action='invitation.denied'` (no-session-safe,
+     as accept does — cannot use `write_audit_log` which needs a JWT).
+   - Return `jsonb_build_object('status','denied','already_responded',false)`.
 
-Remove the `notImplemented` import.
+2. `schemas/invitations.ts`: add `responseToken` (optional, 64-char
+   `/^[0-9a-f]{64}$/`) to `denyInvitationSchema`, matching
+   `acceptInvitationSchema`.
 
-### 6. `tests/unit/app/api/invitations-respond-route.test.ts` (CREATE)
+3. `app/api/invitations/handler.ts` `denyInvitation`: at the top, parse the
+   body with the updated schema. If `responseToken` is present, take a
+   no-session branch — `getAnonSupabaseClient()`, call
+   `supabase.rpc("deny_invitation", { p_invitation_id: id, p_response_token,
+   p_reason })`, and map errors like `acceptInvitation` does
+   (`NOT_FOUND`→404, `FORBIDDEN`→403, `EXPIRED`→410, else 500). Leave the
+   existing authenticated (no-token) path untouched.
 
-Mirror `invitations-accept-route.test.ts`: mock `@/lib/supabase/client`
-(`getAnonSupabaseClient`) and use a `makeRpcClient({ data, error })` helper.
-Import `getInvitationByToken` from `@/app/api/invitations/handler`. Do NOT mock
-or expect `@clerk/nextjs/server` auth to be called. Use a valid token
-`"a".repeat(64)`. Cover every edge case below.
+4. `middleware.ts`: also add `"/api/invitations/(.*)/deny"` to `isPublicRoute`.
 
-## Edge cases the implementation MUST handle
+5. Frontend Decline confirm (Section 3.3): `POST
+   /api/invitations/${invitationId}/deny` with body `{ responseToken: token,
+   reason }` (omit/empty reason is valid → treated as no reason).
 
-1. **Happy path (pending):** RPC returns `status: "pending"` with a populated
-   `service_week` and `events` array → 200; body maps to camelCase
-   (`serviceWeek.serviceDate`, `events[].startTime`, etc.); uses
-   `getAnonSupabaseClient`.
-2. **Expired (>72h, still pending):** RPC returns `status: "expired"` → HTTP 200
-   (NOT an error code), with the invitation details still present.
-3. **Already responded:** RPC returns the real `status` (`"accepted"` /
-   `"denied"` / `"withdrawn"`) → 200 with that status (per #51 semantics).
-4. **Unknown token (valid format, no row):** RPC raises `NOT_FOUND` →
-   404 `{ error: "Not found", code: "NOT_FOUND" }`.
-5. **Malformed token (bad length / non-hex):** handler returns the **identical**
-   404 `{ error: "Not found", code: "NOT_FOUND" }` WITHOUT calling the RPC or
-   `getAnonSupabaseClient`. The message/code/status must be byte-identical to
-   case 4 so format-validity is not leaked (acceptance criterion).
-6. **Empty events:** week with no events yet → `events: []` (RPC `coalesce` to
-   `'[]'`), still 200.
-7. **Unexpected RPC error:** any non-`NOT_FOUND` error message → 500
-   `INTERNAL`.
+## 6. Test config (REQUIRED to test the component)
 
-## Explicitly OUT OF SCOPE (do not implement)
+`jest.config.js` currently sets `testEnvironment: "node"` and
+`testMatch: ["**/tests/unit/**/*.test.ts"]` (`.ts` only). A React component
+test must be `.tsx` under jsdom. Make the minimal change so component tests can
+run without disturbing the node-env API tests:
 
-- Accept/deny mutations (#41/#42 — already done in `acceptInvitation` /
-  `denyInvitation`; this issue is read-only).
-- Any Clerk/session handling on this route.
-- Adding the `events` table to `Database["public"]["Tables"]` — the RPC returns
-  events as JSON, so only the `Functions` entry is needed. Do not widen types
-  beyond what is specified.
-- Notification/SMS dispatch.
+- Add `"**/tests/unit/**/*.test.tsx"` to `testMatch`.
+- Keep the global `testEnvironment: "node"`; the component test file should opt
+  into jsdom with a top-of-file docblock: `/** @jest-environment jsdom */`.
 
-## Verification before finishing (Coding stage)
+Testing-library (`@testing-library/react`, `jest-environment-jsdom`) and
+`@testing-library/jest-dom` (loaded in `jest.setup.ts`) are already installed.
+The tester will place the component test at
+`tests/unit/app/invite-response.test.tsx` and mock `fetch`.
 
-Run `bun run lint`, `bun run typecheck`, and `bun run test` (Jest). The RPC
-itself has no DB test harness in this repo (the `accept_invitation` RPC is
-likewise only exercised through mocked-client route tests), so RPC-body
-correctness is verified by review + the route tests that mock its return values —
-do not add a live-DB test.
+## 7. Edge cases the implementation must handle
+
+- No session at all — the entire happy path (load + accept, and decline once
+  Section 5 lands) must work with no Clerk session. Do not import anything that
+  forces auth in the client component.
+- Malformed/unknown token → lookup returns 404 → `unavailable` view, never a
+  raw error (anti-enumeration is already handled server-side; the client just
+  must not leak it).
+- Expired token: lookup returns `status: "expired"`; accept returns 410. Both
+  → `unavailable`/into-app, per #51.
+- Already responded (`accepted`/`denied`/`withdrawn`) on load OR a re-tap after
+  responding (accept returns `alreadyResponded: true`) → graceful
+  already-responded state, no double side effects.
+- `events` empty → render without crashing.
+- `roleNote` null, `serviceWeek.title` null, event `location` null → omit those
+  lines cleanly.
+- Double-tap / in-flight: disable buttons while a POST is pending.
+- Reason > 200 chars: enforce `maxLength={200}` on the textarea (server also
+  caps at 200).
+
+## 8. Patterns to copy (name the file)
+
+- Page + client-component split, fetch/`useState` flow, `role="alert"` errors,
+  success view: `app/(public)/join/[code]/page.tsx` + `join-form.tsx`.
+- Button + 44px targets + variants: `components/ui/Button.tsx` /
+  `Button.module.css`.
+- No-session accept request shape and error mapping: `acceptInvitation` in
+  `app/api/invitations/handler.ts` (lines 398-463).
+- (Section 5) new RPC structure, auth-by-token, notify + audit inserts:
+  `supabase/migrations/20260712000001_accept_invitation_rpc.sql`.
+- API envelope (`{ data }` / `{ error, code }`): `types/api.ts`.
+
+## 9. Out of scope (do not build)
+
+- In-app accept/deny from the notification inbox (Sprint 4, #71/#73).
+- SMS/email dispatch of the invitation (#67/#68 — already TODO'd in the handler).
+- Any change to the existing authenticated in-app deny/accept behavior beyond
+  the additive token branch in Section 5.

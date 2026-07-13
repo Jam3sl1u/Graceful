@@ -336,6 +336,17 @@ export type Database = {
           attendees_added: number;
         };
       };
+      deny_invitation: {
+        Args: {
+          p_invitation_id: string;
+          p_response_token: string | null;
+          p_reason: string | null;
+        };
+        Returns: {
+          status: InvitationStatus;
+          already_responded: boolean;
+        };
+      };
       get_invitation_by_token: {
         Args: { p_response_token: string };
         Returns: {

@@ -20,8 +20,16 @@ export type CreateInvitationInput = z.infer<typeof createInvitationSchema>;
 // POST /api/invitations/:id/deny body (#42). reason is optional (max 200 chars,
 // PRD §6.3 / BR-08). An absent body or empty/whitespace-only reason both mean
 // "no reason" and are valid (NOT a 400) — the handler coerces them to null.
+// responseToken is optional (#49): absent/empty for the in-app path;
+// present for the no-session SMS/email path, same 64-char hex shape as
+// acceptInvitationSchema's responseToken.
 export const denyInvitationSchema = z.object({
   reason: z.string().trim().max(200).optional(),
+  responseToken: z
+    .string()
+    .length(64)
+    .regex(/^[0-9a-f]{64}$/)
+    .optional(),
 });
 export type DenyInvitationInput = z.infer<typeof denyInvitationSchema>;
 

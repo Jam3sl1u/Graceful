@@ -193,24 +193,62 @@ export async function createInvitation(req: NextRequest, lookup?: UserLookup): P
   }
 }
 
-// POST /api/invitations/:id/deny — any authenticated user, scoped to their
-// own invitation (BR-08, PRD §6.3/§8/§12). Never leaks existence of another
-// user's invitation: not-owned/not-found/wrong-group all resolve to 404.
+// POST /api/invitations/:id/deny — works two ways (#49, mirrors
+// acceptInvitation):
+//   1. No-session (SMS/email link): body carries a `responseToken`, no Clerk
+//      session; runs as the anon role through the deny_invitation SECURITY
+//      DEFINER RPC, authenticated via the token itself.
+//   2. In-app (authenticated member): no token; scoped to the caller's own
+//      invitation (BR-08, PRD §6.3/§8/§12). Never leaks existence of another
+//      user's invitation: not-owned/not-found/wrong-group all resolve to 404.
 export async function denyInvitation(
   req: NextRequest,
   id: string,
   lookup?: UserLookup,
 ): Promise<Response> {
   try {
-    const ctx = await requireAuth(req, lookup);
-
     const body = await req.json().catch(() => null);
     const parsedResult = denyInvitationSchema.safeParse(body ?? {});
     if (!parsedResult.success) {
       return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
     }
+    const { responseToken } = parsedResult.data;
     const rawReason = parsedResult.data.reason;
     const reason = rawReason && rawReason.length > 0 ? rawReason : null;
+
+    // No-session path: authenticated by the token itself inside the RPC, not
+    // by a Clerk session — do not call requireAuth for this branch. Leaves
+    // the existing authenticated (no-token) path below untouched.
+    if (responseToken !== undefined) {
+      const supabase = getAnonSupabaseClient();
+      const { data, error } = await supabase.rpc("deny_invitation", {
+        p_invitation_id: id,
+        p_response_token: responseToken,
+        p_reason: reason,
+      });
+
+      if (error) {
+        const message = error.message ?? "";
+        if (message.includes("NOT_FOUND")) {
+          return fail("Not found", ErrorCode.NOT_FOUND, 404);
+        }
+        if (message.includes("FORBIDDEN")) {
+          return fail("Forbidden", ErrorCode.FORBIDDEN, 403);
+        }
+        if (message.includes("EXPIRED")) {
+          return fail("Invitation expired", ErrorCode.EXPIRED, 410);
+        }
+        return fail("Internal error", ErrorCode.INTERNAL, 500);
+      }
+
+      return ok({
+        invitationId: id,
+        status: data.status,
+        alreadyResponded: data.already_responded,
+      });
+    }
+
+    const ctx = await requireAuth(req, lookup);
 
     const { getToken } = await auth();
     const jwt = await getToken({ template: "supabase" });
