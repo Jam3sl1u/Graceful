@@ -132,7 +132,7 @@ const plan = await agent(
 if (!plan) {
   log(`Planner for issue #${issue.number} did not complete (agent-level failure, e.g. a session/usage limit -- NOT a real open question). Stopping here so this isn't silently mislabeled. Re-invoke this workflow with the same issueNumber to retry once whatever caused the failure has cleared.`)
   await abandonStaleBranchIfEmpty(issue.number, 'planner did not complete')
-  return { status: 'planner-failed', issue: { number: issue.number, title: issue.title, url: issue.url } }
+  return { status: 'planner-failed', reason: 'planner agent call did not complete', issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
 if (plan.hasOpenQuestion && !issueArgs.humanAnswer) {
@@ -152,7 +152,41 @@ const coded = await agent(
 if (!coded || !coded.done) {
   log(`Coder for issue #${issue.number} did not produce a real implementation (${!coded ? 'agent-level failure' : 'reported done:false'}). Stopping here rather than letting the pipeline silently proceed to Test/Review/Ship against missing code. Re-invoke this workflow with the same issueNumber to retry.`)
   await abandonStaleBranchIfEmpty(issue.number, coded ? 'coder reported done:false' : 'coder did not complete')
-  return { status: 'coder-failed', issue: { number: issue.number, title: issue.title, url: issue.url } }
+  return { status: 'coder-failed', reason: coded ? 'coder reported done:false' : 'coder agent call did not complete', issue: { number: issue.number, title: issue.title, url: issue.url } }
+}
+
+// Independent, deliberately mechanical check -- NOT another judgment call. The #41/#42
+// incident happened because the coder's own reasonable-sounding self-assessment (done:true)
+// went unchecked while it had actually written nothing (a cwd-drift bug fed it a stale spec
+// describing already-shipped work). This asks for raw command output only, not an opinion,
+// so it can't rationalize its way past an empty diff the way a second "are you sure?"
+// judgment call could.
+const verified = await agent(
+  pin(`Run exactly these commands in order and report their raw output, nothing else -- do not interpret, do not assess quality, do not read any files: \`git status --porcelain\`, then \`git diff --stat origin/main...HEAD -- . ':(exclude).pipeline'\`. Report: whether git status showed any uncommitted changes, and from the diff --stat output, the number of non-.pipeline files changed and total insertions+deletions.`),
+  {
+    label: `verify:${issue.number}`,
+    phase: 'Code',
+    schema: {
+      type: 'object',
+      properties: {
+        uncommittedChanges: { type: 'boolean' },
+        nonPipelineFilesChanged: { type: 'number' },
+        totalLinesChanged: { type: 'number' },
+      },
+      required: ['uncommittedChanges', 'nonPipelineFilesChanged', 'totalLinesChanged'],
+    },
+  }
+)
+
+if (!verified || verified.uncommittedChanges || verified.nonPipelineFilesChanged === 0) {
+  const reason = !verified
+    ? 'verification agent call did not complete'
+    : verified.uncommittedChanges
+      ? 'working tree has uncommitted changes after the coder stage'
+      : 'independent diff check found no non-pipeline files changed despite coder reporting done:true'
+  log(`Independent verification found no real committed change outside .pipeline/ for issue #${issue.number} (${reason}). Treating as a failure regardless of the coder's own report.`)
+  await abandonStaleBranchIfEmpty(issue.number, reason)
+  return { status: 'coder-verify-failed', reason, issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
 const tested = await agent(
@@ -163,7 +197,7 @@ const tested = await agent(
 if (!tested) {
   log(`Tester for issue #${issue.number} did not complete (agent-level failure). Stopping here rather than letting the pipeline silently proceed to Review without real test results. Re-invoke this workflow with the same issueNumber to retry.`)
   await abandonStaleBranchIfEmpty(issue.number, 'tester did not complete')
-  return { status: 'tester-failed', issue: { number: issue.number, title: issue.title, url: issue.url } }
+  return { status: 'tester-failed', reason: 'tester agent call did not complete', issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
 const review = await agent(
@@ -186,28 +220,38 @@ const review = await agent(
 if (!review) {
   log(`Reviewer for issue #${issue.number} did not complete (agent-level failure, e.g. a session/usage limit). Stopping here rather than shipping without a real review. Re-invoke this workflow with the same issueNumber to retry.`)
   await abandonStaleBranchIfEmpty(issue.number, 'reviewer did not complete')
-  return { status: 'reviewer-failed', issue: { number: issue.number, title: issue.title, url: issue.url } }
+  return { status: 'reviewer-failed', reason: 'reviewer agent call did not complete', issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
 const ship = await agent(
-  pin(`Open the PR for issue #${issue.number} yourself, per AGENTS.md's git/PR policy. Confirm the working tree is clean on the current branch (commit anything outstanding), \`git push -u origin <current-branch-name>\`, then \`gh pr create --base main --head <branch> --title "Fix #${issue.number}: ${issue.title}" --body "..."\` directly (not the mcp__github tool, and no --reviewer). Body must include "Closes #${issue.number}" on its own line, the reviewer's verdict (${review.verdict}) and summary (${review.summary.replace(/"/g, '\\"')}), whether the pipeline fully completed, and any problems hit. Never merge/push-main/close the issue. Leave the current branch checked out (do not check out main). Return the PR URL.`),
+  pin(`Open the PR for issue #${issue.number} yourself, per AGENTS.md's git/PR policy. FIRST, as a last-mile safety check before doing anything else: run \`git status --porcelain\` then \`git diff --stat origin/main...HEAD -- . ':(exclude).pipeline'\`. If that diff is empty (no non-.pipeline files changed), do NOT push or open a PR -- set aborted:true and explain why in your summary instead. Otherwise: confirm the working tree is clean on the current branch (commit anything outstanding), \`git push -u origin <current-branch-name>\`, then \`gh pr create --base main --head <branch> --title "Fix #${issue.number}: ${issue.title}" --body "..."\` directly (not the mcp__github tool, and no --reviewer). Body must include "Closes #${issue.number}" on its own line, the reviewer's verdict (${review.verdict}) and summary (${review.summary.replace(/"/g, '\\"')}), whether the pipeline fully completed, and any problems hit. Never merge/push-main/close the issue. Leave the current branch checked out (do not check out main). Return the PR URL, or aborted:true with a reason if you aborted.`),
   {
     label: `ship:${issue.number}`,
     phase: 'Ship',
     schema: {
       type: 'object',
-      properties: { prUrl: { type: 'string' } },
-      required: ['prUrl'],
+      properties: {
+        prUrl: { type: 'string' },
+        aborted: { type: 'boolean' },
+        reason: { type: 'string' },
+      },
+      required: [],
     },
   }
 )
 
-log(`Issue #${issue.number} shipped: ${ship ? ship.prUrl : 'PR step failed'} (verdict: ${review.verdict})`)
+if (!ship || ship.aborted) {
+  const reason = !ship ? 'ship agent call did not complete' : (ship.reason || 'ship stage aborted: last-mile diff check found nothing to ship')
+  log(`Issue #${issue.number} was NOT shipped (${reason}). This is the same defense-in-depth check as the post-coder verify gate, run again immediately before opening a PR.`)
+  return { status: 'ship-aborted', reason, issue: { number: issue.number, title: issue.title, url: issue.url }, verdict: review.verdict }
+}
+
+log(`Issue #${issue.number} shipped: ${ship.prUrl} (verdict: ${review.verdict})`)
 
 return {
   status: 'shipped',
   issue: { number: issue.number, title: issue.title, url: issue.url },
-  prUrl: ship ? ship.prUrl : null,
+  prUrl: ship.prUrl,
   verdict: review.verdict,
   humanAnswerApplied: issueArgs.humanAnswer || null,
 }

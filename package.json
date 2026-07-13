@@ -15,7 +15,8 @@
     "test:coverage": "jest --coverage",
     "test:rls": "jest --config jest.config.integration.js",
     "test:e2e": "playwright test",
-    "check:service-role": "node scripts/check-service-role.mjs"
+    "check:service-role": "node scripts/check-service-role.mjs",
+    "check:workflows": "node scripts/check-workflows.mjs"
   },
   "dependencies": {
     "next": "^15.3.0",

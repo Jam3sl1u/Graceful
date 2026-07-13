@@ -59,6 +59,22 @@ rather than guessing until a human resolves it.
   judge critically — green tests are not the same as correct behavior. This
   is the last line of defense before a human sees the result.
 
+## Orchestration working-directory contract
+
+An orchestration script that issues multiple sequential agent calls against a
+single isolated worktree must not rely on an inherited working directory
+beyond the very first call in the sequence — each subsequent call must
+explicitly re-assert and verify its working directory (e.g. `pwd` then
+`cd <absolute path>`) before doing anything else, rather than trusting that
+the process still has the cwd it started with. This was the root cause of a
+real incident (issues #41/#42, 2026-07): two stages of a four-stage pipeline
+silently operated against the wrong checkout — writing their output into the
+main repo instead of the pinned worktree — while still reporting nominal
+success, because only the first call in that run reliably inherited the
+intended directory. Any future orchestration tool or script implementing
+this pipeline contract must build in the same explicit re-assertion, not
+just the first tool that hit the bug.
+
 ## Git / PR policy
 
 - Work happens on a branch linked to the originating issue through your git
