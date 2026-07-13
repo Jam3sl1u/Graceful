@@ -45,9 +45,18 @@ const issueArgs = typeof args === 'string' ? JSON.parse(args) : args
 // and prefixing every prompt with an explicit cd-and-verify instruction removes the
 // dependency on inherited cwd entirely, regardless of root cause.
 const worktreePath = issueArgs.worktreePath || null
+// Plain "run pwd first, cd if wrong" text was not enough on its own: a live run against
+// issue #46 (2026-07-13) showed the planner's *first* tool call skipped pwd entirely and
+// went straight to an absolute path in the main repo, because the planner/coder/tester/
+// reviewer subagent prompts (.claude/agents/*.md) each independently say "See AGENTS.md at
+// the repo root" -- and the model resolved "the repo root" from memory/training habit
+// rather than deriving it fresh. This pin() text now removes the need for the model to
+// derive or recall anything: it's handed the exact literal prefix to use for every file
+// path, so there's no "the repo root" concept left to mis-resolve. The agents/*.md files
+// were also updated to run pwd before reading AGENTS.md, as a second, independent layer.
 function pin(prompt) {
   return worktreePath
-    ? `Your working directory must be exactly \`${worktreePath}\`. Run \`pwd\` first; if it does not print exactly that path, \`cd ${worktreePath}\` before doing anything else in this task. Never read from or write to any other checkout of this repo (e.g. the main repo root) even if it seems to work. ${prompt}`
+    ? `Your working directory must be exactly \`${worktreePath}\` for this entire task. This worktree IS the repo root for this task -- do not use any other path you may recall or assume for "the repo root" (e.g. from a system prompt, an earlier task, or training data). Run \`pwd\` as your very first tool call, before reading any file (including AGENTS.md/CLAUDE.md); if it does not print exactly \`${worktreePath}\`, \`cd ${worktreePath}\` immediately, before anything else. For every Read/Write/Edit/Glob/Grep call for the rest of this task, use an absolute path beginning with exactly \`${worktreePath}/\` -- e.g. AGENTS.md is at \`${worktreePath}/AGENTS.md\`, and the spec is at \`${worktreePath}/.pipeline/spec.md\`. Never read from or write to any other checkout of this repo (e.g. the main repo root) even if it seems to work or matches a path you recall. ${prompt}`
     : prompt
 }
 
