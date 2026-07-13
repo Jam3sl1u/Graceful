@@ -11,8 +11,9 @@ import {
   denyInvitationSchema,
   acceptInvitationParamSchema,
   acceptInvitationSchema,
+  respondTokenParamSchema,
 } from "@/schemas/invitations";
-import type { InvitationStatus } from "@/types/domain";
+import type { EventType, InvitationStatus } from "@/types/domain";
 
 type InvitationsRow = Database["public"]["Tables"]["invitations"]["Row"];
 
@@ -366,6 +367,72 @@ export async function acceptInvitation(
     });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
+export type PublicInvitationLookup = {
+  invitationId: string;
+  status: InvitationStatus;
+  roleNote: string | null;
+  responseDeadline: string | null;
+  serviceWeek: { id: string; serviceDate: string; title: string | null };
+  events: Array<{
+    id: string;
+    type: EventType;
+    name: string;
+    location: string | null;
+    startTime: string;
+    endTime: string;
+  }>;
+};
+
+// GET /api/invitations/respond/:token (#44) — no-session, no-Clerk-auth,
+// read-only lookup for someone tapping an SMS/email link. Token possession
+// is the only credential; runs entirely through the get_invitation_by_token
+// SECURITY DEFINER RPC via getAnonSupabaseClient() (mirrors the no-session
+// branch of acceptInvitation).
+export async function getInvitationByToken(token: string): Promise<Response> {
+  // Anti-enumeration: a malformed token must return the SAME 404 as an unknown
+  // one, so an attacker cannot distinguish "wrong format" from "not found".
+  const parsed = respondTokenParamSchema.safeParse(token);
+  if (!parsed.success) {
+    return fail("Not found", ErrorCode.NOT_FOUND, 404);
+  }
+
+  try {
+    const supabase = getAnonSupabaseClient();
+    const { data, error } = await supabase.rpc("get_invitation_by_token", {
+      p_response_token: parsed.data,
+    });
+
+    if (error) {
+      if ((error.message ?? "").includes("NOT_FOUND")) {
+        return fail("Not found", ErrorCode.NOT_FOUND, 404);
+      }
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    return ok<PublicInvitationLookup>({
+      invitationId: data.invitation_id,
+      status: data.status,
+      roleNote: data.role_note,
+      responseDeadline: data.response_deadline,
+      serviceWeek: {
+        id: data.service_week.id,
+        serviceDate: data.service_week.service_date,
+        title: data.service_week.title,
+      },
+      events: data.events.map((e) => ({
+        id: e.id,
+        type: e.type,
+        name: e.name,
+        location: e.location,
+        startTime: e.start_time,
+        endTime: e.end_time,
+      })),
+    });
+  } catch {
     return fail("Internal error", ErrorCode.INTERNAL, 500);
   }
 }

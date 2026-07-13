@@ -1,75 +1,108 @@
-# Changes: Issue #42 — Deny invitation with reason (BR-08 denial cap)
+# Changes — Issue #44: Token-based public invitation lookup
+
+## Summary
+
+Implemented `GET /api/invitations/respond/:token`, a no-session, no-Clerk-auth
+read-only endpoint that returns an invitation's details (plus its service week
+and events) to someone tapping an SMS/email link. Token possession is the only
+credential. Follows the exact pattern the accept-invitation flow (#41) uses for
+its no-session path: a `SECURITY DEFINER` RPC authenticated by the token,
+invoked through `getAnonSupabaseClient()`.
 
 ## Files changed
 
-- `schemas/invitations.ts` — added `denyInvitationSchema` (`reason` optional string, trimmed,
-  max 200 chars, no `.min(1)` so empty/whitespace-only is valid) and its inferred
-  `DenyInvitationInput` type, alongside the existing `createInvitationSchema`.
+- **`supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql`** (new)
+  — `public.get_invitation_by_token(p_response_token text)`, a `STABLE`
+  (read-only) `SECURITY DEFINER` function. Looks up the invitation by
+  `response_token`, raises `NOT_FOUND` (`P0001`) if no row matches, and
+  otherwise returns a jsonb payload with the invitation, its service week, and
+  its events (empty array via `coalesce` when the week has no events yet).
+  Computes an API-only `"expired"` status when a still-`pending` invitation is
+  past its `response_deadline`; already-responded rows (accepted/denied/
+  withdrawn) keep their real status. Granted to `anon` and `authenticated`.
+  Includes the commented `DROP FUNCTION` DOWN line matching the
+  `accept_invitation` migration's style.
 
-- `app/api/invitations/handler.ts` — two changes:
-  1. Added `denyInvitation(req, id, lookup?)`, copying `createInvitation`'s structure
-     (`requireAuth` → tolerant body parse → `auth()`/`getToken({template:"supabase"})` →
-     `getSupabaseClient(jwt)` → try/catch tail). Logic: fetch the caller's own invitation
-     (`id` + `church_group_id` + `user_id` scoped, so a wrong owner/group/id is
-     indistinguishable → 404); if `status !== "pending"` return the current invitation as-is
-     (200, no side effects — idempotent re-response per PRD §12); otherwise count prior
-     `status = 'denied'` rows for that member+service_week, set this row's
-     `denial_count = count + 1`, update `status/denial_reason/denial_count/responded_at`,
-     write an `invitation.denied` audit log (metadata omits the raw reason text, only
-     `reason_provided: boolean`), and return the updated invitation. Left a
-     `TODO(#67/#68)` comment for the deferred SMS/email dispatch to the inviting admin, per
-     spec's precedent from `createInvitation`.
-  2. Added the BR-08 send-guard inside `createInvitation`, immediately after the existing
-     `!week` 404 check and before the BR-05 double-booking check: counts
-     `status = 'denied'` invitations for `(userId, serviceWeekId)`; if `>= 3`, returns
-     409 CONFLICT ("Member has denied 3 invitations for this week and cannot be
-     re-invited (BR-08)") without touching any later branch. Purely additive — no existing
-     `createInvitation` behavior/branch order changed.
+- **`lib/supabase/types.ts`** — added `EventType` to the existing
+  `@/types/domain` import, and added a `get_invitation_by_token` entry to
+  `Database["public"]["Functions"]` alongside `accept_invitation`, typed with
+  the RPC's snake_case `Args`/`Returns` shape.
 
-- `app/api/invitations/[id]/deny/route.ts` — replaced the `notImplemented(...)` stub with a
-  real `POST` handler wired to `denyInvitation`, following the `params: Promise<{id:string}>`
-  pattern from `app/api/service-weeks/[id]/cancel/route.ts`.
+- **`schemas/invitations.ts`** — added `respondTokenParamSchema`, the same
+  64-char-hex `z.string().length(64).regex(/^[0-9a-f]{64}$/)` shape as
+  `acceptInvitationParamSchema`'s token, used to validate the route param
+  before ever calling the RPC.
 
-- `tests/unit/app/api/invitations-deny-route.test.ts` (new) — unit tests, mock scaffolding
-  copied in style from `tests/unit/app/api/invitations-route.test.ts` (jest.mock of
-  `@clerk/nextjs/server` + `@/lib/supabase/client`, `makeReq`/`makeLookup`/`setUpAuth`/
-  `makeChain`/`makeSupabaseClient` helpers). Covers:
-  - 401 (no JWT; Clerk userId null with lookup never consulted)
-  - 404 (invitation not found / not owned by caller)
-  - 400 (`reason` > 200 chars; `reason` not a string)
-  - happy path pending → denied: `status`/`denial_reason`/`denial_count=1` set, and
-    `invitation.denied` audit rpc call asserted with expected metadata shape
-  - empty-body and whitespace-only-reason deny → `denial_reason` stored as `null`, not a 400
-  - idempotent already-denied invitation → 200, no `update`/`rpc` call at all
-  - `denial_count` becomes 2 when one prior denied row exists for the same member+week
-  - 500 when the invitation lookup query errors
-  - BR-08 send guard on `createInvitation`: 409 when 3 denied rows already exist for
-    member+week, and 201 when only 2 exist (guard does not over-trigger)
+- **`app/api/invitations/handler.ts`** — added `EventType` to the existing
+  `@/types/domain` type import and `respondTokenParamSchema` to the existing
+  `@/schemas/invitations` import block. Added:
+  - `export type PublicInvitationLookup` — the camelCase response shape
+    (`invitationId`, `status`, `roleNote`, `responseDeadline`, `serviceWeek`,
+    `events[]`).
+  - `export async function getInvitationByToken(token: string): Promise<Response>`
+    — validates the token format first (anti-enumeration: a malformed token
+    returns the byte-identical 404 as an unknown-but-well-formed one, without
+    ever calling the RPC or `getAnonSupabaseClient`); on valid format, calls
+    `get_invitation_by_token` via `getAnonSupabaseClient()`, maps `NOT_FOUND`
+    RPC errors to 404, any other RPC error to 500 `INTERNAL`, and on success
+    maps the snake_case RPC payload to `PublicInvitationLookup`. Does **not**
+    call `requireAuth`, `auth()`, or `getSupabaseClient` — no session by
+    design.
+
+- **`app/api/invitations/respond/[token]/route.ts`** — replaced the
+  `notImplemented` stub with a thin `GET` handler that awaits `params` and
+  delegates to `getInvitationByToken`.
+
+- **`tests/unit/app/api/invitations-respond-route.test.ts`** (new) — mirrors
+  `invitations-accept-route.test.ts`'s mocking style (`jest.mock` on
+  `@/lib/supabase/client`, a `makeRpcClient({ data, error })` helper). No
+  Clerk/`auth()` mocking (this route never touches it). Covers every edge case
+  from the spec:
+  1. Happy path (pending) — 200, full camelCase body, asserts
+     `getAnonSupabaseClient` was called with the right RPC args.
+  2. Expired (still-pending, RPC-computed `status: "expired"`) — 200, not an
+     error code.
+  3. Already responded — parameterized over `accepted`/`denied`/`withdrawn` —
+     200 with the real status.
+  4. Unknown token (valid format, RPC raises `NOT_FOUND`) — 404
+     `{ error: "Not found", code: "NOT_FOUND" }`.
+  5. Malformed token, two variants (wrong length; non-hex) — asserts the
+     **identical** 404 body as case 4, and that `getAnonSupabaseClient` is
+     never called.
+  6. Empty events (`events: []` from RPC) — still 200, `events: []` in the
+     response.
+  7. Unexpected RPC error message — 500 `INTERNAL`.
+
+- **`.pipeline/spec.md`** — carried forward as-is from the Planning stage's
+  output for issue #44 (not authored by this stage).
+
+## Out of scope (per spec, not touched)
+
+- No changes to `acceptInvitation`/`denyInvitation` (#41/#42).
+- No Clerk/session handling added to this route.
+- Did not add `events` to `Database["public"]["Tables"]` — the RPC returns
+  events as jsonb, so only the `Functions` entry was needed.
+- No notification/SMS dispatch.
 
 ## Verification
 
-- `bun run lint` — clean (no errors/warnings).
-- `bun run typecheck` — clean (`tsc --noEmit`, no errors).
-- `bun run test` — all 26 suites / 339 tests pass, including the new tests in
-  `invitations-deny-route.test.ts`. No existing tests (e.g. `invitations-route.test.ts`,
-  `invitations-route.supplemental.test.ts`) were modified or broken by the new BR-08 guard
-  query added to `createInvitation` — their default fixture (`invitations.select` returns
-  `{ data: [], error: null }`) satisfies both the new deniedForWeek check and the
-  pre-existing acceptedInvitations check.
+- `bun run lint` — clean, no errors.
+- `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
+- `bun run test` (Jest) — full suite: **28 suites / 363 tests passed**,
+  including the new 10-test file for this route. Per the spec, the RPC body
+  itself has no live-DB test harness in this repo (same as
+  `accept_invitation`) — correctness is verified via the route tests that
+  mock its return values.
 
-## Notes for the Tester
+## What the Tester should focus on
 
-- The spec's OPEN QUESTIONS section documents non-blocking design decisions already baked
-  into this implementation (no `requireRole` on deny; deferred notification dispatch;
-  "slot reopens" needs no extra code since there's no `slots` table). These are not gaps —
-  verify behavior matches, not that they were left undone.
-- Worth double-checking against real Supabase behavior (not just mocks): the BR-08
-  denial-count query is scoped to `(user_id, service_week_id)` across all invitation rows
-  regardless of `church_group_id`/`id`, matching the spec's exact query; and the deny
-  handler's ownership scoping (`id` + `church_group_id` + `user_id`) really does make
-  cross-user/cross-group/nonexistent ids indistinguishable (all 404).
-- Two unrelated files (`.claude/workflows/handle-issues.js`, `.pipeline/test-results.md`)
-  show as modified/stale in `git status` in this worktree but were **not touched by this
-  stage** and are intentionally left out of the commit — they predate this session and are
-  orchestration/pipeline-history artifacts, not part of issue #42's scope. `.pipeline/spec.md`
-  is the Planning stage's own output and is committed as-is (unmodified by this stage).
+- The anti-enumeration guarantee: cases 4 and 5 in the new test file assert
+  byte-identical response bodies (`{ error: "Not found", code: "NOT_FOUND" }`,
+  status 404) for both a well-formed-but-unknown token and a malformed one —
+  worth double-checking this holds if the route or handler is touched again.
+- The `"expired"` status is intentionally HTTP 200, not a 4xx/5xx — confirm no
+  downstream assumption treats it as an error.
+- The RPC's own logic (expiry computation, `coalesce` to `'[]'` for no events,
+  `SECURITY DEFINER`/`STABLE`/`search_path` hardening) is not exercised by any
+  automated test in this repo — it was checked by direct code review against
+  the `accept_invitation` migration's established pattern.

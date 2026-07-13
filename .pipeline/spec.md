@@ -1,233 +1,286 @@
-# Spec: Issue #42 — Deny invitation with reason (POST /api/invitations/:id/deny, BR-08 denial cap)
+# Spec — Issue #44: Token-based public invitation lookup
 
-## OPEN QUESTIONS
+`GET /api/invitations/respond/:token` — a **no-session, no-Clerk-auth** read-only
+endpoint that returns an invitation's details to someone tapping an SMS/email
+link. Token possession is the only credential (per #40).
 
-None are blocking. Design decisions made below (proceed with these unless a human overrides):
+## No OPEN QUESTIONS
 
-1. **Who may deny.** PRD §22 lists this endpoint's role as "Member / Guest" and §6.3 frames it as
-   the *invited* member responding to their *own* invitation (in-app path, PRD "In-app response").
-   Decision: any authenticated user may call it, but the query is scoped to the caller's own
-   invitation (`user_id = ctx.userId`). A non-owner (including a set_leader/admin acting on someone
-   else's invitation) simply matches no row → **404 NOT_FOUND**, matching this repo's existing
-   "never leak existence, always 404" convention (see `app/api/service-weeks/[id]/handler.ts`).
-   No `requireRole` call — an invited admin can deny "as any member would" (PRD §11).
+The design is fully determined by existing patterns. In particular the "clear
+expired state, not a generic error" criterion is satisfied by returning HTTP 200
+with a computed `status: "expired"` (the `expired` value already exists in the
+`InvitationStatus` union in `types/domain.ts` even though it is not a DB enum
+value — it is an API-only, derived state). Do not invent a new error code for it.
 
-2. **Notification dispatch is deferred.** AC says admin gets SMS + email "once #67/#68 exist"; they
-   do not exist yet. Mirror the precedent set by `createInvitation` (issue #40), which left this as
-   a `TODO(#67/#68)` comment and created **no** notification row. This issue does the same: audit
-   log is written, actual SMS/email/in-app fan-out is a `TODO(#67/#68)`. Do not invent a
-   notification insert.
+## Background the coder must know
 
-3. **"Slot reopens" requires no new code.** There is no `slots` table; roster/slot status is derived
-   from the `invitations` rows (a denied invitation no longer holds the slot). Setting
-   `status = 'denied'` fully satisfies "slot reopens." Likewise "no event_attendees or calendar
-   entries created on denial" is satisfied by simply not creating any — there is nothing to delete.
+- Direct table reads are impossible here: RLS on `invitations`, `service_weeks`,
+  and `events` grants SELECT only `TO authenticated`, tenant-scoped
+  (`supabase/migrations/20260704000001_rls_policies.sql`). A no-session caller is
+  the Postgres `anon` role and can read none of it.
+- The accept path solved the identical problem: a `SECURITY DEFINER` RPC
+  authenticated by the token, invoked through `getAnonSupabaseClient()`. Copy that
+  pattern. Reference files:
+  - RPC to copy from: `supabase/migrations/20260712000001_accept_invitation_rpc.sql`
+  - Handler to copy from: `acceptInvitation` in `app/api/invitations/handler.ts`
+    (the `responseToken !== undefined` / `getAnonSupabaseClient()` branch and the
+    RPC-error-message → HTTP mapping).
+  - Route to copy from: `app/api/invitations/[id]/accept/route.ts`.
+  - Test to copy from: `tests/unit/app/api/invitations-accept-route.test.ts`.
 
-## Current state (already in place — do NOT recreate)
+## Files to create / modify
 
-- `app/api/invitations/[id]/deny/route.ts` exists but is a `notImplemented("...")` stub.
-- `app/api/invitations/handler.ts` already implements `createInvitation` and exports
-  `toInvitationResponse(row)` + the `InvitationResponse` type — reuse both.
-- DB columns already exist (migration `20260702000003_cluster_3_scheduling_core.sql`):
-  `invitations.status`, `denial_reason text`, `denial_count integer not null default 0`,
-  `responded_at timestamptz`. The Update type `Database["public"]["Tables"]["invitations"]["Update"]`
-  is `Partial<InvitationsRow>`, so all these fields are assignable.
-- `InvitationStatus` union (`types/domain.ts`) already includes `"denied"`.
-- `schemas/invitations.ts` already has `createInvitationSchema`; add the new deny schema alongside it.
+### 1. `supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql` (CREATE)
 
-## Files to change
+A new `SECURITY DEFINER` function, structured exactly like
+`accept_invitation` (same header comment style, `SET search_path = ''`, `P0001`
+error via `RAISE EXCEPTION 'NOT_FOUND'`, and a matching `-- ============ DOWN`
+section). Differences: it is read-only, so mark it `STABLE` (not `VOLATILE`) and
+do NOT mutate anything.
 
-### 1. `schemas/invitations.ts` — add deny body schema
+```sql
+CREATE OR REPLACE FUNCTION public.get_invitation_by_token(p_response_token text)
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  STABLE
+  SET search_path = ''
+AS $$
+DECLARE
+  v_inv    public.invitations%ROWTYPE;
+  v_week   public.service_weeks%ROWTYPE;
+  v_events jsonb;
+  v_status text;
+BEGIN
+  SELECT * INTO v_inv FROM public.invitations WHERE response_token = p_response_token;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'NOT_FOUND' USING ERRCODE = 'P0001';
+  END IF;
 
-Add (follow the style/comments of `createInvitationSchema` in the same file):
+  SELECT * INTO v_week FROM public.service_weeks WHERE id = v_inv.service_week_id;
 
-```ts
-// POST /api/invitations/:id/deny body (#42). reason is optional (max 200 chars,
-// PRD §6.3 / BR-08). An absent body or empty/whitespace-only reason both mean
-// "no reason" and are valid (NOT a 400) — the handler coerces them to null.
-export const denyInvitationSchema = z.object({
-  reason: z.string().trim().max(200).optional(),
-});
-export type DenyInvitationInput = z.infer<typeof denyInvitationSchema>;
+  SELECT coalesce(
+    jsonb_agg(
+      jsonb_build_object(
+        'id',         e.id,
+        'type',       e.type,
+        'name',       e.name,
+        'location',   e.location,
+        'start_time', e.start_time,
+        'end_time',   e.end_time
+      ) ORDER BY e.start_time
+    ),
+    '[]'::jsonb
+  )
+  INTO v_events
+  FROM public.events e
+  WHERE e.service_week_id = v_inv.service_week_id;
+
+  -- Computed "expired" state: only a still-pending invitation past its deadline.
+  -- Already-responded rows keep their real status (accepted/denied/withdrawn).
+  IF v_inv.status = 'pending'
+     AND v_inv.response_deadline IS NOT NULL
+     AND now() > v_inv.response_deadline THEN
+    v_status := 'expired';
+  ELSE
+    v_status := v_inv.status;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'invitation_id',     v_inv.id,
+    'status',            v_status,
+    'role_note',         v_inv.role_note,
+    'response_deadline', v_inv.response_deadline,
+    'service_week', jsonb_build_object(
+      'id',           v_week.id,
+      'service_date', v_week.service_date,
+      'title',        v_week.title
+    ),
+    'events', v_events
+  );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.get_invitation_by_token(text) TO anon, authenticated;
 ```
 
-Note: do NOT use `.min(1)` — an empty reason must be accepted, not rejected.
+Include the commented DOWN line:
+`-- DROP FUNCTION IF EXISTS public.get_invitation_by_token(text);`
 
-### 2. `app/api/invitations/handler.ts` — add `denyInvitation`
+### 2. `lib/supabase/types.ts` (MODIFY)
 
-Add a new exported function. Copy the structure of `createInvitation` (same imports, same
-`try/catch` → `ApiException`/`fail` tail, same `auth()`→`getToken({template:"supabase"})`→
-`getSupabaseClient(jwt)` sequence). Signature:
+Add one entry to `Database["public"]["Functions"]` (alongside `accept_invitation`).
+The RPC returns `jsonb`; type its `Returns` as the snake_case shape above:
 
 ```ts
-export async function denyInvitation(
-  req: NextRequest,
-  id: string,
-  lookup?: UserLookup,
-): Promise<Response>
+get_invitation_by_token: {
+  Args: { p_response_token: string };
+  Returns: {
+    invitation_id: string;
+    status: InvitationStatus;
+    role_note: string | null;
+    response_deadline: string | null;
+    service_week: { id: string; service_date: string; title: string | null };
+    events: Array<{
+      id: string;
+      type: EventType;
+      name: string;
+      location: string | null;
+      start_time: string;
+      end_time: string;
+    }>;
+  };
+};
 ```
 
-Import `denyInvitationSchema` from `@/schemas/invitations`.
+`InvitationStatus` is already imported at the top of this file. Add `EventType`
+to that same import from `@/types/domain`.
 
-Logic, in order:
+### 3. `app/api/invitations/handler.ts` (MODIFY — add one exported function)
 
-1. `const ctx = await requireAuth(req, lookup);` (NO `requireRole` — see OPEN QUESTION 1).
-2. Parse body tolerantly:
-   ```ts
-   const body = await req.json().catch(() => null);
-   const parsedResult = denyInvitationSchema.safeParse(body ?? {});
-   if (!parsedResult.success) return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
-   const rawReason = parsedResult.data.reason;
-   const reason = rawReason && rawReason.length > 0 ? rawReason : null;
-   ```
-   (Passing `body ?? {}` makes a missing/empty POST body valid → reason `null`.)
-3. Get jwt; if none → `fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`. Build `supabase`.
-4. Fetch the caller's own invitation:
-   ```ts
-   const { data: inv, error: invError } = await supabase
-     .from("invitations")
-     .select("*")
-     .eq("id", id)
-     .eq("church_group_id", ctx.churchGroupId)
-     .eq("user_id", ctx.userId)
-     .maybeSingle();
-   ```
-   - `invError` → `fail("Internal error", ErrorCode.INTERNAL, 500)`.
-   - `!inv` → `fail("Not found", ErrorCode.NOT_FOUND, 404)`.
-5. **Idempotency** (PRD §12 "link used after already responding → return current status, no side
-   effects"): if `inv.status !== "pending"`, return `ok({ invitation: toInvitationResponse(inv) })`
-   (200) with NO update, NO count change, NO audit write. Covers already-denied, already-accepted,
-   withdrawn, and expired.
-6. **BR-08 denial_count** (per-week, across invitation rows — see Implementation Notes on the issue:
-   "increment on each new invitation+deny pair, not globally per member"): count prior denied
-   invitations for this member+week, then this one is `+1`:
-   ```ts
-   const { data: priorDenied, error: priorError } = await supabase
-     .from("invitations")
-     .select("id")
-     .eq("user_id", inv.user_id)
-     .eq("service_week_id", inv.service_week_id)
-     .eq("status", "denied");
-   if (priorError) return fail("Internal error", ErrorCode.INTERNAL, 500);
-   const denialCount = (priorDenied ?? []).length + 1;
-   ```
-7. Update this row to denied:
-   ```ts
-   const patch: Database["public"]["Tables"]["invitations"]["Update"] = {
-     status: "denied",
-     denial_reason: reason,
-     denial_count: denialCount,
-     responded_at: new Date().toISOString(),
-   };
-   const { data: updated, error: updateError } = await supabase
-     .from("invitations")
-     .update(patch)
-     .eq("id", id)
-     .eq("church_group_id", ctx.churchGroupId)
-     .eq("user_id", ctx.userId)
-     .select("*")
-     .maybeSingle();
-   ```
-   - `updateError` → 500 INTERNAL. `!updated` → 404 NOT_FOUND.
-8. Audit log (reuse `writeAuditLog`, mirror the `invitation.sent` call in `createInvitation`):
-   ```ts
-   await writeAuditLog(supabase, {
-     action: "invitation.denied",
-     entityType: "invitation",
-     entityId: id,
-     metadata: {
-       service_week_id: inv.service_week_id,
-       denial_count: denialCount,
-       reason_provided: reason !== null,
-     },
-   });
-   ```
-   Do NOT put the raw reason text in the audit metadata.
-9. `// TODO(#67/#68): dispatch SMS + email to invited_by (admin) with member name and reason.`
-10. Return `ok({ invitation: toInvitationResponse(updated) })` (200).
+Add a response type and handler. Do NOT call `requireAuth`, `auth()`, or
+`getSupabaseClient` — this path has no session by design.
 
-### 3. `app/api/invitations/[id]/deny/route.ts` — wire the route
+```ts
+export type PublicInvitationLookup = {
+  invitationId: string;
+  status: InvitationStatus;
+  roleNote: string | null;
+  responseDeadline: string | null;
+  serviceWeek: { id: string; serviceDate: string; title: string | null };
+  events: Array<{
+    id: string;
+    type: EventType;
+    name: string;
+    location: string | null;
+    startTime: string;
+    endTime: string;
+  }>;
+};
 
-Replace the stub. Follow `app/api/service-weeks/[id]/cancel/route.ts` exactly:
+export async function getInvitationByToken(token: string): Promise<Response> {
+  // Anti-enumeration: a malformed token must return the SAME 404 as an unknown
+  // one, so an attacker cannot distinguish "wrong format" from "not found".
+  const parsed = respondTokenParamSchema.safeParse(token);
+  if (!parsed.success) {
+    return fail("Not found", ErrorCode.NOT_FOUND, 404);
+  }
+
+  try {
+    const supabase = getAnonSupabaseClient();
+    const { data, error } = await supabase.rpc("get_invitation_by_token", {
+      p_response_token: parsed.data,
+    });
+
+    if (error) {
+      if ((error.message ?? "").includes("NOT_FOUND")) {
+        return fail("Not found", ErrorCode.NOT_FOUND, 404);
+      }
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    return ok<PublicInvitationLookup>({
+      invitationId: data.invitation_id,
+      status: data.status,
+      roleNote: data.role_note,
+      responseDeadline: data.response_deadline,
+      serviceWeek: {
+        id: data.service_week.id,
+        serviceDate: data.service_week.service_date,
+        title: data.service_week.title,
+      },
+      events: data.events.map((e) => ({
+        id: e.id,
+        type: e.type,
+        name: e.name,
+        location: e.location,
+        startTime: e.start_time,
+        endTime: e.end_time,
+      })),
+    });
+  } catch {
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+```
+
+Add `EventType` to the existing `import type { InvitationStatus } from "@/types/domain"`
+line, and import `respondTokenParamSchema` from `@/schemas/invitations` (add it to
+the existing schema import block). `getAnonSupabaseClient`, `ok`, `fail`,
+`ErrorCode` are already imported in this file.
+
+### 4. `schemas/invitations.ts` (MODIFY)
+
+Add, next to `acceptInvitationParamSchema` (reuse its exact token shape):
+
+```ts
+// GET /api/invitations/respond/:token param (#44). Same 64-char hex shape as the
+// response_token. On mismatch the route returns 404 (NOT 400) — see handler note.
+export const respondTokenParamSchema = z
+  .string()
+  .length(64)
+  .regex(/^[0-9a-f]{64}$/);
+```
+
+### 5. `app/api/invitations/respond/[token]/route.ts` (REPLACE the stub)
 
 ```ts
 import { NextRequest } from "next/server";
-import { denyInvitation } from "../../handler";
+import { getInvitationByToken } from "../../handler";
 
-type Ctx = { params: Promise<{ id: string }> };
+type Ctx = { params: Promise<{ token: string }> };
 
-export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
-  const { id } = await params;
-  return denyInvitation(req, id);
+export async function GET(_req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { token } = await params;
+  return getInvitationByToken(token);
 }
 ```
 
-(`../../handler` resolves from `app/api/invitations/[id]/deny/` to `app/api/invitations/handler.ts`.)
+Remove the `notImplemented` import.
 
-### 4. `app/api/invitations/handler.ts` — enforce the BR-08 cap on the SEND path
+### 6. `tests/unit/app/api/invitations-respond-route.test.ts` (CREATE)
 
-AC #3 requires that "after 3 denials for the same week, no further invites can be sent to that
-member for that week." That enforcement belongs in `createInvitation` (the send path). Add a guard
-**after** the service-week lookup (the `if (!week)` 404 block) and **before** the BR-05
-double-booking check:
+Mirror `invitations-accept-route.test.ts`: mock `@/lib/supabase/client`
+(`getAnonSupabaseClient`) and use a `makeRpcClient({ data, error })` helper.
+Import `getInvitationByToken` from `@/app/api/invitations/handler`. Do NOT mock
+or expect `@clerk/nextjs/server` auth to be called. Use a valid token
+`"a".repeat(64)`. Cover every edge case below.
 
-```ts
-// BR-08 (PRD §8): a member who has denied 3 invitations for this service week
-// cannot be re-invited for it.
-const { data: deniedForWeek, error: deniedError } = await supabase
-  .from("invitations")
-  .select("id")
-  .eq("user_id", parsed.userId)
-  .eq("service_week_id", parsed.serviceWeekId)
-  .eq("status", "denied");
-if (deniedError) return fail("Internal error", ErrorCode.INTERNAL, 500);
-if ((deniedForWeek ?? []).length >= 3) {
-  return fail(
-    "Member has denied 3 invitations for this week and cannot be re-invited (BR-08)",
-    ErrorCode.CONFLICT,
-    409,
-  );
-}
-```
+## Edge cases the implementation MUST handle
 
-This is additive and must not alter any existing `createInvitation` behavior/branch above it.
+1. **Happy path (pending):** RPC returns `status: "pending"` with a populated
+   `service_week` and `events` array → 200; body maps to camelCase
+   (`serviceWeek.serviceDate`, `events[].startTime`, etc.); uses
+   `getAnonSupabaseClient`.
+2. **Expired (>72h, still pending):** RPC returns `status: "expired"` → HTTP 200
+   (NOT an error code), with the invitation details still present.
+3. **Already responded:** RPC returns the real `status` (`"accepted"` /
+   `"denied"` / `"withdrawn"`) → 200 with that status (per #51 semantics).
+4. **Unknown token (valid format, no row):** RPC raises `NOT_FOUND` →
+   404 `{ error: "Not found", code: "NOT_FOUND" }`.
+5. **Malformed token (bad length / non-hex):** handler returns the **identical**
+   404 `{ error: "Not found", code: "NOT_FOUND" }` WITHOUT calling the RPC or
+   `getAnonSupabaseClient`. The message/code/status must be byte-identical to
+   case 4 so format-validity is not leaked (acceptance criterion).
+6. **Empty events:** week with no events yet → `events: []` (RPC `coalesce` to
+   `'[]'`), still 200.
+7. **Unexpected RPC error:** any non-`NOT_FOUND` error message → 500
+   `INTERNAL`.
 
-## Edge cases the implementation must handle
+## Explicitly OUT OF SCOPE (do not implement)
 
-- **No JSON / empty body** on deny → valid, `reason = null`, proceeds to deny.
-- **`reason` > 200 chars** (after trim) → 400 VALIDATION_FAILED. **`reason` present but not a string**
-  (e.g. `{ reason: 123 }`) → 400.
-- **Empty / whitespace-only reason** → accepted, stored as `null` (NOT 400).
-- **Unauthenticated** (no Clerk user, or no supabase JWT) → 401 UNAUTHENTICATED.
-- **Invitation id not found, in another group, or belonging to another user** → 404 NOT_FOUND
-  (indistinguishable by design; never 403, never leak existence).
-- **Already responded** (`status` is `denied`/`accepted`/`withdrawn`/`expired`) → 200 with the
-  current invitation, no side effects (no re-increment, no re-audit).
-- **denial_count accumulation** — 1st ever denial for member+week → `denial_count = 1`; a later new
-  invitation for the same member+week that is denied → `denial_count = 2`; then `3`. Count is derived
-  from existing `status = 'denied'` rows for that member+week, NOT from the row's own default 0.
-- **BR-08 cap on send** — the 4th send attempt (after 3 denials exist for member+week) → 409 CONFLICT
-  from `createInvitation`. The 1st–3rd sends still succeed.
-- **No `event_attendees` / calendar / `conflicts` rows** are created or touched on denial.
+- Accept/deny mutations (#41/#42 — already done in `acceptInvitation` /
+  `denyInvitation`; this issue is read-only).
+- Any Clerk/session handling on this route.
+- Adding the `events` table to `Database["public"]["Tables"]` — the RPC returns
+  events as JSON, so only the `Functions` entry is needed. Do not widen types
+  beyond what is specified.
+- Notification/SMS dispatch.
 
-## Patterns to copy (name the file)
+## Verification before finishing (Coding stage)
 
-- Single-resource status mutation + audit + `try/catch` tail: `app/api/service-weeks/[id]/handler.ts`
-  (`setServiceWeekCancelled`, `updateServiceWeek`).
-- Handler skeleton, `auth()`→jwt→`getSupabaseClient`, `writeAuditLog` usage, `toInvitationResponse`:
-  `app/api/invitations/handler.ts` (`createInvitation`).
-- Route file with `params: Promise<{ id: string }>`: `app/api/service-weeks/[id]/cancel/route.ts`.
-- Deny schema style: `createInvitationSchema` in `schemas/invitations.ts`.
-
-## Tests
-
-Add a unit test file `tests/unit/app/api/invitations-deny-route.test.ts`, copying the mock
-scaffolding style of `tests/unit/app/api/invitations-route.test.ts` (the `makeReq`, `makeLookup`,
-`setUpAuth`, `makeChain`/`makeSupabaseClient` helpers, and `jest.mock` of `@clerk/nextjs/server` +
-`@/lib/supabase/client`). Cover at minimum: 401 (no JWT), 404 (not owner / not found), 400 (reason
-too long), happy path pending→denied sets `status='denied'`/`denial_reason`/`denial_count=1` and
-writes `invitation.denied` audit, empty-body deny (reason null), idempotent already-denied returns
-200 with no update/audit, `denial_count` becomes 2 when one prior denied row exists, and the BR-08
-send guard (`createInvitation` returns 409 when 3 denied rows already exist for member+week).
-
-Verify with `bun run lint`, `bun run typecheck`, and `bun run test` before finishing.
+Run `bun run lint`, `bun run typecheck`, and `bun run test` (Jest). The RPC
+itself has no DB test harness in this repo (the `accept_invitation` RPC is
+likewise only exercised through mocked-client route tests), so RPC-body
+correctness is verified by review + the route tests that mock its return values —
+do not add a live-DB test.

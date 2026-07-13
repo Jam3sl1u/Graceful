@@ -7,6 +7,7 @@
 // so that from().select().eq().maybeSingle() returns typed data.
 
 import type {
+  EventType,
   InvitationStatus,
   NotificationType,
   ResolutionType,
@@ -333,6 +334,24 @@ export type Database = {
           status: InvitationStatus;
           already_responded: boolean;
           attendees_added: number;
+        };
+      };
+      get_invitation_by_token: {
+        Args: { p_response_token: string };
+        Returns: {
+          invitation_id: string;
+          status: InvitationStatus;
+          role_note: string | null;
+          response_deadline: string | null;
+          service_week: { id: string; service_date: string; title: string | null };
+          events: Array<{
+            id: string;
+            type: EventType;
+            name: string;
+            location: string | null;
+            start_time: string;
+            end_time: string;
+          }>;
         };
       };
     };
