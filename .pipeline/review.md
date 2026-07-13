@@ -1,52 +1,60 @@
-# Review — Issue #44: Token-based public invitation lookup
+# Review — Issue #49: Invitation Response screen (mobile, no-login)
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-Reviewed the actual diff for commit `8563bbb` (not just the summaries), re-ran
-`bun run typecheck` (clean) and `bun run test` (29 suites / 368 tests pass), and
-cross-checked correctness beyond green tests.
+Independently verified in the pinned worktree
+(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-49`):
+`bun run lint` clean, `bun run typecheck` clean, `bun run test` = 33 suites /
+407 tests passing (0 failures). Read the full diff (`git diff main...HEAD`),
+not just the summaries.
 
-## What was verified
+## What I checked and found correct
 
-- **Matches spec.** All six files match the spec's code samples near-verbatim:
-  the `get_invitation_by_token` RPC (STABLE / SECURITY DEFINER / `search_path=''`,
-  `P0001` NOT_FOUND raise, `coalesce` to `'[]'` for events, computed `expired`
-  only for still-pending past-deadline rows, GRANT to anon+authenticated,
-  commented DOWN line), the `lib/supabase/types.ts` Functions entry, the schema,
-  the handler, and the thin route wrapper.
-- **Security / anti-enumeration is real, not superficial.** Malformed tokens
-  return the byte-identical `{ error: "Not found", code: "NOT_FOUND" }` 404 as
-  unknown-but-valid tokens, and the RPC / `getAnonSupabaseClient` are never
-  reached on a malformed token. Confirmed by the route tests (two malformed
-  variants asserting `not.toHaveBeenCalled()`) and the supplemental deep-equal
-  test. No Clerk/session/`requireAuth` on this path, by design (#40).
-- **No false-404 risk on real tokens.** `respondTokenParamSchema`
-  (`.length(64).regex(/^[0-9a-f]{64}$/)`) is the exact shape the already-shipped
-  #41 no-session accept path uses to validate `responseToken`, so genuine
-  lowercase-hex `response_token` values pass validation. The lowercase-only
-  regex is intentional and consistent with the existing path.
-- **Tests are meaningful.** The route test covers all 7 spec edge cases (happy,
-  expired→200, already-responded parameterized over accepted/denied/withdrawn,
-  unknown→404, two malformed variants, empty events, unexpected error→500) and
-  asserts the actual camelCase mapping, not just status codes. The Tester's
-  supplemental file adds genuine gaps (deep-equal anti-enumeration, uppercase-hex
-  404, client-construction throw → 500, promise-rejection → 500, null
-  pass-through).
-- **Scope is clean.** The #44 commit touches only the intended files plus the
-  pipeline artifacts; no scope creep, no unrelated refactors. (The deny-route and
-  async-agent-flow docs appearing in a `main...HEAD` three-dot diff are from
-  already-merged PRs #128/#129, not this issue's commit.)
+- **Component (`invite-response.tsx`)** matches spec Sections 3.1-3.4: view
+  state machine (loading/ready/unavailable/accepted-success/declined-success),
+  no-session lookup on mount, reveal-then-confirm decline with a "Keep it"
+  back-out, in-flight button disabling, `maxLength={200}` textarea, and #51
+  behavior — expired/used/unknown/500 never surface a raw `error`/`code`/HTTP
+  status. Reuses `InvitationStatus`/`EventType` from `@/types/domain` as asked.
+- **No-session deny backend (spec Section 5, per the human's Option A
+  resolution)** — the new `deny_invitation` RPC is a faithful, line-for-line
+  mirror of `accept_invitation_rpc.sql`: SECURITY DEFINER, `SET search_path =
+  ''`, token-or-JWT authorization, graceful already-responded short-circuit
+  before the expiry check, BR-08 `denial_count`, notify block, direct
+  `audit_logs` insert, `GRANT ... TO anon, authenticated`. Handler token
+  branch maps errors exactly like accept (NOT_FOUND/FORBIDDEN/EXPIRED/500).
+- **Handler reorder** (body-parse before `requireAuth`) is behavior-preserving
+  for the authenticated path — confirmed by the 13 pre-existing deny tests
+  still green plus an explicit reorder spot-check. Auth for the no-token path
+  is still enforced (401), and the token path is authenticated inside the RPC.
+- **Middleware** — both new public routes are additive; the authenticated deny
+  path still self-enforces via `requireAuth`, same pattern as `.../accept`.
+- **Green Accept button** — `.acceptButton` overrides background via the
+  `className` the `Button` component appends after its variant class; the
+  shared `--color-accent` token is untouched. Buttons are full-width, 56px
+  min-height (>= 44px A-08).
+- **Tests are meaningful, not superficial** — the component test covers happy
+  path, all named Section 7 edge cases (empty events, null fields,
+  already-responded on load vs. re-tap, expired-on-load vs. 410-on-submit,
+  double-tap guard, non-terminal 500 stays on ready), and asserts raw codes
+  are never rendered. The deny-route-token test covers happy path, null-reason
+  coercion, validation (bad token, >200 reason), full error mapping, and that
+  the token branch never falls through to Clerk.
 
-## Notes (non-blocking)
+## Non-blocking notes (for the orchestrator / human, not fixes)
 
-- The RPC body itself has no live-DB test harness in this repo — consistent with
-  the `accept_invitation` precedent and explicitly out of scope per spec. RPC
-  correctness rests on code review against the established pattern, which holds.
-- Handler does not null-guard `data` before `data.invitation_id`; the RPC never
-  returns null on success (it raises on not-found), and any surprise null would
-  fall through to the outer `try/catch` → 500. Acceptable.
-- Malformed-vs-unknown paths differ in latency (malformed short-circuits before
-  the DB round-trip). The spec's acceptance criterion is body-identity only,
-  which is met; a timing side-channel is out of scope.
-
-Ship it. Human still owns the final PR-diff sign-off and merge.
+- The two tester files (`tests/unit/app/invite-response.test.tsx`,
+  `tests/unit/app/api/invitations-deny-route-token.test.ts`) are still
+  UNTRACKED at review time — they are not in commit c9c5bee (which is the
+  Coding stage's commit). This is expected at this pipeline point, but the
+  orchestrator MUST commit them (and the updated `test-results.md`) as part of
+  shipping; otherwise the branch ships source without its tests. Worth an
+  explicit check given this repo's history of silent handoff loss.
+- No live-SQL/RPC test harness and no middleware integration test exist —
+  pre-existing repo-wide gaps, not introduced here. The RPC and middleware
+  changes were verified by static review against the established accept
+  pattern only.
+- Minor: in `handleAccept`/`handleDeclineConfirm`, a 200 response with
+  `alreadyResponded: false` and an unexpected non-terminal status is a silent
+  no-op (stays on `ready`, no error). Not reachable given the RPC contract;
+  noting for completeness, not a fix.

@@ -1,104 +1,125 @@
-# Test Results — Issue #44: Token-based public invitation lookup
+# Test Results — Issue #49: Invitation Response screen (mobile, no-login)
 
 ## Verdict: PASS
 
 All checks re-run independently in the pinned worktree
-(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-44`, branch
-`issue-44-token-based-public-invitation-lookup`), confirmed clean, and
-cross-checked against `.pipeline/spec.md` line by line (RPC SQL,
-`lib/supabase/types.ts`, `schemas/invitations.ts`,
-`app/api/invitations/handler.ts`, `app/api/invitations/respond/[token]/route.ts`).
-Implementation matches the spec's code samples closely (near-verbatim in
-several places). This file overwrites a stale leftover from a prior issue
-(#42) that was still sitting at this path.
+(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-49`) using Bun,
+per AGENTS.md. No source files were changed by this stage — only two new
+test files were added. This file overwrites the stale leftover from a prior
+issue (#44) that was still sitting at this path.
 
-## Commands re-run
+## Commands run
 
-- `bun run lint` — clean, no errors/warnings.
+- `bun run lint` (`eslint .`) — clean, no errors.
 - `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
-- `bun run test` (Jest, full suite) — **29 suites / 368 tests passed** (the
-  coder's 28 suites / 363 tests, plus this stage's new supplemental file with
-  5 additional tests; no failures, no skips).
+- `bun run test` (Jest, full suite) — confirmed the pre-existing baseline of
+  **31 suites / 380 tests** passing before adding anything (matches the
+  Coding stage's claim in `changes.md`), then re-ran with the 2 new test
+  files added: **33 suites / 407 tests passed, 0 failures, 0 regressions**.
 
-## Independent verification performed
+## New test files written by this stage
 
-Read the actual diff (not just `changes.md`'s description) for every file
-listed:
-- `supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql` —
-  matches spec's SQL sample verbatim; `STABLE`/`SECURITY DEFINER`/
-  `SET search_path = ''`, `P0001` NOT_FOUND raise, coalesce to `'[]'` for
-  events, computed `expired` only for still-pending + past-deadline rows,
-  `GRANT ... TO anon, authenticated`, commented DOWN line present.
-- `lib/supabase/types.ts` — `EventType` added to the domain import,
-  `get_invitation_by_token` entry added to `Database["public"]["Functions"]`
-  with the spec's exact `Args`/`Returns` shape.
-- `schemas/invitations.ts` — `respondTokenParamSchema` added with the same
-  64-char lowercase-hex shape as `acceptInvitationParamSchema`'s token.
-- `app/api/invitations/handler.ts` — `getInvitationByToken` added exactly per
-  spec: validates format first (anti-enumeration), never calls `requireAuth`/
-  `auth()`/`getSupabaseClient`, uses `getAnonSupabaseClient()`, maps
-  `NOT_FOUND` → 404, other RPC errors → 500, success → camelCase
-  `PublicInvitationLookup`.
-- `app/api/invitations/respond/[token]/route.ts` — thin `GET` wrapper,
-  awaits `params`, delegates to the handler; `notImplemented` stub removed.
+- `tests/unit/app/api/invitations-deny-route-token.test.ts` (12 tests) —
+  covers the new no-session `responseToken` branch of `denyInvitation`
+  (`app/api/invitations/handler.ts`), mirroring the existing no-session
+  cases in `invitations-accept-route.test.ts`:
+  - Happy path: 200, `getAnonSupabaseClient` used, `getSupabaseClient`/Clerk
+    `auth()` never touched, RPC called with the right `p_invitation_id`/
+    `p_response_token`/`p_reason` params.
+  - Omitted reason is coerced to `null` before being passed to the RPC.
+  - Already-responded: `alreadyResponded: true` with the current (non-denied)
+    status passed through.
+  - Malformed `responseToken` (wrong length, non-hex) → 400
+    `VALIDATION_FAILED`, RPC never called.
+  - `reason` > 200 chars → 400 `VALIDATION_FAILED` even with an otherwise
+    valid token (failure case).
+  - RPC error-message mapping: `NOT_FOUND`→404, `FORBIDDEN`→403,
+    `EXPIRED`→410, unexpected message→500 `INTERNAL`.
+  - Token branch never falls through to the authenticated path (the
+    `lookup` callback and Clerk `auth()` are never invoked when a token is
+    present).
+  - Spot-check that the body-parse-before-`requireAuth` reorder didn't
+    change session-path behavior: no-token + no Clerk session still 401s
+    before ever calling `getSupabaseClient`/`getAnonSupabaseClient`.
+  - Re-ran the 13 pre-existing tests in `invitations-deny-route.test.ts`
+    (the authenticated in-app path) unmodified — still pass, confirming the
+    reorder is behavior-preserving there.
 
-## New test file written by this stage (Tester)
+- `tests/unit/app/invite-response.test.tsx` (15 tests) — covers the
+  `InviteResponse` client component
+  (`app/(public)/invite/[token]/invite-response.tsx`) with `fetch` mocked
+  directly, jsdom opted in via `/** @jest-environment jsdom */` per spec
+  Section 6:
+  - Loading state before the lookup resolves.
+  - Happy path: card renders role note / service week title / event
+    name+location from a pending lookup; Accept posts
+    `{ responseToken }` to `/accept` and lands on the accepted-success view
+    with a `/dashboard` link.
+  - Decline flow: tapping Decline does not submit (verified no second
+    fetch call fires); reveals a `maxLength=200` textarea + Confirm/Keep
+    it; Confirm posts `{ responseToken, reason }` to `/deny` and lands on
+    declined-success; "Keep it" cancels back to the two-button state
+    without ever submitting.
+  - Edge case: empty `events` → "Details coming soon", no crash.
+  - Edge case: null `roleNote`/`serviceWeek.title`/event `location` are all
+    omitted cleanly (spec Section 7).
+  - Edge case: already-responded on load (`status: "accepted"`) → friendly
+    unavailable view; raw status string never rendered.
+  - Edge case: `status: "expired"` on load → unavailable view.
+  - Edge case: re-tap after already responding (`alreadyResponded: true`
+    with a non-accepted status on the accept response) → unavailable view.
+  - Edge case: 410 on accept submission (expired-at-submit-time) →
+    unavailable view; raw `EXPIRED`/`410` never rendered.
+  - Edge case: double-tap guard — both buttons disable while an accept is
+    in flight; a second click on the now-disabled button does not issue a
+    second request (fetch call count stays at 2: initial lookup + one
+    accept).
+  - Failure case: network error (`fetch` rejects) on the initial lookup →
+    friendly unavailable view, not a crash or unhandled rejection.
+  - Failure case: 404 on the initial lookup → unavailable view; raw
+    `NOT_FOUND` code never rendered.
+  - Failure case: non-terminal error (500) on accept submission → inline
+    `role="alert"` message that does not leak `INTERNAL`/`500`, and the
+    screen stays on the `ready` view (card + both buttons still present).
 
-`tests/unit/app/api/invitations-respond-route.supplemental.test.ts` (5 tests,
-all passing) — closes gaps not exercised by the coder's own test file:
+## Manual / non-automated verification
 
-1. **Anti-enumeration, strengthened**: asserts the unknown-token response and
-   a malformed-token response are deep-equal *to each other* (status + body),
-   not just each separately matching a literal object. This is what the
-   acceptance criterion in the spec actually requires and is a stronger check
-   than the coder's two independent literal-equality assertions.
-2. **Case-sensitivity edge case**: an uppercase-hex token of the correct
-   length (`"A".repeat(64)`) is malformed under the regex
-   (`^[0-9a-f]{64}$`, lowercase only) and must 404 without ever calling
-   `getAnonSupabaseClient` — not in the spec's enumerated edge cases or the
-   coder's tests, but a real gap in the anti-enumeration surface if a caller
-   relied on case-insensitive matching.
-3. **Failure case A**: `getAnonSupabaseClient()` itself throwing
-   synchronously (e.g. missing env var) is caught by the handler's outer
-   `try/catch` and maps to 500 `INTERNAL`. Not covered by the coder's suite,
-   which only exercises RPC-level `{ error }` responses, not client
-   construction failures.
-4. **Failure case B**: the RPC call's promise *rejecting* (simulating a
-   network failure) rather than resolving with `{ data: null, error }` is
-   also caught and maps to 500 `INTERNAL`. Also not covered by the coder's
-   suite.
-5. **Null pass-through**: `roleNote`, `responseDeadline`, and
-   `serviceWeek.title` all pass through as `null` unchanged rather than being
-   coerced or dropped, confirming the mapping function's null-safety for
-   every nullable field in `PublicInvitationLookup`.
+- `middleware.ts` (`isPublicRoute`) was read directly and confirmed to list
+  both `"/api/invitations/respond/(.*)"` and `"/api/invitations/(.*)/deny"`
+  alongside the pre-existing `"/api/invitations/(.*)/accept"`, matching
+  spec Sections 4 and 5. This repo has no existing middleware unit-test
+  precedent (`find tests -iname '*middleware*'` returns nothing), so this
+  remains a static/config-level check, not an automated test.
+- `supabase/migrations/20260713000001_deny_invitation_rpc.sql` was read in
+  full and compared against `20260712000001_accept_invitation_rpc.sql`'s
+  established pattern (SECURITY DEFINER, `SET search_path = ''`,
+  token-or-JWT authorization, graceful already-responded short-circuit
+  before the expiry check, BR-08 `denial_count` computed the same way as
+  the handler's authenticated path, notify block, direct `audit_logs`
+  insert since `write_audit_log` needs a JWT, `GRANT EXECUTE ... TO anon,
+  authenticated`). Structurally sound and consistent with the accept RPC.
+  No live-SQL test harness exists in this repo for any RPC (same situation
+  the Coding stage flagged for `accept_invitation`/`get_invitation_by_token`
+  before it), so this remains a manual code-review-level check.
+- `jest.config.js` / `tests/mocks/css-module.js` changes (new `.tsx`
+  `testMatch` entry, CSS-module mock, automatic-JSX-runtime transform) were
+  exercised directly by `invite-response.test.tsx` (which would not run at
+  all without them) and confirmed not to affect the pre-existing 380
+  node-environment tests — full suite green with both old and new tests
+  together.
 
-## Spec edge cases re-verified as covered (by the coder's own test file, independently read and confirmed correct)
+## Gaps / things the Reviewer may want to weigh
 
-1. Happy path (pending) — 200, full camelCase body, `getAnonSupabaseClient`
-   called with correct RPC args. Confirmed.
-2. Expired (still-pending, RPC-computed `status: "expired"`) — 200, not an
-   error code. Confirmed.
-3. Already responded (`accepted`/`denied`/`withdrawn`, parameterized) — 200
-   with the real status. Confirmed.
-4. Unknown token (valid format, RPC `NOT_FOUND`) — 404
-   `{ error: "Not found", code: "NOT_FOUND" }`. Confirmed.
-5. Malformed token (wrong length; non-hex) — identical 404 body to case 4,
-   RPC never called. Confirmed, and strengthened by this stage's byte-
-   identical deep-equal test above.
-6. Empty events (`events: []`) — 200, `events: []` in response. Confirmed.
-7. Unexpected RPC error — 500 `INTERNAL`. Confirmed.
-
-## Not independently verifiable in this environment
-
-- The RPC SQL body itself (`get_invitation_by_token`) has no live-DB test
-  harness in this repo, consistent with `accept_invitation`'s precedent and
-  explicitly out of scope per spec ("do not add a live-DB test"). Correctness
-  was checked by direct line-by-line comparison against the spec's SQL
-  sample and the `accept_invitation` migration's established pattern
-  (`SECURITY DEFINER`, `STABLE`, `search_path` hardening, `P0001` error
-  code), not by execution.
+- No test exercises the real Supabase RPC SQL end-to-end — an existing,
+  repo-wide gap (no live-DB test harness), not specific to this change.
+- No middleware-level integration test exists (asserting an actual request
+  is let through/blocked by `clerkMiddleware`/`isPublicRoute`) — only
+  static confirmation that the route strings were added. This matches the
+  repo's pre-existing lack of middleware test coverage, not a new gap
+  introduced by this issue.
 
 ## Failure cases
 
-None. No test failures encountered in this run — original suite, and the
-5 new supplemental tests, all pass. Lint and typecheck are both clean.
+None. No test failures encountered in this run — the pre-existing suite
+plus the 27 new tests (12 + 15) all pass. Lint and typecheck are both
+clean.
