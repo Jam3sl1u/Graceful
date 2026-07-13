@@ -1,52 +1,80 @@
-# Review — Issue #44: Token-based public invitation lookup
+# Review — Issue #46: Conflict detection on availability change
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-Reviewed the actual diff for commit `8563bbb` (not just the summaries), re-ran
-`bun run typecheck` (clean) and `bun run test` (29 suites / 368 tests pass), and
-cross-checked correctness beyond green tests.
+The issue #46 implementation (commit 09b25ea) is correct, matches the spec
+line-for-line, and is backed by meaningful, green tests. I read the actual
+diff, the full `setAvailability` handler, the new migration, the original RPC
+it replaces, and the live table/enum/RLS schema it depends on — not just the
+summaries. Two non-blocking housekeeping items for the human are listed below.
 
-## What was verified
+## What I verified firsthand
 
-- **Matches spec.** All six files match the spec's code samples near-verbatim:
-  the `get_invitation_by_token` RPC (STABLE / SECURITY DEFINER / `search_path=''`,
-  `P0001` NOT_FOUND raise, `coalesce` to `'[]'` for events, computed `expired`
-  only for still-pending past-deadline rows, GRANT to anon+authenticated,
-  commented DOWN line), the `lib/supabase/types.ts` Functions entry, the schema,
-  the handler, and the thin route wrapper.
-- **Security / anti-enumeration is real, not superficial.** Malformed tokens
-  return the byte-identical `{ error: "Not found", code: "NOT_FOUND" }` 404 as
-  unknown-but-valid tokens, and the RPC / `getAnonSupabaseClient` are never
-  reached on a malformed token. Confirmed by the route tests (two malformed
-  variants asserting `not.toHaveBeenCalled()`) and the supplemental deep-equal
-  test. No Clerk/session/`requireAuth` on this path, by design (#40).
-- **No false-404 risk on real tokens.** `respondTokenParamSchema`
-  (`.length(64).regex(/^[0-9a-f]{64}$/)`) is the exact shape the already-shipped
-  #41 no-session accept path uses to validate `responseToken`, so genuine
-  lowercase-hex `response_token` values pass validation. The lowercase-only
-  regex is intentional and consistent with the existing path.
-- **Tests are meaningful.** The route test covers all 7 spec edge cases (happy,
-  expired→200, already-responded parameterized over accepted/denied/withdrawn,
-  unknown→404, two malformed variants, empty events, unexpected error→500) and
-  asserts the actual camelCase mapping, not just status codes. The Tester's
-  supplemental file adds genuine gaps (deep-equal anti-enumeration, uppercase-hex
-  404, client-construction throw → 500, promise-rejection → 500, null
-  pass-through).
-- **Scope is clean.** The #44 commit touches only the intended files plus the
-  pipeline artifacts; no scope creep, no unrelated refactors. (The deny-route and
-  async-agent-flow docs appearing in a `main...HEAD` three-dot diff are from
-  already-merged PRs #128/#129, not this issue's commit.)
+- **`app/api/availability/handler.ts`** — the #34 PUT wiring is exactly as
+  specced: after the upsert's `if (error)` check and before building the
+  response, it iterates `byDate` and calls
+  `recordAvailabilityConflict(supabase, date, "marked_unavailable")` only for
+  `isAvailable === false` entries, tracks `conflictTriggered`, and returns
+  `ok({ availability, conflictTriggered })`. RPC errors propagate through the
+  existing `try/catch` (no new handling), mirroring `deleteAvailability`. GET,
+  DELETE, validation, expansion, and dedupe are untouched.
+- **`supabase/migrations/20260713000001_conflict_notification.sql`** — a
+  faithful superset of `20260711000001_availability_conflict_rpc.sql`:
+  identical signature `(date, text) RETURNS boolean`, `SECURITY DEFINER
+  VOLATILE SET search_path = ''`, and identical JWT/UNAUTHENTICATED guard and
+  accepted-invitation loop. The original migration is left untouched
+  (append-only convention honored). The only additions are the ones the spec
+  named: `RETURNING id INTO v_conflict_id`, `v_member_name` lookup, `v_reason`
+  from the member's own `availability.note` (correctly NULL on the
+  `availability_deleted` path since the row is gone), `sw.title`/`sw.service_date`
+  pulled into the loop for the service label (`coalesce(title, 'the service on
+  ' || service_date)`), and a per-recipient notification insert filtered to
+  `role IN ('admin','set_leader') AND id <> v_user_id`. The `CASE WHEN
+  v_reason IS NOT NULL` guard omits the reason clause without erroring on NULL.
+  Cross-checked every inserted column against the live `notifications` schema
+  (church_group_id, user_id, type, title varchar(200), body, link_entity_type
+  varchar(50), link_entity_id uuid) — all valid; `'scheduling_conflict'` is a
+  real `notification_type` enum value; `'conflict'`/`'Scheduling conflict'` fit
+  their columns; `conflicts` insert columns and `users.name`/`role` all match.
+  The notify block mirrors `accept_invitation`'s established pattern. Header
+  comment (SECURITY-DEFINER-vs-RLS rationale), TODO(#58/#59), and commented
+  DOWN section are all present.
+- **Tests are meaningful, not superficial.** The committed
+  `availability-route.test.ts` asserts exact RPC args, no-call on
+  available/default dates, once-per-unavailable on a mixed multi-date PUT, and
+  a 500 on RPC error. The tester's supplement additionally proves (a) the RPC
+  is never called when the upsert errors (short-circuit), (b) a 3-day range
+  fires the RPC once per date (not just first/last), and (c) upsert runs
+  before the RPC (via `invocationCallOrder`). I re-ran the suite myself:
+  `typecheck` clean, full suite **32 suites / 388 tests pass**.
+- Out-of-scope items confirmed untouched: no `sendSms`/`sendEmail`, no
+  `conflicts`/resolution routes, `lib/supabase/types.ts` unmodified, no new
+  enum value.
 
-## Notes (non-blocking)
+## Non-blocking items for the human (not code defects)
 
-- The RPC body itself has no live-DB test harness in this repo — consistent with
-  the `accept_invitation` precedent and explicitly out of scope per spec. RPC
-  correctness rests on code review against the established pattern, which holds.
-- Handler does not null-guard `data` before `data.invitation_id`; the RPC never
-  returns null on success (it raises on not-found), and any surprise null would
-  fall through to the outer `try/catch` → 500. Acceptable.
-- Malformed-vs-unknown paths differ in latency (malformed short-circuits before
-  the DB round-trip). The spec's acceptance criterion is body-identity only,
-  which is met; a timing side-channel is out of scope.
+1. **Uncommitted tester artifacts.** `tests/unit/app/api/availability-route-tester-supplement.test.ts`
+   is untracked and `.pipeline/test-results.md` is modified but not staged —
+   neither is in commit 09b25ea. The committed coder tests already cover the
+   spec's required cases, so this doesn't block correctness, but commit the
+   supplement (or consciously drop it) before opening the PR so the extra
+   coverage isn't silently lost.
+2. **PR diff will currently also carry merged PR #134.** `git diff main...HEAD`
+   includes the cwd-drift-fix changes to `.claude/agents/*.md` and
+   `.claude/workflows/handle-issues.js` (commits 83d2273 + merge 18169ee),
+   which are unrelated to #46. They are an already-reviewed, already-merged PR
+   riding in this branch's ancestry, not scope creep introduced here — but if
+   the #46 PR is opened before #134 lands on `main`, those changes will appear
+   in its diff. Rebase/retarget as appropriate so the #46 PR shows only #46.
 
-Ship it. Human still owns the final PR-diff sign-off and merge.
+## Product-level observations (informational, outside this issue's scope)
+
+- Re-marking the same date unavailable inserts a fresh `conflicts` row and
+  re-notifies every admin each time (no dedup/ON CONFLICT). This is inherited
+  from the original RPC's conflicts insert and matches `accept_invitation`'s
+  pattern; the spec did not ask to change it. Flagging only because the added
+  notification makes the duplication user-visible (leaders could get repeat
+  pings if a member toggles availability).
+- A multi-date PUT is not atomic across dates: a mid-loop RPC failure returns
+  500 while earlier dates' conflicts/notifications are already committed. This
+  matches the DELETE path and the spec's "500, never a silent no-op" contract.
