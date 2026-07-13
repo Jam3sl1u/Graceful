@@ -1,69 +1,35 @@
-# Review: Issue #40 — POST /api/invitations (BR-05 double-booking check)
+# Review — Issue #41: Implement accept invitation flow
 
 ## VERDICT: SHIP
 
-## Scope of review
-Read spec.md, changes.md, test-results.md, then reviewed the actual diff
-(`git diff main...HEAD`) and read every touched file plus the reference
-handlers and helpers firsthand. Did NOT rely on the written summaries alone.
+## Scope check vs. issue #41 Acceptance Criteria
+- POST via response_token (no session) OR authenticated session (in-app) — done; dual path converges on one RPC.
+- Token validated for expiry and "already responded" before accepting — done (already-responded returns gracefully, expiry raises EXPIRED, ordering matches AC/#51 intent).
+- Status -> accepted; admin notified in-app — done (single atomic RPC; invited_by notified, or all admin/set_leader in group when null).
+- Member added to event_attendees for the week's events (no-op/queued when none exist) — done (ON CONFLICT DO NOTHING; GET DIAGNOSTICS row count surfaced as attendeesAdded).
+- Audit log with timestamp and time-to-respond — done (time_to_respond_seconds + via in metadata).
+All five AC satisfied.
 
-## What was verified by direct code reading
+## Verification (run independently by review, not trusted from test-results.md)
+- `bun run typecheck` — clean.
+- `bun run lint` — clean.
+- `bun run test` — 26 suites / 340 tests pass (14 new in invitations-accept-route.test.ts).
+- `bun run check:service-role` — clean (getAnonSupabaseClient uses anon key, not service-role).
 
-- `app/api/invitations/handler.ts` — logic matches the spec step-by-step:
-  requireAuth -> requireRole(["admin","set_leader"]) -> body parse (400 incl.
-  non-JSON via `.catch(() => null)`) -> JWT/401 -> service_weeks lookup scoped
-  to `id + church_group_id` (.maybeSingle, 404 on miss / 500 on DB error /
-  never 403) -> BR-05 two-query collision check -> 409 when collision and
-  `acknowledgeConflict !== true` (no insert) -> insert omits `status` so DB
-  default 'pending' applies -> writeAuditLog(action "invitation.sent") ->
-  `// TODO(#67/#68)` seam only, no notification call -> ok(..., 201) -> outer
-  try/catch mirrors service-weeks (ApiException -> its status; else 500).
-- Ordering nuance confirmed correct: 403 (role) before 400 (body) before 401
-  (JWT), matching both the spec edge-case list and service-weeks/handler.ts.
-- BR-05 query correctness: de-dupes accepted week IDs, filters status
-  'accepted', matches on `service_date`, and excludes the current
-  `serviceWeekId` via `.neq("id", serviceWeekId)` — self-re-invite is not a
-  conflict (tester's supplemental test #6 confirms). Collision query only
-  runs when the user has accepted invitations (guards the second select).
-- No `conflicts` row is written (only a comment references it) — correct,
-  deferred to accept flow (#41).
-- Enum/schema alignment against migration 20260702000003: `invitation_status`
-  includes 'accepted'/'pending'; `service_date date`; `response_token
-  varchar(64) unique`; `response_deadline timestamptz`. Token generator emits
-  64 lowercase hex chars (two randomUUID() concatenated, hyphens stripped) —
-  matches the human override in changes.md and the DB column.
-- `lib/supabase/types.ts` InvitationsRow + invitations Insert omit-list match
-  the spec exactly and mirror the service_weeks pattern.
-- `schemas/invitations.ts` createInvitationSchema matches spec; placeholder
-  `invitationsSchema` left intact.
-- `route.ts` — POST delegates to createInvitation; GET untouched stub.
-- `writeAuditLog` throwing on RPC error is caught by the outer try/catch ->
-  500, as spec requires.
+## SQL correctness (RPC can't be executed in-sandbox; verified by code review)
+Every table/column the migration touches was checked against the real migrations:
+- notifications(church_group_id, user_id, type, title, body, link_entity_type, link_entity_id) — matches 20260702000005.
+- event_attendees unique(event_id, user_id) — matches 20260702000003; ON CONFLICT target correct.
+- audit_logs(church_group_id, user_id, action, entity_type, entity_id, metadata) — matches 20260702000006.
+- users(clerk_id, church_group_id, role, name) and invitations(response_token, response_deadline, responded_at, invited_by, service_week_id, user_id, status) — all present.
+- notification_type enum contains 'invitation_accepted' — confirmed.
+- SECURITY DEFINER + SET search_path='' with schema-qualified auth.jwt()/public.* — correct; GRANT to anon+authenticated; DOWN block and TODO(#62) present.
 
-## Tests
-Coder's 14 tests + tester's 9 supplemental tests are meaningful, not
-superficial: they assert insert payload has no `status` key, token regex
-`/^[0-9a-f]{64}$/`, deadline within 60s of now+72h, `invited_by === USER_ID`,
-audit RPC action, and (critically) that NO insert happens on 409 and that the
-insert DOES happen on `acknowledgeConflict: true`. Self-exclusion and
-per-query 500 paths are covered.
+## Tests are meaningful, not superficial
+Cover both happy paths (asserting the CORRECT client factory is used and the exact rpc args incl. p_response_token null vs token), already-responded pass-through, 400 (non-uuid id, wrong-length token, non-hex token), 401 (no session, and session-but-no-JWT with negative assertions that lookup/client are never called), and full error-message mapping 404/403/403-session/410/500, plus a BR-05 non-regression check (exactly one rpc call, no conflicts write).
 
-## Non-blocking notes (no action required for ship)
-- The BR-05 collision query does not exclude `is_cancelled` weeks. If a member
-  accepted a week later cancelled that shares a date with the new week, a
-  conflict would still be flagged. The spec does not require excluding
-  cancelled weeks, so this is spec-compliant; flag for a possible future
-  refinement in the accept-flow issue (#41).
-- All logic is unit-tested with mocks only; the two-query BR-05 behavior and
-  the 409 -> re-POST-with-acknowledgeConflict flow have no live-DB/E2E
-  coverage. Low risk (handler is stateless per request; each half verified),
-  but a Supabase-local integration test is worthwhile follow-up.
-- I could not re-run typecheck/lint/test myself this session (bash command
-  classifier was temporarily unavailable). Both the coder and the tester
-  independently ran all three: typecheck 0 errors, lint 0 errors/warnings,
-  283 tests passing. Code reading found no reason to doubt those results.
+## Advisory (non-blocking, does NOT hold up this PR)
+- BR-05 conflict-on-accept is intentionally deferred (not in #41's AC or Out-of-Scope; conflict handling tracked separately). This is correctly scoped. HOWEVER a pre-existing comment in `app/api/invitations/handler.ts:52-53` states the `conflicts` row "is written at accept time (#41)", which is now stale/misleading against this implementation. It was not introduced by this diff, but a human should either fold BR-05 in or update that comment in a follow-up so it doesn't misdirect future work.
+- The RPC and RLS/anon-role behavior were verified by review only; no live Postgres/test:rls run was possible in this sandbox (same limitation as coding/testing stages). Recommend running test:rls in an environment with SUPABASE_TEST_* creds before/after merge as defense-in-depth.
 
-## Conclusion
-Code matches the spec, follows the established handler/schema/types/test
-patterns faithfully, handles every named edge case, and the tests exercise
-real behavior rather than rubber-stamping. Ship it.
+Non-blocking. Ship it.

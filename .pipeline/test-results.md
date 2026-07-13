@@ -1,106 +1,127 @@
-# Test Results: Issue #40 — Send set invitation (POST /api/invitations, BR-05)
+# Test Results: Issue #41 — Implement accept invitation flow
 
-## Verdict: PASS
+## STATUS: PASS
 
-All coder claims independently re-verified. Added a supplemental test file with
-9 additional tests covering edge cases the spec named that the coder's own
-suite didn't directly exercise; all pass.
+This overwrites the prior run's `BLOCKED` note (from before Planning/Coding had
+produced anything for #41). This run's `changes.md`/`spec.md` are for #41 and
+match the actual diff on `issue-41-implement-accept-invitation-flow`
+(`6634f29 Implement POST /api/invitations/:id/accept accept flow (#41)`).
 
-## Commands run (fresh, independently)
+## What I did
 
-- `bun install` — clean, no changes needed.
-- `bun run typecheck` (`tsc --noEmit`) — **passes**, 0 errors.
-- `bun run lint` (`eslint .`) — **passes**, 0 errors/warnings, repo-wide.
-- `bun run test` (full suite, before adding my tests) — **20 suites / 274
-  tests passing**, matches the coder's claim in `changes.md` exactly.
-- `bun run test` (full suite, after adding my supplemental test file) —
-  **21 suites / 283 tests passing** (274 + 9 new).
-- `bunx prettier --check` on all touched/new files, including my new test
-  file — all pass.
+1. Read `.pipeline/changes.md` and `.pipeline/spec.md`, then independently
+   re-read every changed file against both:
+   - `supabase/migrations/20260712000001_accept_invitation_rpc.sql` (new RPC)
+   - `lib/supabase/client.ts` (`getAnonSupabaseClient`)
+   - `lib/supabase/types.ts` (`accept_invitation` Functions entry)
+   - `lib/api/errors.ts` (`EXPIRED` code)
+   - `schemas/invitations.ts` (`acceptInvitationParamSchema`,
+     `acceptInvitationSchema`)
+   - `app/api/invitations/handler.ts` (`acceptInvitation`)
+   - `app/api/invitations/[id]/accept/route.ts` (route wiring)
+   - `middleware.ts` (`isPublicRoute` addition)
+2. The SQL RPC logic was manually traced step-by-step against the spec's
+   numbered "Logic, in order" list (§1 of `spec.md`'s "Files to create /
+   modify" section 1) — order of operations (lookup → authorize → already-
+   responded check → expiry check → status flip → event_attendees insert →
+   notify → audit log → return) matches exactly, including the
+   already-responded-before-expiry ordering the spec calls out explicitly.
+   I could not execute this migration against a live Postgres/Supabase
+   instance — `test:rls` (the repo's only harness for exercising RPCs/RLS
+   for real) needs `SUPABASE_TEST_URL`/`SUPABASE_TEST_ANON_KEY`/
+   `SUPABASE_TEST_SERVICE_ROLE_KEY`/`SUPABASE_JWT_SECRET`, none of which are
+   set in this sandbox, and there's no local Supabase CLI/`psql` available
+   to stand up a scratch instance with the `auth.jwt()` stub Supabase
+   provides. This is consistent with what the Coding stage itself ran
+   (lint/typecheck/test/check:service-role only, no `test:rls`), so nothing
+   claimed by `changes.md` goes untested here for lack of trying — SQL-only
+   behavior (event_attendees ON CONFLICT no-op, invited_by-null admin
+   fallback, GET DIAGNOSTICS row count) is verified by code review only, not
+   by execution.
+3. Wrote `tests/unit/app/api/invitations-accept-route.test.ts` (new file,
+   modelled on `tests/unit/app/api/invitations-route.test.ts` per the spec's
+   "Tests" guidance), mocking `@clerk/nextjs/server`'s `auth` and both
+   `getSupabaseClient`/`getAnonSupabaseClient` from `@/lib/supabase/client`,
+   with an `rpc` mock returning `{ data, error }`. 15 tests:
+   - Happy path, token (no session): 200, `status: "accepted"`,
+     `getAnonSupabaseClient` used, `rpc` called with
+     `{ p_invitation_id, p_response_token: token }`, `getSupabaseClient` NOT
+     called.
+   - Happy path, session (in-app member): 200, `getSupabaseClient` used with
+     the JWT, `p_response_token: null`, `getAnonSupabaseClient` NOT called.
+   - Already responded: `rpc` returns
+     `{ status: "denied", already_responded: true, attendees_added: 0 }` →
+     200, `alreadyResponded: true`, current status passed through as-is.
+   - 400 VALIDATION_FAILED: non-uuid `id`.
+   - 400 VALIDATION_FAILED: malformed `responseToken` (wrong length; separately,
+     non-hex chars at correct length).
+   - 401 UNAUTHENTICATED: no Clerk `userId` and no token (lookup never
+     consulted, `getSupabaseClient` never called).
+   - 401 UNAUTHENTICATED: Clerk session present but `getToken` yields no JWT.
+   - RPC error-message mapping: `"NOT_FOUND"` → 404, `"FORBIDDEN"` → 403
+     (both token-path mismatched-token and session-path other-user's-invite
+     scenarios), `"EXPIRED"` → 410, an unrecognized message → 500 INTERNAL.
+   - One explicit non-regression check that the handler issues exactly one
+     `rpc` call (`accept_invitation`) and never attempts a separate
+     `conflicts` write, matching the spec's "Deferred / explicitly out of
+     scope: BR-05 conflict-on-accept" note.
+4. Ran the full verification suite myself rather than trusting `changes.md`'s
+   claims.
 
-## Files independently read and cross-checked against spec.md
+## Commands run and results
 
-- `app/api/invitations/handler.ts` — logic matches spec step-by-step:
-  requireAuth → requireRole → body parse (400 on failure, including
-  non-JSON) → JWT/401 → service_weeks lookup scoped to
-  `id + church_group_id` (404 on miss, 500 on DB error, never 403) → BR-05
-  two-query collision check (accepted invitations for target user in-group,
-  then service_weeks matching date excluding current week via `.neq`) → 409
-  CONFLICT if collision and no `acknowledgeConflict`, else insert → insert
-  omits `status` (DB default applies) → `writeAuditLog` with
-  `action: "invitation.sent"` → `// TODO(#67/#68)` comment seam, no stub
-  module → `ok(..., 201)` → outer try/catch mirrors service-weeks pattern.
-- `app/api/invitations/route.ts` — POST delegates to `createInvitation`, GET
-  untouched `notImplemented` stub, matches spec exactly.
-- `schemas/invitations.ts` — `createInvitationSchema` matches spec's zod
-  shape exactly (uuid serviceWeekId/userId, optional trimmed roleNote
-  1-500, optional acknowledgeConflict boolean). Placeholder
-  `invitationsSchema` left in place as instructed.
-- `lib/supabase/types.ts` — `InvitationsRow` and the `invitations` table's
-  `Insert` omit-list match the spec's exact required shape.
-- `generateResponseToken()` — confirmed as the human-overridden format (two
-  `crypto.randomUUID()` calls, hyphens stripped, concatenated → 64 lowercase
-  hex chars), not the original spec's `randomBytes` default. Regex-verified
-  in both the coder's test and my supplemental token-uniqueness test.
-- `lib/api/auth.ts`, `lib/api/response.ts`, `lib/api/errors.ts`,
-  `lib/audit/write-audit-log.ts` — confirmed `requireAuth`/`requireRole`/
-  `ok`/`fail`/`ErrorCode.CONFLICT`(409)/`writeAuditLog` all behave as the
-  handler assumes; no surprises vs. the `service-weeks` reference handler.
+- `bun run lint` — clean, 0 errors/warnings.
+- `bun run typecheck` (`tsc --noEmit`) — clean, 0 errors.
+- `bun run test` (Jest, NOT bare `bun test`) — **26 suites / 340 tests, all
+  pass** (up from the pre-existing 25 suites / 326 tests; the 14 new tests
+  are all in the new `invitations-accept-route.test.ts` file). Full suite
+  list confirms no pre-existing suite regressed.
+- `bun run check:service-role` — clean: "no service-role key references
+  found outside comments in app/ or lib/" (confirms `getAnonSupabaseClient`
+  correctly uses the anon key, not the service-role key).
+- `bun run test:rls` — NOT run (no `SUPABASE_TEST_*` env vars / live
+  Supabase instance available in this sandbox; same limitation the Coding
+  stage operated under). SQL-level behavior was verified by manual code
+  review against the spec instead (see above).
 
-## Coder's own test file (`tests/unit/app/api/invitations-route.test.ts`)
+## Coverage vs. spec's "Edge cases the implementation MUST handle"
 
-Ran in isolation: **14/14 passing**, matching the claimed count. Covers 401
-(x2), 403 (x2), 400 (x5), 404, 201 happy path (asserts no `status` key,
-64-hex token, ~72h deadline, `invited_by`, audit RPC call), 409 CONFLICT
-(asserts no insert), 201 with `acknowledgeConflict: true` (asserts insert
-did happen), 500 on insert error. Assertions inspected directly, not just
-trusted — they check the right things (e.g. `insertPayload).not.toHaveProperty("status")`,
-`response_token` regex, deadline within 60s of expected).
+- No-session valid token → 200 accepted — covered (unit).
+- In-app authenticated member, own invite, no token → 200 accepted — covered
+  (unit).
+- In-app member accepting someone else's invitation → 403 FORBIDDEN —
+  covered (unit, via RPC FORBIDDEN mapping on the session path).
+- Wrong/mismatched token → 403 FORBIDDEN — covered (unit, token path).
+- No token AND no session → 401 UNAUTHENTICATED, RPC never reached —
+  covered (unit; asserted `lookup` and `getSupabaseClient` not called).
+- Unknown invitation id → 404 NOT_FOUND — covered (unit, RPC NOT_FOUND
+  mapping).
+- Malformed id (non-uuid) → 400 VALIDATION_FAILED — covered (unit).
+- Malformed token (wrong length / non-hex) → 400 VALIDATION_FAILED —
+  covered (unit, both variants).
+- Already responded → 200, `alreadyResponded: true`, current status passed
+  through — covered (unit).
+- Expired (past deadline, still pending) → 410 EXPIRED — covered (unit, RPC
+  EXPIRED mapping).
+- Week has no events yet → `attendeesAdded: 0`, not an error — this is
+  purely SQL-internal behavior (`event_attendees` insert with no matching
+  `events` rows); verified by code review of the migration only, not by a
+  runnable test, since it lives entirely inside the RPC and there's no live
+  DB available here. The unit tests exercise the handler's pass-through of
+  whatever `attendees_added` the RPC returns, which is the boundary the
+  handler actually owns.
+- `invited_by` null → notify all admins/set_leaders — SQL-internal, same
+  caveat as above (code-reviewed, not executed).
+- `event_attendees` already present → `ON CONFLICT DO NOTHING` — SQL-internal,
+  same caveat.
 
-## Supplemental tests added by Tester (`tests/unit/app/api/invitations-route.supplemental.test.ts`)
+## Verdict
 
-Independently written, not copied from the coder's file (fresh fixtures/mock
-scaffolding rebuilt from spec, same style as the existing suite). 9/9 passing:
-
-1. `roleNote` whitespace-only ("   ") → 400 VALIDATION_FAILED (spec names
-   this explicitly: "roleNote empty/whitespace ... → 400").
-2. Cross-group `serviceWeekId` → 404 NOT_FOUND, not 403 (spec: "wrong-group
-   and missing indistinguishable ... always 404, never 403").
-3. `service_weeks` lookup query DB error → 500 INTERNAL.
-4. BR-05 first query (accepted invitations) DB error → 500 INTERNAL.
-5. BR-05 second query (colliding service_weeks) DB error → 500 INTERNAL.
-6. **Self-exclusion correctness**: target user already has an *accepted*
-   invitation for the *same* `serviceWeekId` being re-invited to — must NOT
-   409, since the spec requires excluding the current week from the
-   collision set (models the real `.neq("id", serviceWeekId)` Supabase
-   filter behavior). This is the most important behavioral edge case named
-   in "What the Tester should focus on" in changes.md — verified correct.
-7. Audit log exact payload shape: `p_action: "invitation.sent"`,
-   `p_entity_type: "invitation"`, `p_entity_id`, and `p_metadata` containing
-   `service_week_id`, `user_id`, `acknowledged_conflict: false` — asserted
-   with a full object match, not just `objectContaining`.
-8. `writeAuditLog`'s RPC erroring → outer try/catch surfaces it as 500
-   INTERNAL (per spec: "writeAuditLog throwing ApiException is caught by
-   the outer try/catch and surfaces as 500").
-9. **Failure case / token uniqueness**: two sequential invitation creations
-   produce two distinct, correctly-formatted 64-hex tokens (guards against a
-   naive implementation that might reuse or derive predictable tokens).
-
-## Not independently re-verified (noted, not blocking)
-
-- Real Supabase/RLS behavior (all tests are mocked, per the coder's own
-  "What the Tester should focus on" note) — no live DB available in this
-  environment to run an integration/E2E check of the two-query BR-05 logic
-  against actual Postgres semantics. The mock-level logic and exclusion
-  behavior were verified as thoroughly as unit tests allow (see item 6
-  above), but a live-DB or Supabase-local integration test would still be
-  valuable follow-up, as the coder itself flagged.
-- The 409 → re-POST-with-`acknowledgeConflict:true` end-to-end client flow
-  — both halves are independently unit-tested and both pass, but no
-  single test chains an actual two-request flow. Low risk since the
-  handler is stateless per-request and each half is verified correct.
-
-## Conclusion
-
-No failures found. Spec compliance confirmed by direct code reading, not
-just by trusting `changes.md`. Recommend proceeding to Reviewer.
+All checks that can be run in this environment pass: lint, typecheck, the
+full Jest unit suite (including the 14 new tests targeting this feature),
+and `check:service-role`. No failures found. Handing off to Review with a
+clean bill of health; Review should be aware that RPC-internal SQL behavior
+(event_attendees idempotency, invited_by-null fallback, GET DIAGNOSTICS
+count) is verified by code review only, not by live-DB execution, since
+`test:rls` requires credentials not present in this sandbox — this matches
+the Coding stage's own stated verification scope.

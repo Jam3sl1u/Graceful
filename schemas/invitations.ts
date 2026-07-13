@@ -16,3 +16,16 @@ export const createInvitationSchema = z.object({
   acknowledgeConflict: z.boolean().optional(),
 });
 export type CreateInvitationInput = z.infer<typeof createInvitationSchema>;
+
+export const acceptInvitationParamSchema = z.string().uuid();
+
+// Body is optional: absent/empty for the in-app path; { responseToken } for the
+// no-session SMS/email path. Token is the 64-char hex response_token.
+export const acceptInvitationSchema = z.object({
+  responseToken: z
+    .string()
+    .length(64)
+    .regex(/^[0-9a-f]{64}$/)
+    .optional(),
+});
+export type AcceptInvitationInput = z.infer<typeof acceptInvitationSchema>;
