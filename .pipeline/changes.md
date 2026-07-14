@@ -1,92 +1,116 @@
-# Changes — Issue #46: Conflict detection on availability change
+# Changes — Issue #45: 24-hour dual-party invitation reminder scheduler
 
-## Summary
-
-Wired the second (PUT) trigger point for BR-15 conflict detection, and added the
-in-app admin/set_leader notification that was previously missing from the shared
-`record_availability_conflict` RPC. The DELETE trigger point (#35) was already
-wired before this change and is unmodified.
+Implemented exactly per `.pipeline/spec.md`. No scope creep beyond the 8
+files it names.
 
 ## Files changed
 
-### `app/api/availability/handler.ts` (MODIFY)
-In `setAvailability`, after the upsert succeeds, iterate `byDate` and for every
-date where `isAvailable === false`, `await recordAvailabilityConflict(supabase,
-date, "marked_unavailable")`. Tracks whether any call returned `true` into a new
-`conflictTriggered` boolean, now included in the PUT 200 response body:
-`ok({ availability, conflictTriggered })`. No new error handling was added — RPC
-errors (`ApiException(INTERNAL, 500)`) propagate through the function's existing
-`try/catch`, exactly as `deleteAvailability` already relies on. GET, DELETE,
-validation, date expansion, and the dedupe logic are untouched.
+1. **`supabase/migrations/20260713000001_invitation_reminder_scheduler.sql`** (new)
+   - Adds `invitations.last_reminded_at timestamptz` + partial index
+     `idx_invitations_pending_reminder` (`WHERE status = 'pending'`).
+   - Adds `public.send_invitation_reminders()` — `SECURITY DEFINER`,
+     `SET search_path = ''`, mirrors the `accept_invitation` RPC's shape.
+     Selects due invitations (`status = 'pending'` AND
+     `coalesce(last_reminded_at, created_at) <= now() - 24h` AND parent
+     `service_weeks.is_cancelled = false`) into a temp table, builds and
+     returns the JSON member-reminder array, inserts one admin/set_leader
+     notification per affected service week (D2 aggregation — lists ALL
+     currently-pending members for that week by name, not just the due
+     ones), and stamps `last_reminded_at = now()` only on the due rows.
+     `GRANT EXECUTE ... TO anon, authenticated` + commented DOWN block.
+   - `invitation_reminder` notification type already existed
+     (`20260702000005_cluster_5_partial.sql`) — not re-added.
 
-### `supabase/migrations/20260713000001_conflict_notification.sql` (CREATE)
-New append-only migration that `CREATE OR REPLACE`s
-`public.record_availability_conflict` (signature, language, security, and
-JWT/UNAUTHENTICATED guard unchanged from `20260711000001_availability_conflict_rpc.sql`,
-which is left untouched). Behavioral addition: after each `conflicts` insert
-(now capturing `RETURNING id INTO v_conflict_id`), the RPC inserts one
-`notifications` row per `admin`/`set_leader` in the church group, excluding the
-triggering user (`id <> v_user_id`). Notification body is
-`"<member name> can no longer make <service label>[ — reason: <note>]"`, where
-the service label prefers `service_weeks.title` and falls back to
-`'the service on ' || service_date`, and the reason clause is included only when
-the member's `availability.note` for that date is non-null (present on the
-`marked_unavailable` path, absent on `availability_deleted` since the row is
-already gone by the time the RPC runs). Notifications are inserted from this
-SECURITY DEFINER RPC (not the route handler) because
-`notifications_insert_leader_admin` RLS is leader/admin-only. Includes a
-`-- TODO(#58/#59): dispatch SMS + email...` comment per the repo's deferred-
-dispatch convention (no `sendSms`/`sendEmail` calls added), a header comment
-explaining the SECURITY DEFINER rationale, and a commented DOWN section
-matching sibling migrations. `record_availability_conflict`'s signature/return
-type in `lib/supabase/types.ts` is unchanged, so that file was not touched (per
-spec).
+2. **`lib/supabase/types.ts`** (modified)
+   - `InvitationsRow` gains `last_reminded_at: string | null`.
+   - `invitations` table `Insert` type: added `last_reminded_at` to the
+     `Omit<...>` union and as an optional `last_reminded_at?: string | null`
+     override (DB-defaulted to NULL).
+   - `Database["public"]["Functions"]` gains `send_invitation_reminders`
+     with `Args: Record<string, never>` and the `Returns` array shape from
+     the spec.
 
-### `tests/unit/app/api/availability-route.test.ts` (MODIFY)
-- `makeSupabaseClientForPut` now also returns a mocked `rpc` (defaulting to
-  `{ data: false, error: null }` when unspecified), mirroring
-  `makeSupabaseClientForDelete`'s shape.
-- Added four new tests to the `describe("PUT /api/availability")` block:
-  1. Marking a date unavailable calls `rpc("record_availability_conflict", { p_date, p_trigger_reason: "marked_unavailable" })` and the 200 body reports `conflictTriggered: true` when the RPC returns `true`.
-  2. Marking a date available (or omitted, defaulting to available) never calls `rpc`, and `conflictTriggered: false`.
-  3. A multi-date PUT mixing available/unavailable dates calls `rpc` exactly once, only for the unavailable date.
-  4. RPC returning `{ data: null, error: {...} }` yields a 500 `INTERNAL` response (propagated via the existing catch).
-- No existing PUT test needed updating for the new `conflictTriggered` field — all
-  existing assertions read `body.data.availability` specifically rather than
-  asserting `body.data` by full equality.
+3. **`lib/scheduling/reminder.ts`** (new) — pure, unit-testable helpers:
+   - `REMINDER_INTERVAL_MS` (24h in ms).
+   - `isReminderDue(invitation, now)` — mirrors the SQL selector exactly
+     (comment cross-references the migration so the two stay in sync).
+   - `buildMemberReminderSms(memberName, weekLabel)` — short SMS copy.
+   - `formatWeekLabel(title, serviceDate)` — title if present, else
+     `serviceDate` formatted as `Mon DD, YYYY` (UTC), matching the SQL's
+     `to_char(week.service_date, 'Mon DD, YYYY')` used in the admin body.
 
-### `tests/unit/lib/scheduling/conflict-detection.test.ts` (MODIFY — minor)
-Added one test asserting `recordAvailabilityConflict` forwards the
-`"marked_unavailable"` reason verbatim to the RPC call args (existing cases only
-covered `"availability_deleted"`). No behavior change to
-`recordAvailabilityConflict` itself.
+4. **`app/api/cron/invitation-reminders/route.ts`** (new) — `GET` only
+   (Vercel Cron). Contract exactly as spec'd:
+   - `CRON_SECRET` unset → 500 `INTERNAL` (checked before any DB call).
+   - `Authorization` header not exactly `Bearer ${CRON_SECRET}` → 401
+     `UNAUTHENTICATED`.
+   - Calls `send_invitation_reminders` via `getAnonSupabaseClient()`; RPC
+     error → 500 `INTERNAL`.
+   - For each reminder: dispatches `sendSms` (from `lib/pingram/client.ts`,
+     currently a throwing stub) only when `phone` is non-null AND
+     `sms_opted_in === true`; failures are caught per-reminder
+     (`smsFailed` counter + `console.error`) and never fail the job.
+     Members without phone/opt-in are counted as `smsSkipped`, not
+     `smsFailed`.
+   - Returns `ok({ processed, smsSent, smsSkipped, smsFailed })`.
 
-## Explicitly not touched (per spec's "out of scope")
-- No SMS/email dispatch — TODO comment only.
-- `GET /api/conflicts`, `POST /api/conflicts/[id]/resolve`, `app/(app)/conflicts/page.tsx` — untouched stubs.
-- `lib/supabase/types.ts` — not widened (RPC signature/return unchanged).
-- GET /availability, team availability, admin-sets-another-member paths — untouched.
+5. **`vercel.json`** (new) — registers the cron:
+   `{ "crons": [{ "path": "/api/cron/invitation-reminders", "schedule": "0 * * * *" }] }`.
 
-## Verification run (Coding stage)
+6. **`app/api/invitations/handler.ts`** (modified — comment only) —
+   replaced the `TODO(#45/#36)` in `withdrawInvitation` with a comment
+   explaining cancellation is automatic (D1: the reminder selector filters
+   `status = 'pending'`, so the withdraw's status flip already stops future
+   reminders). No logic changed in this file.
+
+7. **`tests/unit/lib/scheduling/reminder.test.ts`** (new) — mocked-time
+   (`Date` fixtures, no real waiting) coverage of `isReminderDue`'s 6 cases
+   from the spec (first reminder at exactly 24h, just-under-threshold,
+   over-threshold, recent repeat-reminder not due, repeat-reminder due,
+   and all three non-pending statuses never due — D1), plus
+   `buildMemberReminderSms` and `formatWeekLabel` (title vs. formatted
+   date).
+
+8. **`tests/unit/app/api/cron-invitation-reminders-route.test.ts`** (new)
+   — mirrors the `invitations-withdraw-route.test.ts` mock-scaffolding
+   style, mocking `@/lib/supabase/client` and `@/lib/pingram/client`.
+   Covers: 401 on missing/wrong Authorization header (RPC never called),
+   500 on unset `CRON_SECRET`, 500 on RPC error, happy path (2 reminders,
+   1 dispatched/1 skipped, correct counts), `sendSms` rejection isolated
+   (still 200, `smsFailed: 1`), and the empty/no-due-invitations case
+   (`processed: 0`, no SMS calls).
+
+## Out of scope (per spec, not touched)
+
+- No real SMS/email dispatch — `sendSms` stub only.
+- No configurable per-week response deadlines.
+- No cancellation table / scheduler-state store (D1: automatic).
+- No changes to accept/deny/withdraw logic beyond the one comment in §6.
+
+## Verification run
+
 - `bun run lint` — clean.
 - `bun run typecheck` — clean.
-- `bun run test` — 31 suites / 385 tests, all passing (includes the 4 new PUT
-  tests, 1 new conflict-detection unit test, and the full existing suite with no
-  regressions).
-- `bun run check:workflows` — OK (no workflow scripts were touched by this
-  change; ran only as a sanity check per repo convention).
+- `bun run test` — 33 suites / 398 tests passed (all pre-existing tests
+  still pass; the 2 new suites above pass).
+- `bun run check:service-role` — clean (the new cron route/RPC caller use
+  `getAnonSupabaseClient()`, never the service-role key).
+- `bun run check:workflows` — clean (no orchestration scripts touched).
+- Migration SQL itself has no live-DB harness in this repo (same as
+  `accept_invitation`); its correctness is covered by the route/helper unit
+  tests that mock the RPC's return value, per the spec's instruction not to
+  add a live-DB test.
 
 ## What the Tester should focus on
-- The RPC migration (`20260713000001_conflict_notification.sql`) has no live-DB
-  test harness in this repo (consistent with `accept_invitation` and the
-  original `record_availability_conflict` migration) — it is only exercised via
-  mocked-client route/unit tests. The Tester should review the SQL body closely
-  for correctness (recipient exclusion, NULL-note handling, service label
-  fallback, `RETURNING id INTO v_conflict_id` wiring) rather than expecting a
-  live-DB test.
-- Confirm the PUT response shape change (`conflictTriggered` added alongside
-  `availability`) doesn't break any caller outside the files touched here (a
-  repo-wide grep for consumers of the PUT response was not in scope for this
-  spec, but worth a quick check).
-- Multi-date / range PUT with a mix of available and unavailable dates — verify
-  only unavailable dates trigger the RPC (edge case 2 in the spec).
+
+- `lib/scheduling/reminder.ts`'s `isReminderDue` boundary conditions
+  (exactly-24h, just-under, non-pending statuses) since the SQL selector in
+  the migration can't be exercised directly in this repo's test harness —
+  the unit tests here are the primary correctness signal for that logic.
+- The cron route's auth ordering (`CRON_SECRET`-unset check happens before
+  any DB call) and that a `sendSms` rejection never surfaces as a non-200
+  response.
+- D2 aggregation (one admin notification per admin per affected week,
+  listing all currently-pending members) is implemented only in the SQL
+  RPC body, which has no live-DB test in this repo — review the migration
+  SQL directly for correctness (temp table + `string_agg` + per-week loop).

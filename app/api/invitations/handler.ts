@@ -377,7 +377,9 @@ export async function withdrawInvitation(
       },
     });
 
-    // TODO(#45/#36): cancel any pending 24h reminders for this invitation.
+    // Cancellation of reminders is automatic (#45): the reminder scheduler
+    // selects on status = 'pending', so the withdraw above already stops
+    // this invitation from being reminded again — nothing to do here.
 
     return ok({ invitation: toInvitationResponse(updated) });
   } catch (err) {

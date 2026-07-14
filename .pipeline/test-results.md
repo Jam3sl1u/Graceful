@@ -1,151 +1,145 @@
-# Test Results — Issue #46: Conflict detection on availability change
+# Test Results — Issue #45: 24-hour dual-party invitation reminder scheduler
+
+Working directory verified before every command below:
+`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-45`.
 
 ## Verdict: PASS
 
-All checks re-run independently in the pinned worktree
-(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-46`) and
-cross-checked against `.pipeline/spec.md` line by line (`app/api/availability/handler.ts`,
-the new migration SQL, `lib/scheduling/conflict-detection.ts`, and both test
-files). This file overwrites a stale leftover from a prior issue (#44) that
-was still sitting at this path.
+All coder-claimed checks were independently re-run in this worktree and
+pass. One supplemental test file was added by this stage to close two real
+coverage gaps found during review of the coder's tests (see below); all
+tests, including the new ones, pass. No application code was modified.
 
-## Commands re-run
+## Checks re-run
 
-- `bun run lint` — clean, no errors/warnings.
-- `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
-- `bun run test` (Jest, full suite) — **32 suites / 388 tests passed** (the
-  coder's 31 suites / 385 tests, plus this stage's new supplemental file with
-  3 additional tests; no failures, no skips).
-- `bun run check:workflows` — OK (sanity check per repo convention; no
-  workflow scripts touched by this change).
+| Command | Result |
+| --- | --- |
+| `bun run lint` | Clean (`eslint .`, no output/errors) |
+| `bun run typecheck` | Clean (`tsc --noEmit`, no output/errors) |
+| `bun run test` | **34 suites / 401 tests passed**, 0 failed (coder's 33/398 + this stage's 1 new suite / 3 new tests) |
+| `bun run check:service-role` | `OK: no service-role key references found outside comments in app/ or lib/.` |
+| `bun run check:workflows` | `OK: 1 workflow script(s) checked — syntax valid, all agent() calls pinned.` (no orchestration scripts touched by this change; check still passes) |
 
-## Independent verification performed
+New/changed suites specifically confirmed passing:
+- `tests/unit/lib/scheduling/reminder.test.ts` (coder's) — PASS
+- `tests/unit/app/api/cron-invitation-reminders-route.test.ts` (coder's) — PASS
+  (one expected `console.error` line from the sendSms-failure-isolation test —
+  not a failure; the test asserts the job still returns 200 despite it)
+- `tests/unit/app/api/cron-invitation-reminders-route-tester-supplement.test.ts`
+  (this stage, new) — PASS, 3 tests
 
-Read the actual diff (not just `changes.md`'s description) for every file listed:
+## Supplemental test written by this stage (Tester)
 
-- `app/api/availability/handler.ts` — `setAvailability`'s wiring matches the
-  spec exactly: iterates `byDate`, fires `recordAvailabilityConflict(supabase,
-  date, "marked_unavailable")` only for `isAvailable === false` entries, after
-  the upsert's error check and before building the response body, tracks
-  `conflictTriggered`, and returns `ok({ availability, conflictTriggered })`.
-  GET, DELETE, validation, expansion, and dedupe logic are byte-for-byte
-  unchanged. `deleteAvailability` (#35 DELETE trigger point) is unmodified and
-  still wired to the same shared RPC.
-- `supabase/migrations/20260713000001_conflict_notification.sql` —
-  `CREATE OR REPLACE`s `record_availability_conflict` with the identical
-  signature/language/security/guard as the original migration (left
-  untouched, confirmed by diff). Verified against the live schema
-  (`20260702000005_cluster_5_partial.sql`): `scheduling_conflict` already
-  exists in the `notification_type` enum (no new enum value added, per spec),
-  `notifications.title` is `varchar(200)` (the literal `'Scheduling conflict'`
-  fits comfortably), `link_entity_type` is a free-text `varchar(50)`
-  (`'conflict'` is valid). Recipient query correctly filters to
-  `admin`/`set_leader` and excludes the triggering user (`id <> v_user_id`).
-  `v_reason` is read from the member's own `availability.note` row
-  post-upsert (correct for `marked_unavailable`) and is NULL on the
-  `availability_deleted` path since the row is already deleted by the time
-  the RPC runs — the `CASE WHEN v_reason IS NOT NULL` guard correctly omits
-  the reason clause without erroring on NULL. `RETURNING id INTO
-  v_conflict_id` and the `-- TODO(#58/#59)` comment are both present. Header
-  comment explaining the SECURITY DEFINER rationale and a commented DOWN
-  section are present, matching sibling migrations. No live-DB test harness
-  exists in this repo for RPC migrations (consistent with `accept_invitation`
-  and the original `record_availability_conflict`) — expected per spec, not a
-  gap.
-- `lib/scheduling/conflict-detection.ts` — unchanged, as spec requires (the
-  `ConflictTriggerReason` union already included `"marked_unavailable"`).
-- `lib/supabase/types.ts` — confirmed untouched (RPC signature/return type
-  unchanged, per spec's explicit instruction not to widen it).
-- Response-shape check: grepped the repo for other consumers of `PUT
-  /api/availability`'s response body — none found (`app/api/availability/team/handler.ts`
-  queries the `availability` table directly for a different GET endpoint,
-  unrelated to this response shape). No frontend caller currently depends on
-  the response body in this repo's current phase, so the added
-  `conflictTriggered` field carries no breakage risk.
+`tests/unit/app/api/cron-invitation-reminders-route-tester-supplement.test.ts`
+— closes two gaps not exercised by the coder's own test file:
 
-## New test file written independently by this stage (Tester)
+1. **SMS-skip condition tested as OR, not just the conjunction.** The
+   coder's happy-path test's only "skipped" fixture combines `phone: null`
+   AND `sms_opted_in: false` in the same row. The handler's actual skip
+   condition is `!phone || sms_opted_in !== true` (OR). A regression that
+   swapped this to `!phone && sms_opted_in !== true` (AND) would produce an
+   *identical* result for that one combined row (still skips) and would
+   still pass the coder's suite, while incorrectly dispatching SMS in
+   production for phone-present-but-opted-out or phone-absent-but-opted-in
+   members. Added two tests exercising each condition alone
+   (phone-present/opted-out, and phone-absent/opted-in), both confirming
+   `smsSkipped: 1` / `sendSms` not called.
+2. **`{ data: null, error: null }` RPC shape.** The route does `data ?? []`
+   defensively, but only the `{ data: [], error: null }` empty-array shape
+   was tested by the coder. Added a test for the RPC actually resolving
+   `data: null` (distinct, plausible Supabase client shape) and confirmed
+   it still returns `processed: 0` with no SMS dispatch.
 
-`tests/unit/app/api/availability-route-tester-supplement.test.ts` (3 tests,
-all passing), following the repo's existing "tester-supplement" convention
-(see `invitations-withdraw-route-tester-supplement.test.ts`,
-`service-weeks-cancel-reactivate-tester-supplement.test.ts`). Closes gaps the
-coder's own `availability-route.test.ts` left open:
+Both gaps are real coverage gaps, not implementation bugs — the current
+`route.ts` code (`!reminder.phone || reminder.sms_opted_in !== true` and
+`const reminders = data ?? []`) is already correct and all three new tests
+pass against the unmodified implementation.
 
-1. **Failure-case / short-circuit check**: asserts the conflict-detection RPC
-   is *never* called when the upsert itself errors (spec: fire conflict
-   detection "after the upsert succeeds"). A regression that fired the RPC
-   unconditionally, or before checking the upsert error, would still have
-   passed the coder's existing test (which only asserts the 500 status, not
-   that `rpc` was never called).
-2. **Edge case — full multi-day range, all unavailable**: a 3-day range PUT
-   with every expanded date set unavailable fires the RPC exactly 3 times,
-   once per date, each with `p_trigger_reason: "marked_unavailable"`. The
-   coder's own multi-date test only mixed one available + one unavailable
-   date, which would not have caught a regression that fires the RPC only for
-   the first or last date in the `byDate` iteration.
-3. **Ordering contract**: asserts `upsert` is invoked before `rpc` (via
-   `mock.invocationCallOrder`), directly verifying the spec's explicit
-   ordering requirement — "the upsert writes the is_available:false row (and
-   its note) BEFORE the RPC runs, so the RPC can read that note for the
-   notification."
+## Independent verification beyond re-running commands
 
-All three pass against the current implementation.
+1. **`isReminderDue` boundary logic** (`lib/scheduling/reminder.ts`) — read
+   directly; matches the spec's pseudocode exactly (`status === "pending" &&
+   anchorMs <= now - 24h`, using `lastRemindedAt ?? createdAt`). The 6 cases
+   in `reminder.test.ts` (exact-24h, 23h59m-under, 25h-over,
+   recent-repeat-not-due, repeat-due, non-pending×3) match spec edge cases
+   1–4 verbatim and all pass.
 
-## Spec edge cases re-verified as covered
+2. **Cron route auth ordering** (`app/api/cron/invitation-reminders/route.ts`)
+   — read directly; confirms `CRON_SECRET`-unset (500/INTERNAL) is checked
+   *before* the `Authorization` header comparison (401/UNAUTHENTICATED), and
+   both are checked before `getAnonSupabaseClient()`/RPC call, matching
+   spec step 1. Confirmed via test assertions that
+   `mockGetAnonSupabaseClient` is `not.toHaveBeenCalled()` in both the
+   missing-header and unset-secret cases.
 
-1. Marking available/default-true never triggers RPC — covered (coder's test
-   `"marking a date available... does not call the conflict-detection RPC"` +
-   this stage's failure-case test). Confirmed.
-2. Multi-date PUT, one RPC call per unavailable date — covered (coder's mixed
-   available/unavailable test + this stage's all-unavailable 3-day range
-   test). Confirmed.
-3. No accepted invitation on the date → RPC returns `false`, PUT still
-   succeeds with `conflictTriggered: false` — covered (coder's DELETE
-   no-invitation test and the PUT default-`rpc` mock behavior). Confirmed.
-4. Reason present (marked_unavailable) vs. absent (availability_deleted, NULL
-   note) — covered by SQL review of the migration's `CASE WHEN v_reason IS
-   NOT NULL` guard; no live-DB harness exists for either trigger path in this
-   repo, consistent with sibling RPCs and explicitly out of scope per spec.
-5. Multiple accepted invitations on one date — RPC loop is unchanged from
-   the original migration (only the notification insert was added inside the
-   existing loop); reviewed, no behavior-flow change from this issue.
-6. RPC/DB error → 500 `INTERNAL`, never a silent no-op — covered on both PUT
-   (coder's `"returns 500 INTERNAL when the conflict-detection RPC returns an
-   error"`) and DELETE (pre-existing test, unmodified). Confirmed.
-7. Triggering user is themselves leader/admin → excluded via
-   `id <> v_user_id` — verified by SQL review; no live-DB harness exists to
-   exercise this at the application-test level, consistent with the spec's
-   own scoping of RPC verification to review + mocked route tests.
-8. Both trigger paths converge on the same RPC (AC3) — verified:
-   `deleteAvailability` (unmodified) and `setAvailability` (newly wired) both
-   call `recordAvailabilityConflict`, and the migration is the single shared
-   RPC implementation backing both `trigger_reason` values.
+3. **`sendSms` failure isolation** — confirmed the `try/catch` wraps only
+   the `sendSms` call (not the RPC), and a rejection increments `smsFailed`
+   without affecting HTTP status (still 200) or throwing. The coder's test
+   exercises this with a real `mockRejectedValue`, not just a synchronous
+   throw — passes.
 
-## Out-of-scope items confirmed untouched
+4. **Migration SQL schema references** — cross-checked every table/column
+   the new RPC
+   (`supabase/migrations/20260713000001_invitation_reminder_scheduler.sql`)
+   reads or writes against the existing schema migrations, since this repo
+   has no live-DB test harness for RPC bodies (same caveat the coder
+   flagged):
+   - `public.users.phone`, `.sms_opted_in`, `.role` (enum `user_role` incl.
+     `admin`/`set_leader`) — confirmed in
+     `20260702000001_cluster_1_organization.sql`.
+   - `public.service_weeks.is_cancelled`, `.title`, `.service_date`,
+     `.church_group_id` — confirmed in
+     `20260702000003_cluster_3_scheduling_core.sql`.
+   - `public.notifications` columns (`church_group_id`, `user_id`, `type`,
+     `title`, `body`, `link_entity_type`, `link_entity_id`) — confirmed in
+     `20260702000005_cluster_5_partial.sql`; the `invitation_reminder`
+     notification_type enum value already exists there (correctly not
+     re-added by this migration, per spec instruction).
+   - `link_entity_type = 'service_week'` string convention — confirmed it
+     matches existing usage in `app/api/service-weeks/[id]/handler.ts:258`
+     (`link_entity_type: "service_week"`), not an invented value.
+   - D2 aggregation correctness: the per-week admin-notification loop
+     re-queries `WHERE i.service_week_id = v_week.id AND i.status =
+     'pending'` (not restricted to the `due_invitations` temp table), which
+     correctly includes pending-but-not-yet-due invitations in the listing
+     — matches spec edge case 7.
+   - `last_reminded_at` is stamped only on rows in the `due_invitations`
+     temp table, not all pending rows in the affected weeks — matches spec
+     step 4.
 
-- No `sendSms`/`sendEmail` calls added; `lib/pingram/client.ts` and
-  `lib/resend/client.ts` unmodified (confirmed via `git status`/diff).
-- `app/api/conflicts/*` (GET/resolve) and `app/(app)/conflicts/page.tsx` not
-  present in this diff.
-- `lib/supabase/types.ts` unmodified.
-- GET `/api/availability`, team availability, and any admin-sets-another-
-  member availability path are unmodified.
-- No new `notification_type` enum value added (`scheduling_conflict` already
-  existed).
+5. **`lib/supabase/types.ts` and `app/api/invitations/handler.ts` diffs** —
+   read via `git show HEAD` directly; confirms `InvitationsRow`, the
+   `Insert`'s `Omit<...>` union + override block, and the
+   `send_invitation_reminders` `Functions` entry match spec §2 verbatim,
+   and the `handler.ts` change is comment-only (no logic diff) as claimed.
 
-## Not independently verifiable in this environment
+## Failure case coverage (explicit ask: at least one)
 
-- The RPC SQL body itself (`record_availability_conflict`) has no live-DB
-  test harness in this repo, consistent with `accept_invitation`'s and the
-  original migration's precedent, and explicitly out of scope per spec ("do
-  not add a live-DB test"). Correctness was checked by direct comparison
-  against the spec's required additions, the live table/enum schema
-  (`notifications`, `notification_type`), and the established
-  `accept_invitation` notify pattern — not by execution against a real
-  database.
+Confirmed present and passing:
+- 401 on missing `Authorization` header, and 401 on a present-but-wrong one
+  (RPC never invoked in either case).
+- 500 when `CRON_SECRET` is unset (checked before any DB call).
+- 500 when the RPC call itself returns a Supabase `error`.
+- `sendSms` rejection (the stub's real failure mode) isolated per-reminder,
+  job still returns 200 (`smsFailed` incremented).
 
-## Failure cases
+## Scope check
 
-None. No test failures encountered in this run — the coder's original 385
-tests, and the 3 new independent supplemental tests added by this stage, all
-pass. Lint, typecheck, and `check:workflows` are all clean.
+`git show HEAD --stat` touches exactly the 8 files (+ `.pipeline/*` handoff
+files) named in `.pipeline/changes.md` and `.pipeline/spec.md` — no
+unrelated files modified by the coder. This stage's own diff is additive
+only (one new supplemental test file); no application code touched.
+
+## Not independently re-verifiable in this environment
+
+- The migration SQL's live execution (temp table + `string_agg` + per-week
+  loop) cannot be run against a real Postgres instance from this harness —
+  same limitation the coder flagged for `accept_invitation`. Verified by
+  static read-through against the schema (see item 4 above) instead; this
+  is the same standard applied to the reference RPC this migration copies
+  from.
+
+## Conclusion
+
+No failing tests. One supplemental test file added (3 new passing tests
+closing real coverage gaps, not implementation bugs). Ready for Review.
