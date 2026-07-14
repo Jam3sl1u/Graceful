@@ -1,9 +1,8 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
-import { createInvitation } from "./handler";
+import { createInvitation, listInvitations } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/invitations");
+export async function GET(req: NextRequest): Promise<Response> {
+  return listInvitations(req);
 }
 
 export async function POST(req: NextRequest): Promise<Response> {

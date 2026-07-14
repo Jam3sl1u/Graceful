@@ -12,6 +12,7 @@ import {
   acceptInvitationParamSchema,
   acceptInvitationSchema,
   respondTokenParamSchema,
+  listInvitationsQuerySchema,
 } from "@/schemas/invitations";
 import type { EventType, InvitationStatus } from "@/types/domain";
 
@@ -48,6 +49,77 @@ export function toInvitationResponse(row: InvitationsRow): InvitationResponse {
 // DB column response_token varchar(64) not null unique.
 function generateResponseToken(): string {
   return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+}
+
+// Roster-safe invitation shape (#48 Week View). IMPORTANT: intentionally
+// omits response_token (the no-session credential) and denial_reason — never
+// reuse InvitationResponse/toInvitationResponse for this endpoint.
+export type WeekInvitation = {
+  id: string;
+  serviceWeekId: string;
+  userId: string;
+  roleNote: string | null;
+  status: InvitationStatus;
+  responseDeadline: string | null;
+  createdAt: string;
+};
+
+type WeekInvitationRow = Pick<
+  InvitationsRow,
+  "id" | "service_week_id" | "user_id" | "role_note" | "status" | "response_deadline" | "created_at"
+>;
+
+function toWeekInvitation(row: WeekInvitationRow): WeekInvitation {
+  return {
+    id: row.id,
+    serviceWeekId: row.service_week_id,
+    userId: row.user_id,
+    roleNote: row.role_note,
+    status: row.status,
+    responseDeadline: row.response_deadline,
+    createdAt: row.created_at,
+  };
+}
+
+// GET /api/invitations?serviceWeekId= (#48 Week View roster) — set_leader/
+// admin only. Roster-safe: selects explicit columns only (never `select("*")`)
+// so response_token/denial_reason never reach this response.
+export async function listInvitations(req: NextRequest, lookup?: UserLookup): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+    requireRole(ctx, ["admin", "set_leader"]);
+
+    const parsedResult = listInvitationsQuerySchema.safeParse(
+      Object.fromEntries(req.nextUrl.searchParams),
+    );
+    if (!parsedResult.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+    const { serviceWeekId } = parsedResult.data;
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data, error } = await supabase
+      .from("invitations")
+      .select("id, service_week_id, user_id, role_note, status, response_deadline, created_at")
+      .eq("service_week_id", serviceWeekId)
+      .eq("church_group_id", ctx.churchGroupId)
+      .order("created_at");
+
+    if (error) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    return ok({ invitations: (data ?? []).map(toWeekInvitation) });
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
 }
 
 // POST /api/invitations — set_leader/admin only (BR-05, PRD §22). Performs
