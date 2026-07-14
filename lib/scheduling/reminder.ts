@@ -6,7 +6,7 @@
 export const REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 // Mirrors the SQL selector in send_invitation_reminders()
-// (supabase/migrations/20260713000001_invitation_reminder_scheduler.sql):
+// (supabase/migrations/20260713000003_invitation_reminder_scheduler.sql):
 //   status = 'pending' AND coalesce(last_reminded_at, created_at) <= now() - interval '24 hours'
 // Keep the two in sync if the threshold or pending check ever changes.
 export function isReminderDue(

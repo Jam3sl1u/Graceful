@@ -1,10 +1,13 @@
 import type { InvitationStatus } from "@/types/domain";
 
 // The pure, DB-free, canonical declaration of the invitation state machine.
-// This module does not call the DB or any handler — it exists solely as an
+// This module does not call the DB or any handler — it exists as an
 // isolated, exhaustively-testable spec of legal invitation transitions.
-// `app/api/invitations/handler.ts` and the `accept_invitation` RPC currently
-// implement these rules inline; this module is not (yet) wired into either.
+// `app/api/invitations/handler.ts` uses canTransition/applyTransition/
+// canInvite for its deny, withdraw, and BR-08 cap logic. The `accept`
+// transition and its validation are owned by the `accept_invitation`
+// Postgres SECURITY DEFINER RPC (SQL, unreachable from this module) and are
+// intentionally not wired here — see supabase/migrations for that logic.
 
 export type InvitationAction = "accept" | "deny" | "withdraw" | "expire";
 

@@ -15,6 +15,7 @@ import {
   listInvitationsQuerySchema,
 } from "@/schemas/invitations";
 import type { EventType, InvitationStatus } from "@/types/domain";
+import { canTransition, applyTransition, canInvite, MAX_DENIALS_PER_WEEK } from "@/lib/invitations/state-machine";
 
 type InvitationsRow = Database["public"]["Tables"]["invitations"]["Row"];
 
@@ -161,8 +162,10 @@ export async function createInvitation(req: NextRequest, lookup?: UserLookup): P
       return fail("Service week not found", ErrorCode.NOT_FOUND, 404);
     }
 
-    // BR-08 (PRD §8): a member who has denied 3 invitations for this service week
-    // cannot be re-invited for it.
+    // BR-08 (PRD §8): a member who has denied MAX_DENIALS_PER_WEEK invitations
+    // for this service week cannot be re-invited for it. canInvite/
+    // MAX_DENIALS_PER_WEEK (lib/invitations/state-machine.ts) are the single
+    // source of truth for the cap.
     const { data: deniedForWeek, error: deniedError } = await supabase
       .from("invitations")
       .select("id")
@@ -170,9 +173,9 @@ export async function createInvitation(req: NextRequest, lookup?: UserLookup): P
       .eq("service_week_id", parsed.serviceWeekId)
       .eq("status", "denied");
     if (deniedError) return fail("Internal error", ErrorCode.INTERNAL, 500);
-    if ((deniedForWeek ?? []).length >= 3) {
+    if (!canInvite((deniedForWeek ?? []).length)) {
       return fail(
-        "Member has denied 3 invitations for this week and cannot be re-invited (BR-08)",
+        `Member has denied ${MAX_DENIALS_PER_WEEK} invitations for this week and cannot be re-invited (BR-08)`,
         ErrorCode.CONFLICT,
         409,
       );
@@ -345,8 +348,9 @@ export async function denyInvitation(
     }
 
     // Idempotency (PRD §12): a link used after already responding returns the
-    // current status with no side effects.
-    if (inv.status !== "pending") {
+    // current status with no side effects. canTransition is the shared
+    // source of truth for which statuses are terminal (lib/invitations/state-machine.ts).
+    if (!canTransition(inv.status, "deny")) {
       return ok({ invitation: toInvitationResponse(inv) });
     }
 
@@ -364,7 +368,7 @@ export async function denyInvitation(
     const denialCount = (priorDenied ?? []).length + 1;
 
     const patch: Database["public"]["Tables"]["invitations"]["Update"] = {
-      status: "denied",
+      status: applyTransition(inv.status, "deny"),
       denial_reason: reason,
       denial_count: denialCount,
       responded_at: new Date().toISOString(),
@@ -441,12 +445,12 @@ export async function withdrawInvitation(
       return fail("Not found", ErrorCode.NOT_FOUND, 404);
     }
 
-    if (inv.status !== "pending") {
+    if (!canTransition(inv.status, "withdraw")) {
       return fail("Invitation is not pending", ErrorCode.CONFLICT, 409);
     }
 
     const patch: Database["public"]["Tables"]["invitations"]["Update"] = {
-      status: "withdrawn",
+      status: applyTransition(inv.status, "withdraw"),
     };
     const { data: updated, error: updateError } = await supabase
       .from("invitations")

@@ -50,7 +50,7 @@ all 4 new spec files) and cross-checked every DB/API assumption against the actu
 current repo state rather than trusting the inline comments:
 
 - **Schema fields**: `invitations.denial_reason`, `.response_token`,
-  `.last_reminded_at` (added by `20260713000001_invitation_reminder_scheduler.sql`),
+  `.last_reminded_at` (added by `20260713000003_invitation_reminder_scheduler.sql`),
   `conflicts.trigger_reason`/`.invitation_id`, `notifications.link_entity_id`/`.type`/
   `.body`, `users.anonymized_at` (added by `20260710000001_member_removal_rpc.sql`,
   not in the original Cluster-1 migration — verified this one specifically since

@@ -269,4 +269,112 @@ describe("WeekView", () => {
     render(<WeekView serviceWeekId={SERVICE_WEEK_ID} />);
     await waitFor(() => expect(screen.getByText(/something went wrong/i)).toBeInTheDocument());
   });
+
+  describe("+ Invite button (#40)", () => {
+    const newInvitation = {
+      id: "inv-new",
+      serviceWeekId: SERVICE_WEEK_ID,
+      userId: MEMBER_OPEN,
+      roleNote: null,
+      status: "pending",
+      responseToken: "unused-in-week-view",
+      responseDeadline: null,
+      invitedBy: "someone",
+      createdAt: "2026-07-19T00:00:00Z",
+    };
+
+    it("happy path: posts to /api/invitations and flips the member to Pending on success", async () => {
+      const fetchMock = mockFetchByUrl({
+        "/api/invitations": jsonResponse(201, { data: { invitation: newInvitation } }),
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      render(<WeekView serviceWeekId={SERVICE_WEEK_ID} />);
+      await waitFor(() => expect(screen.getByText("Sunday Service")).toBeInTheDocument());
+
+      const openSlot = screen.getByText("Open Member").closest("div") as HTMLElement;
+      fireEvent.click(within(openSlot).getByRole("button", { name: /\+ invite/i }));
+
+      await waitFor(() => expect(within(openSlot).getByText("Pending")).toBeInTheDocument());
+      expect(within(openSlot).queryByRole("button", { name: /\+ invite/i })).not.toBeInTheDocument();
+
+      expect(fetchMock).toHaveBeenCalledWith("/api/invitations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ serviceWeekId: SERVICE_WEEK_ID, userId: MEMBER_OPEN }),
+      });
+    });
+
+    it("BR-05 conflict: a 409 prompts for confirmation and retries with acknowledgeConflict on accept", async () => {
+      const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(true);
+      const fetchMock = jest.fn((url: string, init?: RequestInit) => {
+        if (url === "/api/invitations" && init?.method === "POST") {
+          const body = JSON.parse(init.body as string);
+          if (body.acknowledgeConflict === true) {
+            return Promise.resolve(jsonResponse(201, { data: { invitation: newInvitation } }));
+          }
+          return Promise.resolve(
+            jsonResponse(409, { error: "Member already confirmed for another week", code: "CONFLICT" }),
+          );
+        }
+        return mockFetchByUrl()(url);
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      render(<WeekView serviceWeekId={SERVICE_WEEK_ID} />);
+      await waitFor(() => expect(screen.getByText("Sunday Service")).toBeInTheDocument());
+
+      const openSlot = screen.getByText("Open Member").closest("div") as HTMLElement;
+      fireEvent.click(within(openSlot).getByRole("button", { name: /\+ invite/i }));
+
+      await waitFor(() => expect(within(openSlot).getByText("Pending")).toBeInTheDocument());
+      expect(confirmSpy).toHaveBeenCalled();
+
+      confirmSpy.mockRestore();
+    });
+
+    it("BR-05 conflict: declining the confirm prompt leaves the member Open with no retry request", async () => {
+      const confirmSpy = jest.spyOn(window, "confirm").mockReturnValue(false);
+      const fetchMock = jest.fn((url: string, init?: RequestInit) => {
+        if (url === "/api/invitations" && init?.method === "POST") {
+          return Promise.resolve(
+            jsonResponse(409, { error: "Member already confirmed for another week", code: "CONFLICT" }),
+          );
+        }
+        return mockFetchByUrl()(url);
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      render(<WeekView serviceWeekId={SERVICE_WEEK_ID} />);
+      await waitFor(() => expect(screen.getByText("Sunday Service")).toBeInTheDocument());
+
+      const openSlot = screen.getByText("Open Member").closest("div") as HTMLElement;
+      fireEvent.click(within(openSlot).getByRole("button", { name: /\+ invite/i }));
+
+      await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+      expect(within(openSlot).getByText("Open")).toBeInTheDocument();
+      const postCalls = fetchMock.mock.calls.filter(
+        ([url, init]) => url === "/api/invitations" && (init as RequestInit | undefined)?.method === "POST",
+      );
+      expect(postCalls).toHaveLength(1); // declined confirm must not retry
+
+      confirmSpy.mockRestore();
+    });
+
+    it("failure case: a non-409 error shows an inline alert and the member stays Open", async () => {
+      const fetchMock = mockFetchByUrl({
+        "/api/invitations": jsonResponse(500, { error: "Internal error", code: "INTERNAL" }),
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      render(<WeekView serviceWeekId={SERVICE_WEEK_ID} />);
+      await waitFor(() => expect(screen.getByText("Sunday Service")).toBeInTheDocument());
+
+      const openSlot = screen.getByText("Open Member").closest("div") as HTMLElement;
+      fireEvent.click(within(openSlot).getByRole("button", { name: /\+ invite/i }));
+
+      await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+      expect(within(openSlot).getByText("Open")).toBeInTheDocument();
+    });
+  });
 });
