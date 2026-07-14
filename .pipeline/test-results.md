@@ -1,116 +1,139 @@
-# Test Results — Issue #50: Build Conflict Resolution screen (PRD §13 Screen 7)
+# Test Results — Issue #52: E2E tests for invitation & conflict flows
 
-## Verdict: PASS
-
-This overwrites the stale `test-results.md` for issue #51 that was still
+This overwrites the stale `test-results.md` for issue #50 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
-## What I did
+## Summary
 
-Read `.pipeline/changes.md` and `.pipeline/spec.md`, then independently read
-the actual changed/created files (`app/api/conflicts/handler.ts`,
-`app/(app)/conflicts/[id]/page.tsx`, `app/(app)/conflicts/[id]/conflict-resolution.tsx`,
-`app/(app)/conflicts/[id]/conflict-resolution.module.css`,
-`tests/unit/app/api/conflicts-route.test.ts`,
-`tests/unit/app/conflict-resolution.test.tsx`) rather than trusting the
-coder's summary, and re-ran the full verification suite with Bun.
+**ALL CHECKS PASS.** The coder's verification claims in `.pipeline/changes.md` were
+independently reproduced, plus one gap was closed (see "Tester-added coverage"
+below): the delivered E2E spec files, their support helpers, the CI wiring, and the
+env-gating logic are all correct and internally consistent with the actual schema,
+RPCs, and route handlers in this repo.
 
-Two independently-authored supplemental test files were already present
-(untracked) in the worktree:
-- `tests/unit/app/conflict-resolution-tester-supplement.test.tsx`
-- `tests/unit/app/api/conflicts-route-tester-supplement.test.ts`
+## Context: what "testing" means for this issue
 
-I reviewed both for behavioral (not implementation-detail) focus before
-relying on them. They close real gaps the coder's own tests left:
-- "Find a Replacement" click issues **no** additional fetch and leaves the
-  conflict open/ready (the coder's tests only checked the `href`, never the
-  click behavior — this is the spec's core distinguishing behavior for that
-  button: "No API call. Conflict stays open.").
-- A non-OK (500) response on the **initial** `GET /api/conflicts` lookup
-  (the `!res.ok` branch of the load effect) — previously only a thrown
-  network error and a well-formed-but-not-found list were covered.
-- `roleNote: null` encodes as an empty-string query param (`&roleNote=`),
-  not the literal string `"null"`.
-- The role gate on the newly-touched handler rejects `guest`, not just
-  `member` (guards against an accidental `requireRole` loosening while
-  touching this handler).
-- `roleNote: null` when the invitation row **exists** but its `role_note`
-  column is null — distinct code path from "invitation row missing
-  entirely" (proves the `??` fallback, not just optional chaining, is doing
-  real work).
+Issue #52's deliverable *is* a Playwright E2E test suite that requires real staging
+Clerk + Supabase secrets to actually execute its assertions. Those secrets are not
+present in this sandbox (by design — see `tests/e2e/support/env.ts`), so, per
+`changes.md`'s own "What the Tester should focus on" section, this pass focused on:
+(1) re-running every static/local check the coder claimed, (2) a from-scratch cross
+-reference of every DB field/enum/route-response-shape the specs assert against
+the actual migrations and handlers (not trusting the coder's inline comments), and
+(3) adding new, independently-written Jest unit tests for the one piece of new
+logic in this change that *can* run locally without staging secrets
+(`tests/e2e/support/env.ts`'s `checkEnv`/`requireEnv`/`e2eAuthEnabled`), to satisfy
+the pipeline contract's requirement for happy path / edge cases / a failure case.
 
-These are genuine behavioral tests (assert on rendered DOM / fetch calls /
-response bodies, not internals), so I kept them as part of this stage's
-output rather than treating them as noise.
+## Static/local checks (re-run independently)
 
-## Verification run
+| Check | Result |
+| --- | --- |
+| `bun run typecheck` | PASS (clean, no errors) |
+| `bun run lint` | PASS (clean, no errors) |
+| `bun run test` (Jest) | PASS — 48 suites / 529 tests (47/520 pre-existing + 1 new suite/9 new tests added by this Tester pass) |
+| `bun run check:workflows` | PASS |
+| `bun audit --audit-level=high` | PASS — no vulnerabilities |
+| `bun install --frozen-lockfile` | PASS — lockfile matches `package.json` exactly, no drift |
+| `bunx playwright test --list` | PASS — all 7 tests (4 new specs' 5 tests + `health.spec.ts` + skipped SMS/email placeholder) discovered with no module-resolution/syntax errors |
+| `bunx playwright test tests/e2e/health.spec.ts` | PASS — pre-existing unauthenticated E2E test still passes against local `bun run dev`, confirming `playwright.config.ts`'s `webServer`/`workers: 1`/`fullyParallel: false`/`globalSetup` changes don't break it |
+| `bunx playwright test` (full suite, local, no staging secrets) | PASS — 1 passed (`health.spec.ts`), 6 skipped (all issue #52 tests, including the always-skip SMS/email placeholder), confirming `globalSetup.ts` no-ops cleanly and every new spec's `test.skip(!e2eAuthEnabled, ...)` / `test.skip(!cronReady, ...)` gate fires correctly with zero secrets configured |
+| `.github/workflows/ci.yml` YAML syntax | PASS — parses cleanly (`yaml.safe_load`) |
 
-- `bun run typecheck` — clean, no errors.
-- `bun run lint` — clean, no errors/warnings.
-- `bun run test` — **43 suites passed / 495 tests passed**, 0 failed.
-  - Includes the coder's `tests/unit/app/conflict-resolution.test.tsx` (11
-    tests: loading, happy path, href encoding, Mark as Resolved POST, Dismiss
-    POST, null roleNote/triggerReason omission, null serviceWeekTitle
-    fallback, double-submit guard, not-found → unavailable, network error →
-    unavailable, 409 → unavailable, non-OK → inline alert).
-  - Includes the coder's updated `tests/unit/app/api/conflicts-route.test.ts`
-    (7 tests: 403 member, 401 no JWT, happy path with `roleNote`, empty list,
-    missing-invitation-row fallback, 500 on conflicts query, 500 on
-    invitations join).
-  - Includes the 5 tester-supplement tests listed above.
+All of the coder's `changes.md` "Verification performed" claims reproduce exactly.
 
-## Coverage check against the spec
+## Logic/cross-reference review (independent — not just re-running coder's commands)
 
-- **Happy path**: member name, formatted service date, `serviceWeekTitle`
-  heading, role note, reason, all three actions rendered — covered and
-  passing.
-- **Named edge cases** (all covered, all pass):
-  - Conflict id not in the open list → `unavailable`, no crash.
-  - `serviceWeekTitle` null → falls back to "Service".
-  - `roleNote` null → role line omitted cleanly (plus the href-encoding edge
-    case: empty string, not `"null"`).
-  - `triggerReason` null → reason line omitted cleanly.
-  - In-flight request → both buttons disabled, second click produces no
-    second POST.
-  - 409 on resolve → `unavailable`.
-  - Non-OK/network error on resolve → inline `role="alert"` message, buttons
-    stay enabled, no raw error/code/status string leaked.
-  - Non-OK (500) on the *initial* lookup → `unavailable`, no crash.
-- **Failure cases**: network error on initial lookup (thrown fetch), 500 on
-  initial lookup, non-OK on resolve, 409 on resolve — all covered.
-- **"Find a Replacement" behaves as pure navigation**: verified both via
-  `href` assertion (encoded `roleNote` + `serviceWeekId`) and, in the
-  supplement, via a click producing zero additional fetch calls with the
-  screen staying on the ready view — matches the spec's
-  "No API call. Conflict stays open." requirement exactly.
-- **`roleNote` plumbing end-to-end** (`handler.ts` → API response →
-  component): the route test's happy path and missing-invitation-row cases,
-  plus the supplement's "invitation exists but role_note column is null"
-  case, together prove `roleNote: invitation?.role_note ?? null` behaves
-  correctly for all three states (present / row missing / column null).
-- **Role gate**: `member` and (via supplement) `guest` both get 403
-  FORBIDDEN without ever reaching Supabase.
-- **Out-of-scope guardrails held**: `app/(app)/conflicts/page.tsx` (the list
-  stub) is untouched; `resolveConflict` (the resolve handler/schema) is
-  untouched — confirmed by reading `handler.ts` in full; no migration files
-  were touched (confirmed via file list in `changes.md` and `git status`).
+Read every new file (`tests/e2e/support/{env,db,auth,fixtures,global-setup}.ts`,
+all 4 new spec files) and cross-checked every DB/API assumption against the actual
+current repo state rather than trusting the inline comments:
 
-## Manual spot checks
+- **Schema fields**: `invitations.denial_reason`, `.response_token`,
+  `.last_reminded_at` (added by `20260713000001_invitation_reminder_scheduler.sql`),
+  `conflicts.trigger_reason`/`.invitation_id`, `notifications.link_entity_id`/`.type`/
+  `.body`, `users.anonymized_at` (added by `20260710000001_member_removal_rpc.sql`,
+  not in the original Cluster-1 migration — verified this one specifically since
+  `fixtures.ts`'s upsert relies on it) all exist exactly as the specs/fixtures assume.
+- **`notification_type` enum**: `invitation_accepted`, `invitation_reminder`,
+  `scheduling_conflict` (asserted in the accept/reminder/conflict specs) are all
+  valid enum values (`20260702000005_cluster_5_partial.sql` +
+  `20260713000001_conflict_notification.sql`).
+- **RPC → notification linkage**: `record_availability_conflict`'s notification
+  insert uses `link_entity_type: 'conflict'`, `link_entity_id: v_conflict_id` and
+  excludes the triggering user (`id <> v_user_id`) even for admin/set_leader roles
+  — exactly what `conflict-detection.spec.ts`'s two tests assert.
+  `send_invitation_reminders`'s admin notification uses
+  `link_entity_id: v_week.id` (service week, not invitation) and a `body` built
+  from `string_agg(u.name, ...)` — matches `invitation-reminder.spec.ts`'s
+  `.eq("link_entity_id", serviceWeekId)` and `.toContain("E2E Fixture Member")`.
+- **API response shapes**: `POST /api/invitations/:id/accept` and `.../deny` both
+  return `alreadyResponded` (camelCase, from `data.already_responded`) exactly as
+  `invitation-accept.spec.ts`/`invitation-deny.spec.ts` assert;
+  `PUT /api/availability` returns `conflictTriggered`; `GET /api/conflicts` returns
+  `{ data: { conflicts: [{ id, invitationId, triggerReason }] } }` — all match
+  `conflict-detection.spec.ts` field-for-field.
+- **UI selectors**: `app/(public)/invite/[token]/invite-response.tsx` renders
+  exactly the button text (`"Accept"`, `"Decline"`, `"Confirm decline"`), label
+  (`"Reason (optional)"` via `htmlFor="decline-reason"` / `id="decline-reason"`),
+  and heading text (`"You're on the schedule"`, `"Response recorded"`) that
+  `invitation-accept.spec.ts`/`invitation-deny.spec.ts` locate via `getByRole`/
+  `getByLabel`.
+- **`fixtures.ts`'s unique-`clerk_id` architectural claim**: confirmed
+  `users.clerk_id` is genuinely `unique` in `20260702000001_cluster_1_organization.sql`,
+  so the stable-fixture-plus-per-test-cleanup design (vs. the RLS suite's
+  per-test-fresh-fixture design) is a real, correctly-reasoned constraint, not an
+  invented justification.
+- **`GET /api/notifications` 501-stub claim**: confirmed
+  `app/api/notifications/route.ts` is genuinely an unimplemented `501` today,
+  justifying the specs' direct-DB-read workaround for notification assertions.
+- **CI YAML**: `e2e` job's `if: needs.check-secrets.outputs.has-e2e-secrets == 'true'`
+  correctly depends on `check-secrets`, which now computes `has-e2e-secrets` from
+  `STAGING_APP_URL` (mirrors the existing `has-secrets`/`rls-integration` pattern
+  exactly); all 8 required secrets (7 from `env.ts` + `CRON_SECRET`) are wired into
+  the job's `env:` block with matching names.
+- **`package.json`/`bun.lock`**: `@clerk/testing` and `@clerk/backend` are
+  correctly-scoped devDependencies; `test:e2e` script exists (`playwright test`);
+  `bun install --frozen-lockfile` succeeds with zero drift.
 
-- Confirmed by reading source that no raw `error`/`code`/`status` string is
-  ever interpolated into rendered text on any failure path (`actionError` is
-  always a fixed string; the `unavailable` view has no error-derived text).
-- Confirmed the two "back to conflicts" links use `next/link`'s `Link`
-  (required by `@next/next/no-html-link-for-pages` since `/conflicts` is a
-  real stub route), while "Find a Replacement" is intentionally a plain
-  `<a>` to the not-yet-built `/invitations/new` route, matching the spec's
-  OPEN QUESTION 1 chosen default (non-blocking, forward-compatible URL).
+No discrepancies found between what the spec files assert and the actual current
+behavior of the app.
 
-## Conclusion
+## Tester-added coverage
 
-No failing tests. The implementation matches the spec's button-mapping
-table, view-state machine, edge cases, and out-of-scope boundaries. The full
-suite (including two independently-authored supplemental test files closing
-real coverage gaps) is green: 43 suites / 495 tests passed, typecheck clean,
-lint clean. Ready for Review.
+The pipeline contract requires this stage to cover "the happy path, the edge cases
+the spec named, and at least one failure case," but the delivered E2E specs
+themselves cannot execute any assertions in this sandbox (no staging secrets) —
+only `--list`/static verification was possible for them, per `changes.md`'s own
+scoping note. To meet the contract with something that *actually runs and can
+fail*, added a new Jest unit-test file (not touching any coder-delivered file):
+
+**`tests/unit/e2e-support/env.test.ts`** (9 tests, all passing) — exercises
+`tests/e2e/support/env.ts`'s `checkEnv`/`e2eAuthEnabled`/`requireEnv`, the one piece
+of genuinely new logic in this change that has no staging dependency:
+- Happy path: `checkEnv()` / `e2eAuthEnabled` are `true` when all 7 required vars
+  are set; `requireEnv` returns the value when present.
+- Edge cases (named implicitly by the module's own contract): `checkEnv()` is
+  `false` when even one required var is missing; `checkEnv(["CRON_SECRET"])`
+  correctly requires the spec-specific extra on top of the base 7 (this is exactly
+  the mechanism `invitation-reminder.spec.ts`'s `cronReady` gate depends on);
+  `e2eAuthEnabled` is `false` with zero secrets configured (the actual state of
+  this sandbox and of local/CI-without-staging runs); an empty-string var is
+  correctly treated as absent, not merely-present-but-falsy-checked differently.
+- Failure case: `requireEnv` throws `"Missing required env var for E2E tests: <name>"`
+  when the var is absent — this is the failure mode every seeding helper in
+  `fixtures.ts`/`auth.ts`/`db.ts` relies on to fail loudly rather than silently
+  proceeding with `undefined` credentials against staging.
+
+This is genuinely new test coverage (not a duplicate of anything in `changes.md`),
+runs in the normal `bun run test` (Jest) path with no secrets required, and is
+included in the 529-test total reported above.
+
+## Verdict
+
+**PASS.** No failures, no regressions, no schema/API mismatches found. Recommend
+proceeding to Review. Flagging one observation for the Reviewer's judgment (not a
+failure): this Tester, like the Coder, cannot exercise the actual staging-dependent
+assertions (real Clerk sign-in, real conflict RPC round-trip, etc.) without
+provisioned secrets — the review of correctness here is necessarily static
+(schema/route/UI cross-reference) rather than a live run of those 6 gated tests.

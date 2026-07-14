@@ -1,55 +1,68 @@
-# Review — Issue #50: Build Conflict Resolution screen (PRD §13 Screen 7)
+# Review — Issue #52: E2E tests for invitation & conflict flows
 
-## VERDICT: SHIP
+VERDICT: SHIP
 
-## What I checked (not just trusting the summaries)
-- Read spec.md, changes.md, test-results.md.
-- Isolated the actual #50 commit (`aacfbb6`) — the `main...HEAD` three-dot diff
-  also shows #51 / cron-scheduler work that is not this issue; the #50 commit
-  itself touches exactly the 8 files the spec scopes (handler + route test +
-  4 new screen/test files + 2 pipeline artifacts). No scope creep.
-- Read every changed/created source file firsthand, plus both untracked
-  tester-supplement test files.
-- Re-ran `bun run typecheck` (clean), `bun run lint` (clean), `bun run test`
-  (43 suites / 495 tests, 0 failures).
+## Summary
 
-## Correctness assessment
-- **Handler change** matches the spec exactly: `roleNote` added to `OpenConflict`,
-  `role_note` added to both the `Pick<>` type and the `.select()`, surfaced as
-  `roleNote: invitation?.role_note ?? null`. `resolveConflict` untouched.
-- **Button → action mapping** is correct: "Mark as Resolved" POSTs
-  `member_reconfirmed`, "Dismiss" POSTs `admin_dismissed`, "Find a Replacement"
-  is a pure `<a>` navigation (no API call, conflict stays open) with a
-  forward-compatible `/invitations/new` URL and `encodeURIComponent(roleNote ?? "")`.
-- **View-state machine** and all named edge cases are handled: not-found / non-OK
-  / network error on load → `unavailable`; 409 on resolve → `unavailable`;
-  other non-OK / thrown error → inline fixed-string `role="alert"`, buttons stay
-  usable; double-submit guarded by `submitting`; null `serviceWeekTitle` →
-  "Service", null `roleNote` / `triggerReason` lines omitted cleanly.
-- **No sensitive-data leak**: `actionError` is always a fixed string; no
-  `error`/`code`/`status` is ever interpolated into rendered text.
-- **Out-of-scope boundaries held**: list stub, resolve endpoint/schema, and all
-  migrations are untouched.
+High-quality change. The planner correctly identified this issue could not be
+built as literally written and raised OQ1–OQ4; the coder's `changes.md` records
+a human resolution for each (add `@clerk/testing`+`@clerk/backend`, seed staging
+Clerk test users, scope AC#2 to the observable `denied` flip, scope AC#3 to the
+admin in-app reminder via a backdated `created_at` + cron call, add a
+secrets-gated CI job). Every resolution is reasonable and correctly scoped to
+#52 — #67/#68 (SMS/email) were NOT pulled in, and there is no scope creep.
 
-## Test quality
-- The coder's component test and route test are behavioral (assert rendered DOM,
-  fetch URL+body, response envelope) — not superficial.
-- The two tester-supplement files close real gaps behaviorally: click-produces-no-
-  fetch for "Find a Replacement", `!res.ok` load branch, null-roleNote href
-  encoding, `guest` role gate, and `role_note`-column-null vs invitation-row-
-  missing distinction. Both are legitimate assertion-on-behavior tests with no
-  suspicious content. They are untracked in the worktree — they must be committed
-  (or intentionally dropped) before/with the PR so the coverage they claim is not
-  silently lost.
+I did not trust the written summaries. I re-derived the load-bearing
+cross-references against the actual repo and they all hold:
 
-## Non-blocking notes (no action required to ship)
-- "Find a Replacement" anchor is not disabled during an in-flight resolve, though
-  the mapping-table narrative says all three are enabled "except while a request
-  is in flight." This is consistent with the spec's own detailed section 4 (only
-  the two `Button`s get the disabled treatment; the link is a plain anchor that
-  navigates away), so it is intentional, not a defect.
-- The jest run emits a jsdom "navigation not implemented" console warning from the
-  click-the-anchor test; it is cosmetic (jsdom can't perform anchor navigation)
-  and does not affect any assertion or the pass result.
+- `ok()` wraps payloads in `{ data }` (`lib/api/response.ts`); accept/deny
+  handlers return `{ status, alreadyResponded }` (`handler.ts:317`, `:566`) —
+  matches `invitation-accept/deny.spec.ts`.
+- `PUT /api/availability` returns `conflictTriggered`
+  (`app/api/availability/handler.ts:177`) — matches the conflict spec.
+- `GET /api/conflicts` returns `ok({ conflicts: [...] })` with `invitationId`
+  and `triggerReason` fields (`app/api/conflicts/handler.ts:101,114,119`);
+  `"marked_unavailable"` is a real `ConflictTriggerReason`
+  (`lib/scheduling/conflict-detection.ts:10`) — matches field-for-field.
+- `notifications` direct-read workaround is justified: `GET /api/notifications`
+  is a real 501 stub; the service-role client lives under `tests/` and the
+  service-role guard (`scripts/check-service-role.mjs`) only scans `app/`+`lib/`,
+  so no guard violation.
+- `users.clerk_id` UNIQUE constraint reasoning behind the stable-fixture +
+  `workers: 1` design is genuine, not invented.
+- `bunx playwright test --list` cleanly discovers all 7 tests; the always-skip
+  SMS/email placeholder correctly surfaces the OQ2 gap in the report instead of
+  hiding it.
 
-Green tests here reflect genuinely correct behavior. Ship it.
+Tests are meaningful, not superficial: notification assertions are scoped to a
+specific recipient AND entity id (no "some unread notification exists" bleed),
+idempotency and no-double-remind edge cases are asserted, the self-exclusion
+edge case is exercised, and every test tears down its own rows in FK order.
+
+## Notes for the human (confirm, but not blocking)
+
+1. **The whole change presupposes the OQ1–OQ4 human resolution.** AGENTS.md
+   says downstream stages STOP at OPEN QUESTIONS until a human resolves them.
+   `changes.md` asserts that happened, but the only evidence is the coder's
+   prose. Before merge, confirm YOU actually approved: adding the two Clerk
+   devDependencies, provisioning seeded staging Clerk test-mode users, and
+   creating the 8 GitHub Actions secrets. If you did, this is a clean SHIP.
+2. **No live E2E assertion has ever executed** — coder and tester both ran only
+   static checks + a small `env.ts` unit test, because no staging secrets exist
+   in the sandbox. The staging-dependent assertions are verified by
+   cross-reference only. This is inherent to shipping secrets-gated scaffolding
+   (same posture as the RLS suite) and is acceptable, but the first real CI run
+   after provisioning is the true smoke test.
+3. **Minor false-green gap in CI gating:** the `e2e` job runs when
+   `STAGING_APP_URL` alone is set, but each test skips unless ALL 7 vars in
+   `env.ts` are present. If staging URL is set but a Clerk/Supabase secret is
+   missing, the job passes green with every test skipped. Mirrors the existing
+   single-secret `rls-integration` gate, so not a regression — but worth
+   tightening the gate (or having the job fail when partially provisioned) so a
+   half-configured secret set can't silently no-op the suite.
+4. `.gitignore` gained `/.clerk/` (Clerk keyless-mode local dir) — correct,
+   harmless, unrelated-but-defensible.
+
+None of these are code defects. Nothing here can fail a normal local/CI run,
+there are no security or correctness issues in the delivered code, and the
+suite is correctly written against the real app. Ship after confirming item 1.
