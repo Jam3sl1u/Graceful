@@ -252,7 +252,7 @@ describe("GET /api/songs", () => {
 });
 
 describe("POST /api/songs", () => {
-  it("returns 201 for a valid minimal body with nullable fields null and tags []", async () => {
+  it("returns 201 for a valid minimal body with optional fields omitted and tags []", async () => {
     setUpAuth();
     let capturedPayload: unknown;
     mockGetSupabaseClient.mockReturnValue(
@@ -276,6 +276,42 @@ describe("POST /api/songs", () => {
       bpm: null,
       tags: null,
       created_by: USER_ID,
+    });
+  });
+
+  it("returns 201 when optional fields are explicitly null", async () => {
+    setUpAuth();
+    let capturedPayload: unknown;
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient({}, { onInsert: (table, payload) => (capturedPayload = payload) }),
+    );
+
+    const res = await createSong(
+      makeReq(
+        {},
+        {
+          title: "New Song",
+          artist: null,
+          default_key: null,
+          bpm: null,
+          tags: null,
+        },
+      ),
+      makeLookup("admin"),
+    );
+    expect(res.status).toBe(201);
+
+    const body = await res.json();
+    const song: SongResponse = body.data.song;
+    expect(song.artist).toBeNull();
+    expect(song.defaultKey).toBeNull();
+    expect(song.bpm).toBeNull();
+    expect(song.tags).toEqual([]);
+    expect(capturedPayload).toMatchObject({
+      artist: null,
+      default_key: null,
+      bpm: null,
+      tags: null,
     });
   });
 

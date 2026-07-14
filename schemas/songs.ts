@@ -49,10 +49,10 @@ export function isValidSongKey(key: string): boolean {
 // checked in the handler so it can return 422 instead of 400.
 export const createSongSchema = z.object({
   title: z.string().trim().min(1).max(200),
-  artist: z.string().trim().min(1).max(200).optional(),
-  default_key: z.string().trim().min(1).max(5).optional(),
-  bpm: z.number().int().positive().max(400).optional(),
-  tags: z.array(z.string().trim().min(1).max(50)).optional(),
+  artist: z.string().trim().min(1).max(200).nullish(),
+  default_key: z.string().trim().min(1).max(5).nullish(),
+  bpm: z.number().int().positive().max(400).nullish(),
+  tags: z.array(z.string().trim().min(1).max(50)).nullish(),
 });
 export type CreateSongInput = z.infer<typeof createSongSchema>;
 

@@ -101,7 +101,7 @@ export async function createSong(req: NextRequest, lookup?: UserLookup): Promise
 
     // BR-09: key membership is checked here (not in Zod) so a malformed body
     // is 400 but an invalid key value is 422.
-    if (parsed.default_key !== undefined && !isValidSongKey(parsed.default_key)) {
+    if (parsed.default_key != null && !isValidSongKey(parsed.default_key)) {
       return fail("Invalid musical key", ErrorCode.VALIDATION_FAILED, 422);
     }
 

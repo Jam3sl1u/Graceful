@@ -76,6 +76,14 @@ Spotify/familiarity/override/update/delete work (explicitly out of scope).
 - `bun run test` (Jest) — full suite: 50 suites / 569 tests passed, including
   the new 28-test `songs-route.test.ts`.
 
+## Follow-up (review #53 nullish)
+
+- Optional create fields (`artist` / `default_key` / `bpm` / `tags`) now use
+  Zod `.nullish()` so explicit JSON `null` is accepted as omitted → **201**.
+- BR-09 membership check uses `parsed.default_key != null`, so null skips key
+  validation. Closes the reviewer’s blocking item (`.optional()` rejected
+  null → 400 vs spec edge case omit/null → 201).
+
 ## Notes for the Tester
 
 - The BR-09 422-vs-400 split is the crux of this issue: confirm a malformed

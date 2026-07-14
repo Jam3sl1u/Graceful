@@ -49,10 +49,10 @@ Currently just `z.object({})`. Replace with:
   key membership; the key-value check happens in the handler so it can return
   422, see edge cases):
   - `title`: `z.string().trim().min(1).max(200)` (required)
-  - `artist`: `z.string().trim().min(1).max(200).optional()`
-  - `default_key`: `z.string().trim().min(1).max(5).optional()`
-  - `bpm`: `z.number().int().positive().max(400).optional()`
-  - `tags`: `z.array(z.string().trim().min(1).max(50)).optional()`
+  - `artist`: `z.string().trim().min(1).max(200).nullish()`
+  - `default_key`: `z.string().trim().min(1).max(5).nullish()`
+  - `bpm`: `z.number().int().positive().max(400).nullish()`
+  - `tags`: `z.array(z.string().trim().min(1).max(50)).nullish()`
   - Unknown keys may be ignored (no `.strict()` needed).
   - Export `type CreateSongInput = z.infer<typeof createSongSchema>`.
 
@@ -118,12 +118,13 @@ Plus a private `toSongResponse(row)` mapper (snake_case row → `SongResponse`,
 - `const body = await req.json().catch(() => null);` then
   `createSongSchema.safeParse(body)`; on failure →
   `fail("Validation failed", VALIDATION_FAILED, 400)`.
-- **BR-09 key check (must produce 422):** if `parsed.default_key` is present and
-  `!isValidSongKey(parsed.default_key)` →
+- **BR-09 key check (must produce 422):** if `parsed.default_key` is a
+  non-null string and `!isValidSongKey(parsed.default_key)` →
   `fail("Invalid musical key", ErrorCode.VALIDATION_FAILED, 422)`.
-  (Keep this in the handler, NOT in Zod, so malformed body = 400 but invalid
-  key value = 422. Precedent for 422 + VALIDATION_FAILED:
-  `app/api/church-group/members/[id]/handler.ts` lines 52-56.)
+  Membership runs only when `default_key` is present and non-null (omit/null
+  skip the check). Keep this in the handler, NOT in Zod, so malformed body =
+  400 but invalid key value = 422. Precedent for 422 + VALIDATION_FAILED:
+  `app/api/church-group/members/[id]/handler.ts` lines 52-56.
 - Get JWT (401 if missing), build supabase client.
 - Insert payload (narrow cast as above):
   ```
