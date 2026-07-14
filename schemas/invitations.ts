@@ -52,3 +52,9 @@ export const respondTokenParamSchema = z
   .string()
   .length(64)
   .regex(/^[0-9a-f]{64}$/);
+
+// GET /api/invitations?serviceWeekId= query (#48 Week View roster).
+export const listInvitationsQuerySchema = z.object({
+  serviceWeekId: z.string().uuid(),
+});
+export type ListInvitationsQuery = z.infer<typeof listInvitationsQuerySchema>;

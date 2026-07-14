@@ -1,80 +1,113 @@
-# Changes — Issue #51: Invitation state machine unit tests
+# Changes — Issue #48: Build Week View screen (Admin / Set Leader)
 
 ## Summary
 
-There was no isolated, throwing invitation state-machine function in the codebase
-(the transition rules lived inline in `app/api/invitations/handler.ts` and in the
-`accept_invitation` Postgres RPC). Per the spec's design decision, created a new
-pure, DB-free module that is the canonical declaration of the invitation state
-machine, then unit-tested it exhaustively. No existing code was refactored to use
-it — `handler.ts` and the SQL RPC are untouched and keep their current HTTP
-semantics, exactly as scoped.
+Implemented the Set Leader/Admin Week View screen per `.pipeline/spec.md`:
+one backend read endpoint (completing the `GET /api/invitations` 501 stub
+into a roster-safe, week-scoped list) plus the client screen that composes
+it with four existing endpoints (service week, service-week list, roster
+members, conflicts) and one non-critical endpoint (team availability).
 
-## Files changed
+## Backend
 
-- **`lib/invitations/state-machine.ts`** (new) — pure logic module, no
-  `"server-only"` import (isomorphic, unlike `lib/scheduling/conflict-detection.ts`
-  which it otherwise mirrors in style). Exports:
-  - `InvitationAction` type (`"accept" | "deny" | "withdraw" | "expire"`)
-  - `MAX_DENIALS_PER_WEEK = 3` (BR-08)
-  - `InvalidInvitationTransitionError` (carries `.from`/`.action`, `.name` set to
-    `"InvalidInvitationTransitionError"`)
-  - `DenialCapReachedError` (carries `.priorDenialCount`, `.name` set to
-    `"DenialCapReachedError"`)
-  - `canTransition(from, action)` / `applyTransition(from, action)` — both backed
-    by one shared `TRANSITIONS` lookup table so they can never disagree. Only
-    `pending` has legal outgoing actions (→ `accepted`/`denied`/`withdrawn`/
-    `expired`); every other status is terminal. Unknown/runtime-invalid actions
-    fall through to the `undefined` branch and are treated as invalid (no crash,
-    no silent success). `applyTransition` never returns the unchanged `from`
-    status — every illegal transition throws `InvalidInvitationTransitionError`.
-  - `canInvite(priorDenialCount)` / `assertCanInvite(priorDenialCount)` — BR-08
-    gate, cap boundary at `>= 3`, matching `handler.ts`'s existing
-    `(deniedForWeek ?? []).length >= 3` check.
+- **`schemas/invitations.ts`** — added `listInvitationsQuerySchema` /
+  `ListInvitationsQuery` (`serviceWeekId: z.string().uuid()`), mirroring
+  `getTeamAvailabilityQuerySchema`.
+- **`app/api/invitations/handler.ts`** — added:
+  - `WeekInvitation` type (roster-safe: `id`, `serviceWeekId`, `userId`,
+    `roleNote`, `status`, `responseDeadline`, `createdAt`). Deliberately does
+    **not** reuse `InvitationResponse`/`toInvitationResponse`, since those
+    include `responseToken` (the no-session credential) and `denial_reason`.
+  - `toWeekInvitation` mapper.
+  - `listInvitations(req, lookup?)`: `requireAuth` + `requireRole(["admin",
+    "set_leader"])`, parses `req.nextUrl.searchParams` via
+    `listInvitationsQuerySchema` (400 on failure), queries `invitations`
+    filtered by `service_week_id` + `church_group_id`, ordered by
+    `created_at`, selecting **explicit columns only** (never `select("*")`)
+    so `response_token`/`denial_reason` never reach the response. Same
+    try/catch → `ApiException`/`fail`/500 pattern as the other handlers.
+- **`app/api/invitations/route.ts`** — replaced the `notImplemented("GET
+  /api/invitations")` stub with `listInvitations(req)`. `POST` (→
+  `createInvitation`) is untouched.
 
-- **`tests/unit/lib/invitations/state-machine.test.ts`** (new) — 21 tests,
-  mirroring the style of `tests/unit/lib/scheduling/conflict-detection.test.ts`
-  (plain `describe`/`it`, no mocks needed since this is pure logic):
-  - Valid transitions: all 4 `pending → *` cases (accept/deny/withdraw/expire).
-  - Invalid transitions: the issue's named cases (`accepted→accept`,
-    `denied→accept`, `withdrawn→accept`, `expired→accept`) plus terminal-source
-    coverage (`accepted→deny`, `accepted→withdraw`) and self-loop re-application
-    (`denied→deny`, `withdrawn→withdraw`).
-  - One test asserts the thrown error's `.name`/`.from`/`.action` explicitly.
-  - One test covers a runtime-unknown action forced past the type system via a
-    cast, asserting it's treated as an invalid transition (not a crash, not a
-    silent success).
-  - One exhaustive test iterates all 5 statuses × 4 actions (20 pairs) and
-    asserts exactly the 4 `pending→*` pairs are legal, the other 16 throw
-    `InvalidInvitationTransitionError`.
-  - BR-08 cap tests: `canInvite(0/1/2)` → true, `canInvite(3/4)` → false;
-    `assertCanInvite` non-throwing below cap, throwing `DenialCapReachedError`
-    (asserting `.priorDenialCount`) at/above cap; asserts `MAX_DENIALS_PER_WEEK
-    === 3` rather than hard-coding the literal in the boundary tests.
+## Frontend
 
-- **`.pipeline/spec.md`** — committed the current run's issue #51 spec (the copy
-  on disk at HEAD on this branch was a stale #46 spec left over from this
-  branch's prior use; the planner's #51 spec was present but uncommitted in the
-  working tree at the start of this stage).
+- **`app/(app)/week/[id]/page.tsx`** — replaced the placeholder stub with a
+  server component that awaits `params` and renders `<WeekView
+  serviceWeekId={id} />`, mirroring `app/(public)/invite/[token]/page.tsx`.
+- **`app/(app)/week/[id]/week-view.tsx`** (new) — `"use client"` component.
+  One `useEffect` fires `Promise.all` of the five core fetches
+  (`GET /api/service-weeks/:id`, `GET /api/service-weeks`,
+  `GET /api/church-group/members`, `GET /api/invitations?serviceWeekId=`,
+  `GET /api/conflicts`); after that resolves and the week's `serviceDate` is
+  known, a further non-critical `GET /api/availability/team?startDate=&endDate=`
+  fetch is issued for the sidebar (its 7-day UTC window is computed from
+  `serviceDate`, so it cannot be part of the initial parallel batch).
+  - View states: `"loading" | "ready" | "forbidden" | "not-found" | "error"`.
+    A 404 on the service-week fetch → not-found; a 403 on any of the four
+    other core fetches → forbidden; any other non-OK/thrown → error. The
+    week-list and availability fetches are treated as non-critical and
+    degrade to empty nav/sidebar instead of blocking `"ready"`.
+  - Header: service date (`formatServiceDate`, copied from
+    `invite-response.tsx`), title (falls back to "Untitled service"), a
+    `Badge` (`Cancelled`/danger when `isCancelled`, else a static `Draft`/
+    neutral with a `TODO(Sprint 3 #64)`), and prev/next nav arrows computed
+    from the `service-weeks` list's sort order (`getNeighborWeekIds`).
+  - Roster grid: one slot per `DirectoryMember`. `getCurrentInvitation` picks
+    the max-`createdAt` `WeekInvitation` per member; `getRosterStatus` maps
+    it to Conflict (red, checked first) / Confirmed / Pending / Declined /
+    Open (with a non-functional "+ Invite" `Button`), matching the spec's
+    precedence table. Initials avatar via `getInitials`.
+  - Collapsible availability sidebar (`useState<boolean>` toggle): a
+    CSS-grid table with rows = availability members (name resolved via the
+    roster map) and columns = the 7-day window (`getAvailabilityWindow`,
+    UTC-based via `addDaysUTC`), each cell colored by `isAvailable` (blank/
+    grey when no entry).
+  - Events and Setlist cards: static placeholders per spec
+    (`TODO(#59)` / `TODO(Sprint 3 #64)`), each with a non-functional button.
+- **`app/(app)/week/[id]/week-view.module.css`** (new) — plain CSS module,
+  desktop-first two-column layout (main + sidebar), roster grid, sidebar
+  collapse states, availability grid cell coloring. Follows
+  `invite-response.module.css`'s conventions.
 
-## Verification performed
+## Tests
 
-- `bun run typecheck` — passes, no errors.
-- `bun run lint` — passes, no errors/warnings.
-- `bun run test` — full suite: 33 test suites, 409 tests, all passing (includes
-  the 21 new tests). No existing tests were touched or broken.
+- **`tests/unit/app/api/invitations-list-route.test.ts`** (new) — covers:
+  403 for a member; 400 for missing/non-uuid `serviceWeekId`; 401 with no
+  JWT; happy path returns the week-scoped list and asserts the response
+  never has a `responseToken` key (and the selected columns string isn't
+  `"*"` and doesn't mention `response_token`); empty list; 500 on a query
+  error.
+- **`tests/unit/app/week-view.test.tsx`** (new) — covers: loading → ready;
+  header (title, Draft badge, Events/Setlist placeholder cards); roster
+  status mapping for all five states, explicitly asserting the
+  conflict-overrides-accepted case and that "+ Invite" renders only on the
+  Open slot; nav arrows link to the correct prev/next ids; cancelled week
+  shows the Cancelled badge instead of Draft; sidebar collapse/expand
+  toggle; 403 on a core fetch → forbidden view; 404 on the service-week
+  fetch → not-found view; week-list/availability failures degrade
+  gracefully (still "ready", empty nav/sidebar); empty roster renders an
+  empty state; a network error on the core fetches → error view.
+
+## Verification
+
+- `bun run typecheck` — clean.
+- `bun run lint` — clean.
+- `bun run test` — 42 suites / 496 tests passed (includes the two new test
+  files above plus the full existing suite, unchanged elsewhere).
 
 ## What the Tester should focus on
 
-- Confirm the exhaustive 5×4 matrix test genuinely covers all pairs (no typo
-  causing a false negative to be silently skipped).
-- Confirm `applyTransition`/`canTransition` truly share one lookup table
-  (`TRANSITIONS` in `lib/invitations/state-machine.ts`) so they can't
-  independently be made to disagree.
-- Confirm this issue's explicit scope boundary was honored: `handler.ts` and the
-  `accept_invitation` SQL RPC are unmodified (no refactor to call the new
-  module), and their existing route tests
-  (`invitations-deny-route.test.ts`, `invitations-withdraw-route.test.ts`,
-  `invitations-accept-route.test.ts`) still pass unchanged.
-- Confirm the denial-cap boundary (`>= 3`, not `> 3`) matches
-  `app/api/invitations/handler.ts`'s existing BR-08 check.
+- The roster-safety assertion in `invitations-list-route.test.ts` (no
+  `responseToken`/`response_token` anywhere in the response or the executed
+  `select(...)` column string) — this was called out in the spec as the
+  single most important backend correctness point.
+- The conflict-precedence logic (`getRosterStatus` in `week-view.tsx`): an
+  accepted-but-conflicted invitation must render "Conflict", not
+  "Confirmed" — covered by a dedicated test but worth an independent look.
+- The 403→forbidden / 404→not-found routing in `week-view.tsx`'s load
+  effect, since the `(app)` layout does not itself enforce role (per its own
+  TODO) — the client-side handling is the only gate today.
+- Nav-arrow direction (`getNeighborWeekIds`): `GET /api/service-weeks` is
+  ordered `service_date` desc, so index 0 is the newest week; verify the
+  "prev"/"next" semantics still read naturally against real data.

@@ -1,8 +1,8 @@
-# Test Results — Issue #51: Invitation state machine unit tests
+# Test Results — Issue #48: Build Week View screen (Admin / Set Leader)
 
 ## Verdict: PASS
 
-This overwrites the stale `test-results.md` for issue #46 that was still
+This overwrites the stale `test-results.md` for issue #51 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
@@ -10,95 +10,134 @@ recent run).
 
 - `bun run typecheck` — clean, no errors.
 - `bun run lint` — clean, no errors/warnings.
-- `bun run test` (Jest, full suite) — **33 test suites, 409 tests, all
-  passing.**
-- Re-ran just the new file in isolation
-  (`tests/unit/lib/invitations/state-machine.test.ts`) — 21/21 passing.
+- `bun run test` (Jest, full suite, including two new tester-supplement files
+  added below) — **44 test suites, 503 tests, all passing.**
+- Before adding any new tests: ran the full suite once as-is (coder's diff
+  only) — **42 suites / 496 tests**, matching `changes.md`'s claimed count
+  exactly.
 
 ## Independent verification performed
 
-1. **Domain type source of truth**: confirmed `types/domain.ts:6` declares
-   `InvitationStatus = "pending" | "accepted" | "denied" | "withdrawn" |
-   "expired"`, and `lib/invitations/state-machine.ts` imports it rather than
-   redeclaring the union, as the spec required.
+1. **Diff scope matches `changes.md`**: `git diff --stat 4dd31d6 27be00c` (the
+   commit range for this issue) touches exactly the 8 files `changes.md`
+   lists (`schemas/invitations.ts`, `app/api/invitations/{handler,route}.ts`,
+   `app/(app)/week/[id]/{page.tsx,week-view.tsx,week-view.module.css}`, and
+   the two new test files) — no scope creep, no unrelated refactor.
 
-2. **Shared source of truth for `canTransition`/`applyTransition`**: both
-   functions read from the same `TRANSITIONS` lookup table in
-   `lib/invitations/state-machine.ts` (a
-   `Record<InvitationStatus, Partial<Record<InvitationAction,
-   InvitationStatus>>>`), so they cannot be made to disagree independently.
-   Only `pending` has non-empty outgoing entries; the other four statuses map
-   to `{}`, correctly making them terminal.
+2. **Response-token leak (the spec's single most important backend
+   correctness point)**: read `app/api/invitations/handler.ts` directly.
+   `listInvitations` selects an explicit column string (`"id, service_week_id,
+   user_id, role_note, status, response_deadline, created_at"`) — never
+   `select("*")` — and `WeekInvitation`/`toWeekInvitation` never touch
+   `response_token`/`denial_reason`. Confirmed the existing
+   `invitations-list-route.test.ts` happy-path test asserts both the absence
+   of the `responseToken` key and that the executed `select(...)` string
+   isn't `"*"` and doesn't mention `response_token`.
 
-3. **Exhaustive 5×4 matrix test is not vacuous**: read
-   `tests/unit/lib/invitations/state-machine.test.ts` lines 98-115. It builds
-   `legalPairs` from all 4 `pending:*` combinations, then loops all 5
-   statuses x 4 actions (20 pairs total), asserting `canTransition` and
-   `applyTransition` agree with set membership. Traced by hand: 4 legal +
-   16 illegal = 20, matching "5 statuses x 4 actions" exactly — no pair is
-   skipped or duplicated.
+3. **Tenant isolation on the read path (gap the coder's own test left
+   open)**: the coder's `makeChain`/`makeSupabaseClient` helpers in
+   `invitations-list-route.test.ts` never record what `.eq(...)` is actually
+   called with — they only assert the final resolved `{ data, error }`. A
+   regression that silently dropped the `.eq("church_group_id",
+   ctx.churchGroupId)` filter (cross-tenant leak) would have stayed green.
+   Added `tests/unit/app/api/invitations-list-route-tester-supplement.test.ts`
+   with a recording chain that captures every `.eq(...)` call's arguments and
+   asserts both `service_week_id` and `church_group_id` are filtered on, and
+   that an "other" group id is never used. Also added: a `guest`-role 403
+   case (the coder's suite only tries `member`), and an exact-column-list
+   assertion (not just "isn't `*`") so a regression that also dropped a
+   *needed* column (e.g. `status`) would be caught.
 
-4. **Scope boundary honored**: `git show --stat HEAD` (commit `30a1db3`,
-   "Add invitation state-machine module and exhaustive unit tests (#51)")
-   touches only `.pipeline/changes.md`, `.pipeline/spec.md`,
-   `lib/invitations/state-machine.ts`, and
-   `tests/unit/lib/invitations/state-machine.test.ts`. Confirmed via `grep`
-   that `app/api/invitations/handler.ts` is untouched and still carries its
-   own inline guards (`status !== "pending"` at lines 239 and 334,
-   `(deniedForWeek ?? []).length >= 3` at line 101) — the new module is
-   additive only, not wired in anywhere. The three route tests named in
-   `changes.md` (`invitations-deny-route.test.ts`,
-   `invitations-withdraw-route.test.ts`, `invitations-accept-route.test.ts`)
-   all still pass unchanged in the full suite run above. The `accept_invitation`
-   SQL RPC migration is untouched (no new/modified migration file in the diff).
+4. **Conflict-precedence logic** (`getRosterStatus` in `week-view.tsx`): read
+   the implementation — `conflictInvitationIds.has(current.id)` is checked
+   before any `status` comparison, matching the spec's precedence table
+   exactly. The coder's own test explicitly covers the
+   accepted-but-conflicted → "Conflict" (not "Confirmed") case; confirmed by
+   running it and by reading the code, not just trusting the test name.
 
-5. **BR-08 boundary matches `handler.ts`**: `handler.ts:101` uses
-   `(deniedForWeek ?? []).length >= 3`; `state-machine.ts`'s
-   `canInvite`/`assertCanInvite` use the equivalent `< MAX_DENIALS_PER_WEEK`
-   / cap-at-3 semantics (cap reached exactly at 3, not 4 — confirmed by
-   reading the source, not just trusting the test names).
+5. **"No invitation, or only withdrawn/expired" → Open (gap the coder's own
+   test left open)**: the coder's roster-mapping test only tries a member
+   entirely *absent* from the invitations list for the Open case — a member
+   whose current invitation is `withdrawn` was never tried, so a regression
+   that mapped `withdrawn` to some other label (or threw) wouldn't be caught.
+   Added a case to `week-view-tester-supplement.test.tsx` covering exactly
+   this: a member whose only invitation has `status: "withdrawn"` renders
+   "Open" with a working "+ Invite" button.
 
-6. **Mutation check (regression-catching sanity, not part of the shipped
-   diff)**: temporarily changed `canInvite`'s comparison from
-   `< MAX_DENIALS_PER_WEEK` to `<= MAX_DENIALS_PER_WEEK` (an intentional
-   off-by-one bug) and re-ran the state-machine test file in isolation.
-   Result: 2 of 21 tests failed exactly as expected — "blocks invites once
-   the cap is reached" and the `assertCanInvite` throw-at-cap test — proving
-   the boundary tests are not vacuous and would catch a real regression.
-   Reverted immediately afterward; `git status`/`git diff --stat` confirmed
-   the working tree was byte-identical to the committed state (clean, zero
-   diff) before this report was written.
+6. **Nav-arrow index math on a genuine list edge (gap the coder's own test
+   left open)**: the coder's "disabled arrow" behavior is only exercised via
+   a *failed* week-list fetch (both arrows degrade together). Added a case
+   where the week-list fetch succeeds and the current week is genuinely first
+   (newest) in the list — confirms `getNeighborWeekIds`'s index math disables
+   only the "next" arrow while "prev" still resolves to the correct
+   neighbor, independently of fetch-failure degradation.
+
+7. **403 gating on all four core fetches, not just one (gap the coder's own
+   test left open)**: the coder's suite only tries a 403 on
+   `/api/church-group/members`. Per the spec, `/api/invitations` and
+   `/api/conflicts` are equally core, forbidden-gated fetches. Added two
+   cases confirming a 403 on either independently routes to the same
+   `"forbidden"` view (a regression that only checked `membersRes.status`
+   would have passed the coder's suite while silently rendering a broken
+   grid on an invitations/conflicts 403).
+
+8. **Role-gating claim re: the `(app)` layout**: confirmed by reading
+   `app/(app)/layout.tsx` — it has an explicit `TODO(Sprint 0 #6)` and does
+   **not** enforce role; `middleware.ts` has no `week`-specific gating either.
+   This matches `changes.md`'s claim that the client-side 403 handling in
+   `week-view.tsx` is the only real gate today, making point 7 above a
+   meaningful check rather than a redundant one.
+
+9. **UTC availability-window date math**: read `addDaysUTC`/
+   `getAvailabilityWindow` in `week-view.tsx` — uses
+   `new Date(\`${dateStr}T00:00:00Z\`)` plus `n * 86_400_000`, matching
+   `schemas/availability.ts`'s UTC convention (checked directly). No local-
+   timezone off-by-one risk since all arithmetic and formatting
+   (`formatShortDate`'s `timeZone: "UTC"`) stay in UTC.
 
 ## Failure cases covered
 
-- `expect(() => applyTransition("pending", bogusAction)).toThrow(...)` for a
-  runtime-unknown action forced past the type system via a cast, proving the
-  defensive `undefined` fallthrough in `TRANSITIONS` works and doesn't
-  silently no-op or crash uncontrolled.
-- All 16 illegal `(status, action)` pairs in the exhaustive matrix are
-  themselves failure-case assertions (`toThrow(InvalidInvitationTransitionError)`),
-  well beyond the "at least one failure case" requirement.
-- `assertCanInvite` throwing `DenialCapReachedError` at/above the cap, with
-  `.priorDenialCount` asserted on the caught error.
+- Backend: 500 on a Supabase query error (`INTERNAL`), 400 on missing/
+  non-uuid `serviceWeekId`, 401 with no JWT, 403 for `member` (coder) and
+  `guest` (added).
+- Frontend: a thrown/rejected `fetch` on the core batch → `"error"` view
+  (coder); 403 on `church-group/members` (coder), `invitations` (added),
+  `conflicts` (added) → `"forbidden"` view; 404 on the service-week fetch →
+  `"not-found"` view (coder).
 
 ## Edge cases named in the spec, confirmed covered
 
-- All 4 `pending -> *` valid transitions (accept/deny/withdraw/expire).
-- Terminal-source invalid transitions (`accepted->accept`, `denied->accept`,
-  `withdrawn->accept`, `expired->accept`, plus `accepted->deny`,
-  `accepted->withdraw`).
-- Self-loop re-application from a terminal status (`denied->deny`,
-  `withdrawn->withdraw`).
-- Error carries `.from`/`.action`/`.name` context (not a bare `Error`).
-- BR-08 cap boundary at exactly 3 (`canInvite`/`assertCanInvite` for
-  0/1/2/3/4), driven by the exported `MAX_DENIALS_PER_WEEK` constant rather
-  than a hard-coded literal in the boundary-crossing assertions.
+- Response-token/denial_reason never leaked (backend).
+- Explicit-columns-only select, never `select("*")` (backend, both files).
+- Tenant isolation (`church_group_id` filter actually applied — added).
+- Role gating on `/api/invitations`, `/api/availability/team`,
+  `/api/conflicts` (backend 403s; frontend forbidden-view routing for all
+  three core-fetch sources, not just one).
+- Multiple invitations per member/week → max-`createdAt` wins (coder's
+  conflict-member fixture has a stale `denied` row plus a newer `accepted`
+  row).
+- Member with no invitation, and member with only a `withdrawn` invitation →
+  both read "Open" + "+ Invite" (coder + added).
+- Conflict precedence overrides "Confirmed" (coder).
+- Cancelled week → `Cancelled` danger badge, not `Draft` (coder).
+- Empty roster, empty availability, degraded week-list/availability fetches,
+  and a genuine no-neighbor list edge (coder + added) → no crashes.
+- UTC date math for the availability window (read/confirmed).
+- `{ data }` envelope unwrapped on every fetch (read/confirmed).
 
 ## Conclusion
 
 All of the coder's claims in `.pipeline/changes.md` check out under
-independent verification. No discrepancies found. Full suite green (33/33
-suites, 409/409 tests), typecheck and lint clean, the issue's scope boundary
-(no refactor of `handler.ts`/SQL RPC) was honored, and a deliberate mutation
-test confirms the new suite actually catches regressions rather than being
-vacuous. Ready for review.
+independent verification: typecheck and lint are clean, the originally-shipped
+suite is exactly 42/42 suites and 496/496 tests as claimed, and the diff scope
+matches exactly what `changes.md` describes. Two gaps were found in the
+coder's own test coverage (tenant-isolation filter arguments were never
+asserted on the read endpoint, and three edge cases — withdrawn-only
+invitation, genuine list-edge nav arrows, and 403 on the invitations/conflicts
+fetches specifically — were untested); both are closed with new,
+independently-written tests in
+`tests/unit/app/api/invitations-list-route-tester-supplement.test.ts` and
+`tests/unit/app/week-view-tester-supplement.test.tsx`. No behavioral defects
+were found — every added test passed against the existing implementation on
+the first run, meaning these were coverage gaps, not bugs. Full suite is now
+44/44 suites, 503/503 tests, green. Ready for review.
