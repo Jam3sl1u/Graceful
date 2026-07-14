@@ -170,6 +170,8 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
   });
   const [availability, setAvailability] = useState<TeamAvailabilityMember[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [invitingMemberId, setInvitingMemberId] = useState<string | null>(null);
+  const [inviteError, setInviteError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -266,6 +268,58 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
     };
   }, [serviceWeekId]);
 
+  // Sends a set invitation for a roster member with no invitation yet (#40).
+  // On the BR-05 double-booking 409, offers to acknowledge and retry once —
+  // mirrors createInvitation's acknowledgeConflict escape hatch.
+  async function handleInvite(memberId: string) {
+    if (invitingMemberId) return;
+    setInvitingMemberId(memberId);
+    setInviteError(null);
+
+    try {
+      const send = (acknowledgeConflict?: boolean) =>
+        fetch("/api/invitations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ serviceWeekId, userId: memberId, acknowledgeConflict }),
+        });
+
+      let res = await send();
+
+      if (res.status === 409) {
+        const proceed = window.confirm(
+          "This member is already confirmed for another week on this date. Invite anyway?",
+        );
+        if (!proceed) return;
+        res = await send(true);
+      }
+
+      if (!res.ok) {
+        setInviteError("Something went wrong sending the invitation. Please try again.");
+        return;
+      }
+
+      const body = await res.json();
+      const created = body.data.invitation;
+      setInvitations((prev) => [
+        ...prev,
+        {
+          id: created.id,
+          serviceWeekId: created.serviceWeekId,
+          userId: created.userId,
+          roleNote: created.roleNote,
+          status: created.status,
+          responseDeadline: created.responseDeadline,
+          createdAt: created.createdAt,
+        },
+      ]);
+    } catch {
+      setInviteError("Something went wrong sending the invitation. Please try again.");
+    } finally {
+      setInvitingMemberId(null);
+    }
+  }
+
   if (view === "loading") {
     return (
       <main className={styles.container}>
@@ -346,6 +400,11 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
         <div className={styles.main}>
           <section className={styles.card}>
             <h2>Roster</h2>
+            {inviteError ? (
+              <p role="alert" className={styles.error}>
+                {inviteError}
+              </p>
+            ) : null}
             {members.length === 0 ? (
               <p>No members yet</p>
             ) : (
@@ -360,8 +419,14 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
                       <span className={styles.memberName}>{member.name}</span>
                       <Badge tone={status.tone}>{status.label}</Badge>
                       {status.showInvite ? (
-                        <Button variant="secondary" type="button" className={styles.inviteButton}>
-                          + Invite
+                        <Button
+                          variant="secondary"
+                          type="button"
+                          className={styles.inviteButton}
+                          disabled={invitingMemberId === member.id}
+                          onClick={() => handleInvite(member.id)}
+                        >
+                          {invitingMemberId === member.id ? "Inviting…" : "+ Invite"}
                         </Button>
                       ) : null}
                     </div>

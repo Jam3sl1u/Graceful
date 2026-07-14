@@ -1,0 +1,49 @@
+.container {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 3rem 1.5rem;
+}
+
+.list {
+  list-style: none;
+  margin: 1.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.card {
+  display: block;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  color: var(--color-fg);
+  text-decoration: none;
+}
+
+.cardHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.weekTitle {
+  font-weight: 600;
+}
+
+.date {
+  color: var(--color-fg);
+  opacity: 0.75;
+}
+
+.memberName {
+  margin: 0.5rem 0 0;
+}
+
+.reason {
+  margin: 0.25rem 0 0;
+  opacity: 0.75;
+}
