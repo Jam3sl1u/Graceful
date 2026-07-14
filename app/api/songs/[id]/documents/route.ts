@@ -1,10 +1,14 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { listDocuments, registerDocument } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/songs/[id]/documents");
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function GET(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return listDocuments(req, id);
 }
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/songs/[id]/documents");
+export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return registerDocument(req, id);
 }

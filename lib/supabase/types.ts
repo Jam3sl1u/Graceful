@@ -75,6 +75,18 @@ type SongsRow = {
   created_at: string;
 };
 
+type SongDocumentsRow = {
+  id: string;
+  song_id: string;
+  church_group_id: string;
+  name: string;
+  file_key: string;
+  file_type: string;
+  file_size_bytes: number;
+  uploaded_by: string | null;
+  created_at: string;
+};
+
 type AuditLogsRow = {
   id: string;
   church_group_id: string;
@@ -237,6 +249,16 @@ export type Database = {
           created_by?: string | null;
         };
         Update: Partial<SongsRow>;
+        Relationships: [];
+      };
+      song_documents: {
+        Row: SongDocumentsRow;
+        Insert: Omit<SongDocumentsRow, "id" | "created_at" | "uploaded_by"> & {
+          id?: string;
+          created_at?: string;
+          uploaded_by?: string | null;
+        };
+        Update: Partial<SongDocumentsRow>;
         Relationships: [];
       };
       audit_logs: {

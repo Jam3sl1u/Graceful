@@ -1,265 +1,310 @@
-# Spec — Issue #53: Song catalog CRUD + search (BR-09 key validation)
+# Spec — Issue #58: Song-level document attachment (signed URLs)
 
 ## OPEN QUESTIONS
 
-None blocking. One decision made explicitly (not a blocker):
+None blocking. Non-blocking decisions made below (see "Decisions / assumptions")
+are the obvious reading of the issue + PRD security baseline; downstream stages
+should proceed on them, not stop.
 
-- **Key representation (ASCII vs Unicode).** PRD §8 BR-09 (line 186 of
-  `documentation/prd/graceful_requirements_v10.md`) enumerates the keys using
-  Unicode musical symbols (`C♯`, `D♭`, …). Real JSON/HTTP clients send ASCII
-  (`C#`, `Db`). To satisfy both the literal PRD list and practical clients,
-  the accepted set below includes **both** the ASCII and Unicode spellings.
-  The value is stored exactly as received (no normalization) — that is all
-  this issue requires; a future transposition engine can normalize later.
+## Summary
 
-## Scope
+Implement the four song-document endpoints that are currently 501 stubs, plus
+the two R2 presigned-URL helpers they depend on. The DB table `song_documents`,
+its indexes, and its tenant-scoped RLS policies already exist (migrations
+`20260702000004_cluster_4_partial_songs.sql` and `20260704000001_rls_policies.sql`
+— do NOT add or modify migrations). The `@aws-sdk/client-s3` and
+`@aws-sdk/s3-request-presigner` packages are already in `package.json` — do NOT
+add dependencies.
 
-Implement the two `/api/songs` endpoints. Everything is at the API layer — the
-`songs` table, its RLS policies (`songs_select_tenant`, `songs_insert_tenant`),
-and the `varchar(5)` `default_key` column already exist (migrations
-`20260702000004_cluster_4_partial_songs.sql` and `20260704000001_rls_policies.sql`).
-**Do not add or modify any migration.** At 40–60 rows an RLS-scoped seq scan is
-already well within the "reasonably fast" AC — no new DB index is required.
+Flow is a standard two-step signed upload:
+1. Client asks for a presigned PUT URL (server mints the `file_key`).
+2. Client PUTs the bytes straight to R2.
+3. Client registers the completed upload (metadata row in `song_documents`).
+4. List returns each doc with a fresh presigned GET URL (30-min expiry).
+5. Delete removes the metadata row.
 
-Out of scope (do not implement): Spotify enrichment/autocomplete, song
-familiarity, per-song key override (#57), update/delete endpoints (issue only
-asks for list/search + create), song documents (already exist elsewhere).
+## Table already in DB (for reference — do not create)
 
-## Files to create / modify
+`song_documents`: `id uuid pk`, `song_id uuid not null → songs(id) on delete cascade`,
+`church_group_id uuid not null → church_groups(id)`, `name varchar(200) not null`,
+`file_key text not null`, `file_type varchar(50) not null`,
+`file_size_bytes integer not null`, `uploaded_by uuid → users(id) on delete set null`,
+`created_at timestamptz not null default now()`. RLS is tenant-scoped on
+`church_group_id` for select/insert/update/delete (all authenticated).
 
-### 1. `schemas/songs.ts` — REPLACE the placeholder
+## Files to create
 
-Currently just `z.object({})`. Replace with:
-
-- A `VALID_SONG_KEYS` constant — a `ReadonlySet<string>` (or readonly array +
-  Set) containing every accepted `default_key` string. Include the 17 ASCII
-  spellings AND the 10 Unicode accidental spellings:
-
-  ```
-  ASCII:    C  C#  Db  D  D#  Eb  E  F  F#  Gb  G  G#  Ab  A  A#  Bb  B
-  Unicode:  C♯  D♭  D♯  E♭  F♯  G♭  G♯  A♭  A♯  B♭
-  ```
-
-  (These represent the 12 chromatic pitch classes; no `E#`, `B#`, `Cb`, `Fb`.)
-  Match is **case-sensitive and exact** (`Bb` valid, `bb`/`BB` invalid).
-  Export a helper `isValidSongKey(key: string): boolean` returning
-  `VALID_SONG_KEYS.has(key)`.
-
-- `createSongSchema` — Zod object validating request-body **shape only** (NOT
-  key membership; the key-value check happens in the handler so it can return
-  422, see edge cases):
-  - `title`: `z.string().trim().min(1).max(200)` (required)
-  - `artist`: `z.string().trim().min(1).max(200).nullish()`
-  - `default_key`: `z.string().trim().min(1).max(5).nullish()`
-  - `bpm`: `z.number().int().positive().max(400).nullish()`
-  - `tags`: `z.array(z.string().trim().min(1).max(50)).nullish()`
-  - Unknown keys may be ignored (no `.strict()` needed).
-  - Export `type CreateSongInput = z.infer<typeof createSongSchema>`.
-
-- `songSearchQuerySchema` — for GET query params (parse from
-  `Object.fromEntries(req.nextUrl.searchParams)`):
-  - `q`: `z.string().trim().max(200).optional()` (search term)
-  - Export `type SongSearchQuery = z.infer<typeof songSearchQuerySchema>`.
-
-Follow `schemas/instruments.ts` + `schemas/audit-log.ts` for style.
-
-### 2. `app/api/songs/handler.ts` — NEW FILE
-
-Copy the structure/error-handling of `app/api/instruments/handler.ts` exactly
-(same imports: `auth`, `requireAuth`, `requireRole`, `ok`, `fail`,
-`ApiException`, `ErrorCode`, `getSupabaseClient`, `Database` type, plus the new
-song schemas). Same JWT-fetch guard, same `try/catch` → `ApiException`/500
-tail, same `as unknown as Database["public"]["Tables"]["songs"]["Insert"]`
-narrow cast for the insert payload (the hand-rolled Insert type marks
-`created_at` required despite the `now()` default — see the comment in
-`instruments/handler.ts` lines 94-104).
-
-Exports:
+### 1. `schemas/song-documents.ts` (new)
+Follow the style of `schemas/songs.ts`.
 
 ```ts
-export type SongResponse = {
+import { z } from "zod";
+
+// Body for POST /api/songs/:id/documents/upload-url
+export const uploadUrlSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  file_type: z.string().trim().min(1).max(50),
+  file_size_bytes: z.number().int().positive().max(2147483647), // int4 column bound
+});
+export type UploadUrlInput = z.infer<typeof uploadUrlSchema>;
+
+// Body for POST /api/songs/:id/documents (register completed upload)
+export const registerDocumentSchema = uploadUrlSchema.extend({
+  file_key: z.string().trim().min(1).max(1024),
+});
+export type RegisterDocumentInput = z.infer<typeof registerDocumentSchema>;
+```
+
+### 2. `app/api/songs/[id]/documents/handler.ts` (new)
+Single handler module for all four operations. Model it on
+`app/api/songs/handler.ts` (auth → role → jwt/getToken → getSupabaseClient →
+query → `ok`/`fail`, wrapped in try/catch that maps `ApiException`). Import the
+R2 helpers from `@/lib/r2/client` so tests can mock that module.
+
+Response DTO:
+```ts
+export type SongDocumentResponse = {
   id: string;
-  title: string;
-  artist: string | null;
-  defaultKey: string | null;   // maps default_key
-  bpm: number | null;
-  tags: string[];              // [] when the column is null
-  createdBy: string | null;    // maps created_by
-  createdAt: string;           // maps created_at (ISO)
+  songId: string;
+  name: string;
+  fileType: string;
+  fileSizeBytes: number;
+  uploadedBy: string | null;
+  createdAt: string;
+  downloadUrl: string; // presigned GET, 30-min expiry
 };
-
-export async function listSongs(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-export async function createSong(req: NextRequest, lookup?: UserLookup): Promise<Response>;
 ```
 
-Plus a private `toSongResponse(row)` mapper (snake_case row → `SongResponse`,
-`tags: row.tags ?? []`).
-
-**`listSongs` (GET /api/songs):**
-- `requireAuth`, then `requireRole(ctx, ["admin", "set_leader", "member"])`
-  (mirrors `app/api/church-group/members/handler.ts` — group members read the
-  catalog; guests do not).
-- Parse `songSearchQuerySchema` from `req.nextUrl.searchParams`; on failure →
-  `fail("Validation failed", VALIDATION_FAILED, 400)`.
-- Get JWT (401 if missing), build supabase client.
-- Query: `supabase.from("songs").select("id, title, artist, default_key, bpm, tags, created_by, created_at")`.
-  - RLS already scopes to the caller's church group. For defense-in-depth and
-    consistency with the instruments handler you MAY also add
-    `.eq("church_group_id", ctx.churchGroupId)`. Either is acceptable.
-  - When `q` is present and non-empty: add
-    `.or(\`title.ilike.%${q}%,artist.ilike.%${q}%\`)` for case-insensitive
-    partial match across title and artist. When `q` is absent/empty: no filter.
-  - `.order("title", { ascending: true })`.
-- On error → 500 INTERNAL. Return `ok({ songs: (data ?? []).map(toSongResponse) })`.
-
-**`createSong` (POST /api/songs):**
-- `requireAuth`, then `requireRole(ctx, ["admin", "set_leader"])` — Set Leader /
-  Admin only (403 FORBIDDEN otherwise; the guard runs before any DB call).
-- `const body = await req.json().catch(() => null);` then
-  `createSongSchema.safeParse(body)`; on failure →
-  `fail("Validation failed", VALIDATION_FAILED, 400)`.
-- **BR-09 key check (must produce 422):** if `parsed.default_key` is a
-  non-null string and `!isValidSongKey(parsed.default_key)` →
-  `fail("Invalid musical key", ErrorCode.VALIDATION_FAILED, 422)`.
-  Membership runs only when `default_key` is present and non-null (omit/null
-  skip the check). Keep this in the handler, NOT in Zod, so malformed body =
-  400 but invalid key value = 422. Precedent for 422 + VALIDATION_FAILED:
-  `app/api/church-group/members/[id]/handler.ts` lines 52-56.
-- Get JWT (401 if missing), build supabase client.
-- Insert payload (narrow cast as above):
-  ```
-  church_group_id: ctx.churchGroupId,
-  title: parsed.title,
-  artist: parsed.artist ?? null,
-  default_key: parsed.default_key ?? null,
-  bpm: parsed.bpm ?? null,
-  tags: parsed.tags ?? null,
-  created_by: ctx.userId,
-  ```
-  Do NOT set `spotify_id` (manual entry only; column stays null).
-- `.insert(payload).select("id, title, artist, default_key, bpm, tags, created_by, created_at").single()`.
-- On error/no data → 500 INTERNAL. Return `ok({ song: toSongResponse(data) }, 201)`.
-
-No duplicate-title guard — the catalog legitimately allows same-titled songs
-(different arrangements). Do NOT add the instruments-style 409 conflict check.
-
-### 3. `app/api/songs/route.ts` — REWRITE
-
-Replace the `notImplemented` stubs, mirroring `app/api/instruments/route.ts`:
+Exported functions (each mirrors the songs handler's auth/jwt boilerplate):
 
 ```ts
-import { NextRequest } from "next/server";
-import { listSongs, createSong } from "./handler";
-
-export async function GET(req: NextRequest): Promise<Response> {
-  return listSongs(req);
-}
-export async function POST(req: NextRequest): Promise<Response> {
-  return createSong(req);
-}
+export async function createUploadUrl(req: NextRequest, songId: string, lookup?: UserLookup): Promise<Response>;
+export async function registerDocument(req: NextRequest, songId: string, lookup?: UserLookup): Promise<Response>;
+export async function listDocuments(req: NextRequest, songId: string, lookup?: UserLookup): Promise<Response>;
+export async function deleteDocument(req: NextRequest, songId: string, docId: string, lookup?: UserLookup): Promise<Response>;
 ```
 
-### 4. `lib/supabase/types.ts` — ADD the `songs` table
+Shared internal helper — verify the song exists in the caller's group BEFORE any
+R2 or document work (satisfies the issue's "belongs to the church group" guard).
+Query the RLS-scoped client:
+```ts
+// returns true if a row exists for songId within ctx.churchGroupId
+const { data } = await supabase
+  .from("songs")
+  .select("id")
+  .eq("id", songId)
+  .eq("church_group_id", ctx.churchGroupId)
+  .maybeSingle();
+```
+If absent → `fail("Song not found", ErrorCode.NOT_FOUND, 404)`.
 
-The `songs` table is not yet in the hand-rolled `Database` type. Add a
-`SongsRow` type and register it in `Tables`, following the existing entries
-(e.g. `instruments`, `service_weeks`):
+`file_key` generation (used only in `createUploadUrl`):
+```ts
+const safeName = input.name.replace(/[^A-Za-z0-9._-]/g, "_");
+const fileKey = `song-documents/${ctx.churchGroupId}/${songId}/${crypto.randomUUID()}/${safeName}`;
+```
+Use the global `crypto.randomUUID()` (available in the Next.js runtime; no import).
+
+Per-function behavior:
+
+- **createUploadUrl** — role `["admin", "set_leader"]`. Parse body with
+  `uploadUrlSchema` (invalid → 400 VALIDATION_FAILED). Verify song-in-group
+  (else 404). Build `fileKey` as above. Call
+  `getUploadUrl(fileKey, input.file_type)`. Return
+  `ok({ uploadUrl, fileKey }, 200)`.
+
+- **registerDocument** — role `["admin", "set_leader"]`. Parse body with
+  `registerDocumentSchema` (invalid → 400). Verify song-in-group (else 404).
+  Reject a `file_key` the client didn't get from us: require
+  `input.file_key.startsWith(\`song-documents/${ctx.churchGroupId}/${songId}/\`)`
+  — else `fail("Invalid file key", ErrorCode.VALIDATION_FAILED, 400)`. Insert
+  into `song_documents`:
+  ```ts
+  const payload = {
+    song_id: songId,
+    church_group_id: ctx.churchGroupId,
+    name: input.name,
+    file_key: input.file_key,
+    file_type: input.file_type,
+    file_size_bytes: input.file_size_bytes,
+    uploaded_by: ctx.userId,
+  } as unknown as Database["public"]["Tables"]["song_documents"]["Insert"];
+  ```
+  Select back `id, song_id, name, file_key, file_type, file_size_bytes,
+  uploaded_by, created_at` with `.single()`. On error/no data → 500 INTERNAL.
+  Sign the inserted `file_key` with `getDownloadUrl` and return
+  `ok({ document: <full DTO incl. downloadUrl> }, 201)`.
+
+- **listDocuments** — role `["admin", "set_leader", "member"]` (musicians must
+  read; guests excluded). Verify song-in-group (else 404). Query:
+  ```ts
+  supabase.from("song_documents")
+    .select("id, song_id, name, file_key, file_type, file_size_bytes, uploaded_by, created_at")
+    .eq("song_id", songId)
+    .eq("church_group_id", ctx.churchGroupId)
+    .order("created_at", { ascending: true });
+  ```
+  On error → 500. Map each row → DTO, calling `await getDownloadUrl(row.file_key)`
+  per row. Do NOT include the raw `file_key` in the response DTO (it's selected
+  only so it can be signed). Return `ok({ documents: [...] }, 200)`. Empty group
+  → `{ documents: [] }`.
+
+- **deleteDocument** — role `["admin", "set_leader"]`. Verify song-in-group
+  (else 404). Delete the row scoped to all three of `id = docId`,
+  `song_id = songId`, `church_group_id = ctx.churchGroupId`; chain `.select("id")`
+  after `.delete()` so a missing/foreign row comes back empty →
+  `fail("Document not found", ErrorCode.NOT_FOUND, 404)`. On DB error → 500.
+  Success → `ok({ success: true }, 200)`. (R2 object cleanup is out of scope —
+  see decisions.)
+
+## Files to modify
+
+### 3. `lib/r2/client.ts`
+Replace the two throwing stubs with real presigned-URL generation. Keep
+`import "server-only";` and the exported names already referenced by callers, but
+add an optional `contentType` param to `getUploadUrl`:
 
 ```ts
-type SongsRow = {
+import "server-only";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+const SIGNED_URL_EXPIRY_SECONDS = 30 * 60; // 30 min (issue AC + #15 baseline)
+
+// lazy singleton
+let client: S3Client | null = null;
+function getClient(): S3Client { /* build once from env, then reuse */ }
+
+export async function getUploadUrl(key: string, contentType?: string): Promise<string>;
+export async function getDownloadUrl(key: string): Promise<string>;
+```
+
+`getClient()` config: `region: "auto"`, `endpoint: process.env.R2_ENDPOINT`,
+`forcePathStyle: true`, `credentials: { accessKeyId: R2_ACCESS_KEY_ID,
+secretAccessKey: R2_SECRET_ACCESS_KEY }`. If any required env var
+(`R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`) is
+missing, throw a plain `Error` (surfaces as 500 via the handler try/catch).
+
+- `getUploadUrl`: `getSignedUrl(getClient(), new PutObjectCommand({ Bucket:
+  process.env.R2_BUCKET_NAME, Key: key, ContentType: contentType }), {
+  expiresIn: SIGNED_URL_EXPIRY_SECONDS })`.
+- `getDownloadUrl`: `getSignedUrl(getClient(), new GetObjectCommand({ Bucket:
+  process.env.R2_BUCKET_NAME, Key: key }), { expiresIn: SIGNED_URL_EXPIRY_SECONDS })`.
+
+Remove the stale `Sprint 3 #58` TODO comment.
+
+### 4. `app/api/songs/[id]/documents/route.ts`
+Replace stub. Wire params like `app/api/service-weeks/[id]/route.ts`:
+```ts
+type Ctx = { params: Promise<{ id: string }> };
+export async function GET(req, { params }: Ctx) { const { id } = await params; return listDocuments(req, id); }
+export async function POST(req, { params }: Ctx) { const { id } = await params; return registerDocument(req, id); }
+```
+
+### 5. `app/api/songs/[id]/documents/upload-url/route.ts`
+Replace stub:
+```ts
+type Ctx = { params: Promise<{ id: string }> };
+export async function POST(req, { params }: Ctx) { const { id } = await params; return createUploadUrl(req, id); }
+```
+
+### 6. `app/api/songs/[id]/documents/[docId]/route.ts`
+Replace stub:
+```ts
+type Ctx = { params: Promise<{ id: string; docId: string }> };
+export async function DELETE(req, { params }: Ctx) { const { id, docId } = await params; return deleteDocument(req, id, docId); }
+```
+
+### 7. `lib/supabase/types.ts`
+`song_documents` is missing from the hand-rolled `Database` type. Add it,
+matching the existing style (see `SongsRow` at line ~65 and the `songs` Tables
+entry at line ~224).
+
+Add a row type near `SongsRow`:
+```ts
+type SongDocumentsRow = {
   id: string;
+  song_id: string;
   church_group_id: string;
-  title: string;
-  artist: string | null;
-  default_key: string | null;
-  bpm: number | null;
-  tags: string[] | null;
-  spotify_id: string | null;
-  created_by: string | null;
+  name: string;
+  file_key: string;
+  file_type: string;
+  file_size_bytes: number;
+  uploaded_by: string | null;
   created_at: string;
 };
 ```
-
-`Tables.songs`:
+Add a Tables entry alongside `songs` (DB defaults `id`/`created_at`; `uploaded_by`
+is nullable — mirror how `songs` marks defaulted/nullable columns optional):
 ```ts
-songs: {
-  Row: SongsRow;
-  Insert: Omit<
-    SongsRow,
-    "id" | "created_at" | "artist" | "default_key" | "bpm" | "tags" | "spotify_id" | "created_by"
-  > & {
+song_documents: {
+  Row: SongDocumentsRow;
+  Insert: Omit<SongDocumentsRow, "id" | "created_at" | "uploaded_by"> & {
     id?: string;
     created_at?: string;
-    artist?: string | null;
-    default_key?: string | null;
-    bpm?: number | null;
-    tags?: string[] | null;
-    spotify_id?: string | null;
-    created_by?: string | null;
+    uploaded_by?: string | null;
   };
-  Update: Partial<SongsRow>;
+  Update: Partial<SongDocumentsRow>;
   Relationships: [];
 };
 ```
 
-### 5. `tests/unit/app/api/songs-route.test.ts` — NEW FILE
+## Edge cases the implementation must handle
 
-Follow `tests/unit/app/api/instruments-route.test.ts` exactly (same mock
-harness: `jest.mock("@clerk/nextjs/server")`, `jest.mock("@/lib/supabase/client")`,
-`makeReq`, `makeLookup`, `setUpAuth`, `makeChain`/`makeSupabaseClient`). Add
-`songs` to the fixtures. The chainable mock must also stub `.or(...)` and
-`.ilike(...)` → return the chain (add `or: jest.fn(() => chain)` to `makeChain`;
-`.order`/`.eq`/`.select`/`.single` are already there). GET reads searchParams,
-so `makeReq` for GET must provide `nextUrl.searchParams` — build the request
-with `new NextRequest("http://localhost/api/songs?q=...")` or stub
-`{ nextUrl: { searchParams: new URLSearchParams("q=...") } }`. Cover the edge
-cases below. (The Testing stage independently supplements this; the Coder must
-still ship a passing suite.)
+- Unauthenticated (no Clerk user, or `getToken` yields no supabase JWT) → 401
+  UNAUTHENTICATED, and do not touch Supabase/R2. Order like the songs handler:
+  role check runs before the JWT fetch, so forbidden roles never reach the DB.
+- Wrong role → 403 FORBIDDEN before any DB/R2 call:
+  - list: allowed `admin`/`set_leader`/`member`; `guest` → 403.
+  - upload-url, register, delete: allowed `admin`/`set_leader`; `member`/`guest` → 403.
+- Song id not in caller's group (or nonexistent) → 404 NOT_FOUND, checked before
+  R2 signing and before insert/delete (the "belongs to the church group" guard).
+- Malformed / missing JSON body, or fields failing the Zod shape → 400
+  VALIDATION_FAILED. (`file_size_bytes` must be a positive integer; non-number,
+  0, negative, or float → 400.)
+- register with a `file_key` not prefixed by `song-documents/<group>/<song>/` →
+  400 VALIDATION_FAILED (prevents registering an object from another group/song).
+- delete of a docId that doesn't exist, belongs to another group, or belongs to a
+  different song → 404 NOT_FOUND (the three-way scoped delete returns no rows).
+- Empty document list → 200 with `{ documents: [] }`.
+- Supabase query/insert/delete error → 500 INTERNAL.
+- R2 helper throwing (missing env, SDK error) → caught by the handler try/catch →
+  500 INTERNAL. (R2 errors are not `ApiException`, so they hit the generic 500
+  branch — keep the existing `catch (err)` shape from songs handler.)
 
-## Edge cases the implementation MUST handle
+## Patterns to copy (name the file)
 
-GET `/api/songs`:
-- No `q` → returns all songs in the group (200), ordered by title.
-- `q="amaz"` → case-insensitive partial match on title OR artist.
-- Empty `q` (`?q=`) → treated as no filter (return all), not an error.
-- Empty catalog → `200 { songs: [] }`.
-- `tags` column null on a row → response `tags: []`.
-- Caller role `guest` → 403 FORBIDDEN (before DB call).
-- No JWT → 401 UNAUTHENTICATED (before `getSupabaseClient`).
-- DB error → 500 INTERNAL.
+- Handler structure, auth/role/jwt boilerplate, `ok`/`fail`, `ApiException`
+  mapping, and the `... as unknown as Database[...]["Insert"]` cast rationale:
+  `app/api/songs/handler.ts`.
+- Zod schema module style: `schemas/songs.ts`.
+- Dynamic-route param unwrapping (`params: Promise<{...}>`, `await params`):
+  `app/api/service-weeks/[id]/route.ts`.
+- Unit-test harness (mock `@clerk/nextjs/server` + `@/lib/supabase/client`,
+  chainable Supabase mock, `makeLookup(role)`, `setUpAuth`):
+  `tests/unit/app/api/songs-route.test.ts`. New handler tests additionally mock
+  `@/lib/r2/client` (`jest.mock("@/lib/r2/client", () => ({ getUploadUrl: jest.fn(),
+  getDownloadUrl: jest.fn() }))`) so no real AWS SDK/network is involved.
 
-POST `/api/songs`:
-- Valid minimal body `{ title }` → 201, `artist/defaultKey/bpm` null, `tags: []`.
-- Valid `default_key: "C#"` and `"Bb"` (ASCII) → 201, stored as sent.
-- Valid Unicode `default_key: "D♭"` → 201.
-- `default_key` omitted / null → 201 (allowed).
-- Invalid `default_key` (`"H"`, `"c#"`, `"Cmaj"`, `"Z"`, `"bb"`) → **422**
-  VALIDATION_FAILED (this is the BR-09 AC — must be 422, not 400).
-- Missing/empty/whitespace `title` → 400 VALIDATION_FAILED.
-- `title` > 200 chars → 400.
-- `artist` > 200 chars → 400; `artist` omitted → 201.
-- `bpm` non-integer, ≤ 0, or > 400 → 400; `bpm` omitted → 201.
-- `tags` not an array / non-string elements → 400; `tags: []` → 201.
-- Missing/malformed JSON body (`null`) → 400 VALIDATION_FAILED.
-- Caller role `member` or `guest` → 403 FORBIDDEN (before DB call).
-- `admin` and `set_leader` → allowed.
-- No JWT → 401 UNAUTHENTICATED (before `getSupabaseClient`).
-- Insert DB error / no data returned → 500 INTERNAL.
+## Decisions / assumptions (non-blocking)
 
-## Patterns to copy (named)
+- **Attach roles**: acceptance criteria only pin DELETE to Set Leader/Admin.
+  upload-url + register are given the same `admin`/`set_leader` restriction (the
+  goal is a Set Leader attaching); list is opened to `member` so musicians can
+  read their charts. Guests are excluded everywhere.
+- **Expiry**: 30 minutes (1800s) for BOTH upload and download URLs — matches the
+  read-URL AC and #15's baseline; the R2 stub's own TODO already specified 30-min.
+- **No content-type allowlist / product file-size cap**: not requested by the
+  issue. Validation is shape-only (`file_type` a non-empty ≤50-char string,
+  `file_size_bytes` a positive int within the int4 column bound). Do not invent
+  an allowlist or a business size limit.
+- **R2 object deletion on DELETE**: out of scope. DELETE removes the
+  `song_documents` metadata row only (the AC is "removes an attachment"). Do not
+  add an R2 delete helper.
+- **No new migrations, no dependency changes, no public bucket access** — all
+  access is via short-lived presigned URLs generated server-side only after the
+  auth + group + song-ownership checks (PRD §15.2).
 
-- Handler shape, auth/JWT guards, `try/catch` tail, narrow Insert cast:
-  `app/api/instruments/handler.ts`.
-- Role-gated read of the group catalog:
-  `app/api/church-group/members/handler.ts` (`requireRole(["admin","set_leader","member"])`).
-- Query-param Zod parse via `Object.fromEntries(req.nextUrl.searchParams)`:
-  `app/api/church-group/audit-log/handler.ts` + `schemas/audit-log.ts`.
-- 422 + VALIDATION_FAILED response:
-  `app/api/church-group/members/[id]/handler.ts` (line ~52).
-- Route wiring: `app/api/instruments/route.ts`.
-- Unit-test harness: `tests/unit/app/api/instruments-route.test.ts`.
+## Verify before finishing (Coding stage)
 
-## Verify before finishing
-
-`bun run lint`, `bun run typecheck`, and `bun run test` (Jest) must all pass.
-Do not use `bun test` (native runner). Do not touch migrations or unrelated files.
+`bun run lint`, `bun run typecheck`, `bun run test`.
