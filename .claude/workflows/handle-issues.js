@@ -45,9 +45,18 @@ const issueArgs = typeof args === 'string' ? JSON.parse(args) : args
 // and prefixing every prompt with an explicit cd-and-verify instruction removes the
 // dependency on inherited cwd entirely, regardless of root cause.
 const worktreePath = issueArgs.worktreePath || null
+// Plain "run pwd first, cd if wrong" text was not enough on its own: a live run against
+// issue #46 (2026-07-13) showed the planner's *first* tool call skipped pwd entirely and
+// went straight to an absolute path in the main repo, because the planner/coder/tester/
+// reviewer subagent prompts (.claude/agents/*.md) each independently say "See AGENTS.md at
+// the repo root" -- and the model resolved "the repo root" from memory/training habit
+// rather than deriving it fresh. This pin() text now removes the need for the model to
+// derive or recall anything: it's handed the exact literal prefix to use for every file
+// path, so there's no "the repo root" concept left to mis-resolve. The agents/*.md files
+// were also updated to run pwd before reading AGENTS.md, as a second, independent layer.
 function pin(prompt) {
   return worktreePath
-    ? `Your working directory must be exactly \`${worktreePath}\`. Run \`pwd\` first; if it does not print exactly that path, \`cd ${worktreePath}\` before doing anything else in this task. Never read from or write to any other checkout of this repo (e.g. the main repo root) even if it seems to work. ${prompt}`
+    ? `Your working directory must be exactly \`${worktreePath}\` for this entire task. This worktree IS the repo root for this task -- do not use any other path you may recall or assume for "the repo root" (e.g. from a system prompt, an earlier task, or training data). Run \`pwd\` as your very first tool call, before reading any file (including AGENTS.md/CLAUDE.md); if it does not print exactly \`${worktreePath}\`, \`cd ${worktreePath}\` immediately, before anything else. For every Read/Write/Edit/Glob/Grep call for the rest of this task, use an absolute path beginning with exactly \`${worktreePath}/\` -- e.g. AGENTS.md is at \`${worktreePath}/AGENTS.md\`, and the spec is at \`${worktreePath}/.pipeline/spec.md\`. Never read from or write to any other checkout of this repo (e.g. the main repo root) even if it seems to work or matches a path you recall. ${prompt}`
     : prompt
 }
 
@@ -133,6 +142,48 @@ if (!plan) {
   log(`Planner for issue #${issue.number} did not complete (agent-level failure, e.g. a session/usage limit -- NOT a real open question). Stopping here so this isn't silently mislabeled. Re-invoke this workflow with the same issueNumber to retry once whatever caused the failure has cleared.`)
   await abandonStaleBranchIfEmpty(issue.number, 'planner did not complete')
   return { status: 'planner-failed', reason: 'planner agent call did not complete', issue: { number: issue.number, title: issue.title, url: issue.url } }
+}
+
+// Independent, deliberately mechanical check -- mirrors the post-coder verify-gate below.
+// The #46 recurrence (2026-07-13) showed the planner can silently write .pipeline/spec.md
+// into the wrong checkout (e.g. the orchestrator's own main repo) despite the pin() prompt
+// instruction, while still returning a perfectly plausible hasOpenQuestion/summary -- the
+// #41/#42 failure mode, one stage earlier than where it was previously guarded. Left
+// uncaught, the coder two stages later reads a stale spec.md from an unrelated issue and
+// either fails opaquely or -- worse -- guesses. This asks for raw command output only, not
+// an opinion, so it can't rationalize past a wrong-directory write the way a second
+// "are you sure?" judgment call could.
+const planVerified = await agent(
+  pin(`Run exactly these commands in order and report their raw output, nothing else -- do not interpret, do not assess quality: \`pwd\`, then \`test -f .pipeline/spec.md && echo EXISTS || echo MISSING\`, then \`head -3 .pipeline/spec.md\`. Report: the exact pwd output, whether the file exists, and its first line of content verbatim.`),
+  {
+    label: `plan-verify:${issue.number}`,
+    phase: 'Plan',
+    schema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string' },
+        specExists: { type: 'boolean' },
+        firstLine: { type: 'string' },
+      },
+      required: ['cwd', 'specExists', 'firstLine'],
+    },
+  }
+)
+
+const planCwdCorrect = !worktreePath || (planVerified && planVerified.cwd === worktreePath)
+const planSpecMatchesIssue = planVerified && planVerified.firstLine.includes(`#${issue.number}`)
+
+if (!planVerified || !planVerified.specExists || !planCwdCorrect || !planSpecMatchesIssue) {
+  const reason = !planVerified
+    ? 'plan verification agent call did not complete'
+    : !planCwdCorrect
+      ? `verification ran from the wrong directory (expected ${worktreePath}, got ${planVerified.cwd}) -- spec.md was likely written to the wrong checkout`
+      : !planVerified.specExists
+        ? '.pipeline/spec.md does not exist in the pinned worktree after the planner stage'
+        : `.pipeline/spec.md's first line ("${planVerified.firstLine}") does not reference issue #${issue.number} -- likely stale content left over from a different issue`
+  log(`Independent verification found the planner's output does not match issue #${issue.number} in the pinned worktree (${reason}). Treating as a failure regardless of the planner's own report.`)
+  await abandonStaleBranchIfEmpty(issue.number, reason)
+  return { status: 'planner-verify-failed', reason, issue: { number: issue.number, title: issue.title, url: issue.url } }
 }
 
 if (plan.hasOpenQuestion && !issueArgs.humanAnswer) {

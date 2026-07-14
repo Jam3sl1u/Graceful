@@ -153,6 +153,20 @@ export async function setAvailability(req: NextRequest, lookup?: UserLookup): Pr
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
+    // BR-15 (#46): fire conflict detection for every date the member just
+    // marked unavailable (marking available is never a conflict). The
+    // upsert above already wrote the is_available: false row (and its
+    // note) for each such date, so the RPC can read that note for the
+    // notification body. Mirrors deleteAvailability's use of the same
+    // shared trigger point; errors propagate via the existing catch below.
+    let conflictTriggered = false;
+    for (const [date, { isAvailable }] of byDate.entries()) {
+      if (isAvailable === false) {
+        const triggered = await recordAvailabilityConflict(supabase, date, "marked_unavailable");
+        if (triggered) conflictTriggered = true;
+      }
+    }
+
     const availability: AvailabilityEntry[] = (data ?? []).map((row) => ({
       userId: row.user_id,
       date: row.date,
@@ -160,7 +174,7 @@ export async function setAvailability(req: NextRequest, lookup?: UserLookup): Pr
       note: row.note,
     }));
 
-    return ok({ availability });
+    return ok({ availability, conflictTriggered });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);
