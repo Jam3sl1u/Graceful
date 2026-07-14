@@ -1,122 +1,195 @@
-# Changes — Issue #47: Conflict resolution flow (3 paths, manual-only)
+# Changes — Issue #49: Invitation Response screen (mobile, no-login)
+
+## Human resolution applied
+
+The planner's OPEN QUESTION ("does #49 build the no-session deny backend?")
+was resolved by the human to **Option A**: build the no-session deny backend
+as part of this issue (spec Section 5), overriding the spec's default of
+stopping at the question. All of Sections 1-5 of `.pipeline/spec.md` are
+implemented.
 
 ## Summary
 
-Wired up the two previously-stubbed (`notImplemented` 501) conflict endpoints:
-
-- `GET /api/conflicts` — lists OPEN conflicts (`resolved_at IS NULL`) for the
-  caller's church group, joined in-memory with member/service-week data.
-  set_leader/admin only.
-- `POST /api/conflicts/:id/resolve` — resolves one conflict via `withdraw`,
-  `member_reconfirmed`, or `admin_dismissed`. set_leader/admin only.
-
-This is manual-only, per spec — no AI replacement suggestion path was added,
-and `replacement_suggestion_user_id` is never touched.
+Replaced the placeholder `/invite/[token]` page with the real mobile-first
+Invitation Response screen: loads invitation details by `response_token`
+with no session, shows the service date / role note / event list, offers a
+large green Accept button and an outlined Decline button, reveals an
+optional reason + confirm on Decline, shows a checkmark success state with a
+link into the app, and shows a friendly "unavailable" state (never a raw
+error) for expired/already-used/unknown tokens (#51). Also built the
+no-session DECLINE backend (new `deny_invitation` RPC + handler token branch
++ schema field + middleware entry) that the screen's Decline button needs,
+and fixed a middleware bug that blocked the no-session lookup GET.
 
 ## Files changed
 
-- **`types/domain.ts`** — Fixed `ResolutionType` to match the DB enum exactly:
-  `"replaced" | "withdrawn" | "member_reconfirmed" | "admin_dismissed"`
-  (previously `"withdraw" | "member_reconfirmed" | "admin_dismissed"`, which
-  didn't match the DB and would have made writing `'withdrawn'` a TS error).
-  `ResolutionType` has no other referrers besides `lib/supabase/types.ts`, so
-  this is a safe, isolated fix.
+### Frontend (Sections 1-3)
 
-- **`schemas/conflicts.ts`** — Replaced the empty placeholder `conflictsSchema`
-  (confirmed via grep to have no importers) with `resolveConflictSchema`
-  (zod), validating the request body's `resolution` field against the three
-  manual API-facing values (`withdraw` / `member_reconfirmed` /
-  `admin_dismissed` — note this is a distinct, narrower vocabulary from the
-  DB's `resolution_type` enum; the handler maps `"withdraw"` → DB value
-  `"withdrawn"`).
+- **`app/(public)/invite/[token]/page.tsx`** (modified) — replaced the
+  placeholder body with the `page.tsx`/client-component split used by
+  `app/(public)/join/[code]/page.tsx`: awaits `params`, renders
+  `<InviteResponse token={token} />`.
+- **`app/(public)/invite/[token]/invite-response.tsx`** (new, `"use client"`)
+  — the screen itself. View states: `loading | ready | unavailable |
+  accepted-success | declined-success`.
+  - On mount, `GET /api/invitations/respond/${token}`; non-2xx/network error
+    or a non-`"pending"` status routes to `unavailable` with a
+    status-keyed friendly message (never the raw `error`/`code`/HTTP status,
+    per #51); `"pending"` renders the card + Accept/Decline.
+  - Card: service date (formatted via `toLocaleDateString`), `serviceWeek.title`
+    if present, `roleNote` if present, one row per event (name, formatted
+    `startTime`–`endTime`, `location` if present), or "Details coming soon"
+    when `events` is empty.
+  - Accept: `POST /api/invitations/:id/accept` with `{ responseToken: token }`;
+    200+`status==="accepted"` → `accepted-success`; `alreadyResponded` with a
+    different terminal status → `unavailable`; 410/404 → `unavailable`
+    (expired); other errors → inline `role="alert"` message, stays on `ready`.
+  - Decline: tapping Decline reveals a `<textarea maxLength={200}>` reason
+    field and a "Confirm decline" / "Keep it" pair (no submission until
+    confirmed). Confirm does `POST /api/invitations/:id/deny` with
+    `{ responseToken: token, reason }`; same success/expired/error handling
+    as Accept, landing on `declined-success`.
+  - Both action buttons disable while a request is in flight (double-tap
+    guard). Uses `components/ui/Button.tsx` (44px min touch targets already
+    enforced there); Accept gets a `className`-appended green background
+    (`.acceptButton` in the CSS module) without touching the shared
+    `--color-accent` token.
+- **`app/(public)/invite/[token]/invite-response.module.css`** (new) — layout
+  (mirrors `join-form.tsx`'s `padding: 3rem 1.5rem` container), card, event
+  rows, full-width stacked buttons (min-height 56px), green accept button,
+  decline textarea, error/checkmark/app-link styling.
 
-- **`lib/supabase/types.ts`** — Added `events` and `event_attendees` table
-  entries (`EventsRow`, `EventAttendeesRow`, and their `Database["public"]
-  ["Tables"]` entries) matching the columns already defined in migration
-  `20260702000003_cluster_3_scheduling_core.sql`. These tables exist in the DB
-  but were not yet represented in this hand-rolled type file (no prior
-  handler needed them); the withdraw path here is the first to query them
-  (`events` to find a service week's events, `event_attendees` to delete a
-  withdrawn member's attendance rows), so this addition was required for
-  `bun run typecheck` to pass. No other table's types were touched.
+### Middleware fix (Section 4)
 
-- **`app/api/conflicts/handler.ts`** (new) — `getOpenConflicts` and
-  `resolveConflict`, mirroring the auth/error-handling style of
-  `app/api/invitations/handler.ts` and the multi-query in-memory-join style
-  of `app/api/church-group/members/handler.ts`:
-  - `getOpenConflicts`: `requireAuth` + `requireRole(["admin","set_leader"])`,
-    queries `conflicts` scoped to the caller's group with `resolved_at IS
-    NULL`, then joins `invitations` → `users`/`service_weeks` by id sets
-    (guarding empty id-set queries). Missing joined rows fall back to safe
-    defaults (`memberName: ""`, empty ids, `invitationStatus: "withdrawn"`)
-    rather than dropping the conflict. Returns `{ conflicts: OpenConflict[] }`
-    (exported type).
-  - `resolveConflict(req, id, lookup?)`: loads and 404s a missing/wrong-group
-    conflict, 409s an already-resolved one (idempotency guard with no side
-    effects), validates the body against `resolveConflictSchema` (400 on
-    failure), then branches:
-    - `withdraw`: loads the invitation (404 if missing), flips its status to
-      `withdrawn`, deletes the member's `event_attendees` rows across the
-      service week's events (via an `events` lookup by `service_week_id`,
-      skipped entirely when the week has no events — idempotent no-op),
-      leaves a `// TODO(#62): delete member's Google Calendar events for this
-      week` comment (no GCal per-attendee sync exists yet — see spec's NOTE),
-      and inserts an `invitation_withdrawn` notification (same shape as
-      `withdrawInvitation` from #43).
-    - `member_reconfirmed` / `admin_dismissed`: no `invitations`/
-      `event_attendees` writes at all.
-    - All branches then mark the conflict resolved LAST
-      (`resolution_type` + `resolved_at`), so a mid-operation failure leaves
-      the conflict open and retryable, and write an audit log
-      (`conflict.resolved`). Returns `{ conflict: { id, resolutionType,
-      resolvedAt } }`.
-  - Every DB `.error` path returns 500 INTERNAL; the whole body is wrapped in
-    the standard `try/catch` → `ApiException`/`INTERNAL 500` fallback.
+- **`middleware.ts`** (modified) — added `"/api/invitations/respond/(.*)"`
+  (the required fix: the no-session lookup GET was previously blocked by
+  `auth.protect()` before ever reaching the anon-capable handler) and, for
+  Section 5, `"/api/invitations/(.*)/deny"` to `isPublicRoute`'s
+  `createRouteMatcher([...])` list — mirrors the existing `.../accept` entry.
+  The authenticated (no-token) deny path is still enforced inside the
+  handler via `requireAuth`, exactly like accept.
 
-- **`app/api/conflicts/route.ts`** (modified) — replaced the `notImplemented`
-  stub; `GET` now delegates to `getOpenConflicts`.
+### No-session DECLINE backend (Section 5, built per human resolution)
 
-- **`app/api/conflicts/[id]/resolve/route.ts`** (modified) — replaced the
-  `notImplemented` stub; `POST` now awaits the `{ id }` param and delegates to
-  `resolveConflict`, mirroring `app/api/invitations/[id]/route.ts`'s param
-  handling.
+- **`supabase/migrations/20260713000001_deny_invitation_rpc.sql`** (new) —
+  `public.deny_invitation(p_invitation_id uuid, p_response_token text,
+  p_reason text)`, `SECURITY DEFINER`, `VOLATILE`, `SET search_path = ''`.
+  Mirrors `accept_invitation`'s structure: not-found → `NOT_FOUND`; authorize
+  by token match or (session path) `auth.jwt()->>'sub'` → own `user_id`,
+  else `FORBIDDEN`; non-`pending` status returns gracefully with
+  `already_responded: true`; past-deadline pending → `EXPIRED`; computes
+  BR-08 `denial_count` (prior denied rows for user+week, +1); updates status
+  to `denied` with `denial_reason`/`denial_count`/`responded_at`; inserts an
+  `invitation_denied` notification to `invited_by` (or all admins/set_leaders
+  in the group if null); inserts an `audit_logs` row directly (no-session-safe,
+  since `write_audit_log` needs a JWT) with `action='invitation.denied'`.
+  `GRANT EXECUTE ... TO anon, authenticated`. Existing authenticated deny
+  logic (handler.ts, pre-existing tests) is untouched — this RPC is only
+  invoked from the new token branch.
+- **`schemas/invitations.ts`** (modified) — added `responseToken` (optional,
+  64-char `/^[0-9a-f]{64}$/`, same shape as `acceptInvitationSchema`'s) to
+  `denyInvitationSchema`.
+- **`app/api/invitations/handler.ts`** (modified) — `denyInvitation`
+  reordered to parse the body *before* calling `requireAuth` (required so the
+  no-session branch never touches Clerk auth at all, mirroring
+  `acceptInvitation`'s structure). If `responseToken` is present: takes a new
+  branch — `getAnonSupabaseClient()`, `supabase.rpc("deny_invitation", {
+  p_invitation_id: id, p_response_token, p_reason })`, and maps errors
+  exactly like `acceptInvitation` (`NOT_FOUND`→404, `FORBIDDEN`→403,
+  `EXPIRED`→410, else 500 `INTERNAL`); success returns
+  `{ invitationId, status, alreadyResponded }`. The existing authenticated
+  (no-token) path below is otherwise byte-for-byte unchanged — same
+  `requireAuth`/JWT/`getSupabaseClient`/idempotency/BR-08/audit-log logic as
+  before.
+- **`lib/supabase/types.ts`** (modified) — added a `deny_invitation` entry to
+  the hand-rolled `Database["public"]["Functions"]` map (Args
+  `p_invitation_id`/`p_response_token`/`p_reason`, Returns
+  `status`/`already_responded`), alongside the existing `accept_invitation`
+  and `get_invitation_by_token` entries. Not explicitly called out in the
+  spec's file list, but required for `bun run typecheck` to type the new
+  `supabase.rpc("deny_invitation", ...)` call, per this file's own
+  "keep bun run typecheck passing" convention comment.
 
-- **`.pipeline/spec.md`** — carried over as written by the Planning stage for
-  this issue (overwrites the prior #46 spec, per the pipeline contract).
+### Test config (Section 6)
 
-## Not touched (out of scope, per spec)
+- **`jest.config.js`** (modified):
+  - Added `"**/tests/unit/**/*.test.tsx"` to `testMatch` (spec-required).
+  - Added a `moduleNameMapper` entry `"\\.module\\.css$":
+    "<rootDir>/tests/mocks/css-module.js"`. Not explicitly listed in the
+    spec, but turned out to be required: any component test importing
+    `invite-response.tsx` (or anything using `components/ui/Button.tsx`)
+    fails to parse without it, since Jest has no CSS loader outside
+    webpack/Next — this was verified against the spec's own stated goal
+    ("Make the minimal change so component tests can run") with a throwaway
+    smoke test before being removed.
+  - Changed the `@swc/jest` transform entry from a bare string to
+    `[..., { jsc: { transform: { react: { runtime: "automatic" } } } }]` —
+    also required: without it, `.tsx` test files transform JSX assuming a
+    global `React` identifier (old transform), which doesn't exist under
+    React 19's automatic runtime, and `render(<Component />)` throws
+    `ReferenceError: React is not defined`. Verified the same way.
+- **`tests/mocks/css-module.js`** (new) — a `Proxy` that echoes back the
+  requested class name, mirroring the existing `tests/mocks/server-only.js`
+  mock-via-`moduleNameMapper` pattern already used in this config.
 
-- No new SQL migration or RPC — all writes here are permitted to
-  set_leader/admin directly under existing RLS (`conflicts_update_leader_admin`,
-  invitations UPDATE, `event_attendees_delete_tenant`, notifications INSERT).
-- No Google Calendar integration — `TODO(#62)` comment only.
-- No AI replacement-suggestion endpoint (Phase 4) — the "manual replacement
-  always available" AC is satisfied by the withdraw path reopening the slot;
-  a replacement is invited through the existing `POST /api/invitations` flow.
+### Carried forward, not authored by this stage
 
-## Verification run
+- **`.pipeline/spec.md`** — the Section 1-9 spec for #49 plus the resolved
+  OPEN QUESTION note at the top, as written by the Planning stage before
+  this Coding run started.
 
-- `bun run typecheck` — passes (no errors).
-- `bun run lint` — passes (no errors/warnings).
-- `bun run test` — 32 suites / 388 tests, all passing (no regressions; no
-  conflicts-specific tests exist yet — this issue's spec designates writing
-  them to the Testing stage, modeled on
-  `tests/unit/app/api/invitations-withdraw-route.test.ts`).
+## Out of scope (per spec Section 9, not touched)
 
-## Testing-stage focus
+- In-app accept/deny from the notification inbox (#71/#73).
+- SMS/email dispatch of the invitation (#67/#68 — still TODO'd in the
+  handler, unchanged).
+- Any change to the existing authenticated in-app deny/accept behavior
+  beyond the additive token branch.
 
-- The existing chainable Supabase mock in
-  `tests/unit/app/api/invitations-withdraw-route.test.ts` (`makeChain`) does
-  not yet support `.is(...)` (used by `getOpenConflicts`'s `resolved_at IS
-  NULL` filter) or a `.delete()` chain (used by the withdraw path's
-  `event_attendees` cleanup) — the Testing stage will need to extend the
-  mock/fixture helpers for those.
-- Edge cases named in the spec worth exercising explicitly: unknown/
-  wrong-group conflict id → 404; already-resolved conflict → 409 with no side
-  effects; invalid/missing `resolution` → 400; member/unauthenticated caller →
-  403/401 on both GET and resolve; withdraw with zero events for the week
-  (no-op delete, still succeeds); withdraw on an invitation already
-  `withdrawn`/`denied` (no 409 — only the conflict's own `resolved_at`
-  guards); `member_reconfirmed`/`admin_dismissed` must not write
-  `invitations`/`event_attendees` at all; GET with no open conflicts → `{
-  conflicts: [] }`.
+## Verification
+
+- `bun run lint` (`eslint .`) — clean, no errors.
+- `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
+- `bun run test` (Jest) — full existing suite: **31 suites / 380 tests
+  passed**, unchanged pass count from before this change (no existing test
+  was modified) — confirms the `denyInvitation` reordering did not regress
+  any of the 13 existing tests in
+  `tests/unit/app/api/invitations-deny-route.test.ts`.
+- Manually verified the new component-test toolchain (jsdom environment,
+  `.tsx` `testMatch`, CSS module mock, automatic JSX runtime) with a
+  throwaway smoke test rendering `InviteResponse` and asserting the Accept
+  button appears; deleted before committing since the actual component test
+  file is the Tester's to write per spec Section 6
+  (`tests/unit/app/invite-response.test.tsx`).
+- No RPC/migration test harness exists in this repo for live SQL (same
+  situation as `accept_invitation`/`get_invitation_by_token` before it); the
+  `deny_invitation` migration was reviewed by hand against
+  `accept_invitation_rpc.sql`'s established pattern line-for-line.
+
+## What the Tester should focus on
+
+- **New `deny_invitation` RPC branch in `denyInvitation`** — no existing test
+  covers the no-session path; needs new tests mirroring
+  `invitations-accept-route.test.ts`'s no-session cases (happy path via
+  `getAnonSupabaseClient`, `NOT_FOUND`→404, `FORBIDDEN`→403, `EXPIRED`→410,
+  already-responded, malformed/non-hex `responseToken`→400). Also confirm
+  the *reordering* (body-parse-before-`requireAuth`) didn't change any
+  session-path behavior — the 13 existing deny tests already pass unchanged,
+  but worth an explicit look since the diff touches control flow shared by
+  both paths.
+- **The component itself** (`invite-response.tsx`) — no automated test
+  exists yet; per spec Section 6 the Tester places
+  `tests/unit/app/invite-response.test.tsx`. Edge cases named in spec
+  Section 7 to prioritize: empty `events`, null `roleNote`/`serviceWeek.title`/
+  event `location`, already-responded on load vs. re-tap after responding,
+  expired via lookup vs. via a 410 on submit, double-tap/in-flight button
+  disabling, reason >200 chars.
+- **Middleware**: confirm both new public routes
+  (`/api/invitations/respond/(.*)`, `/api/invitations/(.*)/deny`) don't
+  inadvertently open anything beyond what's intended — the authenticated
+  deny path still self-enforces via `requireAuth` inside the handler, same
+  as the pre-existing `.../accept` pattern.
+- **Jest config changes** (`moduleNameMapper` CSS mock, automatic JSX
+  runtime) are new infrastructure with no prior precedent in this repo —
+  worth confirming they don't affect the existing 380 non-component tests
+  (verified green in this run, but flagging since it's shared global config).

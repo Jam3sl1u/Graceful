@@ -14,12 +14,27 @@ const config = {
     "<rootDir>/tests/e2e/",
     "<rootDir>/tests/integration/",
   ],
-  testMatch: ["**/tests/unit/**/*.test.ts"],
+  testMatch: ["**/tests/unit/**/*.test.ts", "**/tests/unit/**/*.test.tsx"],
   transform: {
-    "^.+\\.(t|j)sx?$": "@swc/jest",
+    // The `react.runtime: "automatic"` option is required so @swc/jest emits
+    // the new JSX transform (auto `jsx-runtime` import) instead of assuming a
+    // global `React` identifier — needed once .tsx component tests exist.
+    "^.+\\.(t|j)sx?$": [
+      "@swc/jest",
+      {
+        jsc: {
+          transform: {
+            react: {
+              runtime: "automatic",
+            },
+          },
+        },
+      },
+    ],
   },
   moduleNameMapper: {
     "^server-only$": "<rootDir>/tests/mocks/server-only.js",
+    "\\.module\\.css$": "<rootDir>/tests/mocks/css-module.js",
     "^@/(.*)$": "<rootDir>/$1",
   },
   setupFilesAfterEnv: ["<rootDir>/jest.setup.ts"],
