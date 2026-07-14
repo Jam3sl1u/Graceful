@@ -65,6 +65,7 @@ production) versus which may be shared across environments.
 | Upstash QStash | `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | Distinct — dedicated staging QStash credentials |
 | Modal | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `MODAL_WEBHOOK_SECRET` | Distinct — dedicated staging Modal token/webhook secret |
 | Spotify | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | Shared — metadata-only lookup, no user data at risk; a single Spotify app's credentials may be reused across environments |
+| Cron | `CRON_SECRET` | Distinct — bearer token the invitation-reminders endpoint validates (see §6) |
 
 ## 4. Test / sandbox keys
 
@@ -94,7 +95,35 @@ staging project's `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
 and `SUPABASE_SERVICE_ROLE_KEY` are set as the staging (Preview) values in
 Vercel per §3 above and are never committed to this repo.
 
-## 6. Verification checklist
+## 6. Invitation reminders cron
+
+The invitation reminder scheduler runs hourly against staging via a GitHub
+Actions workflow (`.github/workflows/invitation-reminders-cron.yml`), not
+Vercel Cron — Hobby deployments reject hourly Vercel cron expressions at
+deploy time. The workflow calls `GET /api/cron/invitation-reminders` with a
+shared bearer token; the route and Supabase RPC are unchanged.
+
+| Where | Variable | Purpose |
+| --- | --- | --- |
+| Vercel Preview (staging) | `CRON_SECRET` | Bearer token the route validates |
+| GitHub repo secrets | `CRON_SECRET` | Same value as Vercel |
+| GitHub repo secrets | `STAGING_APP_URL` | Staging base URL, e.g. `https://your-project.vercel.app` |
+
+**Human setup after merge** (required for reminders to actually run):
+
+1. Generate a long random `CRON_SECRET`.
+2. Set it in Vercel → Project → Settings → Environment Variables → **Preview**
+   (and later **Production** when production is provisioned).
+3. Add GitHub repository secrets `CRON_SECRET` and `STAGING_APP_URL` (Settings
+   → Secrets and variables → Actions).
+4. Redeploy staging (push to `main` or redeploy in the Vercel dashboard).
+5. Test via GitHub Actions → "Invitation reminders cron" → **Run workflow**;
+   expect HTTP 200 and a JSON body with `{ processed, smsSent, ... }`.
+
+If either GitHub secret is missing, the scheduled workflow skips the HTTP
+call instead of failing every hour.
+
+## 7. Verification checklist
 
 - [ ] A staging Supabase project exists and is distinct from the production
       Supabase project (separate project ID, separate database).
