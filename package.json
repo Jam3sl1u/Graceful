@@ -34,6 +34,8 @@
     "svix": "^1.45.0"
   },
   "devDependencies": {
+    "@clerk/backend": "^3.11.5",
+    "@clerk/testing": "^2.2.8",
     "@eslint/eslintrc": "^3.2.0",
     "@playwright/test": "^1.49.0",
     "@swc/core": "^1.10.0",

@@ -22,3 +22,5 @@ next-env.d.ts
 
 # ephemeral orchestration state (NOT the .pipeline/*.md audit trail, which stays tracked)
 /.claude/state/
+# clerk configuration (can include secrets)
+/.clerk/

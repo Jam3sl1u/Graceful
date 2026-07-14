@@ -123,7 +123,53 @@ shared bearer token; the route and Supabase RPC are unchanged.
 If either GitHub secret is missing, the scheduled workflow skips the HTTP
 call instead of failing every hour.
 
-## 7. Verification checklist
+## 7. Playwright E2E tests (issue #52)
+
+The `e2e` job in `.github/workflows/ci.yml` runs `bun run test:e2e`
+(Playwright) against the real staging deployment on every PR, gated by the
+same secrets-gated pattern as `rls-integration` (skipped, not failed, when
+secrets are absent — see `check-secrets`). It covers the invitation
+accept/deny/reminder flows and conflict detection
+(`tests/e2e/*.spec.ts`), and needs two things beyond what §3–§6 already
+cover:
+
+1. **A real, signed-in browser session.** These flows need actual Clerk
+   authentication, not the Jest-only `auth()` mock used elsewhere
+   (`tests/support/api-auth.ts`). The tests use
+   [`@clerk/testing`](https://clerk.com/docs/testing/playwright/overview)'s
+   Playwright helper (`tests/e2e/support/auth.ts`) against **two seeded
+   staging Clerk test-mode users** (an admin persona and a member persona) —
+   provision these once in the staging Clerk test instance and set their
+   emails as the `E2E_ADMIN_EMAIL` / `E2E_MEMBER_EMAIL` secrets below. No
+   password is needed: the helper signs in via a short-lived Clerk sign-in
+   ticket (Clerk Backend API), keyed only by email.
+2. **Service-role seed/teardown access to the staging Supabase project.**
+   `tests/e2e/support/fixtures.ts` seeds a stable admin/member/church-group
+   fixture (once, idempotently) plus per-test service weeks/invitations,
+   and tears the per-test rows down afterward — mirroring
+   `tests/integration/rls/setup.ts`'s pattern, but against the real staging
+   project rather than a scratch DB.
+
+| GitHub repo secret | Purpose |
+| --- | --- |
+| `STAGING_APP_URL` | Staging base URL (Playwright `baseURL`) — same secret as §6 |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Staging Clerk test-mode instance — same name/value the app itself reads |
+| `CLERK_SECRET_KEY` | Staging Clerk test-mode instance secret key |
+| `E2E_ADMIN_EMAIL` | Seeded staging Clerk test user (admin persona) |
+| `E2E_MEMBER_EMAIL` | Seeded staging Clerk test user (member persona) |
+| `E2E_SUPABASE_URL` | Staging Supabase project URL — seed/teardown only, never used to bypass app authorization |
+| `E2E_SUPABASE_SERVICE_ROLE_KEY` | Staging Supabase service-role key — seed/teardown only |
+| `CRON_SECRET` | Same secret as §6 — needed by `invitation-reminder.spec.ts` to trigger the reminder RPC directly |
+
+**Note (issue #52 OQ2/OQ3):** `GET /api/notifications` is an unimplemented
+501 stub (`app/api/notifications/route.ts`) as of this issue, so admin
+in-app notification assertions read the `notifications` table directly via
+the service-role client rather than through that endpoint. Admin SMS/email
+on invitation deny is deferred until #67/#68 ship (both dispatch primitives
+are unimplemented throwing stubs today) and is not asserted here; the member
+side of the 24h reminder is dropped for the same reason (`sendSms` stub).
+
+## 8. Verification checklist
 
 - [ ] A staging Supabase project exists and is distinct from the production
       Supabase project (separate project ID, separate database).
