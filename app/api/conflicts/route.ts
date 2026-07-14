@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { getOpenConflicts } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/conflicts");
+export async function GET(req: NextRequest): Promise<Response> {
+  return getOpenConflicts(req);
 }

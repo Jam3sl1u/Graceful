@@ -1,92 +1,122 @@
-# Changes — Issue #46: Conflict detection on availability change
+# Changes — Issue #47: Conflict resolution flow (3 paths, manual-only)
 
 ## Summary
 
-Wired the second (PUT) trigger point for BR-15 conflict detection, and added the
-in-app admin/set_leader notification that was previously missing from the shared
-`record_availability_conflict` RPC. The DELETE trigger point (#35) was already
-wired before this change and is unmodified.
+Wired up the two previously-stubbed (`notImplemented` 501) conflict endpoints:
+
+- `GET /api/conflicts` — lists OPEN conflicts (`resolved_at IS NULL`) for the
+  caller's church group, joined in-memory with member/service-week data.
+  set_leader/admin only.
+- `POST /api/conflicts/:id/resolve` — resolves one conflict via `withdraw`,
+  `member_reconfirmed`, or `admin_dismissed`. set_leader/admin only.
+
+This is manual-only, per spec — no AI replacement suggestion path was added,
+and `replacement_suggestion_user_id` is never touched.
 
 ## Files changed
 
-### `app/api/availability/handler.ts` (MODIFY)
-In `setAvailability`, after the upsert succeeds, iterate `byDate` and for every
-date where `isAvailable === false`, `await recordAvailabilityConflict(supabase,
-date, "marked_unavailable")`. Tracks whether any call returned `true` into a new
-`conflictTriggered` boolean, now included in the PUT 200 response body:
-`ok({ availability, conflictTriggered })`. No new error handling was added — RPC
-errors (`ApiException(INTERNAL, 500)`) propagate through the function's existing
-`try/catch`, exactly as `deleteAvailability` already relies on. GET, DELETE,
-validation, date expansion, and the dedupe logic are untouched.
+- **`types/domain.ts`** — Fixed `ResolutionType` to match the DB enum exactly:
+  `"replaced" | "withdrawn" | "member_reconfirmed" | "admin_dismissed"`
+  (previously `"withdraw" | "member_reconfirmed" | "admin_dismissed"`, which
+  didn't match the DB and would have made writing `'withdrawn'` a TS error).
+  `ResolutionType` has no other referrers besides `lib/supabase/types.ts`, so
+  this is a safe, isolated fix.
 
-### `supabase/migrations/20260713000001_conflict_notification.sql` (CREATE)
-New append-only migration that `CREATE OR REPLACE`s
-`public.record_availability_conflict` (signature, language, security, and
-JWT/UNAUTHENTICATED guard unchanged from `20260711000001_availability_conflict_rpc.sql`,
-which is left untouched). Behavioral addition: after each `conflicts` insert
-(now capturing `RETURNING id INTO v_conflict_id`), the RPC inserts one
-`notifications` row per `admin`/`set_leader` in the church group, excluding the
-triggering user (`id <> v_user_id`). Notification body is
-`"<member name> can no longer make <service label>[ — reason: <note>]"`, where
-the service label prefers `service_weeks.title` and falls back to
-`'the service on ' || service_date`, and the reason clause is included only when
-the member's `availability.note` for that date is non-null (present on the
-`marked_unavailable` path, absent on `availability_deleted` since the row is
-already gone by the time the RPC runs). Notifications are inserted from this
-SECURITY DEFINER RPC (not the route handler) because
-`notifications_insert_leader_admin` RLS is leader/admin-only. Includes a
-`-- TODO(#58/#59): dispatch SMS + email...` comment per the repo's deferred-
-dispatch convention (no `sendSms`/`sendEmail` calls added), a header comment
-explaining the SECURITY DEFINER rationale, and a commented DOWN section
-matching sibling migrations. `record_availability_conflict`'s signature/return
-type in `lib/supabase/types.ts` is unchanged, so that file was not touched (per
-spec).
+- **`schemas/conflicts.ts`** — Replaced the empty placeholder `conflictsSchema`
+  (confirmed via grep to have no importers) with `resolveConflictSchema`
+  (zod), validating the request body's `resolution` field against the three
+  manual API-facing values (`withdraw` / `member_reconfirmed` /
+  `admin_dismissed` — note this is a distinct, narrower vocabulary from the
+  DB's `resolution_type` enum; the handler maps `"withdraw"` → DB value
+  `"withdrawn"`).
 
-### `tests/unit/app/api/availability-route.test.ts` (MODIFY)
-- `makeSupabaseClientForPut` now also returns a mocked `rpc` (defaulting to
-  `{ data: false, error: null }` when unspecified), mirroring
-  `makeSupabaseClientForDelete`'s shape.
-- Added four new tests to the `describe("PUT /api/availability")` block:
-  1. Marking a date unavailable calls `rpc("record_availability_conflict", { p_date, p_trigger_reason: "marked_unavailable" })` and the 200 body reports `conflictTriggered: true` when the RPC returns `true`.
-  2. Marking a date available (or omitted, defaulting to available) never calls `rpc`, and `conflictTriggered: false`.
-  3. A multi-date PUT mixing available/unavailable dates calls `rpc` exactly once, only for the unavailable date.
-  4. RPC returning `{ data: null, error: {...} }` yields a 500 `INTERNAL` response (propagated via the existing catch).
-- No existing PUT test needed updating for the new `conflictTriggered` field — all
-  existing assertions read `body.data.availability` specifically rather than
-  asserting `body.data` by full equality.
+- **`lib/supabase/types.ts`** — Added `events` and `event_attendees` table
+  entries (`EventsRow`, `EventAttendeesRow`, and their `Database["public"]
+  ["Tables"]` entries) matching the columns already defined in migration
+  `20260702000003_cluster_3_scheduling_core.sql`. These tables exist in the DB
+  but were not yet represented in this hand-rolled type file (no prior
+  handler needed them); the withdraw path here is the first to query them
+  (`events` to find a service week's events, `event_attendees` to delete a
+  withdrawn member's attendance rows), so this addition was required for
+  `bun run typecheck` to pass. No other table's types were touched.
 
-### `tests/unit/lib/scheduling/conflict-detection.test.ts` (MODIFY — minor)
-Added one test asserting `recordAvailabilityConflict` forwards the
-`"marked_unavailable"` reason verbatim to the RPC call args (existing cases only
-covered `"availability_deleted"`). No behavior change to
-`recordAvailabilityConflict` itself.
+- **`app/api/conflicts/handler.ts`** (new) — `getOpenConflicts` and
+  `resolveConflict`, mirroring the auth/error-handling style of
+  `app/api/invitations/handler.ts` and the multi-query in-memory-join style
+  of `app/api/church-group/members/handler.ts`:
+  - `getOpenConflicts`: `requireAuth` + `requireRole(["admin","set_leader"])`,
+    queries `conflicts` scoped to the caller's group with `resolved_at IS
+    NULL`, then joins `invitations` → `users`/`service_weeks` by id sets
+    (guarding empty id-set queries). Missing joined rows fall back to safe
+    defaults (`memberName: ""`, empty ids, `invitationStatus: "withdrawn"`)
+    rather than dropping the conflict. Returns `{ conflicts: OpenConflict[] }`
+    (exported type).
+  - `resolveConflict(req, id, lookup?)`: loads and 404s a missing/wrong-group
+    conflict, 409s an already-resolved one (idempotency guard with no side
+    effects), validates the body against `resolveConflictSchema` (400 on
+    failure), then branches:
+    - `withdraw`: loads the invitation (404 if missing), flips its status to
+      `withdrawn`, deletes the member's `event_attendees` rows across the
+      service week's events (via an `events` lookup by `service_week_id`,
+      skipped entirely when the week has no events — idempotent no-op),
+      leaves a `// TODO(#62): delete member's Google Calendar events for this
+      week` comment (no GCal per-attendee sync exists yet — see spec's NOTE),
+      and inserts an `invitation_withdrawn` notification (same shape as
+      `withdrawInvitation` from #43).
+    - `member_reconfirmed` / `admin_dismissed`: no `invitations`/
+      `event_attendees` writes at all.
+    - All branches then mark the conflict resolved LAST
+      (`resolution_type` + `resolved_at`), so a mid-operation failure leaves
+      the conflict open and retryable, and write an audit log
+      (`conflict.resolved`). Returns `{ conflict: { id, resolutionType,
+      resolvedAt } }`.
+  - Every DB `.error` path returns 500 INTERNAL; the whole body is wrapped in
+    the standard `try/catch` → `ApiException`/`INTERNAL 500` fallback.
 
-## Explicitly not touched (per spec's "out of scope")
-- No SMS/email dispatch — TODO comment only.
-- `GET /api/conflicts`, `POST /api/conflicts/[id]/resolve`, `app/(app)/conflicts/page.tsx` — untouched stubs.
-- `lib/supabase/types.ts` — not widened (RPC signature/return unchanged).
-- GET /availability, team availability, admin-sets-another-member paths — untouched.
+- **`app/api/conflicts/route.ts`** (modified) — replaced the `notImplemented`
+  stub; `GET` now delegates to `getOpenConflicts`.
 
-## Verification run (Coding stage)
-- `bun run lint` — clean.
-- `bun run typecheck` — clean.
-- `bun run test` — 31 suites / 385 tests, all passing (includes the 4 new PUT
-  tests, 1 new conflict-detection unit test, and the full existing suite with no
-  regressions).
-- `bun run check:workflows` — OK (no workflow scripts were touched by this
-  change; ran only as a sanity check per repo convention).
+- **`app/api/conflicts/[id]/resolve/route.ts`** (modified) — replaced the
+  `notImplemented` stub; `POST` now awaits the `{ id }` param and delegates to
+  `resolveConflict`, mirroring `app/api/invitations/[id]/route.ts`'s param
+  handling.
 
-## What the Tester should focus on
-- The RPC migration (`20260713000001_conflict_notification.sql`) has no live-DB
-  test harness in this repo (consistent with `accept_invitation` and the
-  original `record_availability_conflict` migration) — it is only exercised via
-  mocked-client route/unit tests. The Tester should review the SQL body closely
-  for correctness (recipient exclusion, NULL-note handling, service label
-  fallback, `RETURNING id INTO v_conflict_id` wiring) rather than expecting a
-  live-DB test.
-- Confirm the PUT response shape change (`conflictTriggered` added alongside
-  `availability`) doesn't break any caller outside the files touched here (a
-  repo-wide grep for consumers of the PUT response was not in scope for this
-  spec, but worth a quick check).
-- Multi-date / range PUT with a mix of available and unavailable dates — verify
-  only unavailable dates trigger the RPC (edge case 2 in the spec).
+- **`.pipeline/spec.md`** — carried over as written by the Planning stage for
+  this issue (overwrites the prior #46 spec, per the pipeline contract).
+
+## Not touched (out of scope, per spec)
+
+- No new SQL migration or RPC — all writes here are permitted to
+  set_leader/admin directly under existing RLS (`conflicts_update_leader_admin`,
+  invitations UPDATE, `event_attendees_delete_tenant`, notifications INSERT).
+- No Google Calendar integration — `TODO(#62)` comment only.
+- No AI replacement-suggestion endpoint (Phase 4) — the "manual replacement
+  always available" AC is satisfied by the withdraw path reopening the slot;
+  a replacement is invited through the existing `POST /api/invitations` flow.
+
+## Verification run
+
+- `bun run typecheck` — passes (no errors).
+- `bun run lint` — passes (no errors/warnings).
+- `bun run test` — 32 suites / 388 tests, all passing (no regressions; no
+  conflicts-specific tests exist yet — this issue's spec designates writing
+  them to the Testing stage, modeled on
+  `tests/unit/app/api/invitations-withdraw-route.test.ts`).
+
+## Testing-stage focus
+
+- The existing chainable Supabase mock in
+  `tests/unit/app/api/invitations-withdraw-route.test.ts` (`makeChain`) does
+  not yet support `.is(...)` (used by `getOpenConflicts`'s `resolved_at IS
+  NULL` filter) or a `.delete()` chain (used by the withdraw path's
+  `event_attendees` cleanup) — the Testing stage will need to extend the
+  mock/fixture helpers for those.
+- Edge cases named in the spec worth exercising explicitly: unknown/
+  wrong-group conflict id → 404; already-resolved conflict → 409 with no side
+  effects; invalid/missing `resolution` → 400; member/unauthenticated caller →
+  403/401 on both GET and resolve; withdraw with zero events for the week
+  (no-op delete, still succeeds); withdraw on an invitation already
+  `withdrawn`/`denied` (no 409 — only the conflict's own `resolved_at`
+  guards); `member_reconfirmed`/`admin_dismissed` must not write
+  `invitations`/`event_attendees` at all; GET with no open conflicts → `{
+  conflicts: [] }`.

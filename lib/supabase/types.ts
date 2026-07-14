@@ -137,6 +137,30 @@ type ConflictsRow = {
   created_at: string;
 };
 
+// Added for #47 (conflict resolution withdraw path needs to find + clear a
+// member's event_attendees rows for a service week's events).
+type EventsRow = {
+  id: string;
+  church_group_id: string;
+  service_week_id: string;
+  type: EventType;
+  name: string;
+  location: string | null;
+  start_time: string;
+  end_time: string;
+  google_calendar_event_id: string | null;
+  notes: string | null;
+  created_by: string | null;
+  created_at: string;
+};
+
+type EventAttendeesRow = {
+  id: string;
+  event_id: string;
+  user_id: string;
+  created_at: string;
+};
+
 type NotificationsRow = {
   id: string;
   church_group_id: string;
@@ -269,6 +293,31 @@ export type Database = {
           resolution_type?: ResolutionType | null;
         };
         Update: Partial<ConflictsRow>;
+        Relationships: [];
+      };
+      events: {
+        Row: EventsRow;
+        Insert: Omit<
+          EventsRow,
+          "id" | "created_at" | "location" | "google_calendar_event_id" | "notes" | "created_by"
+        > & {
+          id?: string;
+          created_at?: string;
+          location?: string | null;
+          google_calendar_event_id?: string | null;
+          notes?: string | null;
+          created_by?: string | null;
+        };
+        Update: Partial<EventsRow>;
+        Relationships: [];
+      };
+      event_attendees: {
+        Row: EventAttendeesRow;
+        Insert: Omit<EventAttendeesRow, "id" | "created_at"> & {
+          id?: string;
+          created_at?: string;
+        };
+        Update: Partial<EventAttendeesRow>;
         Relationships: [];
       };
       notifications: {
