@@ -33,15 +33,22 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has-secrets: ${{ steps.check.outputs.has-secrets }}
+      has-e2e-secrets: ${{ steps.check.outputs.has-e2e-secrets }}
     steps:
       - id: check
         env:
           URL: ${{ secrets.SUPABASE_TEST_URL }}
+          STAGING_APP_URL: ${{ secrets.STAGING_APP_URL }}
         run: |
           if [ -n "$URL" ]; then
             echo "has-secrets=true" >> $GITHUB_OUTPUT
           else
             echo "has-secrets=false" >> $GITHUB_OUTPUT
+          fi
+          if [ -n "$STAGING_APP_URL" ]; then
+            echo "has-e2e-secrets=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-e2e-secrets=false" >> $GITHUB_OUTPUT
           fi
 
   rls-integration:
@@ -83,3 +90,39 @@ jobs:
 
       - name: Run RLS integration tests
         run: bun run test:rls
+
+  e2e:
+    needs: check-secrets
+    runs-on: ubuntu-latest
+    # Only runs when staging (#13) is provisioned and its secrets are
+    # configured — otherwise skipped, not failed (issue #52, OQ4). Exercises
+    # the invitation accept/deny/reminder and conflict-detection E2E flows
+    # against the real staging deployment: a real Clerk test-mode instance
+    # (via @clerk/testing, OQ1) plus the staging Supabase project
+    # (service-role client for seed/teardown only — see tests/e2e/support/).
+    # Does NOT add a Vercel deploy step (documentation/staging-environment.md
+    # §3): Vercel's Git integration owns staging deploys entirely.
+    if: needs.check-secrets.outputs.has-e2e-secrets == 'true'
+    env:
+      STAGING_APP_URL: ${{ secrets.STAGING_APP_URL }}
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+      CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+      E2E_ADMIN_EMAIL: ${{ secrets.E2E_ADMIN_EMAIL }}
+      E2E_MEMBER_EMAIL: ${{ secrets.E2E_MEMBER_EMAIL }}
+      E2E_SUPABASE_URL: ${{ secrets.E2E_SUPABASE_URL }}
+      E2E_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.E2E_SUPABASE_SERVICE_ROLE_KEY }}
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.x
+
+      - run: bun install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        run: bunx playwright install --with-deps
+
+      - name: Run E2E tests against staging
+        run: bun run test:e2e
