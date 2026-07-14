@@ -1,98 +1,82 @@
-# Changes — Issue #53: Song catalog CRUD + search (BR-09 key validation)
+# Changes — Issue #54: Draft setlist creation (BR-01 zero-song valid state)
 
 ## Summary
 
-Implemented `GET /api/songs` (list/search) and `POST /api/songs` (create),
-per `.pipeline/spec.md`. API layer only — no migrations touched, no
-Spotify/familiarity/override/update/delete work (explicitly out of scope).
+Implemented `GET` and `POST /api/service-weeks/:id/setlist`, replacing the two
+`notImplemented` (501) stubs. No migration and no change to `createServiceWeek`
+were needed — the `setlists` table, RLS policies, and week-creation
+auto-create path already existed and were left untouched, per the spec.
 
 ## Files changed
 
-- `schemas/songs.ts` (replaced placeholder)
-  - `VALID_SONG_KEYS: ReadonlySet<string>` — 17 ASCII + 10 Unicode chromatic
-    key spellings (BR-09), case-sensitive exact match.
-  - `isValidSongKey(key)` helper.
-  - `createSongSchema` — shape-only Zod validation for POST body (`title`
-    required, `artist`/`default_key`/`bpm`/`tags` optional). Deliberately
-    does NOT check key membership — that's a handler-level 422, not a Zod
-    400 (see BR-09 edge case below).
-  - `songSearchQuerySchema` — `{ q?: string }` for GET query params.
+- **`app/api/service-weeks/[id]/setlist/handler.ts`** (new). Mirrors the
+  structure of `app/api/service-weeks/[id]/handler.ts`.
+  - `toSetlistResponse` / `SetlistResponse` — maps a `setlists` row to camelCase
+    API shape (no songs array — out of scope, tracked separately as #55).
+  - `getSetlist(req, id, lookup?)` — any authenticated role. Queries
+    `setlists` scoped by `service_week_id` + `church_group_id`. RLS hides
+    drafts from members/guests, so both "no setlist" and "draft hidden by
+    RLS" map to a single 404 (never 403, never leaks existence). Guests
+    additionally require a matching invitation for the week (mirrors
+    `getServiceWeek`) — no invitation -> 404, not 403.
+  - `createSetlist(req, id, lookup?)` — `admin`/`set_leader` only
+    (`requireRole` throws 403 for member/guest before Supabase is even
+    constructed). Flow: tenant-scoped `service_weeks` existence check (404 if
+    missing/cross-tenant) -> get-or-create on `setlists` (200 + existing row
+    if one exists — leader/admin RLS sees drafts too; 201 + newly inserted
+    draft row otherwise). Insert payload only sets `church_group_id`,
+    `service_week_id`, `created_by`; `status` is left to the DB default
+    (`'draft'`). No request body is read or validated — zero songs is a valid
+    setlist state (BR-01).
+  - All error paths: Supabase `error` -> 500 `ErrorCode.INTERNAL`; caught
+    `ApiException` -> mapped to its own status/code; anything else -> 500.
 
-- `app/api/songs/handler.ts` (new)
-  - `SongResponse` type + private `toSongResponse` mapper (snake_case row →
-    camelCase response, `tags: row.tags ?? []`).
-  - `listSongs(req, lookup?)`: `requireAuth` → `requireRole(["admin",
-    "set_leader", "member"])` → parse `q` via `songSearchQuerySchema` → JWT
-    guard → `songs` query scoped by `church_group_id`, optional
-    `.or("title.ilike.%q%,artist.ilike.%q%")` when `q` is non-empty,
-    `.order("title")` → `ok({ songs: [...] })`.
-  - `createSong(req, lookup?)`: `requireAuth` → `requireRole(["admin",
-    "set_leader"])` → `req.json()` + `createSongSchema.safeParse` (400 on
-    failure) → **BR-09 check**: if `default_key` present and
-    `!isValidSongKey(...)` → `fail(..., VALIDATION_FAILED, 422)` — this is
-    the load-bearing behavior for this issue, malformed body is 400,
-    semantically-invalid key value is 422 → JWT guard → insert (narrow
-    `as unknown as Database[...]["Insert"]` cast, same rationale as
-    `instruments/handler.ts`) → `ok({ song: ... }, 201)`.
-  - Copies the auth/JWT/try-catch shape of `app/api/instruments/handler.ts`
-    exactly; no duplicate-title guard (spec explicitly says catalog allows
-    same-titled songs — do not add the instruments-style 409 check).
+- **`app/api/service-weeks/[id]/setlist/route.ts`** (rewritten). Replaced the
+  `notImplemented` stubs with thin `GET`/`POST` handlers following the `Ctx`
+  params pattern from `app/api/service-weeks/[id]/route.ts`, delegating to
+  `getSetlist`/`createSetlist`.
 
-- `app/api/songs/route.ts` (rewritten) — replaced `notImplemented` stubs
-  with `GET`/`POST` wired to `listSongs`/`createSong`, mirroring
-  `app/api/instruments/route.ts`.
-
-- `lib/supabase/types.ts` — added `SongsRow` type and registered
-  `Tables.songs` (Row/Insert/Update/Relationships), following the
-  `instruments` entry's pattern. `Insert` narrows the same way as other
-  tables with DB-default columns (`created_at` has a `now()` default but the
-  hand-rolled type still needs it optional).
-
-- `tests/unit/app/api/songs-route.test.ts` (new) — 28 tests, follows the
-  `instruments-route.test.ts` mock harness (`jest.mock` for `@clerk/nextjs/server`
-  and `@/lib/supabase/client`, `makeLookup`/`setUpAuth`/`makeChain`/
-  `makeSupabaseClient`) plus the audit-log test's `nextUrl.searchParams`
-  `makeReq` pattern for GET query params. `makeChain` stubs `.eq`, `.or`,
-  `.order`, `.select`, `.single`.
-  - GET: all songs / ordered, search filter applied (`.or` called with the
-    exact ilike string), empty `q` → no filter, empty catalog, tags-null →
-    `[]`, 403 for `guest`, 401 no-JWT, 500 on DB error.
-  - POST: minimal valid body, ASCII keys (`C#`, `Bb`), Unicode key (`D♭`),
-    invalid keys (`H`, `c#`, `Cmaj`, `Z`, `bb`) → **422** VALIDATION_FAILED
-    (the BR-09 AC), missing/empty/whitespace title → 400, title/artist
-    length bounds, `bpm` bounds (non-integer/≤0/>400) and omission, `tags`
-    non-array / non-string elements and empty-array acceptance,
-    missing/malformed JSON body → 400, role gating (`member`/`guest` → 403,
-    `admin`/`set_leader` → allowed), 401 no-JWT, 500 on insert error.
-
-- `.pipeline/spec.md` — retained as written by the Planning stage this run
-  for Issue #53 (previously contained the #52 spec from the prior pipeline
-  run; each run overwrites this file per the AGENTS.md contract).
+- **`tests/unit/app/api/service-weeks-setlist-route.test.ts`** (new). Mirrors
+  the mocking harness from `tests/unit/app/api/service-weeks-id-route.test.ts`
+  (`jest.mock` of `@clerk/nextjs/server` and `@/lib/supabase/client`,
+  chainable `makeChain`/`makeSupabaseClient`/`makeLookup`/`setUpAuth`
+  helpers). Extended `makeChain`/`makeSupabaseClient` to support
+  `.insert(...).select(...).maybeSingle()` alongside the existing
+  `.select().eq().eq().maybeSingle()` chain, with an `onInsert` hook to
+  capture the insert payload for assertions. 16 test cases covering:
+  - `getSetlist`: 401 (no Clerk userId, lookup never consulted), 401 (no
+    JWT), 200 for a member seeing a published setlist, 404 when the setlist
+    query returns `{ data: null }` (draft-hidden-by-RLS / no-setlist case),
+    200 for a guest with a matching invitation, 404 (not 403) for a guest
+    without one, 500 on query error.
+  - `createSetlist`: 401 cases, 403 for member and guest (asserting Supabase
+    is never constructed), 404 when the tenant-scoped week lookup returns
+    null, 500 on week-lookup error, 200 + no insert when a setlist already
+    exists, 201 + captured insert payload (`church_group_id`,
+    `service_week_id`, `created_by`) when creating a fresh draft, 500 on
+    insert error.
 
 ## Verification
 
 - `bun run lint` — clean.
 - `bun run typecheck` — clean.
-- `bun run test` (Jest) — full suite: 50 suites / 569 tests passed, including
-  the new 28-test `songs-route.test.ts`.
-
-## Follow-up (review #53 nullish)
-
-- Optional create fields (`artist` / `default_key` / `bpm` / `tags`) now use
-  Zod `.nullish()` so explicit JSON `null` is accepted as omitted → **201**.
-- BR-09 membership check uses `parsed.default_key != null`, so null skips key
-  validation. Closes the reviewer’s blocking item (`.optional()` rejected
-  null → 400 vs spec edge case omit/null → 201).
+- `bun run test tests/unit/app/api/service-weeks-setlist-route.test.ts` — 16/16
+  passed.
+- `bun run test` (full suite) — 52 suites / 596 tests, all passed (no
+  regressions).
 
 ## Notes for the Tester
 
-- The BR-09 422-vs-400 split is the crux of this issue: confirm a malformed
-  body (e.g. missing `title`) is 400, while a syntactically fine but
-  semantically invalid `default_key` (e.g. `"H"`, `"c#"`) is 422.
-- Case sensitivity matters: `Bb` valid, `bb`/`BB` invalid.
-- Confirm `q=""` (present but empty) returns the unfiltered list (no `.or`
-  call), distinct from `q` entirely absent.
-- Confirm role gating is enforced *before* any DB call (test harness asserts
-  `mockGetSupabaseClient` not called for 403 cases).
-- No migration changes were made or needed — `songs` table, RLS policies,
-  and `default_key varchar(5)` column already exist per the spec.
+- Confirm the 404-not-403 behavior for members/guests hitting a draft setlist
+  is actually indistinguishable from a genuinely absent setlist (no status
+  leak).
+- Confirm the get-or-create idempotency on `POST`: calling it twice for the
+  same week never produces a second insert / a 409, and the second call
+  returns 200 (not 201) with the same row.
+- Confirm the tenant-scoped week check on `POST` blocks cross-tenant /
+  nonexistent week ids with 404 before any insert is attempted.
+- Confirm zero-song / no-body semantics: `POST` does not read or require
+  `req.json()`.
+- No migration changes were made or needed — the `setlists` table, its RLS
+  policies, and the auto-create-on-week-creation path already existed per the
+  spec.
