@@ -1,279 +1,224 @@
-# Spec — Issue #48: Build Week View screen (Admin / Set Leader)
+# Spec — Issue #50: Build Conflict Resolution screen (PRD §13 Screen 7)
 
 ## OPEN QUESTIONS
 
-**None blocking.** There is one scope judgment call (a small read endpoint the
-screen needs but the issue doesn't literally name) documented under "Design
-decision" below; it follows this repo's existing precedent (see the prior
-`spec.md` for #51, which created an implied-but-unnamed module) and does not
-need a human to resolve before coding. Secondary non-blocking assumptions are
-listed under "Assumptions" — a reviewer can override any of them cheaply.
+None are hard-blocking — the screen is fully buildable. Two judgment calls were
+made while planning; both have a chosen default so the pipeline does NOT halt.
+They are called out here only so a human can override later.
 
-## Design decision (read this first)
+1. **"Find a Replacement" deep-link target (#40) does not exist yet.** There is
+   no send-invitation UI anywhere in the repo (grep confirms). The AC says this
+   button "opens the invitation flow, slot pre-selected." Since #40's route +
+   query-param contract is undefined, this spec fixes a forward-compatible URL:
+   `/invitations/new?serviceWeekId={serviceWeekId}&roleNote={encoded roleNote}`.
+   Clicking it today will land on a not-yet-built route — that is acceptable
+   (the issue lists #40 only as an implementation note, not a hard blocker, and
+   the button is present, labeled, and clickable per the AC). When #40 lands,
+   the human/that issue can correct the path/params.
 
-The screen is the Set Leader's planning workspace for one service week. I read
-the actual backend and found the data sources split three ways:
+2. **"Their reason if provided" maps to `conflict.triggerReason`.** The member's
+   own free-text note (availability `note`) is NOT durably stored on the conflict
+   row — it is only interpolated into the notification body at creation time (see
+   `supabase/migrations/20260713000001_conflict_notification.sql`). The only
+   reason-like field durably retrievable per conflict is `conflicts.trigger_reason`
+   (a caller-supplied tag such as `"marked_unavailable"` / `"availability_deleted"`).
+   This spec surfaces `triggerReason` as the reason line. Recovering the member's
+   verbatim note would require a data-model change and is out of scope here.
 
-**Available today (build against these):**
+## Context (current state — verified, do not re-assume)
 
-- `GET /api/service-weeks/:id` → `{ serviceWeek }` (`ServiceWeekResponse`:
-  `serviceDate`, `title`, `isCancelled`, …). Header data.
-- `GET /api/service-weeks` → `{ serviceWeeks }` ordered `service_date` desc.
-  Used to compute prev/next week for the nav arrows.
-- `GET /api/availability/team?startDate=&endDate=` →
-  `{ startDate, endDate, members: TeamAvailabilityMember[] }`
-  (set_leader/admin only). Availability sidebar (this is #36).
-- `GET /api/church-group/members` → `{ members: DirectoryMember[] }`
-  (`id`, `name`, `role`, `vocalCapability`, `instruments`; no avatar URL).
-  Roster names/identity.
-- `GET /api/conflicts` → `{ conflicts: OpenConflict[] }` (set_leader/admin).
-  Each has `invitationId`, `memberId`, `serviceWeekId`. Conflict flag per slot.
+- `app/(app)/conflicts/page.tsx` is a one-line stub ("coming soon"). Leave it
+  as-is; this issue does NOT build the conflicts list.
+- The resolve endpoint (#47) is live: `POST /api/conflicts/[id]/resolve` accepts
+  `{ resolution: "withdraw" | "member_reconfirmed" | "admin_dismissed" }`
+  (`schemas/conflicts.ts`), returns `{ data: { conflict: {...} } }`, and 409s if
+  already resolved. Note "replaced" is NOT a resolution this endpoint accepts.
+- The list endpoint (#47) is live: `GET /api/conflicts` returns
+  `{ data: { conflicts: OpenConflict[] } }` for OPEN conflicts only
+  (`resolved_at IS NULL`) in the caller's group. `OpenConflict` currently lacks
+  `roleNote` — this spec adds it.
+- Conflict notifications deep-link with `link_entity_type: "conflict"`,
+  `link_entity_id: <conflictId>`. The notification inbox that would turn that
+  into a URL is itself a stub — so this issue only builds the destination screen
+  at a routable URL; wiring the inbox link is out of scope.
+- API success envelope is `{ data: T }`; errors are `{ error, code }` (see
+  `lib/api/response.ts`). Client fetch reads `body.data`.
+- App screens under `app/(app)/**` render inside `AppShell` via the `(app)`
+  layout — no per-page shell needed.
 
-**NOT available (render as incremental placeholders, do NOT build the backend):**
+## Button → action mapping (the core of this screen)
 
-- `GET /api/events` → 501 stub. Events land in #59.
-- `GET /api/service-weeks/:id/setlist` → 501 stub. Setlist lands in Sprint 3.
-- A per-week **invitation list** — `GET /api/invitations` is a 501 stub. There
-  is no way to read a member's invitation status for a week. The roster
-  status-badge acceptance criterion (Open / Pending / Confirmed / Declined /
-  Conflict) is impossible without it.
+| Button label         | Behavior                                                                 |
+| -------------------- | ------------------------------------------------------------------------ |
+| Find a Replacement   | Navigate (link) to the invitation flow URL in OPEN QUESTION 1. No API call. Conflict stays open. |
+| Mark as Resolved     | `POST /api/conflicts/{id}/resolve` `{ resolution: "member_reconfirmed" }` |
+| Dismiss              | `POST /api/conflicts/{id}/resolve` `{ resolution: "admin_dismissed" }`    |
 
-**The one judgment call:** complete the existing `GET /api/invitations` 501 stub
-into a minimal, week-scoped, roster-safe list endpoint (set_leader/admin), so the
-roster can show real statuses. This is required to satisfy a named acceptance
-criterion, the route stub already exists and is owned by no other open issue, and
-it is a trivial read that mirrors `getOpenConflicts` exactly. **Scope guard:** do
-NOT add write/mutation behavior, do NOT touch events/setlist backends, do NOT
-build the actual invite-send flow — the roster's "+ Invite" button is a
-non-functional placeholder for this issue (invite creation is #40, already
-shipped as `POST /api/invitations`, but wiring the create UI is out of scope
-here).
+All three must always be visible and enabled (except while a request is in
+flight). No AI-suggestion UI is implemented (Phase 4). Leave a short HTML comment
+above the button row marking where the Phase 4 AI suggestion will render.
 
-## Files to modify — backend (the one read endpoint)
+## Files to modify
 
-### 1. `schemas/invitations.ts` (modify — add one schema)
+### 1. `app/api/conflicts/handler.ts` — expose `roleNote`
 
-Add, mirroring `getTeamAvailabilityQuerySchema` in `schemas/availability.ts`:
+Minimal, additive change so the screen can show "original role":
+- Add `roleNote: string | null;` to the `OpenConflict` type.
+- In the invitations query (currently
+  `.select("id, user_id, service_week_id, status")`), add `role_note`, and add
+  `"role_note"` to the `Pick<..., "id" | "user_id" | "service_week_id" | "status">`
+  type on `invitationRows`.
+- In the `result` map, add `roleNote: invitation?.role_note ?? null,`.
+- Do not touch any other field, ordering, or the resolve handler.
 
-```ts
-// GET /api/invitations?serviceWeekId= query (#48 Week View roster).
-export const listInvitationsQuerySchema = z.object({
-  serviceWeekId: z.string().uuid(),
-});
-export type ListInvitationsQuery = z.infer<typeof listInvitationsQuerySchema>;
-```
+### 2. `tests/unit/app/api/conflicts-route.test.ts` — keep it green
 
-### 2. `app/api/invitations/handler.ts` (modify — add `listInvitations`)
+The happy-path test uses an exact `toEqual`, so it must be updated for the new
+field (otherwise CI fails):
+- Add `role_note: "Lead vocals"` to the `invitationRow` fixture (~line 95-100).
+- Add `roleNote: "Lead vocals"` to the expected object in the "happy path"
+  `toEqual` (~line 150-161).
+- The "missing joined invitation row" test uses `toMatchObject`; no change needed,
+  but you may optionally assert `roleNote: null` there.
 
-- Add a **roster-safe** response type and mapper. IMPORTANT: do NOT reuse
-  `toInvitationResponse` — it exposes `responseToken`, which is the no-session
-  credential and must never be sent to the roster UI.
+## Files to create
 
-```ts
-export type WeekInvitation = {
-  id: string;
-  serviceWeekId: string;
-  userId: string;
-  roleNote: string | null;
-  status: InvitationStatus;
-  responseDeadline: string | null;
-  createdAt: string;
-};
-// NOTE: intentionally omits response_token / denial_reason.
-```
+Follow the pattern of the invitation-response screen
+(`app/(public)/invite/[token]/page.tsx` + `invite-response.tsx` +
+`invite-response.module.css`) closely — same server-page-awaits-params +
+client-component-does-fetch/actions structure, same loading/ready/terminal view
+states, same CSS-module approach, same `Button` from `@/components/ui/Button`.
 
-- Add `listInvitations(req: NextRequest, lookup?: UserLookup): Promise<Response>`:
-  - `requireAuth` then `requireRole(ctx, ["admin", "set_leader"])` (copy the top
-    of `getTeamAvailability` / `getOpenConflicts`).
-  - Parse `req.nextUrl.searchParams` with `listInvitationsQuerySchema`; on
-    failure `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)`.
-  - Get the Supabase JWT client exactly as the other handlers do.
-  - Query `invitations` filtered by `.eq("service_week_id", serviceWeekId)` and
-    `.eq("church_group_id", ctx.churchGroupId)`, `.order("created_at")`. Select
-    only the `WeekInvitation` columns (`id, service_week_id, user_id, role_note,
-    status, response_deadline, created_at`) — do NOT `select("*")`, to avoid
-    pulling the token.
-  - Return `ok({ invitations: rows.map(toWeekInvitation) })`.
-  - Wrap in the same `try/catch` returning `ApiException` → `fail(...)` else
-    `INTERNAL 500`, identical to the other handlers.
+### 3. `app/(app)/conflicts/[id]/page.tsx` (server component)
 
-### 3. `app/api/invitations/route.ts` (modify — wire GET)
-
-Replace the `GET` body (currently `notImplemented("GET /api/invitations")`) with
-a call to `listInvitations(req)`. Leave the existing `POST` (→ `createInvitation`)
-untouched. Import `listInvitations` alongside `createInvitation`.
-
-## Files to create — frontend (the screen)
-
-Follow the invite-response screen pattern exactly:
-`app/(public)/invite/[token]/page.tsx` (server wrapper that awaits `params` and
-renders a `"use client"` child) + `invite-response.tsx` (client component that
-`fetch`es and renders) + `invite-response.module.css` (CSS module).
-
-### 4. `app/(app)/week/[id]/page.tsx` (modify — replace the stub)
-
-Server component. Mirror `app/(public)/invite/[token]/page.tsx`:
-
+Mirror `app/(public)/invite/[token]/page.tsx`:
 ```tsx
-export default async function WeekViewPage({
+export default async function ConflictResolutionPage({
   params,
-}: { params: Promise<{ id: string }> }) {
+}: {
+  params: Promise<{ id: string }>;
+}) {
   const { id } = await params;
-  return <WeekView serviceWeekId={id} />;
+  return <ConflictResolution conflictId={id} />;
 }
 ```
+Add a short comment noting PRD §13 Screen 7 / issue #50.
 
-### 5. `app/(app)/week/[id]/week-view.tsx` (new — `"use client"`)
+### 4. `app/(app)/conflicts/[id]/conflict-resolution.tsx` (client component)
 
-Client component `WeekView({ serviceWeekId }: { serviceWeekId: string })`.
-Structure and conventions copied from `invite-response.tsx` (useState/useEffect,
-cancelled-flag load guard, `fetch` with `{ data }` envelope unwrap, graceful
-error/permission states, local date/time formatting helpers). Use the shared
-`Badge` (`components/ui/Badge`) and `Button` (`components/ui/Button`) components.
+`"use client"`. Props: `{ conflictId: string }`.
 
-Data load (one `useEffect`, `Promise.all` of five `fetch`es, all read
-`body.data`):
+Local data shape (subset of `OpenConflict`):
+```ts
+type Conflict = {
+  id: string;
+  memberName: string;
+  serviceDate: string;      // "YYYY-MM-DD"
+  serviceWeekTitle: string | null;
+  serviceWeekId: string;
+  roleNote: string | null;
+  triggerReason: string | null;
+};
+```
 
-1. `GET /api/service-weeks/${serviceWeekId}` → header + service date.
-2. `GET /api/service-weeks` → to compute prev/next week ids (see nav below).
-3. `GET /api/church-group/members` → roster identities.
-4. `GET /api/invitations?serviceWeekId=${serviceWeekId}` → `WeekInvitation[]`.
-5. `GET /api/conflicts` → filter to `serviceWeekId === serviceWeekId`.
-6. `GET /api/availability/team?startDate=${start}&endDate=${end}` → sidebar,
-   where `[start, end]` is the 7-day window `serviceDate − 6 days ..
-   serviceDate` inclusive (the lead-up week incl. service day). Do the date math
-   in UTC via `new Date(\`${serviceDate}T00:00:00Z\`)` ± `n*86_400_000` then
-   `.toISOString().slice(0,10)`, matching `schemas/availability.ts`'s UTC
-   convention to avoid off-by-one.
+View states: `"loading" | "ready" | "unavailable" | "resolved-success"`.
 
-State model (copy the `ViewState` union idea from `invite-response.tsx`):
-`"loading" | "ready" | "forbidden" | "not-found" | "error"`.
-- Any core fetch (1, 3, 4, 5) returning 403 → `"forbidden"` (this screen is
-  Admin/Set Leader only; a member/guest must see an access message, not a crash).
-- Fetch (1) returning 404 → `"not-found"`.
-- Any other non-OK / thrown → `"error"`.
-- The availability (6) and week-list (2) fetches are non-critical: if they fail,
-  still render `"ready"` with the sidebar / nav degraded (empty), never block the
-  whole screen on them.
+Load (in `useEffect`, with the `cancelled` guard from invite-response):
+- `GET /api/conflicts`, read `body.data.conflicts`, find the entry whose `id === conflictId`.
+- Found → `ready`. Not found (already resolved, or bad id) or non-OK response or
+  network error → `unavailable`.
 
-Regions to render in `"ready"` (desktop-first two-column layout: main content +
-collapsible right sidebar):
+Render on `ready`:
+- Member name (`memberName`).
+- Service date — reuse a `formatServiceDate(dateStr)` helper copied from
+  invite-response (`new Date(\`${dateStr}T00:00:00\`)` + `toLocaleDateString`).
+  If `serviceWeekTitle` is present, show it as a heading alongside the date.
+- Original role: show `roleNote` if non-null; otherwise omit the line (or show a
+  muted "No role specified"). Do not render an empty label.
+- Reason: show `triggerReason` under a "Reason" label if non-null; otherwise omit.
+- `<!-- Phase 4 (#, out of scope): AI-suggested replacement renders here -->`
+- Button row (see mapping table), using `@/components/ui/Button`:
+  - "Find a Replacement": render as a Next `Link`/anchor styled as a button with
+    `href={\`/invitations/new?serviceWeekId=${serviceWeekId}&roleNote=${encodeURIComponent(roleNote ?? "")}\`}`.
+    Using a plain link (not `useRouter`) keeps it testable via `href` and avoids
+    a router mock.
+  - "Mark as Resolved" and "Dismiss": `Button`s calling a shared
+    `resolve(resolution)` handler.
 
-**Header** (AC 1): service date (format like `formatServiceDate` in
-`invite-response.tsx`), `serviceWeek.title ?? "Untitled service"`, a publish
-status `Badge`, and prev/next nav arrows.
-- Publish badge: setlist publish state is not yet fetchable (setlist endpoint is
-  501). Render a `Badge tone="neutral"` reading `Draft` with a
-  `// TODO(Sprint 3 #64): drive from setlist status` comment. If
-  `serviceWeek.isCancelled` is true, show a `Badge tone="danger"` reading
-  `Cancelled` instead.
-- Nav arrows: from the `GET /api/service-weeks` list (sorted by `serviceDate`),
-  find the current week's index; the newer/older neighbors become next/prev,
-  each a link to `/week/${neighborId}`. Disable an arrow when no neighbor exists.
+`resolve(resolution: "member_reconfirmed" | "admin_dismissed")`:
+- Guard against double-submit (`submitting` flag; disable all buttons while true).
+- `POST /api/conflicts/${conflictId}/resolve`, headers `Content-Type: application/json`,
+  body `JSON.stringify({ resolution })`.
+- `res.ok` → `resolved-success`.
+- `res.status === 409` (already resolved) → `unavailable` (treat as gone).
+- any other non-OK, or thrown error → set an inline `actionError` string, stay on
+  `ready`, keep buttons usable. Never surface raw `error`/`code`/`status`.
 
-**Roster grid** (AC 2): one slot per member from `GET /api/church-group/members`.
-For each member, pick their "current" invitation = the `WeekInvitation` for that
-`userId` with the max `createdAt`. Map to a status badge:
+Render on `unavailable`: a message like "This conflict has been resolved or no
+longer exists." plus a link back to `/conflicts` (or `/dashboard`).
 
-| Condition (checked in this order)                                   | Label     | `Badge` tone | Extra              |
-| ------------------------------------------------------------------- | --------- | ------------ | ------------------ |
-| current invitation's `id` ∈ conflicts for this week                 | Conflict  | `danger`     | —                  |
-| current invitation `status === "accepted"`                          | Confirmed | `success`    | —                  |
-| current invitation `status === "pending"`                           | Pending   | `warning`    | —                  |
-| current invitation `status === "denied"`                            | Declined  | `neutral`    | —                  |
-| no invitation, or only `withdrawn`/`expired`                        | Open      | `neutral`    | show "+ Invite" btn |
+Render on `resolved-success`: a brief confirmation ("Conflict resolved") plus a
+link back to `/conflicts` (or `/dashboard`).
 
-Each slot shows: an initials avatar (derive from `member.name` — first letter of
-first + last whitespace-delimited token, uppercased; no image URL exists in
-`DirectoryMember`), the member name, and the status `Badge`. The "+ Invite"
-`Button` is a non-functional placeholder for now (renders, but no create flow —
-see scope guard). Conflict badge MUST be visually red (use `tone="danger"`,
-which is the red tone in `Badge.module.css`).
+Render on `loading`: a simple "Loading…" placeholder.
 
-**Collapsible availability sidebar** (AC 3): a right-hand panel with a
-collapse/expand toggle (`useState<boolean>`), rendering the team availability
-grid from response (6): rows = members (`TeamAvailabilityMember.userId`, resolve
-name via the roster members map), columns = the 7 dates in the window, each cell
-green/red-ish from `entries[].isAvailable` for that date (no entry = unknown/
-blank). Keep it simple — a CSS-grid table is fine.
+### 5. `app/(app)/conflicts/[id]/conflict-resolution.module.css`
 
-**Events timeline** (AC 4): placeholder card. Events endpoint is 501 (#59). Show
-a heading "Events", an empty-state line ("No events yet"), and a non-functional
-"+ Add event" `Button`. Add `// TODO(#59): wire to GET/POST /api/events`.
+Copy the relevant class shapes from `invite-response.module.css` (`.container`,
+`.card`, `.date`, `.roleNote`, `.buttonRow`, `.error`). Use existing CSS vars
+(`var(--color-border)`, `var(--color-fg)`). Keep touch targets comfortable
+(PRD mobile-first). No new design system work.
 
-**Setlist preview card** (AC 5): placeholder card. Setlist endpoint is 501
-(Sprint 3). Show "Setlist", "0 songs", and a non-functional "Edit setlist"
-`Button`. Add `// TODO(Sprint 3 #64): wire to setlist`.
+### 6. `tests/unit/app/conflict-resolution.test.tsx` (component test)
 
-### 6. `app/(app)/week/[id]/week-view.module.css` (new)
-
-CSS module for the above. Copy the conventions of
-`app/(public)/invite/[token]/invite-response.module.css` (plain CSS modules,
-class-per-element). Desktop-first: a two-column layout (main + sidebar), a roster
-grid, and the collapsible sidebar. No design system beyond the existing `Badge`
-/ `Button` — keep styling minimal and functional.
+Mirror `tests/unit/app/invite-response.test.tsx`: `/** @jest-environment jsdom */`,
+`@testing-library/react`, mock `global.fetch` directly, `jsonResponse(status, body)`
+helper. Cover:
+- Loading state before the GET resolves.
+- Happy path: GET returns a `{ data: { conflicts: [conflict] } }` list containing
+  the target id → renders member name, formatted service date, role note, and
+  reason. Assert the three action controls are present.
+- "Find a Replacement" anchor has the expected `href` (with encoded `roleNote`
+  and correct `serviceWeekId`).
+- "Mark as Resolved" click → POST to `/api/conflicts/{id}/resolve` with body
+  `{ resolution: "member_reconfirmed" }`, then success view. Assert the request
+  URL + body.
+- "Dismiss" click → POST with `{ resolution: "admin_dismissed" }`.
+- Not-found: GET returns a list NOT containing the id → unavailable view (a
+  failure/edge case).
+- (Optional but encouraged) 409 on resolve → unavailable view.
 
 ## Edge cases the implementation must handle
 
-- **Response-token leak:** the roster endpoint must NOT return `response_token`
-  (or `denial_reason`). Select explicit columns; never `select("*")`. This is the
-  single most important backend correctness point.
-- **Role gating:** `/api/invitations` (list), `/api/availability/team`, and
-  `/api/conflicts` are set_leader/admin-only and return 403 for members/guests.
-  The page's `(app)` layout does NOT enforce role yet (see its TODO), so the
-  client must handle 403 → `"forbidden"` view rather than rendering a broken grid.
-- **Multiple invitations per member/week:** re-invites after a denial create
-  multiple rows; always select the max-`createdAt` row as "current" so a stale
-  `denied`/`withdrawn` row doesn't mask an active `pending`/`accepted` one.
-- **Member with no invitation:** shows "Open" + "+ Invite", not a crash.
-- **Conflict precedence:** an accepted-but-conflicted member reads "Conflict"
-  (red), not "Confirmed".
-- **Cancelled week:** header shows a `Cancelled` danger badge.
-- **Empty roster / empty availability / no neighbor weeks:** render empty states,
-  never throw.
-- **Date math:** UTC-based (`T00:00:00Z`) for the availability window, matching
-  the codebase, to avoid timezone off-by-one on the range bounds.
-- **`{ data }` envelope:** every endpoint wraps its payload in `{ data }`
-  (`types/api.ts`); unwrap `body.data` on each fetch, exactly like
-  `invite-response.tsx`.
+- Conflict id not present in the open list (already resolved, or invalid id) →
+  `unavailable`, never a crash.
+- `serviceWeekTitle` null → fall back to the formatted date / "Service".
+- `roleNote` null → omit the role line cleanly.
+- `triggerReason` null → omit the reason line cleanly.
+- In-flight request → all buttons disabled; no double-submit.
+- 409 (conflict already resolved by someone else) → `unavailable`.
+- Non-OK / network error on resolve → inline error, buttons stay usable.
+- No raw `error`/`code`/`status` strings shown to the user.
 
-## Assumptions (non-blocking; a reviewer can override)
+## Patterns to copy (name the file)
 
-- "Slot" = one church-group member (all members are candidate slots). No
-  position/instrument-slot model exists in the data yet.
-- Avatar = generated initials (no avatar URL in `DirectoryMember`).
-- Availability window = `serviceDate − 6 days .. serviceDate` (lead-up week).
-- Publish badge shows a static `Draft` until the setlist endpoint lands.
+- Server page awaiting `params` + delegating to a client component:
+  `app/(public)/invite/[token]/page.tsx`.
+- Client fetch + view-state machine + action handlers + `cancelled` guard +
+  `formatServiceDate`: `app/(public)/invite/[token]/invite-response.tsx`.
+- CSS module: `app/(public)/invite/[token]/invite-response.module.css`.
+- Button: `@/components/ui/Button`.
+- Component test scaffolding (jsdom, fetch mock, `jsonResponse`):
+  `tests/unit/app/invite-response.test.tsx`.
+- Endpoint handler/test conventions: `app/api/conflicts/handler.ts` +
+  `tests/unit/app/api/conflicts-route.test.ts`.
 
-## Tests
+## Out of scope (do not build)
 
-Two new files (Jest picks up `tests/unit/**/*.test.ts(x)` per `jest.config.js`):
-
-- `tests/unit/app/api/invitations-list-route.test.ts` — copy the mocking style of
-  `tests/unit/app/api/conflicts-route.test.ts` /
-  `tests/unit/app/api/invitations-route.test.ts` (Supabase + auth mocks via
-  `tests/support/api-auth.ts`). Cover: happy path returns week-scoped
-  invitations; **the response never includes `responseToken`** (assert the key is
-  absent); non-admin/set_leader → 403; missing/invalid `serviceWeekId` → 400.
-- `tests/unit/app/week-view.test.tsx` — copy `tests/unit/app/invite-response.test.tsx`
-  (`/** @jest-environment jsdom */`, `@testing-library/react`, mocked `global.fetch`
-  keyed by URL). Cover: loading → ready; roster status mapping for each of Open /
-  Pending / Confirmed / Declined / Conflict (conflict overrides accepted); the
-  "+ Invite" button appears only on Open slots; 403 on a core fetch → forbidden
-  view; sidebar collapse toggle.
-
-## Patterns to copy (by file)
-
-- Read endpoint w/ role gate + in-memory join: `app/api/conflicts/handler.ts`
-  (`getOpenConflicts`) and `app/api/availability/team/handler.ts`.
-- Query-schema shape: `getTeamAvailabilityQuerySchema` in `schemas/availability.ts`.
-- Route GET wiring: `app/api/availability/team/route.ts`.
-- Client screen (fetch + envelope + states + formatting): `invite-response.tsx`.
-- Server page wrapper: `app/(public)/invite/[token]/page.tsx`.
-- CSS module conventions: `invite-response.module.css`.
-- UI atoms: `components/ui/Badge.tsx` (tones neutral/success/warning/danger),
-  `components/ui/Button.tsx`.
-- Endpoint unit test: `conflicts-route.test.ts`. Component test: `invite-response.test.tsx`.
+- AI-suggested replacement (Phase 4) — reserve a commented placeholder only.
+- The conflicts list screen, the notification inbox, and the actual #40
+  send-invitation flow. Do not modify `app/(app)/conflicts/page.tsx`.
+- Any change to the resolve endpoint, its schema, or the DB migrations.
 
 ## Verification before finishing (coder)
 

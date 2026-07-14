@@ -1,7 +1,21 @@
-// Tests for GET /api/conflicts (#47). Mock scaffolding style mirrors
-// tests/unit/app/api/invitations-withdraw-route.test.ts (makeReq, makeLookup,
-// setUpAuth, chainable Supabase mock), extended with `.is(...)` support for
-// the `resolved_at IS NULL` filter used here.
+// Supplementary tests written independently by the Tester stage for #50
+// (GET /api/conflicts's new `roleNote` field).
+//
+// The coder's own conflicts-route.test.ts covers the happy path (an
+// invitation row WITH a role_note) and the "invitation row entirely
+// missing" fallback (roleNote: null), but leaves a gap this file closes:
+// it never exercises an invitation row that DOES exist but whose
+// `role_note` column is itself `null` (e.g. a set_leader never filled it
+// in) — a distinct code path from "no invitation row at all", since both
+// go through the same `invitation?.role_note ?? null` expression but only
+// one of them proves the `??` fallback (not just optional-chaining) is
+// doing real work.
+//
+// It also never asserts the role gate on this newly-touched handler
+// rejects `guest`, not just `member` — this matters here because the
+// spec's own out-of-scope list singles out "any change to ... schema",
+// so a regression that accidentally loosened `requireRole` while adding
+// the new column would not be caught by the coder's single "member" case.
 
 jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }));
 jest.mock("@/lib/supabase/client", () => ({ getSupabaseClient: jest.fn() }));
@@ -41,13 +55,8 @@ function setUpAuth(jwt: string | null = JWT) {
 }
 
 type QueryResult = { data: unknown; error: unknown };
-type TableFixture = {
-  selects?: QueryResult[];
-};
+type TableFixture = { selects?: QueryResult[] };
 
-// Chainable mock covering .select(...).eq(...).is(...).order(...) as well as
-// .select(...).in(...), resolved either by awaiting the chain directly
-// (via `then`) or via `.maybeSingle()`.
 function makeChain(result: QueryResult) {
   const chain: Record<string, unknown> & PromiseLike<QueryResult> = {
     eq: jest.fn(() => chain),
@@ -92,14 +101,6 @@ const conflictRow = {
   created_at: "2026-07-12T00:00:00Z",
 };
 
-const invitationRow = {
-  id: INVITATION_ID,
-  user_id: MEMBER_ID,
-  service_week_id: SERVICE_WEEK_ID,
-  status: "accepted",
-  role_note: "Lead vocals",
-};
-
 const userRow = { id: MEMBER_ID, name: "Jane Doe" };
 const weekRow = { id: SERVICE_WEEK_ID, service_date: "2026-07-19", title: "Sunday Service" };
 
@@ -108,11 +109,11 @@ beforeEach(() => {
   mockGetSupabaseClient.mockReset();
 });
 
-describe("GET /api/conflicts", () => {
-  it("returns 403 FORBIDDEN when caller role is member", async () => {
+describe("GET /api/conflicts — tester supplement (#50 roleNote)", () => {
+  it("returns 403 FORBIDDEN when caller role is guest (not just member)", async () => {
     setUpAuth();
 
-    const res = await getOpenConflicts(makeReq(), makeLookup("member"));
+    const res = await getOpenConflicts(makeReq(), makeLookup("guest"));
     expect(res.status).toBe(403);
 
     const body = await res.json();
@@ -120,34 +121,34 @@ describe("GET /api/conflicts", () => {
     expect(mockGetSupabaseClient).not.toHaveBeenCalled();
   });
 
-  it("returns 401 UNAUTHENTICATED when getToken yields no JWT", async () => {
-    setUpAuth(null);
-
-    const res = await getOpenConflicts(makeReq(), makeLookup("admin"));
-    expect(res.status).toBe(401);
-
-    const body = await res.json();
-    expect(body.code).toBe("UNAUTHENTICATED");
-    expect(mockGetSupabaseClient).not.toHaveBeenCalled();
-  });
-
-  it("happy path: returns open conflicts joined with member/week data", async () => {
+  it("surfaces roleNote: null when the joined invitation row EXISTS but its role_note column is null " +
+    "(distinct from the invitation row being entirely missing)", async () => {
     setUpAuth();
+    const invitationRowWithNullRoleNote = {
+      id: INVITATION_ID,
+      user_id: MEMBER_ID,
+      service_week_id: SERVICE_WEEK_ID,
+      status: "accepted",
+      role_note: null,
+    };
     mockGetSupabaseClient.mockReturnValue(
       makeSupabaseClient({
         conflicts: { selects: [{ data: [conflictRow], error: null }] },
-        invitations: { selects: [{ data: [invitationRow], error: null }] },
+        invitations: { selects: [{ data: [invitationRowWithNullRoleNote], error: null }] },
         users: { selects: [{ data: [userRow], error: null }] },
         service_weeks: { selects: [{ data: [weekRow], error: null }] },
       }),
     );
 
-    const res = await getOpenConflicts(makeReq(), makeLookup("set_leader"));
+    const res = await getOpenConflicts(makeReq(), makeLookup("admin"));
     expect(res.status).toBe(200);
 
     const body = await res.json();
     const conflicts: OpenConflict[] = body.data.conflicts;
     expect(conflicts).toHaveLength(1);
+    // The invitation row (and its user/week joins) are fully present here —
+    // only role_note itself is null — so every other field should still be
+    // populated normally, proving the null-coalesce is scoped to roleNote.
     expect(conflicts[0]).toEqual({
       id: CONFLICT_ID,
       invitationId: INVITATION_ID,
@@ -156,84 +157,10 @@ describe("GET /api/conflicts", () => {
       serviceWeekId: SERVICE_WEEK_ID,
       serviceDate: "2026-07-19",
       serviceWeekTitle: "Sunday Service",
-      roleNote: "Lead vocals",
+      roleNote: null,
       invitationStatus: "accepted",
       triggerReason: "double-booked",
       createdAt: "2026-07-12T00:00:00Z",
     });
-  });
-
-  it("returns { conflicts: [] } when there are no open conflicts", async () => {
-    setUpAuth();
-    mockGetSupabaseClient.mockReturnValue(
-      makeSupabaseClient({
-        conflicts: { selects: [{ data: [], error: null }] },
-      }),
-    );
-
-    const res = await getOpenConflicts(makeReq(), makeLookup("admin"));
-    expect(res.status).toBe(200);
-
-    const body = await res.json();
-    expect(body.data.conflicts).toEqual([]);
-  });
-
-  it("does not drop a conflict when its joined invitation row is missing, using safe fallbacks", async () => {
-    setUpAuth();
-    mockGetSupabaseClient.mockReturnValue(
-      makeSupabaseClient({
-        conflicts: { selects: [{ data: [conflictRow], error: null }] },
-        invitations: { selects: [{ data: [], error: null }] },
-        users: { selects: [{ data: [], error: null }] },
-        service_weeks: { selects: [{ data: [], error: null }] },
-      }),
-    );
-
-    const res = await getOpenConflicts(makeReq(), makeLookup("admin"));
-    expect(res.status).toBe(200);
-
-    const body = await res.json();
-    const conflicts: OpenConflict[] = body.data.conflicts;
-    expect(conflicts).toHaveLength(1);
-    expect(conflicts[0]).toMatchObject({
-      id: CONFLICT_ID,
-      memberId: "",
-      memberName: "",
-      serviceWeekId: "",
-      serviceDate: "",
-      roleNote: null,
-      invitationStatus: "withdrawn",
-    });
-  });
-
-  it("returns 500 INTERNAL when the conflicts query errors", async () => {
-    setUpAuth();
-    mockGetSupabaseClient.mockReturnValue(
-      makeSupabaseClient({
-        conflicts: { selects: [{ data: null, error: { message: "connection refused" } }] },
-      }),
-    );
-
-    const res = await getOpenConflicts(makeReq(), makeLookup("admin"));
-    expect(res.status).toBe(500);
-
-    const body = await res.json();
-    expect(body.code).toBe("INTERNAL");
-  });
-
-  it("returns 500 INTERNAL when a joined query (invitations) errors", async () => {
-    setUpAuth();
-    mockGetSupabaseClient.mockReturnValue(
-      makeSupabaseClient({
-        conflicts: { selects: [{ data: [conflictRow], error: null }] },
-        invitations: { selects: [{ data: null, error: { message: "boom" } }] },
-      }),
-    );
-
-    const res = await getOpenConflicts(makeReq(), makeLookup("admin"));
-    expect(res.status).toBe(500);
-
-    const body = await res.json();
-    expect(body.code).toBe("INTERNAL");
   });
 });

@@ -1,113 +1,110 @@
-# Changes — Issue #48: Build Week View screen (Admin / Set Leader)
+# Changes — Issue #50: Build Conflict Resolution screen (PRD §13 Screen 7)
 
 ## Summary
 
-Implemented the Set Leader/Admin Week View screen per `.pipeline/spec.md`:
-one backend read endpoint (completing the `GET /api/invitations` 501 stub
-into a roster-safe, week-scoped list) plus the client screen that composes
-it with four existing endpoints (service week, service-week list, roster
-members, conflicts) and one non-critical endpoint (team availability).
+Built the destination screen for a resolved/dismissed conflict (routable at
+`/conflicts/[id]`), following the same server-page + client-fetch pattern as
+the invitation-response screen (#49). Made a minimal, additive change to the
+`GET /api/conflicts` handler so it also returns `roleNote` (the "original
+role" the member was booked for), which the new screen needs to render.
+
+No changes were made to the conflicts list screen, the notification inbox,
+the resolve endpoint/schema, or any DB migration — all explicitly out of
+scope per spec.
 
 ## Backend
 
-- **`schemas/invitations.ts`** — added `listInvitationsQuerySchema` /
-  `ListInvitationsQuery` (`serviceWeekId: z.string().uuid()`), mirroring
-  `getTeamAvailabilityQuerySchema`.
-- **`app/api/invitations/handler.ts`** — added:
-  - `WeekInvitation` type (roster-safe: `id`, `serviceWeekId`, `userId`,
-    `roleNote`, `status`, `responseDeadline`, `createdAt`). Deliberately does
-    **not** reuse `InvitationResponse`/`toInvitationResponse`, since those
-    include `responseToken` (the no-session credential) and `denial_reason`.
-  - `toWeekInvitation` mapper.
-  - `listInvitations(req, lookup?)`: `requireAuth` + `requireRole(["admin",
-    "set_leader"])`, parses `req.nextUrl.searchParams` via
-    `listInvitationsQuerySchema` (400 on failure), queries `invitations`
-    filtered by `service_week_id` + `church_group_id`, ordered by
-    `created_at`, selecting **explicit columns only** (never `select("*")`)
-    so `response_token`/`denial_reason` never reach the response. Same
-    try/catch → `ApiException`/`fail`/500 pattern as the other handlers.
-- **`app/api/invitations/route.ts`** — replaced the `notImplemented("GET
-  /api/invitations")` stub with `listInvitations(req)`. `POST` (→
-  `createInvitation`) is untouched.
+- **`app/api/conflicts/handler.ts`** — added `roleNote: string | null` to the
+  `OpenConflict` type; the invitations join now selects `role_note` in
+  addition to the existing columns, and the `result` map surfaces it as
+  `roleNote: invitation?.role_note ?? null`. The resolve handler
+  (`resolveConflict`) is untouched.
+- **`tests/unit/app/api/conflicts-route.test.ts`** — updated the happy-path
+  fixture/expectation (exact `toEqual`) to include `role_note`/`roleNote`;
+  added `roleNote: null` to the "missing joined invitation row" `toMatchObject`
+  assertion (optional per spec, done for completeness).
 
-## Frontend
+## Files created
 
-- **`app/(app)/week/[id]/page.tsx`** — replaced the placeholder stub with a
-  server component that awaits `params` and renders `<WeekView
-  serviceWeekId={id} />`, mirroring `app/(public)/invite/[token]/page.tsx`.
-- **`app/(app)/week/[id]/week-view.tsx`** (new) — `"use client"` component.
-  One `useEffect` fires `Promise.all` of the five core fetches
-  (`GET /api/service-weeks/:id`, `GET /api/service-weeks`,
-  `GET /api/church-group/members`, `GET /api/invitations?serviceWeekId=`,
-  `GET /api/conflicts`); after that resolves and the week's `serviceDate` is
-  known, a further non-critical `GET /api/availability/team?startDate=&endDate=`
-  fetch is issued for the sidebar (its 7-day UTC window is computed from
-  `serviceDate`, so it cannot be part of the initial parallel batch).
-  - View states: `"loading" | "ready" | "forbidden" | "not-found" | "error"`.
-    A 404 on the service-week fetch → not-found; a 403 on any of the four
-    other core fetches → forbidden; any other non-OK/thrown → error. The
-    week-list and availability fetches are treated as non-critical and
-    degrade to empty nav/sidebar instead of blocking `"ready"`.
-  - Header: service date (`formatServiceDate`, copied from
-    `invite-response.tsx`), title (falls back to "Untitled service"), a
-    `Badge` (`Cancelled`/danger when `isCancelled`, else a static `Draft`/
-    neutral with a `TODO(Sprint 3 #64)`), and prev/next nav arrows computed
-    from the `service-weeks` list's sort order (`getNeighborWeekIds`).
-  - Roster grid: one slot per `DirectoryMember`. `getCurrentInvitation` picks
-    the max-`createdAt` `WeekInvitation` per member; `getRosterStatus` maps
-    it to Conflict (red, checked first) / Confirmed / Pending / Declined /
-    Open (with a non-functional "+ Invite" `Button`), matching the spec's
-    precedence table. Initials avatar via `getInitials`.
-  - Collapsible availability sidebar (`useState<boolean>` toggle): a
-    CSS-grid table with rows = availability members (name resolved via the
-    roster map) and columns = the 7-day window (`getAvailabilityWindow`,
-    UTC-based via `addDaysUTC`), each cell colored by `isAvailable` (blank/
-    grey when no entry).
-  - Events and Setlist cards: static placeholders per spec
-    (`TODO(#59)` / `TODO(Sprint 3 #64)`), each with a non-functional button.
-- **`app/(app)/week/[id]/week-view.module.css`** (new) — plain CSS module,
-  desktop-first two-column layout (main + sidebar), roster grid, sidebar
-  collapse states, availability grid cell coloring. Follows
-  `invite-response.module.css`'s conventions.
-
-## Tests
-
-- **`tests/unit/app/api/invitations-list-route.test.ts`** (new) — covers:
-  403 for a member; 400 for missing/non-uuid `serviceWeekId`; 401 with no
-  JWT; happy path returns the week-scoped list and asserts the response
-  never has a `responseToken` key (and the selected columns string isn't
-  `"*"` and doesn't mention `response_token`); empty list; 500 on a query
-  error.
-- **`tests/unit/app/week-view.test.tsx`** (new) — covers: loading → ready;
-  header (title, Draft badge, Events/Setlist placeholder cards); roster
-  status mapping for all five states, explicitly asserting the
-  conflict-overrides-accepted case and that "+ Invite" renders only on the
-  Open slot; nav arrows link to the correct prev/next ids; cancelled week
-  shows the Cancelled badge instead of Draft; sidebar collapse/expand
-  toggle; 403 on a core fetch → forbidden view; 404 on the service-week
-  fetch → not-found view; week-list/availability failures degrade
-  gracefully (still "ready", empty nav/sidebar); empty roster renders an
-  empty state; a network error on the core fetches → error view.
+- **`app/(app)/conflicts/[id]/page.tsx`** — server component; awaits
+  `params`, delegates to the client component. Mirrors
+  `app/(public)/invite/[token]/page.tsx`.
+- **`app/(app)/conflicts/[id]/conflict-resolution.tsx`** — client component
+  (`"use client"`), mirrors `invite-response.tsx`'s structure:
+  - View-state machine: `"loading" | "ready" | "unavailable" | "resolved-success"`.
+  - Load effect (with `cancelled` guard): `GET /api/conflicts`, finds the
+    conflict whose `id === conflictId` in `body.data.conflicts`. Not found,
+    non-OK, or a thrown/network error all route to `"unavailable"`.
+  - `formatServiceDate` helper copied verbatim from `invite-response.tsx`.
+  - Renders member name, service date (+ `serviceWeekTitle` heading, falling
+    back to `"Service"` when null), "Original role" line (omitted when
+    `roleNote` is null), and "Reason" line (omitted when `triggerReason` is
+    null).
+  - A commented placeholder above the button row:
+    `{/* Phase 4 (out of scope): AI-suggested replacement renders here */}`.
+  - Button row (all three always visible/enabled except mid-request):
+    - **Find a Replacement** — plain `<a>` (not `next/link`'s `Link`, per the
+      spec's own reasoning: testable via `href`, no router mock needed) to
+      `/invitations/new?serviceWeekId={id}&roleNote={encodeURIComponent(roleNote ?? "")}`.
+      This route does not exist yet (#40 is unbuilt) — intentional per spec's
+      OPEN QUESTION 1.
+    - **Mark as Resolved** / **Dismiss** — `Button`s that call a shared
+      `resolve(resolution)` handler with `"member_reconfirmed"` /
+      `"admin_dismissed"` respectively.
+  - `resolve()`: guards double-submit via a `submitting` flag (disables both
+    buttons while in flight), `POST`s to
+    `/api/conflicts/{conflictId}/resolve`. `res.ok` → `"resolved-success"`;
+    `409` → `"unavailable"` (already resolved by someone else); any other
+    non-OK or thrown error → sets an inline `actionError` string and stays on
+    `"ready"` (buttons remain enabled). No raw `error`/`code`/`status` is ever
+    rendered.
+  - The two internal "back" links (`unavailable` and `resolved-success`
+    views, both pointing at `/conflicts`) use `next/link`'s `Link` — plain
+    `<a>` tags there tripped `@next/next/no-html-link-for-pages` (the
+    `/conflicts` stub is a real page, unlike the not-yet-built
+    `/invitations/new`). `Link` renders as an `<a>` in tests so this required
+    no test changes/router mocking.
+- **`app/(app)/conflicts/[id]/conflict-resolution.module.css`** — copied the
+  relevant class shapes (`.container`, `.card`, `.date`, `.roleNote`,
+  `.buttonRow`, `.error`, `.checkmark`, `.appLink`) from
+  `invite-response.module.css`, plus a new `.replacementLink` class so the
+  plain anchor visually matches the `Button` styling.
+- **`tests/unit/app/conflict-resolution.test.tsx`** — jsdom component test
+  mirroring `invite-response.test.tsx`'s scaffolding (`fetch` mocked
+  directly, `jsonResponse` helper). Covers: loading state; happy path
+  (member name, formatted date, role note, reason, all three actions
+  present); the "Find a Replacement" anchor's `href` (encoded `roleNote` +
+  `serviceWeekId`); "Mark as Resolved" and "Dismiss" each POST the correct
+  `resolution` body and land on the success view; null `roleNote`/
+  `triggerReason` are omitted cleanly; null `serviceWeekTitle` falls back to
+  "Service"; in-flight double-submit guard (both buttons disabled, no
+  second request); not-found-in-list → unavailable; network error on lookup
+  → unavailable (no crash); 409 on resolve → unavailable; non-OK (500) on
+  resolve → inline alert, stays on ready view, no raw error/code leaked.
 
 ## Verification
 
 - `bun run typecheck` — clean.
-- `bun run lint` — clean.
-- `bun run test` — 42 suites / 496 tests passed (includes the two new test
-  files above plus the full existing suite, unchanged elsewhere).
+- `bun run lint` — clean (the two "back to conflicts" links had to become
+  `next/link`'s `Link` to satisfy `@next/next/no-html-link-for-pages`; see
+  above).
+- `bun run test` — full suite green: 41 suites / 490 tests passed, including
+  the 19 new/updated tests across `conflict-resolution.test.tsx` (new) and
+  `conflicts-route.test.ts` (updated).
 
 ## What the Tester should focus on
 
-- The roster-safety assertion in `invitations-list-route.test.ts` (no
-  `responseToken`/`response_token` anywhere in the response or the executed
-  `select(...)` column string) — this was called out in the spec as the
-  single most important backend correctness point.
-- The conflict-precedence logic (`getRosterStatus` in `week-view.tsx`): an
-  accepted-but-conflicted invitation must render "Conflict", not
-  "Confirmed" — covered by a dedicated test but worth an independent look.
-- The 403→forbidden / 404→not-found routing in `week-view.tsx`'s load
-  effect, since the `(app)` layout does not itself enforce role (per its own
-  TODO) — the client-side handling is the only gate today.
-- Nav-arrow direction (`getNeighborWeekIds`): `GET /api/service-weeks` is
-  ordered `service_date` desc, so index 0 is the newest week; verify the
-  "prev"/"next" semantics still read naturally against real data.
+- The `roleNote` plumbing end-to-end: `handler.ts` → API response →
+  component render (including the null-omission edge case).
+- The three button behaviors, especially that "Find a Replacement" makes
+  **no** API call and leaves the conflict open (it's a pure navigation
+  link), while the other two both hit `POST /resolve` with the right
+  `resolution` value.
+- Double-submit protection and the 409/"already resolved" → unavailable
+  path, since a real admin/set_leader could plausibly race another admin
+  resolving the same conflict.
+- That no raw `error`/`code`/`status` string is ever shown to the user on
+  any failure path (component test asserts this negatively but worth a
+  manual look too).
+- Scope: `app/(app)/conflicts/page.tsx` (the list stub) was intentionally
+  left untouched, as was the resolve endpoint/schema and all migrations.

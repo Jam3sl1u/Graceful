@@ -17,6 +17,7 @@ export type OpenConflict = {
   serviceWeekId: string;
   serviceDate: string;
   serviceWeekTitle: string | null;
+  roleNote: string | null;
   invitationStatus: InvitationStatus;
   triggerReason: string | null;
   createdAt: string;
@@ -55,12 +56,12 @@ export async function getOpenConflicts(req: NextRequest, lookup?: UserLookup): P
 
     let invitationRows: Pick<
       Database["public"]["Tables"]["invitations"]["Row"],
-      "id" | "user_id" | "service_week_id" | "status"
+      "id" | "user_id" | "service_week_id" | "status" | "role_note"
     >[] = [];
     if (invitationIds.length > 0) {
       const { data, error } = await supabase
         .from("invitations")
-        .select("id, user_id, service_week_id, status")
+        .select("id, user_id, service_week_id, status, role_note")
         .in("id", invitationIds);
       if (error) return fail("Internal error", ErrorCode.INTERNAL, 500);
       invitationRows = data ?? [];
@@ -103,6 +104,7 @@ export async function getOpenConflicts(req: NextRequest, lookup?: UserLookup): P
         serviceWeekId: invitation?.service_week_id ?? "",
         serviceDate: week?.service_date ?? "",
         serviceWeekTitle: week?.title ?? null,
+        roleNote: invitation?.role_note ?? null,
         // The invitation row backing a conflict should always exist (conflicts.
         // invitation_id is ON DELETE CASCADE from invitations) — "withdrawn" is
         // the safe fallback for the defensive case where the joined row is

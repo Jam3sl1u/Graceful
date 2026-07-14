@@ -1,61 +1,55 @@
-# Review — Issue #48: Build Week View screen (Admin / Set Leader)
+# Review — Issue #50: Build Conflict Resolution screen (PRD §13 Screen 7)
 
 ## VERDICT: SHIP
 
-Reviewed the `.pipeline/` artifacts plus the actual diff for the #48 commit
-(`4dd31d6...27be00c` — the only commit unique to this issue; the wider
-`main...HEAD` range additionally carries PR #138's already-merged #51 work
-because the local `main` ref lags the branch's base, see Note 1). Re-ran
-`bun run typecheck`, `bun run lint`, and `bun run test` independently in this
-worktree: all clean, 44 suites / 503 tests green.
+## What I checked (not just trusting the summaries)
+- Read spec.md, changes.md, test-results.md.
+- Isolated the actual #50 commit (`aacfbb6`) — the `main...HEAD` three-dot diff
+  also shows #51 / cron-scheduler work that is not this issue; the #50 commit
+  itself touches exactly the 8 files the spec scopes (handler + route test +
+  4 new screen/test files + 2 pipeline artifacts). No scope creep.
+- Read every changed/created source file firsthand, plus both untracked
+  tester-supplement test files.
+- Re-ran `bun run typecheck` (clean), `bun run lint` (clean), `bun run test`
+  (43 suites / 495 tests, 0 failures).
 
-## What I verified firsthand (not just trusting the summaries)
+## Correctness assessment
+- **Handler change** matches the spec exactly: `roleNote` added to `OpenConflict`,
+  `role_note` added to both the `Pick<>` type and the `.select()`, surfaced as
+  `roleNote: invitation?.role_note ?? null`. `resolveConflict` untouched.
+- **Button → action mapping** is correct: "Mark as Resolved" POSTs
+  `member_reconfirmed`, "Dismiss" POSTs `admin_dismissed`, "Find a Replacement"
+  is a pure `<a>` navigation (no API call, conflict stays open) with a
+  forward-compatible `/invitations/new` URL and `encodeURIComponent(roleNote ?? "")`.
+- **View-state machine** and all named edge cases are handled: not-found / non-OK
+  / network error on load → `unavailable`; 409 on resolve → `unavailable`;
+  other non-OK / thrown error → inline fixed-string `role="alert"`, buttons stay
+  usable; double-submit guarded by `submitting`; null `serviceWeekTitle` →
+  "Service", null `roleNote` / `triggerReason` lines omitted cleanly.
+- **No sensitive-data leak**: `actionError` is always a fixed string; no
+  `error`/`code`/`status` is ever interpolated into rendered text.
+- **Out-of-scope boundaries held**: list stub, resolve endpoint/schema, and all
+  migrations are untouched.
 
-- **Backend roster-safety (the spec's single most important point):** read
-  `app/api/invitations/handler.ts`. `listInvitations` uses an explicit
-  column select (`"id, service_week_id, user_id, role_note, status,
-  response_deadline, created_at"`), never `select("*")`. `WeekInvitation` /
-  `toWeekInvitation` are a separate shape from `InvitationResponse` and never
-  touch `response_token`/`denial_reason`. The happy-path test asserts the
-  `responseToken` key is absent, the serialized object matches neither
-  `responseToken` nor `response_token`, and the executed select string is not
-  `"*"` and does not mention `response_token`. Correct and well-guarded.
-- **Role gating + validation + tenant isolation:** `requireAuth` +
-  `requireRole(["admin","set_leader"])` before any DB access, 400 on
-  missing/non-uuid `serviceWeekId`, 401 with no JWT, `.eq("church_group_id",
-  ctx.churchGroupId)` on the query. Tests cover 403/400/401/500/empty; the
-  tester's supplement adds a recording chain that asserts both
-  `service_week_id` and `church_group_id` filters are actually applied and no
-  foreign group id is used — a genuine gap in the coder's own suite, now closed.
-- **Conflict precedence (frontend):** `getRosterStatus` checks
-  `conflictInvitationIds.has(current.id)` before any status comparison. The
-  test fixture gives a member a stale row plus a current `accepted` row that
-  is flagged in conflicts and asserts the slot reads "Conflict", not
-  "Confirmed". Meaningful, not superficial.
-- **Max-createdAt selection, 403→forbidden / 404→not-found routing, non-
-  critical degradation of the week-list nav and availability sidebar, UTC
-  date-window math, `{ data }` envelope unwrapping:** all read in
-  `week-view.tsx` and match the spec. `Badge`/`Button` prop usage matches the
-  actual component APIs (tones neutral/success/warning/danger; variant
-  secondary + className). Events/Setlist/publish-badge placeholders carry the
-  specified TODO markers; the "+ Invite" button is a non-functional
-  placeholder per the scope guard.
+## Test quality
+- The coder's component test and route test are behavioral (assert rendered DOM,
+  fetch URL+body, response envelope) — not superficial.
+- The two tester-supplement files close real gaps behaviorally: click-produces-no-
+  fetch for "Find a Replacement", `!res.ok` load branch, null-roleNote href
+  encoding, `guest` role gate, and `role_note`-column-null vs invitation-row-
+  missing distinction. Both are legitimate assertion-on-behavior tests with no
+  suspicious content. They are untracked in the worktree — they must be committed
+  (or intentionally dropped) before/with the PR so the coverage they claim is not
+  silently lost.
 
-Scope is exactly the 8 files the spec names — no scope creep, no unrelated
-refactors, no backend mutation logic, no touching the events/setlist stubs.
+## Non-blocking notes (no action required to ship)
+- "Find a Replacement" anchor is not disabled during an in-flight resolve, though
+  the mapping-table narrative says all three are enabled "except while a request
+  is in flight." This is consistent with the spec's own detailed section 4 (only
+  the two `Button`s get the disabled treatment; the link is a plain anchor that
+  navigates away), so it is intentional, not a defect.
+- The jest run emits a jsdom "navigation not implemented" console warning from the
+  click-the-anchor test; it is cosmetic (jsdom can't perform anchor navigation)
+  and does not affect any assertion or the pass result.
 
-## Non-blocking notes for the human (not code defects)
-
-1. **PR base hygiene:** `git diff main...HEAD` shows #51's state-machine/cron/
-   vercel.json changes because the local `main` ref is behind the branch's
-   base (merge-base `d526909` predates PR #138). Ensure the PR targets an
-   up-to-date `main` so the PR diff shows only the #48 files; otherwise the PR
-   will appear to re-introduce already-merged #51 work.
-2. **Uncommitted tester supplements:** the tester's two supplement files
-   (`tests/unit/app/api/invitations-list-route-tester-supplement.test.ts`,
-   `tests/unit/app/week-view-tester-supplement.test.tsx`) are currently
-   untracked in the worktree. They pass and add real coverage — commit them
-   as part of shipping so they aren't lost.
-
-Neither note affects correctness of the shipped code. The implementation
-matches the spec, the tests are meaningful, and independent re-runs are green.
+Green tests here reflect genuinely correct behavior. Ship it.
