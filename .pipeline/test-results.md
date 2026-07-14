@@ -1,151 +1,104 @@
-# Test Results — Issue #46: Conflict detection on availability change
+# Test Results — Issue #51: Invitation state machine unit tests
 
 ## Verdict: PASS
 
-All checks re-run independently in the pinned worktree
-(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-46`) and
-cross-checked against `.pipeline/spec.md` line by line (`app/api/availability/handler.ts`,
-the new migration SQL, `lib/scheduling/conflict-detection.ts`, and both test
-files). This file overwrites a stale leftover from a prior issue (#44) that
-was still sitting at this path.
+This overwrites the stale `test-results.md` for issue #46 that was still
+sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
+recent run).
 
-## Commands re-run
+## Commands re-run independently in this worktree
 
+- `bun run typecheck` — clean, no errors.
 - `bun run lint` — clean, no errors/warnings.
-- `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
-- `bun run test` (Jest, full suite) — **32 suites / 388 tests passed** (the
-  coder's 31 suites / 385 tests, plus this stage's new supplemental file with
-  3 additional tests; no failures, no skips).
-- `bun run check:workflows` — OK (sanity check per repo convention; no
-  workflow scripts touched by this change).
+- `bun run test` (Jest, full suite) — **33 test suites, 409 tests, all
+  passing.**
+- Re-ran just the new file in isolation
+  (`tests/unit/lib/invitations/state-machine.test.ts`) — 21/21 passing.
 
 ## Independent verification performed
 
-Read the actual diff (not just `changes.md`'s description) for every file listed:
+1. **Domain type source of truth**: confirmed `types/domain.ts:6` declares
+   `InvitationStatus = "pending" | "accepted" | "denied" | "withdrawn" |
+   "expired"`, and `lib/invitations/state-machine.ts` imports it rather than
+   redeclaring the union, as the spec required.
 
-- `app/api/availability/handler.ts` — `setAvailability`'s wiring matches the
-  spec exactly: iterates `byDate`, fires `recordAvailabilityConflict(supabase,
-  date, "marked_unavailable")` only for `isAvailable === false` entries, after
-  the upsert's error check and before building the response body, tracks
-  `conflictTriggered`, and returns `ok({ availability, conflictTriggered })`.
-  GET, DELETE, validation, expansion, and dedupe logic are byte-for-byte
-  unchanged. `deleteAvailability` (#35 DELETE trigger point) is unmodified and
-  still wired to the same shared RPC.
-- `supabase/migrations/20260713000001_conflict_notification.sql` —
-  `CREATE OR REPLACE`s `record_availability_conflict` with the identical
-  signature/language/security/guard as the original migration (left
-  untouched, confirmed by diff). Verified against the live schema
-  (`20260702000005_cluster_5_partial.sql`): `scheduling_conflict` already
-  exists in the `notification_type` enum (no new enum value added, per spec),
-  `notifications.title` is `varchar(200)` (the literal `'Scheduling conflict'`
-  fits comfortably), `link_entity_type` is a free-text `varchar(50)`
-  (`'conflict'` is valid). Recipient query correctly filters to
-  `admin`/`set_leader` and excludes the triggering user (`id <> v_user_id`).
-  `v_reason` is read from the member's own `availability.note` row
-  post-upsert (correct for `marked_unavailable`) and is NULL on the
-  `availability_deleted` path since the row is already deleted by the time
-  the RPC runs — the `CASE WHEN v_reason IS NOT NULL` guard correctly omits
-  the reason clause without erroring on NULL. `RETURNING id INTO
-  v_conflict_id` and the `-- TODO(#58/#59)` comment are both present. Header
-  comment explaining the SECURITY DEFINER rationale and a commented DOWN
-  section are present, matching sibling migrations. No live-DB test harness
-  exists in this repo for RPC migrations (consistent with `accept_invitation`
-  and the original `record_availability_conflict`) — expected per spec, not a
-  gap.
-- `lib/scheduling/conflict-detection.ts` — unchanged, as spec requires (the
-  `ConflictTriggerReason` union already included `"marked_unavailable"`).
-- `lib/supabase/types.ts` — confirmed untouched (RPC signature/return type
-  unchanged, per spec's explicit instruction not to widen it).
-- Response-shape check: grepped the repo for other consumers of `PUT
-  /api/availability`'s response body — none found (`app/api/availability/team/handler.ts`
-  queries the `availability` table directly for a different GET endpoint,
-  unrelated to this response shape). No frontend caller currently depends on
-  the response body in this repo's current phase, so the added
-  `conflictTriggered` field carries no breakage risk.
+2. **Shared source of truth for `canTransition`/`applyTransition`**: both
+   functions read from the same `TRANSITIONS` lookup table in
+   `lib/invitations/state-machine.ts` (a
+   `Record<InvitationStatus, Partial<Record<InvitationAction,
+   InvitationStatus>>>`), so they cannot be made to disagree independently.
+   Only `pending` has non-empty outgoing entries; the other four statuses map
+   to `{}`, correctly making them terminal.
 
-## New test file written independently by this stage (Tester)
+3. **Exhaustive 5×4 matrix test is not vacuous**: read
+   `tests/unit/lib/invitations/state-machine.test.ts` lines 98-115. It builds
+   `legalPairs` from all 4 `pending:*` combinations, then loops all 5
+   statuses x 4 actions (20 pairs total), asserting `canTransition` and
+   `applyTransition` agree with set membership. Traced by hand: 4 legal +
+   16 illegal = 20, matching "5 statuses x 4 actions" exactly — no pair is
+   skipped or duplicated.
 
-`tests/unit/app/api/availability-route-tester-supplement.test.ts` (3 tests,
-all passing), following the repo's existing "tester-supplement" convention
-(see `invitations-withdraw-route-tester-supplement.test.ts`,
-`service-weeks-cancel-reactivate-tester-supplement.test.ts`). Closes gaps the
-coder's own `availability-route.test.ts` left open:
+4. **Scope boundary honored**: `git show --stat HEAD` (commit `30a1db3`,
+   "Add invitation state-machine module and exhaustive unit tests (#51)")
+   touches only `.pipeline/changes.md`, `.pipeline/spec.md`,
+   `lib/invitations/state-machine.ts`, and
+   `tests/unit/lib/invitations/state-machine.test.ts`. Confirmed via `grep`
+   that `app/api/invitations/handler.ts` is untouched and still carries its
+   own inline guards (`status !== "pending"` at lines 239 and 334,
+   `(deniedForWeek ?? []).length >= 3` at line 101) — the new module is
+   additive only, not wired in anywhere. The three route tests named in
+   `changes.md` (`invitations-deny-route.test.ts`,
+   `invitations-withdraw-route.test.ts`, `invitations-accept-route.test.ts`)
+   all still pass unchanged in the full suite run above. The `accept_invitation`
+   SQL RPC migration is untouched (no new/modified migration file in the diff).
 
-1. **Failure-case / short-circuit check**: asserts the conflict-detection RPC
-   is *never* called when the upsert itself errors (spec: fire conflict
-   detection "after the upsert succeeds"). A regression that fired the RPC
-   unconditionally, or before checking the upsert error, would still have
-   passed the coder's existing test (which only asserts the 500 status, not
-   that `rpc` was never called).
-2. **Edge case — full multi-day range, all unavailable**: a 3-day range PUT
-   with every expanded date set unavailable fires the RPC exactly 3 times,
-   once per date, each with `p_trigger_reason: "marked_unavailable"`. The
-   coder's own multi-date test only mixed one available + one unavailable
-   date, which would not have caught a regression that fires the RPC only for
-   the first or last date in the `byDate` iteration.
-3. **Ordering contract**: asserts `upsert` is invoked before `rpc` (via
-   `mock.invocationCallOrder`), directly verifying the spec's explicit
-   ordering requirement — "the upsert writes the is_available:false row (and
-   its note) BEFORE the RPC runs, so the RPC can read that note for the
-   notification."
+5. **BR-08 boundary matches `handler.ts`**: `handler.ts:101` uses
+   `(deniedForWeek ?? []).length >= 3`; `state-machine.ts`'s
+   `canInvite`/`assertCanInvite` use the equivalent `< MAX_DENIALS_PER_WEEK`
+   / cap-at-3 semantics (cap reached exactly at 3, not 4 — confirmed by
+   reading the source, not just trusting the test names).
 
-All three pass against the current implementation.
+6. **Mutation check (regression-catching sanity, not part of the shipped
+   diff)**: temporarily changed `canInvite`'s comparison from
+   `< MAX_DENIALS_PER_WEEK` to `<= MAX_DENIALS_PER_WEEK` (an intentional
+   off-by-one bug) and re-ran the state-machine test file in isolation.
+   Result: 2 of 21 tests failed exactly as expected — "blocks invites once
+   the cap is reached" and the `assertCanInvite` throw-at-cap test — proving
+   the boundary tests are not vacuous and would catch a real regression.
+   Reverted immediately afterward; `git status`/`git diff --stat` confirmed
+   the working tree was byte-identical to the committed state (clean, zero
+   diff) before this report was written.
 
-## Spec edge cases re-verified as covered
+## Failure cases covered
 
-1. Marking available/default-true never triggers RPC — covered (coder's test
-   `"marking a date available... does not call the conflict-detection RPC"` +
-   this stage's failure-case test). Confirmed.
-2. Multi-date PUT, one RPC call per unavailable date — covered (coder's mixed
-   available/unavailable test + this stage's all-unavailable 3-day range
-   test). Confirmed.
-3. No accepted invitation on the date → RPC returns `false`, PUT still
-   succeeds with `conflictTriggered: false` — covered (coder's DELETE
-   no-invitation test and the PUT default-`rpc` mock behavior). Confirmed.
-4. Reason present (marked_unavailable) vs. absent (availability_deleted, NULL
-   note) — covered by SQL review of the migration's `CASE WHEN v_reason IS
-   NOT NULL` guard; no live-DB harness exists for either trigger path in this
-   repo, consistent with sibling RPCs and explicitly out of scope per spec.
-5. Multiple accepted invitations on one date — RPC loop is unchanged from
-   the original migration (only the notification insert was added inside the
-   existing loop); reviewed, no behavior-flow change from this issue.
-6. RPC/DB error → 500 `INTERNAL`, never a silent no-op — covered on both PUT
-   (coder's `"returns 500 INTERNAL when the conflict-detection RPC returns an
-   error"`) and DELETE (pre-existing test, unmodified). Confirmed.
-7. Triggering user is themselves leader/admin → excluded via
-   `id <> v_user_id` — verified by SQL review; no live-DB harness exists to
-   exercise this at the application-test level, consistent with the spec's
-   own scoping of RPC verification to review + mocked route tests.
-8. Both trigger paths converge on the same RPC (AC3) — verified:
-   `deleteAvailability` (unmodified) and `setAvailability` (newly wired) both
-   call `recordAvailabilityConflict`, and the migration is the single shared
-   RPC implementation backing both `trigger_reason` values.
+- `expect(() => applyTransition("pending", bogusAction)).toThrow(...)` for a
+  runtime-unknown action forced past the type system via a cast, proving the
+  defensive `undefined` fallthrough in `TRANSITIONS` works and doesn't
+  silently no-op or crash uncontrolled.
+- All 16 illegal `(status, action)` pairs in the exhaustive matrix are
+  themselves failure-case assertions (`toThrow(InvalidInvitationTransitionError)`),
+  well beyond the "at least one failure case" requirement.
+- `assertCanInvite` throwing `DenialCapReachedError` at/above the cap, with
+  `.priorDenialCount` asserted on the caught error.
 
-## Out-of-scope items confirmed untouched
+## Edge cases named in the spec, confirmed covered
 
-- No `sendSms`/`sendEmail` calls added; `lib/pingram/client.ts` and
-  `lib/resend/client.ts` unmodified (confirmed via `git status`/diff).
-- `app/api/conflicts/*` (GET/resolve) and `app/(app)/conflicts/page.tsx` not
-  present in this diff.
-- `lib/supabase/types.ts` unmodified.
-- GET `/api/availability`, team availability, and any admin-sets-another-
-  member availability path are unmodified.
-- No new `notification_type` enum value added (`scheduling_conflict` already
-  existed).
+- All 4 `pending -> *` valid transitions (accept/deny/withdraw/expire).
+- Terminal-source invalid transitions (`accepted->accept`, `denied->accept`,
+  `withdrawn->accept`, `expired->accept`, plus `accepted->deny`,
+  `accepted->withdraw`).
+- Self-loop re-application from a terminal status (`denied->deny`,
+  `withdrawn->withdraw`).
+- Error carries `.from`/`.action`/`.name` context (not a bare `Error`).
+- BR-08 cap boundary at exactly 3 (`canInvite`/`assertCanInvite` for
+  0/1/2/3/4), driven by the exported `MAX_DENIALS_PER_WEEK` constant rather
+  than a hard-coded literal in the boundary-crossing assertions.
 
-## Not independently verifiable in this environment
+## Conclusion
 
-- The RPC SQL body itself (`record_availability_conflict`) has no live-DB
-  test harness in this repo, consistent with `accept_invitation`'s and the
-  original migration's precedent, and explicitly out of scope per spec ("do
-  not add a live-DB test"). Correctness was checked by direct comparison
-  against the spec's required additions, the live table/enum schema
-  (`notifications`, `notification_type`), and the established
-  `accept_invitation` notify pattern — not by execution against a real
-  database.
-
-## Failure cases
-
-None. No test failures encountered in this run — the coder's original 385
-tests, and the 3 new independent supplemental tests added by this stage, all
-pass. Lint, typecheck, and `check:workflows` are all clean.
+All of the coder's claims in `.pipeline/changes.md` check out under
+independent verification. No discrepancies found. Full suite green (33/33
+suites, 409/409 tests), typecheck and lint clean, the issue's scope boundary
+(no refactor of `handler.ts`/SQL RPC) was honored, and a deliberate mutation
+test confirms the new suite actually catches regressions rather than being
+vacuous. Ready for review.
