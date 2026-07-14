@@ -12,7 +12,7 @@ No changes were made to the conflicts list screen, the notification inbox,
 the resolve endpoint/schema, or any DB migration — all explicitly out of
 scope per spec.
 
-## Files changed
+## Backend
 
 - **`app/api/conflicts/handler.ts`** — added `roleNote: string | null` to the
   `OpenConflict` type; the invitations join now selects `role_note` in

@@ -1,0 +1,156 @@
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1.5rem;
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.headerTitle h1 {
+  margin: 0;
+}
+
+.date {
+  margin: 0.25rem 0 0;
+  color: var(--color-fg);
+}
+
+.navDisabled {
+  opacity: 0.3;
+}
+
+.layout {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.card {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 1.5rem;
+}
+
+.rosterGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.rosterSlot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 1rem;
+  text-align: center;
+}
+
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: #e5e7eb;
+  color: #374151;
+  font-weight: 600;
+}
+
+.memberName {
+  font-weight: 600;
+}
+
+.inviteButton {
+  margin-top: 0.25rem;
+}
+
+.sidebar {
+  width: 320px;
+  flex-shrink: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.sidebarCollapsed {
+  width: auto;
+  flex-shrink: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.sidebarHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.sidebarHeader h2 {
+  margin: 0;
+}
+
+.availabilityGrid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  overflow-x: auto;
+}
+
+.availabilityRow {
+  display: grid;
+  grid-template-columns: 100px repeat(7, 1fr);
+  gap: 0.25rem;
+  align-items: center;
+}
+
+.availabilityMemberCell {
+  font-size: 0.85rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.availabilityDateCell {
+  height: 20px;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  text-align: center;
+}
+
+.availabilityAvailable {
+  background: #dcfce7;
+}
+
+.availabilityUnavailable {
+  background: #fee2e2;
+}
+
+.availabilityUnknown {
+  background: #f0f0f0;
+}
