@@ -1,45 +1,55 @@
-# Review — Issue #51: Invitation state machine unit tests
+# Review — Issue #50: Build Conflict Resolution screen (PRD §13 Screen 7)
 
 ## VERDICT: SHIP
 
-## What I verified (firsthand, not from the summaries)
+## What I checked (not just trusting the summaries)
+- Read spec.md, changes.md, test-results.md.
+- Isolated the actual #50 commit (`aacfbb6`) — the `main...HEAD` three-dot diff
+  also shows #51 / cron-scheduler work that is not this issue; the #50 commit
+  itself touches exactly the 8 files the spec scopes (handler + route test +
+  4 new screen/test files + 2 pipeline artifacts). No scope creep.
+- Read every changed/created source file firsthand, plus both untracked
+  tester-supplement test files.
+- Re-ran `bun run typecheck` (clean), `bun run lint` (clean), `bun run test`
+  (43 suites / 495 tests, 0 failures).
 
-- `git diff main...HEAD --stat`: only 4 files touched — the new module
-  (`lib/invitations/state-machine.ts`), the new test
-  (`tests/unit/lib/invitations/state-machine.test.ts`), and the two pipeline
-  docs (`.pipeline/spec.md`, `.pipeline/changes.md`). No stray changes.
-- `git diff main...HEAD -- app/api/invitations/handler.ts supabase/` is empty:
-  the scope boundary the spec set (no refactor of the route handler or the
-  `accept_invitation` RPC) is genuinely honored, not just claimed.
-- Read the module source: `canTransition` and `applyTransition` are both backed
-  by one shared `TRANSITIONS` table, so they cannot drift apart. Only `pending`
-  has outgoing edges; the other four statuses map to `{}` (terminal).
-  `applyTransition` throws `InvalidInvitationTransitionError` on every illegal
-  cell and never returns the unchanged `from` — the exact silent-failure mode
-  AC2 forbids is closed. Both error classes set a stable `.name` and carry
-  context (`.from`/`.action`, `.priorDenialCount`).
-- BR-08 boundary: module uses `priorDenialCount < MAX_DENIALS_PER_WEEK` (cap 3),
-  and `handler.ts:101` uses `(deniedForWeek ?? []).length >= 3`. These agree —
-  no off-by-one.
-- Read the test: the exhaustive 5×4 loop builds `legalPairs` from the 4
-  `pending:*` combos and asserts the other 16 throw — not vacuous. Boundary
-  tests are driven by the exported `MAX_DENIALS_PER_WEEK` constant, not a magic
-  literal. A runtime-unknown-action cast case is covered.
-- Ran the tools myself: `bun run typecheck` clean; the new suite passes 21/21.
+## Correctness assessment
+- **Handler change** matches the spec exactly: `roleNote` added to `OpenConflict`,
+  `role_note` added to both the `Pick<>` type and the `.select()`, surfaced as
+  `roleNote: invitation?.role_note ?? null`. `resolveConflict` untouched.
+- **Button → action mapping** is correct: "Mark as Resolved" POSTs
+  `member_reconfirmed`, "Dismiss" POSTs `admin_dismissed`, "Find a Replacement"
+  is a pure `<a>` navigation (no API call, conflict stays open) with a
+  forward-compatible `/invitations/new` URL and `encodeURIComponent(roleNote ?? "")`.
+- **View-state machine** and all named edge cases are handled: not-found / non-OK
+  / network error on load → `unavailable`; 409 on resolve → `unavailable`;
+  other non-OK / thrown error → inline fixed-string `role="alert"`, buttons stay
+  usable; double-submit guarded by `submitting`; null `serviceWeekTitle` →
+  "Service", null `roleNote` / `triggerReason` lines omitted cleanly.
+- **No sensitive-data leak**: `actionError` is always a fixed string; no
+  `error`/`code`/`status` is ever interpolated into rendered text.
+- **Out-of-scope boundaries held**: list stub, resolve endpoint/schema, and all
+  migrations are untouched.
 
-## Judgment on correctness (green tests != correct)
+## Test quality
+- The coder's component test and route test are behavioral (assert rendered DOM,
+  fetch URL+body, response envelope) — not superficial.
+- The two tester-supplement files close real gaps behaviorally: click-produces-no-
+  fetch for "Find a Replacement", `!res.ok` load branch, null-roleNote href
+  encoding, `guest` role gate, and `role_note`-column-null vs invitation-row-
+  missing distinction. Both are legitimate assertion-on-behavior tests with no
+  suspicious content. They are untracked in the worktree — they must be committed
+  (or intentionally dropped) before/with the PR so the coverage they claim is not
+  silently lost.
 
-The module is the canonical, throw-on-invalid state machine the issue asked for,
-implemented in isolation and tested exhaustively. Signatures match the spec
-verbatim. The tester's mutation check (flipping `<` to `<=`) failing 2 tests is
-consistent with what I traced by hand. Domain union is imported from
-`types/domain.ts`, not redeclared.
+## Non-blocking notes (no action required to ship)
+- "Find a Replacement" anchor is not disabled during an in-flight resolve, though
+  the mapping-table narrative says all three are enabled "except while a request
+  is in flight." This is consistent with the spec's own detailed section 4 (only
+  the two `Button`s get the disabled treatment; the link is a plain anchor that
+  navigates away), so it is intentional, not a defect.
+- The jest run emits a jsdom "navigation not implemented" console warning from the
+  click-the-anchor test; it is cosmetic (jsdom can't perform anchor navigation)
+  and does not affect any assertion or the pass result.
 
-## Notes (non-blocking, for the human)
-
-- The module is intentionally NOT wired into `handler.ts` or the SQL RPC, per
-  the spec's explicit scope guard. That means the canonical machine and the two
-  inline implementations can still diverge in the future; converging them is a
-  deliberate follow-up, not part of this issue.
-
-No changes required. Ship it.
+Green tests here reflect genuinely correct behavior. Ship it.

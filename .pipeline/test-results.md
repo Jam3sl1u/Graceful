@@ -1,104 +1,116 @@
-# Test Results — Issue #51: Invitation state machine unit tests
+# Test Results — Issue #50: Build Conflict Resolution screen (PRD §13 Screen 7)
 
 ## Verdict: PASS
 
-This overwrites the stale `test-results.md` for issue #46 that was still
+This overwrites the stale `test-results.md` for issue #51 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
-## Commands re-run independently in this worktree
+## What I did
+
+Read `.pipeline/changes.md` and `.pipeline/spec.md`, then independently read
+the actual changed/created files (`app/api/conflicts/handler.ts`,
+`app/(app)/conflicts/[id]/page.tsx`, `app/(app)/conflicts/[id]/conflict-resolution.tsx`,
+`app/(app)/conflicts/[id]/conflict-resolution.module.css`,
+`tests/unit/app/api/conflicts-route.test.ts`,
+`tests/unit/app/conflict-resolution.test.tsx`) rather than trusting the
+coder's summary, and re-ran the full verification suite with Bun.
+
+Two independently-authored supplemental test files were already present
+(untracked) in the worktree:
+- `tests/unit/app/conflict-resolution-tester-supplement.test.tsx`
+- `tests/unit/app/api/conflicts-route-tester-supplement.test.ts`
+
+I reviewed both for behavioral (not implementation-detail) focus before
+relying on them. They close real gaps the coder's own tests left:
+- "Find a Replacement" click issues **no** additional fetch and leaves the
+  conflict open/ready (the coder's tests only checked the `href`, never the
+  click behavior — this is the spec's core distinguishing behavior for that
+  button: "No API call. Conflict stays open.").
+- A non-OK (500) response on the **initial** `GET /api/conflicts` lookup
+  (the `!res.ok` branch of the load effect) — previously only a thrown
+  network error and a well-formed-but-not-found list were covered.
+- `roleNote: null` encodes as an empty-string query param (`&roleNote=`),
+  not the literal string `"null"`.
+- The role gate on the newly-touched handler rejects `guest`, not just
+  `member` (guards against an accidental `requireRole` loosening while
+  touching this handler).
+- `roleNote: null` when the invitation row **exists** but its `role_note`
+  column is null — distinct code path from "invitation row missing
+  entirely" (proves the `??` fallback, not just optional chaining, is doing
+  real work).
+
+These are genuine behavioral tests (assert on rendered DOM / fetch calls /
+response bodies, not internals), so I kept them as part of this stage's
+output rather than treating them as noise.
+
+## Verification run
 
 - `bun run typecheck` — clean, no errors.
 - `bun run lint` — clean, no errors/warnings.
-- `bun run test` (Jest, full suite) — **33 test suites, 409 tests, all
-  passing.**
-- Re-ran just the new file in isolation
-  (`tests/unit/lib/invitations/state-machine.test.ts`) — 21/21 passing.
+- `bun run test` — **43 suites passed / 495 tests passed**, 0 failed.
+  - Includes the coder's `tests/unit/app/conflict-resolution.test.tsx` (11
+    tests: loading, happy path, href encoding, Mark as Resolved POST, Dismiss
+    POST, null roleNote/triggerReason omission, null serviceWeekTitle
+    fallback, double-submit guard, not-found → unavailable, network error →
+    unavailable, 409 → unavailable, non-OK → inline alert).
+  - Includes the coder's updated `tests/unit/app/api/conflicts-route.test.ts`
+    (7 tests: 403 member, 401 no JWT, happy path with `roleNote`, empty list,
+    missing-invitation-row fallback, 500 on conflicts query, 500 on
+    invitations join).
+  - Includes the 5 tester-supplement tests listed above.
 
-## Independent verification performed
+## Coverage check against the spec
 
-1. **Domain type source of truth**: confirmed `types/domain.ts:6` declares
-   `InvitationStatus = "pending" | "accepted" | "denied" | "withdrawn" |
-   "expired"`, and `lib/invitations/state-machine.ts` imports it rather than
-   redeclaring the union, as the spec required.
+- **Happy path**: member name, formatted service date, `serviceWeekTitle`
+  heading, role note, reason, all three actions rendered — covered and
+  passing.
+- **Named edge cases** (all covered, all pass):
+  - Conflict id not in the open list → `unavailable`, no crash.
+  - `serviceWeekTitle` null → falls back to "Service".
+  - `roleNote` null → role line omitted cleanly (plus the href-encoding edge
+    case: empty string, not `"null"`).
+  - `triggerReason` null → reason line omitted cleanly.
+  - In-flight request → both buttons disabled, second click produces no
+    second POST.
+  - 409 on resolve → `unavailable`.
+  - Non-OK/network error on resolve → inline `role="alert"` message, buttons
+    stay enabled, no raw error/code/status string leaked.
+  - Non-OK (500) on the *initial* lookup → `unavailable`, no crash.
+- **Failure cases**: network error on initial lookup (thrown fetch), 500 on
+  initial lookup, non-OK on resolve, 409 on resolve — all covered.
+- **"Find a Replacement" behaves as pure navigation**: verified both via
+  `href` assertion (encoded `roleNote` + `serviceWeekId`) and, in the
+  supplement, via a click producing zero additional fetch calls with the
+  screen staying on the ready view — matches the spec's
+  "No API call. Conflict stays open." requirement exactly.
+- **`roleNote` plumbing end-to-end** (`handler.ts` → API response →
+  component): the route test's happy path and missing-invitation-row cases,
+  plus the supplement's "invitation exists but role_note column is null"
+  case, together prove `roleNote: invitation?.role_note ?? null` behaves
+  correctly for all three states (present / row missing / column null).
+- **Role gate**: `member` and (via supplement) `guest` both get 403
+  FORBIDDEN without ever reaching Supabase.
+- **Out-of-scope guardrails held**: `app/(app)/conflicts/page.tsx` (the list
+  stub) is untouched; `resolveConflict` (the resolve handler/schema) is
+  untouched — confirmed by reading `handler.ts` in full; no migration files
+  were touched (confirmed via file list in `changes.md` and `git status`).
 
-2. **Shared source of truth for `canTransition`/`applyTransition`**: both
-   functions read from the same `TRANSITIONS` lookup table in
-   `lib/invitations/state-machine.ts` (a
-   `Record<InvitationStatus, Partial<Record<InvitationAction,
-   InvitationStatus>>>`), so they cannot be made to disagree independently.
-   Only `pending` has non-empty outgoing entries; the other four statuses map
-   to `{}`, correctly making them terminal.
+## Manual spot checks
 
-3. **Exhaustive 5×4 matrix test is not vacuous**: read
-   `tests/unit/lib/invitations/state-machine.test.ts` lines 98-115. It builds
-   `legalPairs` from all 4 `pending:*` combinations, then loops all 5
-   statuses x 4 actions (20 pairs total), asserting `canTransition` and
-   `applyTransition` agree with set membership. Traced by hand: 4 legal +
-   16 illegal = 20, matching "5 statuses x 4 actions" exactly — no pair is
-   skipped or duplicated.
-
-4. **Scope boundary honored**: `git show --stat HEAD` (commit `30a1db3`,
-   "Add invitation state-machine module and exhaustive unit tests (#51)")
-   touches only `.pipeline/changes.md`, `.pipeline/spec.md`,
-   `lib/invitations/state-machine.ts`, and
-   `tests/unit/lib/invitations/state-machine.test.ts`. Confirmed via `grep`
-   that `app/api/invitations/handler.ts` is untouched and still carries its
-   own inline guards (`status !== "pending"` at lines 239 and 334,
-   `(deniedForWeek ?? []).length >= 3` at line 101) — the new module is
-   additive only, not wired in anywhere. The three route tests named in
-   `changes.md` (`invitations-deny-route.test.ts`,
-   `invitations-withdraw-route.test.ts`, `invitations-accept-route.test.ts`)
-   all still pass unchanged in the full suite run above. The `accept_invitation`
-   SQL RPC migration is untouched (no new/modified migration file in the diff).
-
-5. **BR-08 boundary matches `handler.ts`**: `handler.ts:101` uses
-   `(deniedForWeek ?? []).length >= 3`; `state-machine.ts`'s
-   `canInvite`/`assertCanInvite` use the equivalent `< MAX_DENIALS_PER_WEEK`
-   / cap-at-3 semantics (cap reached exactly at 3, not 4 — confirmed by
-   reading the source, not just trusting the test names).
-
-6. **Mutation check (regression-catching sanity, not part of the shipped
-   diff)**: temporarily changed `canInvite`'s comparison from
-   `< MAX_DENIALS_PER_WEEK` to `<= MAX_DENIALS_PER_WEEK` (an intentional
-   off-by-one bug) and re-ran the state-machine test file in isolation.
-   Result: 2 of 21 tests failed exactly as expected — "blocks invites once
-   the cap is reached" and the `assertCanInvite` throw-at-cap test — proving
-   the boundary tests are not vacuous and would catch a real regression.
-   Reverted immediately afterward; `git status`/`git diff --stat` confirmed
-   the working tree was byte-identical to the committed state (clean, zero
-   diff) before this report was written.
-
-## Failure cases covered
-
-- `expect(() => applyTransition("pending", bogusAction)).toThrow(...)` for a
-  runtime-unknown action forced past the type system via a cast, proving the
-  defensive `undefined` fallthrough in `TRANSITIONS` works and doesn't
-  silently no-op or crash uncontrolled.
-- All 16 illegal `(status, action)` pairs in the exhaustive matrix are
-  themselves failure-case assertions (`toThrow(InvalidInvitationTransitionError)`),
-  well beyond the "at least one failure case" requirement.
-- `assertCanInvite` throwing `DenialCapReachedError` at/above the cap, with
-  `.priorDenialCount` asserted on the caught error.
-
-## Edge cases named in the spec, confirmed covered
-
-- All 4 `pending -> *` valid transitions (accept/deny/withdraw/expire).
-- Terminal-source invalid transitions (`accepted->accept`, `denied->accept`,
-  `withdrawn->accept`, `expired->accept`, plus `accepted->deny`,
-  `accepted->withdraw`).
-- Self-loop re-application from a terminal status (`denied->deny`,
-  `withdrawn->withdraw`).
-- Error carries `.from`/`.action`/`.name` context (not a bare `Error`).
-- BR-08 cap boundary at exactly 3 (`canInvite`/`assertCanInvite` for
-  0/1/2/3/4), driven by the exported `MAX_DENIALS_PER_WEEK` constant rather
-  than a hard-coded literal in the boundary-crossing assertions.
+- Confirmed by reading source that no raw `error`/`code`/`status` string is
+  ever interpolated into rendered text on any failure path (`actionError` is
+  always a fixed string; the `unavailable` view has no error-derived text).
+- Confirmed the two "back to conflicts" links use `next/link`'s `Link`
+  (required by `@next/next/no-html-link-for-pages` since `/conflicts` is a
+  real stub route), while "Find a Replacement" is intentionally a plain
+  `<a>` to the not-yet-built `/invitations/new` route, matching the spec's
+  OPEN QUESTION 1 chosen default (non-blocking, forward-compatible URL).
 
 ## Conclusion
 
-All of the coder's claims in `.pipeline/changes.md` check out under
-independent verification. No discrepancies found. Full suite green (33/33
-suites, 409/409 tests), typecheck and lint clean, the issue's scope boundary
-(no refactor of `handler.ts`/SQL RPC) was honored, and a deliberate mutation
-test confirms the new suite actually catches regressions rather than being
-vacuous. Ready for review.
+No failing tests. The implementation matches the spec's button-mapping
+table, view-state machine, edge cases, and out-of-scope boundaries. The full
+suite (including two independently-authored supplemental test files closing
+real coverage gaps) is green: 43 suites / 495 tests passed, typecheck clean,
+lint clean. Ready for Review.
