@@ -1,104 +1,136 @@
-# Test Results — Issue #53: Song catalog CRUD + search (BR-09 key validation)
+# Test Results — Issue #58: Song-level document attachment (signed URLs)
 
-This overwrites the stale `test-results.md` for issue #52 that was still
+This overwrites the stale `test-results.md` for issue #53 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
-## Verification performed
+## Summary
 
-Ran independently in the pinned worktree
-(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-53`):
+**PASS.** All verification commands are clean and the coder's claims in
+`.pipeline/changes.md` hold up under independent re-verification. One gap
+noted in changes.md ("What the Tester should focus on") — no standalone
+`lib/r2/client.ts` unit test existed — has been filled in with a new test
+file; it passes.
 
-- `bun run lint` — **clean** (0 errors, 0 warnings, after fixing an unused
-  import in this stage's own new test file — see below).
-- `bun run typecheck` (`tsc --noEmit`) — **clean**.
-- `bun run test` (Jest, full suite) — **51 suites / 579 tests passed**
-  (50 suites / 569 tests from the Coder's work, plus 1 new suite / 10 tests
-  added by this Testing stage).
+## Commands re-run independently
 
-All of the Coder's `changes.md` claims check out: lint/typecheck/test were
-independently re-run from a clean state (not trusted from the report), and
-the full suite is green.
+- `bun run lint` — clean, 0 errors / 0 warnings.
+- `bun run typecheck` (`tsc --noEmit`) — clean.
+- `bun run test` — **53 suites / 628 tests pass** (52 suites / 615 tests from
+  the coder's existing work, plus 1 new suite / 13 new tests added by this
+  stage).
 
 ## Independent code read
 
-Read `schemas/songs.ts`, `app/api/songs/handler.ts`, `app/api/songs/route.ts`,
-and the `songs` table registration in `lib/supabase/types.ts` against
-`.pipeline/spec.md`. Confirmed:
+Read `schemas/song-documents.ts`, `app/api/songs/[id]/documents/handler.ts`,
+`lib/r2/client.ts`, the three `route.ts` wiring files
+(`app/api/songs/[id]/documents/route.ts`, `.../upload-url/route.ts`,
+`.../[docId]/route.ts`), and the `song_documents` table registration in
+`lib/supabase/types.ts` against `.pipeline/spec.md` line by line. Confirmed:
 
-- `VALID_SONG_KEYS` contains exactly the 17 ASCII + 10 Unicode spellings
-  named in the spec, case-sensitive `Set.has`.
-- The BR-09 split is implemented as specified: `createSongSchema.safeParse`
-  failure → 400 VALIDATION_FAILED; a syntactically valid but semantically
-  invalid `default_key` → 422 VALIDATION_FAILED, checked in the handler
-  (not Zod), after `.trim()` (Zod trims before the handler's membership
-  check runs).
-- `listSongs`: `requireAuth` → `requireRole(["admin","set_leader","member"])`
-  → query-schema parse → JWT guard → `.eq("church_group_id", ...)` (defense
-  in depth, present) → optional `.or(ilike title/artist)` → `.order("title")`
-  → 500 on DB error → `ok({ songs: [...] })`.
-- `createSong`: `requireAuth` → `requireRole(["admin","set_leader"])` → body
-  parse (400) → BR-09 check (422) → JWT guard (401) → insert with
-  `spotify_id` untouched → 500 on error/no data → `ok({ song }, 201)`. No
-  duplicate-title 409 guard, matching the spec's explicit instruction.
-- `lib/supabase/types.ts` `songs` table entry matches the spec's `SongsRow`
-  / `Insert`/`Update`/`Relationships` shape verbatim.
-- `app/api/songs/route.ts` wires `GET`/`POST` straight to `listSongs`/
-  `createSong`, mirroring `app/api/instruments/route.ts`.
+- Role matrix matches spec exactly: `createUploadUrl`/`registerDocument`/
+  `deleteDocument` → `["admin", "set_leader"]`; `listDocuments` →
+  `["admin", "set_leader", "member"]` (guest excluded everywhere).
+- `songExistsInGroup` runs before any R2 call and before any DB insert/delete
+  in all four functions; existing tests assert `getUploadUrl`/`getDownloadUrl`
+  are never invoked on the 404 path (`expect(mockGetUploadUrl).not.toHaveBeenCalled()`),
+  and forbidden roles never reach `getSupabaseClient`
+  (`expect(mockGetSupabaseClient).not.toHaveBeenCalled()`).
+- `file_key` prefix check in `registerDocument` rejects all three malformed
+  cases the spec calls out: an unrelated key, another group's key, and
+  another song's key within the same group — confirmed via
+  `tests/unit/app/api/song-documents-route.test.ts`'s
+  `it.each(["not-prefixed/at/all.pdf", "song-documents/other-group/...", "song-documents/${group}/other-song/..."])`.
+- `file_size_bytes` edge cases (`0`, `-1`, `1.5`, `"2048"` string) all 400 —
+  matches `uploadUrlSchema`'s `z.number().int().positive()`.
+- Delete's 3-way scope (`id` + `song_id` + `church_group_id`) returns 404 on
+  an empty result set rather than silently no-op-succeeding — confirmed in
+  code and test (`delete: { data: [], error: null }` → 404 NOT_FOUND).
+- Response DTOs never leak the raw `file_key`: `listDocuments` and
+  `registerDocument` select `file_key` only to sign it via `getDownloadUrl`,
+  and the mapped `SongDocumentResponse` omits it; tests assert
+  `expect(document).not.toHaveProperty("fileKey")` /
+  `not.toHaveProperty("file_key")`.
+- 401/403 ordering matches the spec and the songs-handler pattern: role check
+  (`requireRole`) happens before the JWT fetch, so a forbidden role never
+  reaches Supabase, and a missing JWT short-circuits before any Supabase call.
+- `lib/r2/client.ts` matches the spec's exact shape: lazy singleton `S3Client`
+  (`region: "auto"`, `forcePathStyle: true`), 30-minute
+  (`SIGNED_URL_EXPIRY_SECONDS = 30 * 60`) expiry on both `getUploadUrl` and
+  `getDownloadUrl`, optional `contentType` param, throws a plain `Error` if
+  any of `R2_ENDPOINT`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`/`R2_BUCKET_NAME`
+  is missing. The stale `Sprint 3 #58` TODO comment is gone, as claimed.
+- `lib/supabase/types.ts`'s new `SongDocumentsRow` / `song_documents` Tables
+  entry matches the spec's exact shape (`Insert` omits `id`/`created_at`/
+  `uploaded_by` as optional, matching the `songs` table's style).
+- Route wiring files correctly unwrap `params: Promise<{...}>` and delegate
+  straight to the handler functions with no extra logic, matching
+  `app/api/service-weeks/[id]/route.ts`'s pattern.
+- No migrations were added/modified and no new dependencies were introduced,
+  per the spec's explicit "do NOT" constraints — `git status` shows only the
+  files `changes.md` lists as created/modified, plus the one new test file
+  added by this stage.
 
 ## New tests written by this stage
 
-Added `tests/unit/app/api/songs-route-tester-supplement.test.ts` (10 tests,
-independent of the Coder's `songs-route.test.ts`) covering behavior the
-Coder's own suite did not exercise:
+**`tests/unit/lib/r2/client.test.ts`** (13 tests, new) — fills the gap the
+coder flagged in changes.md ("What the Tester should focus on"): a
+standalone unit test for `lib/r2/client.ts` that mocks `@aws-sdk/client-s3`
+and `@aws-sdk/s3-request-presigner` directly (no handler indirection), using
+`jest.isolateModulesAsync` per test to get a fresh lazy-singleton `S3Client`
+each time. Covers:
 
-- **Route wiring**: `route.GET`/`route.POST` delegate to the handler and
-  return a `Response` without throwing.
-- **Auth branches not covered by the Coder's suite**: Clerk `userId` null
-  (401, before any DB call) for both GET and POST; `lookup` resolving to
-  `null` — i.e. an authenticated Clerk user with no matching `users` row
-  (401, before any DB call) for both GET and POST. The Coder's suite only
-  exercised the "no JWT" 401 path, not these two.
-- **Defense-in-depth scoping**: GET's select chain is asserted to call
-  `.eq("church_group_id", CHURCH_GROUP_ID)`, not just to return 200.
-- **Trim-before-BR-09-check edge case**: `default_key: " C "` → 201, stored
-  as the trimmed `"C"`; `default_key: " H "` → still 422 (trimming happens
-  in Zod before the handler's `isValidSongKey` check, so padding can't be
-  used to dodge either the valid or invalid paths).
-- **Unknown body fields are dropped, not stored or rejected** — e.g.
-  `spotify_id` sent in the POST body is confirmed absent from the insert
-  payload (the spec requires `spotify_id` stay server-controlled/null,
-  manual entry only; a client trying to smuggle it in must not succeed).
+- `getUploadUrl` signs a `PutObjectCommand` with the correct
+  `Bucket`/`Key`/`ContentType` and a 30-minute (`1800`s) `expiresIn`.
+- `getUploadUrl` works with `contentType` omitted (optional param).
+- `getDownloadUrl` signs a `GetObjectCommand` with the correct
+  `Bucket`/`Key` and the same 30-minute expiry.
+- Each of the four required env vars (`R2_ENDPOINT`, `R2_ACCESS_KEY_ID`,
+  `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`), when **missing**, throws
+  `/R2 is not configured/` and never calls `getSignedUrl`.
+- Each of the four required env vars, when **present but an empty string**,
+  also throws — confirms `!endpoint` etc. treats `""` as falsy/missing, not
+  just `undefined`. This was explicitly called out as unverified in
+  changes.md and is now covered.
+- The `S3Client` singleton is constructed exactly once across two calls
+  (`getUploadUrl` then `getDownloadUrl`) with the exact expected config
+  (`region: "auto"`, `endpoint`, `forcePathStyle: true`, `credentials`).
 
-All 10 new tests pass. One lint warning surfaced during this stage's own
-test authoring (an unused `SongResponse` type import) — fixed directly in
-the new test file (a Tester-owned file, not the Coder's code), and
-`bun run lint` is clean again after the fix.
+All 13 pass; `bun run lint` / `bun run typecheck` remain clean with the new
+file included.
 
 ## Manual verification of spec edge cases
 
-Cross-checked every edge case enumerated in `.pipeline/spec.md` ("Edge
-cases the implementation MUST handle") against the Coder's
-`songs-route.test.ts` and confirmed each one has a corresponding assertion:
-all GET cases (no `q`, `q` filter, empty `q`, empty catalog, `tags` null →
-`[]`, guest → 403, no JWT → 401, DB error → 500) and all POST cases (minimal
-valid body, ASCII/Unicode valid keys, omitted/invalid key → 422 for `H`,
-`c#`, `Cmaj`, `Z`, `bb`, missing/whitespace/oversized title → 400, oversized
-artist → 400 / omitted → 201, `bpm` bounds/omission, `tags` shape/empty,
-malformed JSON body → 400, role gating member/guest → 403 vs admin/set_leader
-→ 201, no JWT → 401, insert error → 500) are all present and pass.
+Cross-checked every edge case enumerated in `.pipeline/spec.md` ("Edge cases
+the implementation must handle") against the coder's
+`tests/unit/app/api/song-documents-route.test.ts` and confirmed each has a
+corresponding, passing assertion: unauthenticated 401 (before Supabase/R2
+touch) for all four endpoints; role gating per-endpoint (list allows
+`member`, others don't; `guest` always 403); song-not-in-group 404 (before
+R2 signing and before insert/delete) for all four; malformed/missing JSON
+body → 400; `file_size_bytes` invalid (non-number/0/negative/float) → 400;
+`file_key` prefix mismatch (3 variants) → 400; empty document list → 200
+`{ documents: [] }`; delete-miss (wrong doc/song/group) → 404; Supabase
+query/insert/delete errors → 500; R2 helper throwing → 500 INTERNAL.
 
-## Failure cases confirmed
+## Failure cases exercised
 
-The BR-09 negative path (`it.each(["H", "c#", "Cmaj", "Z", "bb"])` → 422
-VALIDATION_FAILED) and the 500-on-DB-error / 500-on-insert-error cases are
-genuine failure-path tests, independently re-run and passing. This stage's
-own added failure cases (401 for unauthenticated/unprovisioned users on
-both endpoints, and confirming smuggled `spotify_id`/unknown fields don't
-reach the insert payload) also pass.
+Per the pipeline contract's requirement to cover at least one failure case,
+the following were independently confirmed (both pre-existing in the
+coder's suite and newly added by this stage):
+
+- R2 SDK throwing (e.g. `getUploadUrl` rejecting) is caught by the handler's
+  generic `catch (err)` and surfaces as 500 INTERNAL, not an unhandled
+  rejection (`tests/unit/app/api/song-documents-route.test.ts`, "returns 500
+  INTERNAL when the R2 helper throws").
+- `lib/r2/client.ts` itself throwing synchronously on missing/empty env vars,
+  verified independently of the handler's mocking (new
+  `tests/unit/lib/r2/client.test.ts`).
+- Supabase insert/list/delete query errors all map to 500 INTERNAL in their
+  respective handler functions (pre-existing tests, re-run and confirmed).
 
 ## Verdict
 
-**PASS.** 51 test suites / 579 tests green, lint clean, typecheck clean.
-No discrepancies found between `.pipeline/spec.md`, `.pipeline/changes.md`,
-and the actual diff. Ready for Review.
+No failures found. Nothing was patched around — the implementation matched
+the spec on every point checked, and the one coverage gap the coder itself
+flagged is now closed. Ready for Review.
