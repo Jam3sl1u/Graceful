@@ -1,180 +1,224 @@
-# Spec — Issue #51: Invitation state machine unit tests
+# Spec — Issue #50: Build Conflict Resolution screen (PRD §13 Screen 7)
 
 ## OPEN QUESTIONS
 
-None blocking. See "Design decision" below for the one judgment call made while
-planning; it does not require a human to resolve before coding.
+None are hard-blocking — the screen is fully buildable. Two judgment calls were
+made while planning; both have a chosen default so the pipeline does NOT halt.
+They are called out here only so a human can override later.
 
-## Design decision (read this first)
+1. **"Find a Replacement" deep-link target (#40) does not exist yet.** There is
+   no send-invitation UI anywhere in the repo (grep confirms). The AC says this
+   button "opens the invitation flow, slot pre-selected." Since #40's route +
+   query-param contract is undefined, this spec fixes a forward-compatible URL:
+   `/invitations/new?serviceWeekId={serviceWeekId}&roleNote={encoded roleNote}`.
+   Clicking it today will land on a not-yet-built route — that is acceptable
+   (the issue lists #40 only as an implementation note, not a hard blocker, and
+   the button is present, labeled, and clickable per the AC). When #40 lands,
+   the human/that issue can correct the path/params.
 
-There is **no isolated invitation state-machine function in the codebase today.**
-The transition rules currently live scattered and inline across three places:
+2. **"Their reason if provided" maps to `conflict.triggerReason`.** The member's
+   own free-text note (availability `note`) is NOT durably stored on the conflict
+   row — it is only interpolated into the notification body at creation time (see
+   `supabase/migrations/20260713000001_conflict_notification.sql`). The only
+   reason-like field durably retrievable per conflict is `conflicts.trigger_reason`
+   (a caller-supplied tag such as `"marked_unavailable"` / `"availability_deleted"`).
+   This spec surfaces `triggerReason` as the reason line. Recovering the member's
+   verbatim note would require a data-model change and is out of scope here.
 
-- `app/api/invitations/handler.ts` — `denyInvitation` (guards `status !== "pending"`),
-  `withdrawInvitation` (guards `status !== "pending"`, returns 409), and the BR-08
-  denial-cap check inside `createInvitation` (`deniedForWeek.length >= 3`).
-- `supabase/migrations/20260712000001_accept_invitation_rpc.sql` — the accept
-  transition and its `status <> 'pending'` guard (in Postgres, not testable in
-  isolation without a DB).
+## Context (current state — verified, do not re-assume)
 
-The issue explicitly asks to "test the state machine function in isolation" with
-invalid transitions that "throw, not silently fail." No such throwing function
-exists, so the coder must **create a small pure module that is the canonical
-declaration of the invitation state machine**, then unit-test it exhaustively.
+- `app/(app)/conflicts/page.tsx` is a one-line stub ("coming soon"). Leave it
+  as-is; this issue does NOT build the conflicts list.
+- The resolve endpoint (#47) is live: `POST /api/conflicts/[id]/resolve` accepts
+  `{ resolution: "withdraw" | "member_reconfirmed" | "admin_dismissed" }`
+  (`schemas/conflicts.ts`), returns `{ data: { conflict: {...} } }`, and 409s if
+  already resolved. Note "replaced" is NOT a resolution this endpoint accepts.
+- The list endpoint (#47) is live: `GET /api/conflicts` returns
+  `{ data: { conflicts: OpenConflict[] } }` for OPEN conflicts only
+  (`resolved_at IS NULL`) in the caller's group. `OpenConflict` currently lacks
+  `roleNote` — this spec adds it.
+- Conflict notifications deep-link with `link_entity_type: "conflict"`,
+  `link_entity_id: <conflictId>`. The notification inbox that would turn that
+  into a URL is itself a stub — so this issue only builds the destination screen
+  at a routable URL; wiring the inbox link is out of scope.
+- API success envelope is `{ data: T }`; errors are `{ error, code }` (see
+  `lib/api/response.ts`). Client fetch reads `body.data`.
+- App screens under `app/(app)/**` render inside `AppShell` via the `(app)`
+  layout — no per-page shell needed.
 
-Scope guard for the coder:
-- **Create** the pure module + its unit test only.
-- **Do NOT** refactor `handler.ts` or the SQL RPC to call the new module — that is
-  a larger change not requested by this issue. The existing route handlers already
-  have their own unit tests (`invitations-deny-route.test.ts`,
-  `invitations-withdraw-route.test.ts`, `invitations-accept-route.test.ts`) and
-  keep their current (intentionally idempotent/graceful) HTTP semantics unchanged.
-- The new module is a standalone, DB-free, canonical spec of the transitions with
-  strict throw-on-invalid semantics, exactly as the acceptance criteria require.
+## Button → action mapping (the core of this screen)
+
+| Button label         | Behavior                                                                 |
+| -------------------- | ------------------------------------------------------------------------ |
+| Find a Replacement   | Navigate (link) to the invitation flow URL in OPEN QUESTION 1. No API call. Conflict stays open. |
+| Mark as Resolved     | `POST /api/conflicts/{id}/resolve` `{ resolution: "member_reconfirmed" }` |
+| Dismiss              | `POST /api/conflicts/{id}/resolve` `{ resolution: "admin_dismissed" }`    |
+
+All three must always be visible and enabled (except while a request is in
+flight). No AI-suggestion UI is implemented (Phase 4). Leave a short HTML comment
+above the button row marking where the Phase 4 AI suggestion will render.
+
+## Files to modify
+
+### 1. `app/api/conflicts/handler.ts` — expose `roleNote`
+
+Minimal, additive change so the screen can show "original role":
+- Add `roleNote: string | null;` to the `OpenConflict` type.
+- In the invitations query (currently
+  `.select("id, user_id, service_week_id, status")`), add `role_note`, and add
+  `"role_note"` to the `Pick<..., "id" | "user_id" | "service_week_id" | "status">`
+  type on `invitationRows`.
+- In the `result` map, add `roleNote: invitation?.role_note ?? null,`.
+- Do not touch any other field, ordering, or the resolve handler.
+
+### 2. `tests/unit/app/api/conflicts-route.test.ts` — keep it green
+
+The happy-path test uses an exact `toEqual`, so it must be updated for the new
+field (otherwise CI fails):
+- Add `role_note: "Lead vocals"` to the `invitationRow` fixture (~line 95-100).
+- Add `roleNote: "Lead vocals"` to the expected object in the "happy path"
+  `toEqual` (~line 150-161).
+- The "missing joined invitation row" test uses `toMatchObject`; no change needed,
+  but you may optionally assert `roleNote: null` there.
 
 ## Files to create
 
-### 1. `lib/invitations/state-machine.ts` (new — pure logic module)
+Follow the pattern of the invitation-response screen
+(`app/(public)/invite/[token]/page.tsx` + `invite-response.tsx` +
+`invite-response.module.css`) closely — same server-page-awaits-params +
+client-component-does-fetch/actions structure, same loading/ready/terminal view
+states, same CSS-module approach, same `Button` from `@/components/ui/Button`.
 
-Follow the style of `lib/scheduling/conflict-detection.ts` (small, single-purpose,
-typed) BUT **do not** import `"server-only"` — this module is pure and isomorphic.
-Import the status union from the existing domain types; do not redefine it.
+### 3. `app/(app)/conflicts/[id]/page.tsx` (server component)
 
+Mirror `app/(public)/invite/[token]/page.tsx`:
+```tsx
+export default async function ConflictResolutionPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  return <ConflictResolution conflictId={id} />;
+}
+```
+Add a short comment noting PRD §13 Screen 7 / issue #50.
+
+### 4. `app/(app)/conflicts/[id]/conflict-resolution.tsx` (client component)
+
+`"use client"`. Props: `{ conflictId: string }`.
+
+Local data shape (subset of `OpenConflict`):
 ```ts
-import type { InvitationStatus } from "@/types/domain";
-// InvitationStatus = "pending" | "accepted" | "denied" | "withdrawn" | "expired"
-
-export type InvitationAction = "accept" | "deny" | "withdraw" | "expire";
-
-// BR-08 (PRD §8): a member who has denied this many invitations for a given
-// service week cannot be re-invited for it.
-export const MAX_DENIALS_PER_WEEK = 3;
-
-export class InvalidInvitationTransitionError extends Error {
-  readonly from: InvitationStatus;
-  readonly action: InvitationAction;
-  constructor(from: InvitationStatus, action: InvitationAction);
-}
-
-export class DenialCapReachedError extends Error {
-  readonly priorDenialCount: number;
-  constructor(priorDenialCount: number);
-}
-
-// True iff `action` is legal from status `from`.
-export function canTransition(from: InvitationStatus, action: InvitationAction): boolean;
-
-// Returns the resulting status for a legal transition; THROWS
-// InvalidInvitationTransitionError for any illegal one. Must never silently
-// return the unchanged status.
-export function applyTransition(from: InvitationStatus, action: InvitationAction): InvitationStatus;
-
-// BR-08 gate. True iff a member with `priorDenialCount` prior denials for a week
-// may still be invited again for that week.
-export function canInvite(priorDenialCount: number): boolean;
-
-// BR-08 gate, throwing variant; THROWS DenialCapReachedError when the cap is hit.
-export function assertCanInvite(priorDenialCount: number): void;
+type Conflict = {
+  id: string;
+  memberName: string;
+  serviceDate: string;      // "YYYY-MM-DD"
+  serviceWeekTitle: string | null;
+  serviceWeekId: string;
+  roleNote: string | null;
+  triggerReason: string | null;
+};
 ```
 
-Transition table (the ONLY legal transitions — everything else is invalid):
+View states: `"loading" | "ready" | "unavailable" | "resolved-success"`.
 
-| from      | accept   | deny   | withdraw  | expire  |
-| --------- | -------- | ------ | --------- | ------- |
-| pending   | accepted | denied | withdrawn | expired |
-| accepted  | —        | —      | —         | —       |
-| denied    | —        | —      | —         | —       |
-| withdrawn | —        | —      | —         | —       |
-| expired   | —        | —      | —         | —       |
+Load (in `useEffect`, with the `cancelled` guard from invite-response):
+- `GET /api/conflicts`, read `body.data.conflicts`, find the entry whose `id === conflictId`.
+- Found → `ready`. Not found (already resolved, or bad id) or non-OK response or
+  network error → `unavailable`.
 
-`accepted`, `denied`, `withdrawn`, and `expired` are terminal: no action is legal
-from them.
+Render on `ready`:
+- Member name (`memberName`).
+- Service date — reuse a `formatServiceDate(dateStr)` helper copied from
+  invite-response (`new Date(\`${dateStr}T00:00:00\`)` + `toLocaleDateString`).
+  If `serviceWeekTitle` is present, show it as a heading alongside the date.
+- Original role: show `roleNote` if non-null; otherwise omit the line (or show a
+  muted "No role specified"). Do not render an empty label.
+- Reason: show `triggerReason` under a "Reason" label if non-null; otherwise omit.
+- `<!-- Phase 4 (#, out of scope): AI-suggested replacement renders here -->`
+- Button row (see mapping table), using `@/components/ui/Button`:
+  - "Find a Replacement": render as a Next `Link`/anchor styled as a button with
+    `href={\`/invitations/new?serviceWeekId=${serviceWeekId}&roleNote=${encodeURIComponent(roleNote ?? "")}\`}`.
+    Using a plain link (not `useRouter`) keeps it testable via `href` and avoids
+    a router mock.
+  - "Mark as Resolved" and "Dismiss": `Button`s calling a shared
+    `resolve(resolution)` handler.
 
-Behavior details the coder must implement:
-- `applyTransition` on any `—` cell throws `InvalidInvitationTransitionError` with
-  `from` and `action` populated; the thrown error must NOT be a plain `Error` with
-  no data (tests assert on `.name`/`.from`/`.action`).
-- Set a stable, distinct `.name` on each error class (e.g.
-  `this.name = "InvalidInvitationTransitionError"`) so tests can assert on it.
-- `canTransition` returns `false` for exactly the cells `applyTransition` throws on,
-  `true` otherwise. Keep them backed by one shared transition map so they can never
-  disagree.
-- `canInvite(n)` = `n < MAX_DENIALS_PER_WEEK`. `assertCanInvite(n)` throws
-  `DenialCapReachedError` when `n >= MAX_DENIALS_PER_WEEK`, returns `void` otherwise.
-- Guard against a runtime-unknown action (defensive default in the lookup) even
-  though the type system forbids it — an unknown action is an invalid transition.
+`resolve(resolution: "member_reconfirmed" | "admin_dismissed")`:
+- Guard against double-submit (`submitting` flag; disable all buttons while true).
+- `POST /api/conflicts/${conflictId}/resolve`, headers `Content-Type: application/json`,
+  body `JSON.stringify({ resolution })`.
+- `res.ok` → `resolved-success`.
+- `res.status === 409` (already resolved) → `unavailable` (treat as gone).
+- any other non-OK, or thrown error → set an inline `actionError` string, stay on
+  `ready`, keep buttons usable. Never surface raw `error`/`code`/`status`.
 
-## Files to create — tests
+Render on `unavailable`: a message like "This conflict has been resolved or no
+longer exists." plus a link back to `/conflicts` (or `/dashboard`).
 
-### 2. `tests/unit/lib/invitations/state-machine.test.ts` (new)
+Render on `resolved-success`: a brief confirmation ("Conflict resolved") plus a
+link back to `/conflicts` (or `/dashboard`).
 
-Mirror the structure/style of `tests/unit/lib/scheduling/conflict-detection.test.ts`
-(plain `describe`/`it`, no Supabase mock needed here — this is pure logic). Path
-must be under `tests/unit/**` so Jest's `testMatch` (`**/tests/unit/**/*.test.ts`,
-see `jest.config.js`) picks it up and CI runs it (see "CI" below).
+Render on `loading`: a simple "Loading…" placeholder.
 
-Required cases (map 1:1 to the acceptance criteria):
+### 5. `app/(app)/conflicts/[id]/conflict-resolution.module.css`
 
-Valid transitions (AC 1) — assert `applyTransition` returns the target status AND
-`canTransition` returns `true`:
-- `pending → accepted` via `accept`
-- `pending → denied` via `deny`
-- `pending → withdrawn` via `withdraw`
-- (also cover `pending → expired` via `expire`, since `expired` is a real
-  `InvitationStatus` the machine must handle)
+Copy the relevant class shapes from `invite-response.module.css` (`.container`,
+`.card`, `.date`, `.roleNote`, `.buttonRow`, `.error`). Use existing CSS vars
+(`var(--color-border)`, `var(--color-fg)`). Keep touch targets comfortable
+(PRD mobile-first). No new design system work.
 
-Invalid transitions (AC 2) — assert `applyTransition` THROWS
-`InvalidInvitationTransitionError` (use `expect(() => ...).toThrow(InvalidInvitationTransitionError)`)
-AND `canTransition` returns `false`. Cover at minimum the issue's named cases plus
-representative terminal-source cases:
-- `accepted → accepted` (accept)
-- `denied → accepted` (accept)
-- `withdrawn → accepted` (accept)
-- `accepted → deny`, `accepted → withdraw` (terminal source, other actions)
-- `denied → deny`, `withdrawn → withdraw` (re-applying the action that reached them)
-- `expired → accept`
-- Assert the thrown error carries the correct `.from` and `.action` for at least
-  one case, proving it fails loudly with context rather than silently.
-- Exhaustiveness: iterate every (status, action) pair over all 5 statuses × 4
-  actions; assert that exactly the 4 `pending → *` pairs are legal and the other
-  16 throw. This guarantees no invalid transition silently succeeds.
+### 6. `tests/unit/app/conflict-resolution.test.tsx` (component test)
 
-BR-08 denial cap (AC 3) — cover explicitly:
-- `canInvite(0)`, `canInvite(1)`, `canInvite(2)` → `true`
-- `canInvite(3)` → `false` (cap reached at exactly 3)
-- `canInvite(4)` → `false`
-- `assertCanInvite(2)` does not throw; `assertCanInvite(3)` and `assertCanInvite(4)`
-  throw `DenialCapReachedError`; assert the thrown error exposes `priorDenialCount`.
-- Assert the boundary is driven by the exported `MAX_DENIALS_PER_WEEK` constant
-  (value `3`), not a hard-coded literal in the test.
+Mirror `tests/unit/app/invite-response.test.tsx`: `/** @jest-environment jsdom */`,
+`@testing-library/react`, mock `global.fetch` directly, `jsonResponse(status, body)`
+helper. Cover:
+- Loading state before the GET resolves.
+- Happy path: GET returns a `{ data: { conflicts: [conflict] } }` list containing
+  the target id → renders member name, formatted service date, role note, and
+  reason. Assert the three action controls are present.
+- "Find a Replacement" anchor has the expected `href` (with encoded `roleNote`
+  and correct `serviceWeekId`).
+- "Mark as Resolved" click → POST to `/api/conflicts/{id}/resolve` with body
+  `{ resolution: "member_reconfirmed" }`, then success view. Assert the request
+  URL + body.
+- "Dismiss" click → POST with `{ resolution: "admin_dismissed" }`.
+- Not-found: GET returns a list NOT containing the id → unavailable view (a
+  failure/edge case).
+- (Optional but encouraged) 409 on resolve → unavailable view.
 
 ## Edge cases the implementation must handle
 
-- Terminal → same-action self-loops (e.g. `accepted → accept`) are invalid and throw.
-- The denial cap boundary is `>= 3` (three denials already recorded blocks the
-  next invite), matching the existing `handler.ts` `createInvitation` check
-  (`(deniedForWeek ?? []).length >= 3`). Do not off-by-one this.
-- `applyTransition` must never return the unchanged `from` status as a "graceful
-  no-op" — that would be the exact silent-failure mode AC 2 forbids. Always throw.
-- `canTransition` and `applyTransition` must stay consistent (shared source of truth).
+- Conflict id not present in the open list (already resolved, or invalid id) →
+  `unavailable`, never a crash.
+- `serviceWeekTitle` null → fall back to the formatted date / "Service".
+- `roleNote` null → omit the role line cleanly.
+- `triggerReason` null → omit the reason line cleanly.
+- In-flight request → all buttons disabled; no double-submit.
+- 409 (conflict already resolved by someone else) → `unavailable`.
+- Non-OK / network error on resolve → inline error, buttons stay usable.
+- No raw `error`/`code`/`status` strings shown to the user.
 
-## CI (AC 4) — no config change needed
+## Patterns to copy (name the file)
 
-`.github/workflows/ci.yml` already runs `bun run test:coverage` (`jest --coverage`),
-and `jest.config.js` `testMatch` is `**/tests/unit/**/*.test.ts`. A test placed at
-`tests/unit/lib/invitations/state-machine.test.ts` is therefore run in CI and
-blocks merge on failure automatically. Do **not** edit CI config, `jest.config.js`,
-or `package.json`.
+- Server page awaiting `params` + delegating to a client component:
+  `app/(public)/invite/[token]/page.tsx`.
+- Client fetch + view-state machine + action handlers + `cancelled` guard +
+  `formatServiceDate`: `app/(public)/invite/[token]/invite-response.tsx`.
+- CSS module: `app/(public)/invite/[token]/invite-response.module.css`.
+- Button: `@/components/ui/Button`.
+- Component test scaffolding (jsdom, fetch mock, `jsonResponse`):
+  `tests/unit/app/invite-response.test.tsx`.
+- Endpoint handler/test conventions: `app/api/conflicts/handler.ts` +
+  `tests/unit/app/api/conflicts-route.test.ts`.
 
-## Patterns to copy
+## Out of scope (do not build)
 
-- Pure single-purpose module shape: `lib/scheduling/conflict-detection.ts`
-  (but omit the `"server-only"` import — this module is pure).
-- Unit-test file shape/location/naming: `tests/unit/lib/scheduling/conflict-detection.test.ts`.
-- Throw-assertion style: `expect(() => ...).toThrow(ErrorClass)` as used in that
-  test file's style.
-- Domain enum source of truth: `types/domain.ts` (`InvitationStatus`). Do not
-  redeclare the status strings.
+- AI-suggested replacement (Phase 4) — reserve a commented placeholder only.
+- The conflicts list screen, the notification inbox, and the actual #40
+  send-invitation flow. Do not modify `app/(app)/conflicts/page.tsx`.
+- Any change to the resolve endpoint, its schema, or the DB migrations.
 
 ## Verification before finishing (coder)
 

@@ -97,6 +97,7 @@ const invitationRow = {
   user_id: MEMBER_ID,
   service_week_id: SERVICE_WEEK_ID,
   status: "accepted",
+  role_note: "Lead vocals",
 };
 
 const userRow = { id: MEMBER_ID, name: "Jane Doe" };
@@ -155,6 +156,7 @@ describe("GET /api/conflicts", () => {
       serviceWeekId: SERVICE_WEEK_ID,
       serviceDate: "2026-07-19",
       serviceWeekTitle: "Sunday Service",
+      roleNote: "Lead vocals",
       invitationStatus: "accepted",
       triggerReason: "double-booked",
       createdAt: "2026-07-12T00:00:00Z",
@@ -199,6 +201,7 @@ describe("GET /api/conflicts", () => {
       memberName: "",
       serviceWeekId: "",
       serviceDate: "",
+      roleNote: null,
       invitationStatus: "withdrawn",
     });
   });
