@@ -113,6 +113,7 @@ type InvitationsRow = {
   response_deadline: string | null;
   invited_by: string | null;
   created_at: string;
+  last_reminded_at: string | null;
 };
 
 type AvailabilityRow = {
@@ -134,6 +135,30 @@ type ConflictsRow = {
   replacement_suggestion_user_id: string | null;
   resolved_at: string | null;
   resolution_type: ResolutionType | null;
+  created_at: string;
+};
+
+// Added for #47 (conflict resolution withdraw path needs to find + clear a
+// member's event_attendees rows for a service week's events).
+type EventsRow = {
+  id: string;
+  church_group_id: string;
+  service_week_id: string;
+  type: EventType;
+  name: string;
+  location: string | null;
+  start_time: string;
+  end_time: string;
+  google_calendar_event_id: string | null;
+  notes: string | null;
+  created_by: string | null;
+  created_at: string;
+};
+
+type EventAttendeesRow = {
+  id: string;
+  event_id: string;
+  user_id: string;
   created_at: string;
 };
 
@@ -226,6 +251,7 @@ export type Database = {
           | "denial_reason"
           | "denial_count"
           | "response_deadline"
+          | "last_reminded_at"
         > & {
           id?: string;
           created_at?: string;
@@ -234,6 +260,7 @@ export type Database = {
           denial_reason?: string | null;
           denial_count?: number;
           response_deadline?: string | null;
+          last_reminded_at?: string | null;
         };
         Update: Partial<InvitationsRow>;
         Relationships: [];
@@ -269,6 +296,31 @@ export type Database = {
           resolution_type?: ResolutionType | null;
         };
         Update: Partial<ConflictsRow>;
+        Relationships: [];
+      };
+      events: {
+        Row: EventsRow;
+        Insert: Omit<
+          EventsRow,
+          "id" | "created_at" | "location" | "google_calendar_event_id" | "notes" | "created_by"
+        > & {
+          id?: string;
+          created_at?: string;
+          location?: string | null;
+          google_calendar_event_id?: string | null;
+          notes?: string | null;
+          created_by?: string | null;
+        };
+        Update: Partial<EventsRow>;
+        Relationships: [];
+      };
+      event_attendees: {
+        Row: EventAttendeesRow;
+        Insert: Omit<EventAttendeesRow, "id" | "created_at"> & {
+          id?: string;
+          created_at?: string;
+        };
+        Update: Partial<EventAttendeesRow>;
         Relationships: [];
       };
       notifications: {
@@ -364,6 +416,19 @@ export type Database = {
             end_time: string;
           }>;
         };
+      };
+      send_invitation_reminders: {
+        Args: Record<string, never>;
+        Returns: Array<{
+          invitation_id: string;
+          user_id: string;
+          member_name: string;
+          phone: string | null;
+          sms_opted_in: boolean;
+          service_week_id: string;
+          service_date: string;
+          week_title: string | null;
+        }>;
       };
     };
     Enums: {

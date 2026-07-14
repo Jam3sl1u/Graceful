@@ -21,6 +21,18 @@ describe("recordAvailabilityConflict", () => {
     });
   });
 
+  it("forwards the marked_unavailable reason verbatim to the RPC", async () => {
+    const supabase = makeSupabaseClient({ data: true, error: null });
+
+    await recordAvailabilityConflict(supabase, "2026-08-01", "marked_unavailable");
+
+    expect(supabase.rpc).toHaveBeenCalledTimes(1);
+    expect(supabase.rpc).toHaveBeenCalledWith("record_availability_conflict", {
+      p_date: "2026-08-01",
+      p_trigger_reason: "marked_unavailable",
+    });
+  });
+
   it("returns true when the RPC reports a conflict was recorded", async () => {
     const supabase = makeSupabaseClient({ data: true, error: null });
 

@@ -114,6 +114,9 @@ type Lookup = {
   }>;
 };
 ```
+`ResolutionType` is referenced only in `types/domain.ts` and
+`lib/supabase/types.ts` — this change is safe. The API request field
+(`resolution`, below) is a separate concept and keeps the `withdraw` spelling.
 
 Reuse types where possible: import `InvitationStatus`, `EventType` from
 `@/types/domain` rather than re-declaring the unions.
