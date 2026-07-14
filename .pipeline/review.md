@@ -1,68 +1,65 @@
-# Review — Issue #52: E2E tests for invitation & conflict flows
+# Review — Issue #53: Song catalog CRUD + search (BR-09 key validation)
 
-VERDICT: SHIP
+VERDICT: NEEDS WORK
 
-## Summary
+## What I verified independently
+- Re-ran from the pinned worktree: `bun run lint` clean, `bun run typecheck`
+  clean, `bun run test -- songs` → 38 tests pass across the Coder's suite
+  (`songs-route.test.ts`, 28) and the Tester supplement
+  (`songs-route-tester-supplement.test.ts`, 10, currently untracked).
+- Read the full `git diff main...HEAD`. Scope is exactly the five spec-named
+  files (`schemas/songs.ts`, `app/api/songs/handler.ts`,
+  `app/api/songs/route.ts`, `lib/supabase/types.ts`, the Coder test) plus
+  `.pipeline/`. No migrations touched. No unrelated refactors. The handler
+  faithfully mirrors `app/api/instruments/handler.ts` (auth → role → JWT guard
+  → query → try/catch tail → narrow Insert cast).
+- BR-09 422-vs-400 split is correct: Zod shape failure → 400; syntactically
+  valid but invalid key value → 422, checked in the handler after Zod's trim.
+  `VALID_SONG_KEYS` holds the 17 ASCII + 10 Unicode spellings, case-sensitive.
+- Role gating (list: admin/set_leader/member; create: admin/set_leader) runs
+  before any DB call; 401-no-JWT before `getSupabaseClient`. Confirmed by tests.
 
-High-quality change. The planner correctly identified this issue could not be
-built as literally written and raised OQ1–OQ4; the coder's `changes.md` records
-a human resolution for each (add `@clerk/testing`+`@clerk/backend`, seed staging
-Clerk test users, scope AC#2 to the observable `denied` flip, scope AC#3 to the
-admin in-app reminder via a backdated `created_at` + cron call, add a
-secrets-gated CI job). Every resolution is reasonable and correctly scoped to
-#52 — #67/#68 (SMS/email) were NOT pulled in, and there is no scope creep.
+## Must fix (blocking this verdict)
 
-I did not trust the written summaries. I re-derived the load-bearing
-cross-references against the actual repo and they all hold:
+1. **Explicit `null` on optional fields returns 400, but the spec says
+   `default_key` null → 201.** `schemas/songs.ts` uses `.optional()` on
+   `default_key`, `artist`, `bpm`, and `tags`. Zod's `.optional()` accepts
+   `undefined` (omitted) but rejects an explicit JSON `null` — I verified this
+   directly: `createSongSchema.safeParse({ title: "x", default_key: null })`
+   → `success: false` (same for artist/bpm/tags). So a client POSTing
+   `{"title":"x","default_key":null}` gets **400**, whereas
+   `.pipeline/spec.md` line 234 lists under "Edge cases the implementation MUST
+   handle": "`default_key` omitted / null → 201 (allowed)". Neither test suite
+   exercises the explicit-null path, so the green suite masked this gap.
+   - Note the spec is internally inconsistent: its prescribed schema (line 53,
+     `.optional()`) contradicts its own edge-case bullet (line 234). The Coder
+     followed the schema line verbatim, which is why this slipped through.
+   - Fix (pick one, then align the spec so they agree):
+     (a) Make the fields accept null-as-omitted, e.g.
+     `default_key: z.string().trim().min(1).max(5).nullish()` (or
+     `.nullable().optional()`), which lets `default_key ?? null` in the handler
+     do the right thing and yields 201. Apply consistently to
+     `artist`/`bpm`/`tags` if the same null-tolerance is wanted; OR
+     (b) correct spec line 234 to say null → 400 and keep the code as-is.
+   - Add a test for `default_key: null` → 201 (and, if fixing artist/bpm/tags,
+     their null cases) so the resolved behavior is pinned.
 
-- `ok()` wraps payloads in `{ data }` (`lib/api/response.ts`); accept/deny
-  handlers return `{ status, alreadyResponded }` (`handler.ts:317`, `:566`) —
-  matches `invitation-accept/deny.spec.ts`.
-- `PUT /api/availability` returns `conflictTriggered`
-  (`app/api/availability/handler.ts:177`) — matches the conflict spec.
-- `GET /api/conflicts` returns `ok({ conflicts: [...] })` with `invitationId`
-  and `triggerReason` fields (`app/api/conflicts/handler.ts:101,114,119`);
-  `"marked_unavailable"` is a real `ConflictTriggerReason`
-  (`lib/scheduling/conflict-detection.ts:10`) — matches field-for-field.
-- `notifications` direct-read workaround is justified: `GET /api/notifications`
-  is a real 501 stub; the service-role client lives under `tests/` and the
-  service-role guard (`scripts/check-service-role.mjs`) only scans `app/`+`lib/`,
-  so no guard violation.
-- `users.clerk_id` UNIQUE constraint reasoning behind the stable-fixture +
-  `workers: 1` design is genuine, not invented.
-- `bunx playwright test --list` cleanly discovers all 7 tests; the always-skip
-  SMS/email placeholder correctly surfaces the OQ2 gap in the report instead of
-  hiding it.
+## Non-blocking observations (do not need a re-run to ship, but worth noting)
+- **PostgREST `.or()` interpolation.** `listSongs` builds
+  `` `title.ilike.%${q}%,artist.ilike.%${q}%` `` by interpolating raw user
+  input. This is the exact pattern the spec prescribed, and impact is contained:
+  RLS plus `.eq("church_group_id", ctx.churchGroupId)` scope every row to the
+  caller's own tenant, and an unfiltered list already returns all of them — so
+  a crafted `q` cannot expose data the caller can't already read. Worst
+  realistic case is a malformed filter → PostgREST error → 500. Acceptable for
+  this issue; a future hardening pass could escape `%`/`,`/`)` in `q`.
+- The Tester supplement file and updated `test-results.md` are uncommitted
+  working-tree changes — expected mid-pipeline; the Coder's committed suite
+  stands on its own.
 
-Tests are meaningful, not superficial: notification assertions are scoped to a
-specific recipient AND entity id (no "some unread notification exists" bleed),
-idempotency and no-double-remind edge cases are asserted, the self-exclusion
-edge case is exercised, and every test tears down its own rows in FK order.
-
-## Notes for the human (confirm, but not blocking)
-
-1. **The whole change presupposes the OQ1–OQ4 human resolution.** AGENTS.md
-   says downstream stages STOP at OPEN QUESTIONS until a human resolves them.
-   `changes.md` asserts that happened, but the only evidence is the coder's
-   prose. Before merge, confirm YOU actually approved: adding the two Clerk
-   devDependencies, provisioning seeded staging Clerk test-mode users, and
-   creating the 8 GitHub Actions secrets. If you did, this is a clean SHIP.
-2. **No live E2E assertion has ever executed** — coder and tester both ran only
-   static checks + a small `env.ts` unit test, because no staging secrets exist
-   in the sandbox. The staging-dependent assertions are verified by
-   cross-reference only. This is inherent to shipping secrets-gated scaffolding
-   (same posture as the RLS suite) and is acceptable, but the first real CI run
-   after provisioning is the true smoke test.
-3. **Minor false-green gap in CI gating:** the `e2e` job runs when
-   `STAGING_APP_URL` alone is set, but each test skips unless ALL 7 vars in
-   `env.ts` are present. If staging URL is set but a Clerk/Supabase secret is
-   missing, the job passes green with every test skipped. Mirrors the existing
-   single-secret `rls-integration` gate, so not a regression — but worth
-   tightening the gate (or having the job fail when partially provisioned) so a
-   half-configured secret set can't silently no-op the suite.
-4. `.gitignore` gained `/.clerk/` (Clerk keyless-mode local dir) — correct,
-   harmless, unrelated-but-defensible.
-
-None of these are code defects. Nothing here can fail a normal local/CI run,
-there are no security or correctness issues in the delivered code, and the
-suite is correctly written against the real app. Ship after confirming item 1.
+## Bottom line
+Clean, well-scoped, faithfully patterned, and the BR-09 acceptance criterion
+(the crux of the issue) is implemented and tested correctly. The one concrete
+defect is the explicit-`null` optional-field behavior diverging from a
+spec-mandated edge case, uncaught by either suite — a small, well-scoped fix
+plus a spec reconciliation. Fix that (and its test) and this is a SHIP.

@@ -62,6 +62,19 @@ type MemberInstrumentsRow = {
   instrument_id: string;
 };
 
+type SongsRow = {
+  id: string;
+  church_group_id: string;
+  title: string;
+  artist: string | null;
+  default_key: string | null;
+  bpm: number | null;
+  tags: string[] | null;
+  spotify_id: string | null;
+  created_by: string | null;
+  created_at: string;
+};
+
 type AuditLogsRow = {
   id: string;
   church_group_id: string;
@@ -206,6 +219,24 @@ export type Database = {
         Row: MemberInstrumentsRow;
         Insert: Omit<MemberInstrumentsRow, "id"> & { id?: string };
         Update: Partial<MemberInstrumentsRow>;
+        Relationships: [];
+      };
+      songs: {
+        Row: SongsRow;
+        Insert: Omit<
+          SongsRow,
+          "id" | "created_at" | "artist" | "default_key" | "bpm" | "tags" | "spotify_id" | "created_by"
+        > & {
+          id?: string;
+          created_at?: string;
+          artist?: string | null;
+          default_key?: string | null;
+          bpm?: number | null;
+          tags?: string[] | null;
+          spotify_id?: string | null;
+          created_by?: string | null;
+        };
+        Update: Partial<SongsRow>;
         Relationships: [];
       };
       audit_logs: {

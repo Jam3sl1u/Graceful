@@ -1,155 +1,265 @@
-# Spec — Issue #52: E2E tests for invitation & conflict flows
+# Spec — Issue #53: Song catalog CRUD + search (BR-09 key validation)
 
-> Planner note: I inspected the actual repo state (handlers, RPC migrations,
-> notification stubs, Playwright config, CI). This issue as written cannot be
-> fully implemented today: two of the four required tests assert behavior the
-> app does not yet perform, and there is no mechanism to authenticate a real
-> browser against staging. These are genuine blocking ambiguities, not
-> guessable details — the pipeline must stop here until a human resolves the
-> OPEN QUESTIONS below.
+## OPEN QUESTIONS
 
-## OPEN QUESTIONS (must be resolved by a human before coding)
+None blocking. One decision made explicitly (not a blocker):
 
-### OQ1 — How do E2E tests sign in against staging? (blocks all four tests)
-The issue says "Reuse the auth-matrix test harness pattern from #32 for minting
-test sessions." That harness is `tests/support/api-auth.ts`, and it is a
-**Jest-only mock** of `@clerk/nextjs/server`'s `auth()` (`mockClerkAuthed` /
-`mockClerkAnonymous`, using `jest.fn()`). It cannot authenticate a real browser
-against a real Clerk instance on staging. There is currently:
-- no Playwright/browser session-minting helper anywhere in the repo,
-- no `@clerk/testing` dependency (not in `package.json`),
-- no seeded staging test users and no credentials for them.
+- **Key representation (ASCII vs Unicode).** PRD §8 BR-09 (line 186 of
+  `documentation/prd/graceful_requirements_v10.md`) enumerates the keys using
+  Unicode musical symbols (`C♯`, `D♭`, …). Real JSON/HTTP clients send ASCII
+  (`C#`, `Db`). To satisfy both the literal PRD list and practical clients,
+  the accepted set below includes **both** the ASCII and Unicode spellings.
+  The value is stored exactly as received (no normalization) — that is all
+  this issue requires; a future transposition engine can normalize later.
 
-A human must choose the approach and provision what it needs, e.g. adding
-`@clerk/testing` (`setupClerkTestingToken`) plus seeded staging test users and
-Clerk **test-mode** keys, or a documented session-injection path. Until this is
-decided, none of the four browser tests can log in. Note the health-check E2E
-test (`tests/e2e/health.spec.ts`) is unauthenticated and gives no precedent for
-authenticated flows.
+## Scope
 
-### OQ2 — AC #2 (deny → admin receives SMS + email with reason): nothing to test
-The deny handler does not send SMS or email. `app/api/invitations/handler.ts`
-(~line 399) still reads `// TODO(#67/#68): dispatch SMS + email to invited_by`.
-Both dispatch primitives are unimplemented stubs that *throw*:
-- `lib/pingram/client.ts` → `sendSms` throws `"sendSms not implemented — see Sprint 4 #58"`.
-- `lib/resend/client.ts` → `sendEmail` throws `"sendEmail not implemented — see Sprint 4 #59"`.
+Implement the two `/api/songs` endpoints. Everything is at the API layer — the
+`songs` table, its RLS policies (`songs_select_tenant`, `songs_insert_tenant`),
+and the `varchar(5)` `default_key` column already exist (migrations
+`20260702000004_cluster_4_partial_songs.sql` and `20260704000001_rls_policies.sql`).
+**Do not add or modify any migration.** At 40–60 rows an RLS-scoped seq scan is
+already well within the "reasonably fast" AC — no new DB index is required.
 
-The AC hedges "(once #67/#68 exist…)"; they do not exist, and #52 does not list
-#67/#68 as dependencies or claim them as in-scope. Decision needed: either
-(a) defer AC #2's SMS+email assertions — test only the observable parts today
-(slot reopens to `denied`, and the admin's in-app signal, if any) or skip the
-test with a tracked reason — or (b) explicitly expand this issue's scope to
-implement #67/#68 (SMS/email dispatch), which is not currently in scope.
+Out of scope (do not implement): Spotify enrichment/autocomplete, song
+familiarity, per-song key override (#57), update/delete endpoints (issue only
+asks for list/search + create), song documents (already exist elsewhere).
 
-### OQ3 — AC #3 (24h reminder, both member AND admin): partially untestable
-- Admin side is real: `send_invitation_reminders` RPC
-  (`supabase/migrations/20260713000003_invitation_reminder_scheduler.sql`)
-  inserts admin in-app notifications and stamps `last_reminded_at`.
-- Member side is SMS via the same throwing `sendSms` stub; the cron route
-  (`app/api/cron/invitation-reminders/route.ts`) deliberately swallows the
-  failure (`smsFailed`). So "member receives a reminder" cannot be verified
-  E2E until #58.
-- "time mocked to advance 24 hours" is not achievable against a remote staging
-  server from Playwright — the reminder selector uses server `now()`
-  (`lib/scheduling/reminder.ts` `isReminderDue`, mirrored in SQL). The only
-  viable trigger is to seed/backdate an invitation's `created_at` via the
-  service-role client so it is already due, then call
-  `GET /api/cron/invitation-reminders` with the `CRON_SECRET` bearer token.
-  A human must confirm this backdating approach is acceptable and that the
-  member-SMS assertion is dropped/deferred (leaving only the admin in-app
-  reminder as the assertion).
+## Files to create / modify
 
-### OQ4 — Is staging (#13) provisioned, and what secrets does CI have?
-AC #5 requires the four tests to "run against staging and pass in CI."
-Today:
-- `playwright.config.ts` targets a local `bun run dev` server via
-  `NEXT_PUBLIC_APP_URL` (default `http://localhost:3000`); there is no
-  staging baseURL/project wiring.
-- `.github/workflows/ci.yml` has **no** Playwright job (only typecheck, lint,
-  `check:workflows`, `test:coverage`, `bun audit`, and a secrets-gated
-  `rls-integration` job).
-- `documentation/staging-environment.md` says Vercel owns deploys and CI must
-  NOT add a deploy job, but is silent on an E2E job and its secrets.
+### 1. `schemas/songs.ts` — REPLACE the placeholder
 
-A human must confirm (a) staging (#13) is actually deployed/reachable, and
-(b) which secrets are available to GitHub Actions for an E2E job — at minimum:
-staging base URL, Clerk test-mode keys + test-user credentials (per OQ1),
-`CRON_SECRET` (per OQ3), and a service-role key for seeding/teardown. Follow
-the existing secrets-gated pattern in `ci.yml` (`check-secrets` job →
-`if: needs.check-secrets.outputs.has-secrets == 'true'`) so the job is skipped,
-not failed, when secrets are absent.
+Currently just `z.object({})`. Replace with:
 
----
+- A `VALID_SONG_KEYS` constant — a `ReadonlySet<string>` (or readonly array +
+  Set) containing every accepted `default_key` string. Include the 17 ASCII
+  spellings AND the 10 Unicode accidental spellings:
 
-## Current state (verified — for whoever resolves the above)
+  ```
+  ASCII:    C  C#  Db  D  D#  Eb  E  F  F#  Gb  G  G#  Ab  A  A#  Bb  B
+  Unicode:  C♯  D♭  D♯  E♭  F♯  G♭  G♯  A♭  A♯  B♭
+  ```
 
-What the app ACTUALLY does today, so the resolver knows which ACs have real
-behavior behind them:
+  (These represent the 12 chromatic pitch classes; no `E#`, `B#`, `Cb`, `Fb`.)
+  Match is **case-sensitive and exact** (`Bb` valid, `bb`/`BB` invalid).
+  Export a helper `isValidSongKey(key: string): boolean` returning
+  `VALID_SONG_KEYS.has(key)`.
 
-| AC | Flow | Backing implementation | E2E-testable today? |
-| -- | ---- | ---------------------- | ------------------- |
-| #1 | accept → Confirmed → admin in-app notification | `accept_invitation` RPC (`supabase/migrations/20260712000001_accept_invitation_rpc.sql`) does status flip + `event_attendees` insert + admin in-app notify + audit log | Yes (behavior exists); blocked only by OQ1 auth |
-| #2 | deny → slot reopens → admin SMS + email | Slot reopen = `status:'denied'` real (`denyInvitation`); **SMS + email NOT implemented** (OQ2) | Partially — SMS/email cannot be asserted |
-| #3 | 24h reminder → member + admin | Admin in-app reminder real; member SMS stubbed/throws (OQ3); time cannot be mocked remotely (OQ3) | Partially — admin only |
-| #4 | confirm → mark unavailable → admin conflict notification → slot reopens | `record_availability_conflict` RPC (`supabase/migrations/20260713000001_conflict_notification.sql`) inserts `scheduling_conflict` in-app notification to admins/set_leaders | Yes (behavior exists); blocked only by OQ1 auth |
+- `createSongSchema` — Zod object validating request-body **shape only** (NOT
+  key membership; the key-value check happens in the handler so it can return
+  422, see edge cases):
+  - `title`: `z.string().trim().min(1).max(200)` (required)
+  - `artist`: `z.string().trim().min(1).max(200).nullish()`
+  - `default_key`: `z.string().trim().min(1).max(5).nullish()`
+  - `bpm`: `z.number().int().positive().max(400).nullish()`
+  - `tags`: `z.array(z.string().trim().min(1).max(50)).nullish()`
+  - Unknown keys may be ignored (no `.strict()` needed).
+  - Export `type CreateSongInput = z.infer<typeof createSongSchema>`.
 
-Sprint-2 screen/state-machine dependencies appear satisfied:
-`app/(app)/week/[id]/week-view.tsx` (#48), `app/(public)/invite/[token]/`
-+ `app/api/invitations/[id]/deny` (#49),
-`app/(app)/conflicts/[id]/conflict-resolution.tsx` (#50),
-`lib/invitations/state-machine.ts` (#51). In-app notifications are observable
-via `app/(app)/notifications/page.tsx`, `GET /api/notifications`, and
-`GET /api/notifications/unread-count`.
+- `songSearchQuerySchema` — for GET query params (parse from
+  `Object.fromEntries(req.nextUrl.searchParams)`):
+  - `q`: `z.string().trim().max(200).optional()` (search term)
+  - Export `type SongSearchQuery = z.infer<typeof songSearchQuerySchema>`.
 
----
+Follow `schemas/instruments.ts` + `schemas/audit-log.ts` for style.
 
-## Conditional implementation plan (only after OQ1–OQ4 are resolved)
+### 2. `app/api/songs/handler.ts` — NEW FILE
 
-Scaffolding guidance for the coder once a human answers above; do NOT build it
-while the OPEN QUESTIONS stand.
+Copy the structure/error-handling of `app/api/instruments/handler.ts` exactly
+(same imports: `auth`, `requireAuth`, `requireRole`, `ok`, `fail`,
+`ApiException`, `ErrorCode`, `getSupabaseClient`, `Database` type, plus the new
+song schemas). Same JWT-fetch guard, same `try/catch` → `ApiException`/500
+tail, same `as unknown as Database["public"]["Tables"]["songs"]["Insert"]`
+narrow cast for the insert payload (the hand-rolled Insert type marks
+`created_at` required despite the `now()` default — see the comment in
+`instruments/handler.ts` lines 94-104).
 
-### Files to create
-- `tests/e2e/invitation-accept.spec.ts` — AC #1.
-- `tests/e2e/invitation-deny.spec.ts` — AC #2 (scope per OQ2 resolution).
-- `tests/e2e/invitation-reminder.spec.ts` — AC #3 (scope per OQ3 resolution).
-- `tests/e2e/conflict-detection.spec.ts` — AC #4.
-- `tests/e2e/support/` — E2E-only helpers: (a) the browser auth helper decided
-  in OQ1, and (b) a service-role seeding/teardown helper for staging fixtures.
+Exports:
 
-### Files to modify
-- `playwright.config.ts` — add staging `baseURL` wiring and (per OQ4) any
-  project/reporter config; keep the existing `NEXT_PUBLIC_APP_URL` fallback.
-- `.github/workflows/ci.yml` — add a secrets-gated E2E job mirroring the
-  existing `check-secrets` → gated-job pattern; install Playwright browsers
-  (`bunx playwright install --with-deps`) and run `bun run test:e2e`
-  (script already exists in `package.json`). Do NOT add a Vercel deploy step
-  (`documentation/staging-environment.md` §3).
+```ts
+export type SongResponse = {
+  id: string;
+  title: string;
+  artist: string | null;
+  defaultKey: string | null;   // maps default_key
+  bpm: number | null;
+  tags: string[];              // [] when the column is null
+  createdBy: string | null;    // maps created_by
+  createdAt: string;           // maps created_at (ISO)
+};
 
-### Patterns to follow (name-checked)
-- Test structure/imports: `tests/e2e/health.spec.ts`
-  (`import { test, expect } from "@playwright/test"`).
-- Service-role seeding + stable fixture IDs + per-test cleanup discipline:
-  `tests/integration/rls/setup.ts` and `tests/integration/rls/client.ts`
-  (`getServiceClient`). Reuse its seed persona shape (admin/member in one
-  church group) rather than inventing new fixtures.
-- Secrets-gated CI job: the `check-secrets` + `rls-integration` jobs in
-  `.github/workflows/ci.yml`.
-- Cron trigger for the reminder test (OQ3): `Authorization: Bearer <CRON_SECRET>`
-  against `GET /api/cron/invitation-reminders` (see the route's auth check).
+export async function listSongs(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+export async function createSong(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+```
 
-### Edge cases the tests must handle (once unblocked)
-- Each test seeds its own fixture and tears it down (or uses uniquely-suffixed
-  identifiers) — staging is shared and long-lived; do NOT rely on a pristine DB
-  or mutate another test's rows (mirror the isolation discipline in the RLS
-  suite).
-- Notification assertions must scope to the specific admin recipient and the
-  specific entity (`link_entity_id`), not just "an unread notification exists,"
-  to avoid cross-test bleed on shared staging.
-- Reminder test must assert the invitation was stamped `last_reminded_at` and
-  is not double-reminded on a second cron call within the window.
-- Conflict test: the triggering member must NOT receive a self-notification
-  even if they also hold an admin/set_leader role (the RPC excludes the
-  triggering user: `id <> v_user_id`).
-- Deny idempotency: a second deny/accept on an already-responded invitation is
-  a no-op returning current status (per `denyInvitation` / `accept_invitation`).
-</content>
+Plus a private `toSongResponse(row)` mapper (snake_case row → `SongResponse`,
+`tags: row.tags ?? []`).
+
+**`listSongs` (GET /api/songs):**
+- `requireAuth`, then `requireRole(ctx, ["admin", "set_leader", "member"])`
+  (mirrors `app/api/church-group/members/handler.ts` — group members read the
+  catalog; guests do not).
+- Parse `songSearchQuerySchema` from `req.nextUrl.searchParams`; on failure →
+  `fail("Validation failed", VALIDATION_FAILED, 400)`.
+- Get JWT (401 if missing), build supabase client.
+- Query: `supabase.from("songs").select("id, title, artist, default_key, bpm, tags, created_by, created_at")`.
+  - RLS already scopes to the caller's church group. For defense-in-depth and
+    consistency with the instruments handler you MAY also add
+    `.eq("church_group_id", ctx.churchGroupId)`. Either is acceptable.
+  - When `q` is present and non-empty: add
+    `.or(\`title.ilike.%${q}%,artist.ilike.%${q}%\`)` for case-insensitive
+    partial match across title and artist. When `q` is absent/empty: no filter.
+  - `.order("title", { ascending: true })`.
+- On error → 500 INTERNAL. Return `ok({ songs: (data ?? []).map(toSongResponse) })`.
+
+**`createSong` (POST /api/songs):**
+- `requireAuth`, then `requireRole(ctx, ["admin", "set_leader"])` — Set Leader /
+  Admin only (403 FORBIDDEN otherwise; the guard runs before any DB call).
+- `const body = await req.json().catch(() => null);` then
+  `createSongSchema.safeParse(body)`; on failure →
+  `fail("Validation failed", VALIDATION_FAILED, 400)`.
+- **BR-09 key check (must produce 422):** if `parsed.default_key` is a
+  non-null string and `!isValidSongKey(parsed.default_key)` →
+  `fail("Invalid musical key", ErrorCode.VALIDATION_FAILED, 422)`.
+  Membership runs only when `default_key` is present and non-null (omit/null
+  skip the check). Keep this in the handler, NOT in Zod, so malformed body =
+  400 but invalid key value = 422. Precedent for 422 + VALIDATION_FAILED:
+  `app/api/church-group/members/[id]/handler.ts` lines 52-56.
+- Get JWT (401 if missing), build supabase client.
+- Insert payload (narrow cast as above):
+  ```
+  church_group_id: ctx.churchGroupId,
+  title: parsed.title,
+  artist: parsed.artist ?? null,
+  default_key: parsed.default_key ?? null,
+  bpm: parsed.bpm ?? null,
+  tags: parsed.tags ?? null,
+  created_by: ctx.userId,
+  ```
+  Do NOT set `spotify_id` (manual entry only; column stays null).
+- `.insert(payload).select("id, title, artist, default_key, bpm, tags, created_by, created_at").single()`.
+- On error/no data → 500 INTERNAL. Return `ok({ song: toSongResponse(data) }, 201)`.
+
+No duplicate-title guard — the catalog legitimately allows same-titled songs
+(different arrangements). Do NOT add the instruments-style 409 conflict check.
+
+### 3. `app/api/songs/route.ts` — REWRITE
+
+Replace the `notImplemented` stubs, mirroring `app/api/instruments/route.ts`:
+
+```ts
+import { NextRequest } from "next/server";
+import { listSongs, createSong } from "./handler";
+
+export async function GET(req: NextRequest): Promise<Response> {
+  return listSongs(req);
+}
+export async function POST(req: NextRequest): Promise<Response> {
+  return createSong(req);
+}
+```
+
+### 4. `lib/supabase/types.ts` — ADD the `songs` table
+
+The `songs` table is not yet in the hand-rolled `Database` type. Add a
+`SongsRow` type and register it in `Tables`, following the existing entries
+(e.g. `instruments`, `service_weeks`):
+
+```ts
+type SongsRow = {
+  id: string;
+  church_group_id: string;
+  title: string;
+  artist: string | null;
+  default_key: string | null;
+  bpm: number | null;
+  tags: string[] | null;
+  spotify_id: string | null;
+  created_by: string | null;
+  created_at: string;
+};
+```
+
+`Tables.songs`:
+```ts
+songs: {
+  Row: SongsRow;
+  Insert: Omit<
+    SongsRow,
+    "id" | "created_at" | "artist" | "default_key" | "bpm" | "tags" | "spotify_id" | "created_by"
+  > & {
+    id?: string;
+    created_at?: string;
+    artist?: string | null;
+    default_key?: string | null;
+    bpm?: number | null;
+    tags?: string[] | null;
+    spotify_id?: string | null;
+    created_by?: string | null;
+  };
+  Update: Partial<SongsRow>;
+  Relationships: [];
+};
+```
+
+### 5. `tests/unit/app/api/songs-route.test.ts` — NEW FILE
+
+Follow `tests/unit/app/api/instruments-route.test.ts` exactly (same mock
+harness: `jest.mock("@clerk/nextjs/server")`, `jest.mock("@/lib/supabase/client")`,
+`makeReq`, `makeLookup`, `setUpAuth`, `makeChain`/`makeSupabaseClient`). Add
+`songs` to the fixtures. The chainable mock must also stub `.or(...)` and
+`.ilike(...)` → return the chain (add `or: jest.fn(() => chain)` to `makeChain`;
+`.order`/`.eq`/`.select`/`.single` are already there). GET reads searchParams,
+so `makeReq` for GET must provide `nextUrl.searchParams` — build the request
+with `new NextRequest("http://localhost/api/songs?q=...")` or stub
+`{ nextUrl: { searchParams: new URLSearchParams("q=...") } }`. Cover the edge
+cases below. (The Testing stage independently supplements this; the Coder must
+still ship a passing suite.)
+
+## Edge cases the implementation MUST handle
+
+GET `/api/songs`:
+- No `q` → returns all songs in the group (200), ordered by title.
+- `q="amaz"` → case-insensitive partial match on title OR artist.
+- Empty `q` (`?q=`) → treated as no filter (return all), not an error.
+- Empty catalog → `200 { songs: [] }`.
+- `tags` column null on a row → response `tags: []`.
+- Caller role `guest` → 403 FORBIDDEN (before DB call).
+- No JWT → 401 UNAUTHENTICATED (before `getSupabaseClient`).
+- DB error → 500 INTERNAL.
+
+POST `/api/songs`:
+- Valid minimal body `{ title }` → 201, `artist/defaultKey/bpm` null, `tags: []`.
+- Valid `default_key: "C#"` and `"Bb"` (ASCII) → 201, stored as sent.
+- Valid Unicode `default_key: "D♭"` → 201.
+- `default_key` omitted / null → 201 (allowed).
+- Invalid `default_key` (`"H"`, `"c#"`, `"Cmaj"`, `"Z"`, `"bb"`) → **422**
+  VALIDATION_FAILED (this is the BR-09 AC — must be 422, not 400).
+- Missing/empty/whitespace `title` → 400 VALIDATION_FAILED.
+- `title` > 200 chars → 400.
+- `artist` > 200 chars → 400; `artist` omitted → 201.
+- `bpm` non-integer, ≤ 0, or > 400 → 400; `bpm` omitted → 201.
+- `tags` not an array / non-string elements → 400; `tags: []` → 201.
+- Missing/malformed JSON body (`null`) → 400 VALIDATION_FAILED.
+- Caller role `member` or `guest` → 403 FORBIDDEN (before DB call).
+- `admin` and `set_leader` → allowed.
+- No JWT → 401 UNAUTHENTICATED (before `getSupabaseClient`).
+- Insert DB error / no data returned → 500 INTERNAL.
+
+## Patterns to copy (named)
+
+- Handler shape, auth/JWT guards, `try/catch` tail, narrow Insert cast:
+  `app/api/instruments/handler.ts`.
+- Role-gated read of the group catalog:
+  `app/api/church-group/members/handler.ts` (`requireRole(["admin","set_leader","member"])`).
+- Query-param Zod parse via `Object.fromEntries(req.nextUrl.searchParams)`:
+  `app/api/church-group/audit-log/handler.ts` + `schemas/audit-log.ts`.
+- 422 + VALIDATION_FAILED response:
+  `app/api/church-group/members/[id]/handler.ts` (line ~52).
+- Route wiring: `app/api/instruments/route.ts`.
+- Unit-test harness: `tests/unit/app/api/instruments-route.test.ts`.
+
+## Verify before finishing
+
+`bun run lint`, `bun run typecheck`, and `bun run test` (Jest) must all pass.
+Do not use `bun test` (native runner). Do not touch migrations or unrelated files.
