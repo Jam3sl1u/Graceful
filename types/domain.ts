@@ -7,7 +7,7 @@ export type InvitationStatus = "pending" | "accepted" | "denied" | "withdrawn" |
 
 export type EventType = "pre_practice" | "rehearsal" | "sound_check" | "service";
 
-export type ResolutionType = "withdraw" | "member_reconfirmed" | "admin_dismissed";
+export type ResolutionType = "replaced" | "withdrawn" | "member_reconfirmed" | "admin_dismissed";
 
 export type SetlistStatus = "draft" | "published";
 

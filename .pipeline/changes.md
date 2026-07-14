@@ -1,116 +1,122 @@
-# Changes — Issue #45: 24-hour dual-party invitation reminder scheduler
+# Changes — Issue #47: Conflict resolution flow (3 paths, manual-only)
 
-Implemented exactly per `.pipeline/spec.md`. No scope creep beyond the 8
-files it names.
+## Summary
+
+Wired up the two previously-stubbed (`notImplemented` 501) conflict endpoints:
+
+- `GET /api/conflicts` — lists OPEN conflicts (`resolved_at IS NULL`) for the
+  caller's church group, joined in-memory with member/service-week data.
+  set_leader/admin only.
+- `POST /api/conflicts/:id/resolve` — resolves one conflict via `withdraw`,
+  `member_reconfirmed`, or `admin_dismissed`. set_leader/admin only.
+
+This is manual-only, per spec — no AI replacement suggestion path was added,
+and `replacement_suggestion_user_id` is never touched.
 
 ## Files changed
 
-1. **`supabase/migrations/20260713000001_invitation_reminder_scheduler.sql`** (new)
-   - Adds `invitations.last_reminded_at timestamptz` + partial index
-     `idx_invitations_pending_reminder` (`WHERE status = 'pending'`).
-   - Adds `public.send_invitation_reminders()` — `SECURITY DEFINER`,
-     `SET search_path = ''`, mirrors the `accept_invitation` RPC's shape.
-     Selects due invitations (`status = 'pending'` AND
-     `coalesce(last_reminded_at, created_at) <= now() - 24h` AND parent
-     `service_weeks.is_cancelled = false`) into a temp table, builds and
-     returns the JSON member-reminder array, inserts one admin/set_leader
-     notification per affected service week (D2 aggregation — lists ALL
-     currently-pending members for that week by name, not just the due
-     ones), and stamps `last_reminded_at = now()` only on the due rows.
-     `GRANT EXECUTE ... TO anon, authenticated` + commented DOWN block.
-   - `invitation_reminder` notification type already existed
-     (`20260702000005_cluster_5_partial.sql`) — not re-added.
+- **`types/domain.ts`** — Fixed `ResolutionType` to match the DB enum exactly:
+  `"replaced" | "withdrawn" | "member_reconfirmed" | "admin_dismissed"`
+  (previously `"withdraw" | "member_reconfirmed" | "admin_dismissed"`, which
+  didn't match the DB and would have made writing `'withdrawn'` a TS error).
+  `ResolutionType` has no other referrers besides `lib/supabase/types.ts`, so
+  this is a safe, isolated fix.
 
-2. **`lib/supabase/types.ts`** (modified)
-   - `InvitationsRow` gains `last_reminded_at: string | null`.
-   - `invitations` table `Insert` type: added `last_reminded_at` to the
-     `Omit<...>` union and as an optional `last_reminded_at?: string | null`
-     override (DB-defaulted to NULL).
-   - `Database["public"]["Functions"]` gains `send_invitation_reminders`
-     with `Args: Record<string, never>` and the `Returns` array shape from
-     the spec.
+- **`schemas/conflicts.ts`** — Replaced the empty placeholder `conflictsSchema`
+  (confirmed via grep to have no importers) with `resolveConflictSchema`
+  (zod), validating the request body's `resolution` field against the three
+  manual API-facing values (`withdraw` / `member_reconfirmed` /
+  `admin_dismissed` — note this is a distinct, narrower vocabulary from the
+  DB's `resolution_type` enum; the handler maps `"withdraw"` → DB value
+  `"withdrawn"`).
 
-3. **`lib/scheduling/reminder.ts`** (new) — pure, unit-testable helpers:
-   - `REMINDER_INTERVAL_MS` (24h in ms).
-   - `isReminderDue(invitation, now)` — mirrors the SQL selector exactly
-     (comment cross-references the migration so the two stay in sync).
-   - `buildMemberReminderSms(memberName, weekLabel)` — short SMS copy.
-   - `formatWeekLabel(title, serviceDate)` — title if present, else
-     `serviceDate` formatted as `Mon DD, YYYY` (UTC), matching the SQL's
-     `to_char(week.service_date, 'Mon DD, YYYY')` used in the admin body.
+- **`lib/supabase/types.ts`** — Added `events` and `event_attendees` table
+  entries (`EventsRow`, `EventAttendeesRow`, and their `Database["public"]
+  ["Tables"]` entries) matching the columns already defined in migration
+  `20260702000003_cluster_3_scheduling_core.sql`. These tables exist in the DB
+  but were not yet represented in this hand-rolled type file (no prior
+  handler needed them); the withdraw path here is the first to query them
+  (`events` to find a service week's events, `event_attendees` to delete a
+  withdrawn member's attendance rows), so this addition was required for
+  `bun run typecheck` to pass. No other table's types were touched.
 
-4. **`app/api/cron/invitation-reminders/route.ts`** (new) — `GET` only
-   (Vercel Cron). Contract exactly as spec'd:
-   - `CRON_SECRET` unset → 500 `INTERNAL` (checked before any DB call).
-   - `Authorization` header not exactly `Bearer ${CRON_SECRET}` → 401
-     `UNAUTHENTICATED`.
-   - Calls `send_invitation_reminders` via `getAnonSupabaseClient()`; RPC
-     error → 500 `INTERNAL`.
-   - For each reminder: dispatches `sendSms` (from `lib/pingram/client.ts`,
-     currently a throwing stub) only when `phone` is non-null AND
-     `sms_opted_in === true`; failures are caught per-reminder
-     (`smsFailed` counter + `console.error`) and never fail the job.
-     Members without phone/opt-in are counted as `smsSkipped`, not
-     `smsFailed`.
-   - Returns `ok({ processed, smsSent, smsSkipped, smsFailed })`.
+- **`app/api/conflicts/handler.ts`** (new) — `getOpenConflicts` and
+  `resolveConflict`, mirroring the auth/error-handling style of
+  `app/api/invitations/handler.ts` and the multi-query in-memory-join style
+  of `app/api/church-group/members/handler.ts`:
+  - `getOpenConflicts`: `requireAuth` + `requireRole(["admin","set_leader"])`,
+    queries `conflicts` scoped to the caller's group with `resolved_at IS
+    NULL`, then joins `invitations` → `users`/`service_weeks` by id sets
+    (guarding empty id-set queries). Missing joined rows fall back to safe
+    defaults (`memberName: ""`, empty ids, `invitationStatus: "withdrawn"`)
+    rather than dropping the conflict. Returns `{ conflicts: OpenConflict[] }`
+    (exported type).
+  - `resolveConflict(req, id, lookup?)`: loads and 404s a missing/wrong-group
+    conflict, 409s an already-resolved one (idempotency guard with no side
+    effects), validates the body against `resolveConflictSchema` (400 on
+    failure), then branches:
+    - `withdraw`: loads the invitation (404 if missing), flips its status to
+      `withdrawn`, deletes the member's `event_attendees` rows across the
+      service week's events (via an `events` lookup by `service_week_id`,
+      skipped entirely when the week has no events — idempotent no-op),
+      leaves a `// TODO(#62): delete member's Google Calendar events for this
+      week` comment (no GCal per-attendee sync exists yet — see spec's NOTE),
+      and inserts an `invitation_withdrawn` notification (same shape as
+      `withdrawInvitation` from #43).
+    - `member_reconfirmed` / `admin_dismissed`: no `invitations`/
+      `event_attendees` writes at all.
+    - All branches then mark the conflict resolved LAST
+      (`resolution_type` + `resolved_at`), so a mid-operation failure leaves
+      the conflict open and retryable, and write an audit log
+      (`conflict.resolved`). Returns `{ conflict: { id, resolutionType,
+      resolvedAt } }`.
+  - Every DB `.error` path returns 500 INTERNAL; the whole body is wrapped in
+    the standard `try/catch` → `ApiException`/`INTERNAL 500` fallback.
 
-5. **`vercel.json`** (new) — registers the cron:
-   `{ "crons": [{ "path": "/api/cron/invitation-reminders", "schedule": "0 * * * *" }] }`.
+- **`app/api/conflicts/route.ts`** (modified) — replaced the `notImplemented`
+  stub; `GET` now delegates to `getOpenConflicts`.
 
-6. **`app/api/invitations/handler.ts`** (modified — comment only) —
-   replaced the `TODO(#45/#36)` in `withdrawInvitation` with a comment
-   explaining cancellation is automatic (D1: the reminder selector filters
-   `status = 'pending'`, so the withdraw's status flip already stops future
-   reminders). No logic changed in this file.
+- **`app/api/conflicts/[id]/resolve/route.ts`** (modified) — replaced the
+  `notImplemented` stub; `POST` now awaits the `{ id }` param and delegates to
+  `resolveConflict`, mirroring `app/api/invitations/[id]/route.ts`'s param
+  handling.
 
-7. **`tests/unit/lib/scheduling/reminder.test.ts`** (new) — mocked-time
-   (`Date` fixtures, no real waiting) coverage of `isReminderDue`'s 6 cases
-   from the spec (first reminder at exactly 24h, just-under-threshold,
-   over-threshold, recent repeat-reminder not due, repeat-reminder due,
-   and all three non-pending statuses never due — D1), plus
-   `buildMemberReminderSms` and `formatWeekLabel` (title vs. formatted
-   date).
+- **`.pipeline/spec.md`** — carried over as written by the Planning stage for
+  this issue (overwrites the prior #46 spec, per the pipeline contract).
 
-8. **`tests/unit/app/api/cron-invitation-reminders-route.test.ts`** (new)
-   — mirrors the `invitations-withdraw-route.test.ts` mock-scaffolding
-   style, mocking `@/lib/supabase/client` and `@/lib/pingram/client`.
-   Covers: 401 on missing/wrong Authorization header (RPC never called),
-   500 on unset `CRON_SECRET`, 500 on RPC error, happy path (2 reminders,
-   1 dispatched/1 skipped, correct counts), `sendSms` rejection isolated
-   (still 200, `smsFailed: 1`), and the empty/no-due-invitations case
-   (`processed: 0`, no SMS calls).
+## Not touched (out of scope, per spec)
 
-## Out of scope (per spec, not touched)
-
-- No real SMS/email dispatch — `sendSms` stub only.
-- No configurable per-week response deadlines.
-- No cancellation table / scheduler-state store (D1: automatic).
-- No changes to accept/deny/withdraw logic beyond the one comment in §6.
+- No new SQL migration or RPC — all writes here are permitted to
+  set_leader/admin directly under existing RLS (`conflicts_update_leader_admin`,
+  invitations UPDATE, `event_attendees_delete_tenant`, notifications INSERT).
+- No Google Calendar integration — `TODO(#62)` comment only.
+- No AI replacement-suggestion endpoint (Phase 4) — the "manual replacement
+  always available" AC is satisfied by the withdraw path reopening the slot;
+  a replacement is invited through the existing `POST /api/invitations` flow.
 
 ## Verification run
 
-- `bun run lint` — clean.
-- `bun run typecheck` — clean.
-- `bun run test` — 33 suites / 398 tests passed (all pre-existing tests
-  still pass; the 2 new suites above pass).
-- `bun run check:service-role` — clean (the new cron route/RPC caller use
-  `getAnonSupabaseClient()`, never the service-role key).
-- `bun run check:workflows` — clean (no orchestration scripts touched).
-- Migration SQL itself has no live-DB harness in this repo (same as
-  `accept_invitation`); its correctness is covered by the route/helper unit
-  tests that mock the RPC's return value, per the spec's instruction not to
-  add a live-DB test.
+- `bun run typecheck` — passes (no errors).
+- `bun run lint` — passes (no errors/warnings).
+- `bun run test` — 32 suites / 388 tests, all passing (no regressions; no
+  conflicts-specific tests exist yet — this issue's spec designates writing
+  them to the Testing stage, modeled on
+  `tests/unit/app/api/invitations-withdraw-route.test.ts`).
 
-## What the Tester should focus on
+## Testing-stage focus
 
-- `lib/scheduling/reminder.ts`'s `isReminderDue` boundary conditions
-  (exactly-24h, just-under, non-pending statuses) since the SQL selector in
-  the migration can't be exercised directly in this repo's test harness —
-  the unit tests here are the primary correctness signal for that logic.
-- The cron route's auth ordering (`CRON_SECRET`-unset check happens before
-  any DB call) and that a `sendSms` rejection never surfaces as a non-200
-  response.
-- D2 aggregation (one admin notification per admin per affected week,
-  listing all currently-pending members) is implemented only in the SQL
-  RPC body, which has no live-DB test in this repo — review the migration
-  SQL directly for correctness (temp table + `string_agg` + per-week loop).
+- The existing chainable Supabase mock in
+  `tests/unit/app/api/invitations-withdraw-route.test.ts` (`makeChain`) does
+  not yet support `.is(...)` (used by `getOpenConflicts`'s `resolved_at IS
+  NULL` filter) or a `.delete()` chain (used by the withdraw path's
+  `event_attendees` cleanup) — the Testing stage will need to extend the
+  mock/fixture helpers for those.
+- Edge cases named in the spec worth exercising explicitly: unknown/
+  wrong-group conflict id → 404; already-resolved conflict → 409 with no side
+  effects; invalid/missing `resolution` → 400; member/unauthenticated caller →
+  403/401 on both GET and resolve; withdraw with zero events for the week
+  (no-op delete, still succeeds); withdraw on an invitation already
+  `withdrawn`/`denied` (no 409 — only the conflict's own `resolved_at`
+  guards); `member_reconfirmed`/`admin_dismissed` must not write
+  `invitations`/`event_attendees` at all; GET with no open conflicts → `{
+  conflicts: [] }`.
