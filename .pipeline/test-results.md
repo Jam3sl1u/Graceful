@@ -1,104 +1,124 @@
-# Test Results — Issue #53: Song catalog CRUD + search (BR-09 key validation)
+# Test Results — Issue #59: Event CRUD + BR-10 time validation (Sprint 3)
 
-This overwrites the stale `test-results.md` for issue #52 that was still
+This overwrites the stale `test-results.md` for issue #53 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
-## Verification performed
+## Verdict: PASS
 
-Ran independently in the pinned worktree
-(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-53`):
+## What I did
 
-- `bun run lint` — **clean** (0 errors, 0 warnings, after fixing an unused
-  import in this stage's own new test file — see below).
-- `bun run typecheck` (`tsc --noEmit`) — **clean**.
-- `bun run test` (Jest, full suite) — **51 suites / 579 tests passed**
-  (50 suites / 569 tests from the Coder's work, plus 1 new suite / 10 tests
-  added by this Testing stage).
+1. Read `.pipeline/changes.md` and `.pipeline/spec.md`, then independently
+   read the actual implementation: `schemas/events.ts`,
+   `app/api/events/handler.ts`, `app/api/events/[id]/handler.ts`,
+   `app/api/events/route.ts`, `app/api/events/[id]/route.ts`. Confirmed the
+   code matches the spec's file-by-file description (auth flow, BR-10
+   400-vs-422 split, role scoping, patch semantics).
+2. Wrote three new test files, copying the mocking harness used by
+   `service-weeks-route.test.ts` / `service-weeks-id-route.test.ts`
+   (Clerk `auth` + `getSupabaseClient` mocked, `lookup` seam injected,
+   chainable Supabase mock covering `select/insert/update/delete` +
+   `eq/order/in/maybeSingle/then`):
+   - `tests/unit/schemas/events.test.ts` — pure unit tests for
+     `validateEventTiming` (BR-10) and `createEventSchema`/`updateEventSchema`
+     shape rules, independent of the handler/HTTP layer.
+   - `tests/unit/app/api/events-route.test.ts` — `listEvents` (GET) and
+     `createEvent` (POST).
+   - `tests/unit/app/api/events-id-route.test.ts` — `updateEvent` (PUT) and
+     `deleteEvent` (DELETE).
+3. Ran `bun run lint`, `bun run typecheck`, and `bun run test` (full suite,
+   not just the new files) to independently verify, rather than trusting the
+   coder's verification claims in `changes.md`.
 
-All of the Coder's `changes.md` claims check out: lint/typecheck/test were
-independently re-run from a clean state (not trusted from the report), and
-the full suite is green.
+## Verification run (independently re-run, not trusted from changes.md)
 
-## Independent code read
+- `bun run lint` — clean, 0 errors / 0 warnings (fixed 6 unused-destructured-var
+  warnings I introduced in my own test files by prefixing with `_`, matching
+  repo convention).
+- `bun run typecheck` — clean, `tsc --noEmit`, 0 errors.
+- `bun run test` — **54 suites / 658 tests, all passing** (up from the
+  coder's reported 51 suites / 580 tests — the delta is my 3 new files: 78
+  new tests, 0 failures).
 
-Read `schemas/songs.ts`, `app/api/songs/handler.ts`, `app/api/songs/route.ts`,
-and the `songs` table registration in `lib/supabase/types.ts` against
-`.pipeline/spec.md`. Confirmed:
+## Coverage against the spec's "what the Tester should focus on" list
 
-- `VALID_SONG_KEYS` contains exactly the 17 ASCII + 10 Unicode spellings
-  named in the spec, case-sensitive `Set.has`.
-- The BR-09 split is implemented as specified: `createSongSchema.safeParse`
-  failure → 400 VALIDATION_FAILED; a syntactically valid but semantically
-  invalid `default_key` → 422 VALIDATION_FAILED, checked in the handler
-  (not Zod), after `.trim()` (Zod trims before the handler's membership
-  check runs).
-- `listSongs`: `requireAuth` → `requireRole(["admin","set_leader","member"])`
-  → query-schema parse → JWT guard → `.eq("church_group_id", ...)` (defense
-  in depth, present) → optional `.or(ilike title/artist)` → `.order("title")`
-  → 500 on DB error → `ok({ songs: [...] })`.
-- `createSong`: `requireAuth` → `requireRole(["admin","set_leader"])` → body
-  parse (400) → BR-09 check (422) → JWT guard (401) → insert with
-  `spotify_id` untouched → 500 on error/no data → `ok({ song }, 201)`. No
-  duplicate-title 409 guard, matching the spec's explicit instruction.
-- `lib/supabase/types.ts` `songs` table entry matches the spec's `SongsRow`
-  / `Insert`/`Update`/`Relationships` shape verbatim.
-- `app/api/songs/route.ts` wires `GET`/`POST` straight to `listSongs`/
-  `createSong`, mirroring `app/api/instruments/route.ts`.
+All items in `changes.md`'s "What the Tester should focus on" section are
+covered:
 
-## New tests written by this stage
+- **BR-10 order edge case** — `end_time === start_time` → 422 (not just
+  `end < start`). Covered in both the pure schema test (`schemas/events.test.ts`)
+  and end-to-end via `createEvent`/`updateEvent`.
+- **BR-10 window boundary** — exactly ±72h is valid (`Math.abs(...) >
+  BR10_WINDOW_MS`, not `>=`), one ms over/under is not. Covered with exact
+  boundary-ms arithmetic in `schemas/events.test.ts` (4 boundary tests: +72h
+  exact/+1ms over, -72h exact/-1ms under), plus a "start OK but end violates"
+  asymmetric case.
+- **400 vs 422 split** — malformed body (bad enum, missing name, non-uuid,
+  non-ISO datetime, missing offset) → 400 `VALIDATION_FAILED`; syntactically
+  valid body violating BR-10 → 422 `VALIDATION_FAILED`. Both codes and status
+  values asserted separately in the route tests so a regression that
+  collapses the two would be caught.
+- **`createEvent` 404 on unknown/cross-group `serviceWeekId`** — asserted via
+  a null `service_weeks` fixture; response body checked to be generic
+  `NOT_FOUND` (no existence leak).
+- **`updateEvent`/`deleteEvent` 404 on unknown/cross-group id** — asserted
+  for both a null `events` select fixture (update) and null `events` delete
+  fixture (delete's tenant-scoped race case).
+- **`updateEvent` BR-10 re-check with only one of start/end supplied** —
+  two dedicated tests: only `startTime` provided (falls back to existing
+  `end_time`, and is asserted to actually trip a 422 when the new start
+  moves past the existing end — proving the fallback value is real, not just
+  present), and only `endTime` provided (falls back to existing `start_time`,
+  accepted as valid). Also a test asserting `service_weeks` is *not* queried
+  at all when neither time field changes (would catch an accidental
+  always-re-check regression as well as a "never re-checks" regression).
+- **`listEvents` role scoping** — admin sees all; each of
+  set_leader/member/guest is parametrized (`it.each`) for both "has an
+  invitation → sees the event" and "zero invitations → `{ events: [] }`".
+- **`location`/`notes` null-vs-omit semantics** — create: omitted → stored
+  `null`; update: explicit `null` clears the column (payload asserted to be
+  exactly `{ location: null }`, not merged with other fields), omission
+  leaves the column out of the patch entirely (payload asserted to lack the
+  key via `not.toHaveProperty`).
+- **401/403 paths** — no Clerk `userId` (lookup never consulted, asserted via
+  `expect(lookup).not.toHaveBeenCalled()`), no Supabase JWT (`getSupabaseClient`
+  never called), and wrong role (member/guest) on POST/PUT/DELETE, including
+  confirming `set_leader` *is* allowed (not just admin) on all three mutating
+  endpoints.
 
-Added `tests/unit/app/api/songs-route-tester-supplement.test.ts` (10 tests,
-independent of the Coder's `songs-route.test.ts`) covering behavior the
-Coder's own suite did not exercise:
+## Additional cases beyond the spec's list
 
-- **Route wiring**: `route.GET`/`route.POST` delegate to the handler and
-  return a `Response` without throwing.
-- **Auth branches not covered by the Coder's suite**: Clerk `userId` null
-  (401, before any DB call) for both GET and POST; `lookup` resolving to
-  `null` — i.e. an authenticated Clerk user with no matching `users` row
-  (401, before any DB call) for both GET and POST. The Coder's suite only
-  exercised the "no JWT" 401 path, not these two.
-- **Defense-in-depth scoping**: GET's select chain is asserted to call
-  `.eq("church_group_id", CHURCH_GROUP_ID)`, not just to return 200.
-- **Trim-before-BR-09-check edge case**: `default_key: " C "` → 201, stored
-  as the trimmed `"C"`; `default_key: " H "` → still 422 (trimming happens
-  in Zod before the handler's `isValidSongKey` check, so padding can't be
-  used to dodge either the valid or invalid paths).
-- **Unknown body fields are dropped, not stored or rejected** — e.g.
-  `spotify_id` sent in the POST body is confirmed absent from the insert
-  payload (the spec requires `spotify_id` stay server-controlled/null,
-  manual entry only; a client trying to smuggle it in must not succeed).
+- `google_calendar_event_id` is never exposed in `GET /api/events` responses
+  even when present on the underlying row (guards against the #62-scope leak
+  the spec calls out as out-of-scope-but-must-not-leak).
+- 500 `INTERNAL` on every Supabase query point that can independently fail:
+  events select/insert/update/delete, invitations select, and the
+  service_weeks lookup (both on create and on the update-time BR-10
+  re-check).
+- Tenant-isolation assertion for `deleteEvent` — captures the actual `.eq()`
+  call arguments to confirm the delete is scoped to
+  `id + church_group_id` in that order, not just "returns the right status."
 
-All 10 new tests pass. One lint warning surfaced during this stage's own
-test authoring (an unused `SongResponse` type import) — fixed directly in
-the new test file (a Tester-owned file, not the Coder's code), and
-`bun run lint` is clean again after the fix.
+## One bug I found and fixed in my own tests (not the implementation)
 
-## Manual verification of spec edge cases
+My first draft of `events-route.test.ts` used a non-UUID placeholder
+(`"week-1"`) as `WEEK_ID`, which is also used as the `serviceWeekId` value in
+POST bodies. Since `createEventSchema.serviceWeekId` is `z.string().uuid()`,
+every `createEvent` test with a non-UUID `WEEK_ID` was actually failing
+`safeParse` and returning 400 — even the ones asserting 201/404/422/500 —
+which surfaced as 9 failing tests on the first run (correctly caught,
+nothing swallowed silently). Fixed by using a real UUID literal
+(`"22222222-2222-2222-2222-222222222222"`) for `WEEK_ID`; re-ran and all 78
+new tests pass for the intended reason. This was a bug in my test fixture,
+not in the implementation under test — noted here for the Reviewer's
+awareness.
 
-Cross-checked every edge case enumerated in `.pipeline/spec.md` ("Edge
-cases the implementation MUST handle") against the Coder's
-`songs-route.test.ts` and confirmed each one has a corresponding assertion:
-all GET cases (no `q`, `q` filter, empty `q`, empty catalog, `tags` null →
-`[]`, guest → 403, no JWT → 401, DB error → 500) and all POST cases (minimal
-valid body, ASCII/Unicode valid keys, omitted/invalid key → 422 for `H`,
-`c#`, `Cmaj`, `Z`, `bb`, missing/whitespace/oversized title → 400, oversized
-artist → 400 / omitted → 201, `bpm` bounds/omission, `tags` shape/empty,
-malformed JSON body → 400, role gating member/guest → 403 vs admin/set_leader
-→ 201, no JWT → 401, insert error → 500) are all present and pass.
+## Files added
 
-## Failure cases confirmed
+- `tests/unit/schemas/events.test.ts`
+- `tests/unit/app/api/events-route.test.ts`
+- `tests/unit/app/api/events-id-route.test.ts`
 
-The BR-09 negative path (`it.each(["H", "c#", "Cmaj", "Z", "bb"])` → 422
-VALIDATION_FAILED) and the 500-on-DB-error / 500-on-insert-error cases are
-genuine failure-path tests, independently re-run and passing. This stage's
-own added failure cases (401 for unauthenticated/unprovisioned users on
-both endpoints, and confirming smuggled `spotify_id`/unknown fields don't
-reach the insert payload) also pass.
-
-## Verdict
-
-**PASS.** 51 test suites / 579 tests green, lint clean, typecheck clean.
-No discrepancies found between `.pipeline/spec.md`, `.pipeline/changes.md`,
-and the actual diff. Ready for Review.
+No implementation files were modified — per the pipeline contract, this
+stage only tests, it does not patch around failures. No failures remained
+after fixing my own fixture bug above.
