@@ -1,98 +1,96 @@
-# Changes — Issue #53: Song catalog CRUD + search (BR-09 key validation)
+# Changes — Issue #59: Event CRUD + BR-10 time validation (Sprint 3)
 
 ## Summary
 
-Implemented `GET /api/songs` (list/search) and `POST /api/songs` (create),
-per `.pipeline/spec.md`. API layer only — no migrations touched, no
-Spotify/familiarity/override/update/delete work (explicitly out of scope).
+Implemented the four `/api/events` endpoints (previously `notImplemented`
+stubs), mirroring the `service-weeks` handler pattern per the spec, including
+BR-10 time-window/order validation as a pure helper reused on both create and
+update.
 
 ## Files changed
 
-- `schemas/songs.ts` (replaced placeholder)
-  - `VALID_SONG_KEYS: ReadonlySet<string>` — 17 ASCII + 10 Unicode chromatic
-    key spellings (BR-09), case-sensitive exact match.
-  - `isValidSongKey(key)` helper.
-  - `createSongSchema` — shape-only Zod validation for POST body (`title`
-    required, `artist`/`default_key`/`bpm`/`tags` optional). Deliberately
-    does NOT check key membership — that's a handler-level 422, not a Zod
-    400 (see BR-09 edge case below).
-  - `songSearchQuerySchema` — `{ q?: string }` for GET query params.
+- **`schemas/events.ts`** (replaced placeholder `z.object({})`):
+  - `eventTypeSchema` — enum of the 4 event types.
+  - `createEventSchema` — POST body shape (camelCase: `serviceWeekId`, `type`,
+    `name`, `location`, `startTime`, `endTime`, `notes`). `startTime`/`endTime`
+    use `z.string().datetime({ offset: true })`.
+  - `updateEventSchema` — PUT body, all fields optional, `.refine` requiring
+    at least one present. `serviceWeekId` intentionally not updatable.
+  - `validateEventTiming(serviceDate, startTime, endTime)` — pure BR-10 check:
+    `end > start` required, and both endpoints must be within ±72h
+    (`BR10_WINDOW_MS`) of `serviceDate` anchored at 00:00:00 UTC. Returns an
+    error message string or `null`.
 
-- `app/api/songs/handler.ts` (new)
-  - `SongResponse` type + private `toSongResponse` mapper (snake_case row →
-    camelCase response, `tags: row.tags ?? []`).
-  - `listSongs(req, lookup?)`: `requireAuth` → `requireRole(["admin",
-    "set_leader", "member"])` → parse `q` via `songSearchQuerySchema` → JWT
-    guard → `songs` query scoped by `church_group_id`, optional
-    `.or("title.ilike.%q%,artist.ilike.%q%")` when `q` is non-empty,
-    `.order("title")` → `ok({ songs: [...] })`.
-  - `createSong(req, lookup?)`: `requireAuth` → `requireRole(["admin",
-    "set_leader"])` → `req.json()` + `createSongSchema.safeParse` (400 on
-    failure) → **BR-09 check**: if `default_key` present and
-    `!isValidSongKey(...)` → `fail(..., VALIDATION_FAILED, 422)` — this is
-    the load-bearing behavior for this issue, malformed body is 400,
-    semantically-invalid key value is 422 → JWT guard → insert (narrow
-    `as unknown as Database[...]["Insert"]` cast, same rationale as
-    `instruments/handler.ts`) → `ok({ song: ... }, 201)`.
-  - Copies the auth/JWT/try-catch shape of `app/api/instruments/handler.ts`
-    exactly; no duplicate-title guard (spec explicitly says catalog allows
-    same-titled songs — do not add the instruments-style 409 check).
+- **`app/api/events/handler.ts`** (new): `toEventResponse` (snake→camel
+  mapper, does not expose `google_calendar_event_id`), `listEvents`,
+  `createEvent`.
+  - `listEvents`: any authenticated role. Admins see all events in the
+    church group (`order by start_time asc`). All non-admins (set_leader,
+    member, guest) are scoped to events whose `service_week_id` is in the
+    caller's `invitations` — this is broader scoping than service-weeks
+    (where only guests are scoped), per spec.
+  - `createEvent`: admin/set_leader only. Validates body shape (400 on
+    failure), fetches the parent `service_weeks.service_date` scoped to the
+    caller's church group (404 if missing/cross-group), then runs BR-10 via
+    `validateEventTiming` (422 `VALIDATION_FAILED` on violation, distinct
+    from the 400 Zod-shape failure). Inserts with a narrow
+    `as unknown as ... Insert` cast matching the `service-weeks` pattern.
 
-- `app/api/songs/route.ts` (rewritten) — replaced `notImplemented` stubs
-  with `GET`/`POST` wired to `listSongs`/`createSong`, mirroring
-  `app/api/instruments/route.ts`.
+- **`app/api/events/[id]/handler.ts`** (new): `updateEvent`, `deleteEvent`.
+  - `updateEvent`: admin/set_leader only. Fetches the existing event scoped
+    to the church group (404 if missing). If `startTime` and/or `endTime` is
+    present in the body, re-fetches the parent week's `service_date` and
+    re-runs BR-10 against the *effective* start/end (new value if provided,
+    else the existing row's value) — 422 on violation. Builds an `Update`
+    patch only from keys present in the parsed body (so an explicit `null`
+    for `location`/`notes` clears the column, and omission leaves it
+    unchanged).
+  - `deleteEvent`: admin/set_leader only, hard delete scoped to the church
+    group; selects the deleted `id` so a missing/cross-group id returns 404
+    instead of a silent 200. `event_attendees` children are left to the DB
+    cascade (not deleted here).
 
-- `lib/supabase/types.ts` — added `SongsRow` type and registered
-  `Tables.songs` (Row/Insert/Update/Relationships), following the
-  `instruments` entry's pattern. `Insert` narrows the same way as other
-  tables with DB-default columns (`created_at` has a `now()` default but the
-  hand-rolled type still needs it optional).
+- **`app/api/events/route.ts`** (replaced stub): wires `GET` → `listEvents`,
+  `POST` → `createEvent`.
 
-- `tests/unit/app/api/songs-route.test.ts` (new) — 28 tests, follows the
-  `instruments-route.test.ts` mock harness (`jest.mock` for `@clerk/nextjs/server`
-  and `@/lib/supabase/client`, `makeLookup`/`setUpAuth`/`makeChain`/
-  `makeSupabaseClient`) plus the audit-log test's `nextUrl.searchParams`
-  `makeReq` pattern for GET query params. `makeChain` stubs `.eq`, `.or`,
-  `.order`, `.select`, `.single`.
-  - GET: all songs / ordered, search filter applied (`.or` called with the
-    exact ilike string), empty `q` → no filter, empty catalog, tags-null →
-    `[]`, 403 for `guest`, 401 no-JWT, 500 on DB error.
-  - POST: minimal valid body, ASCII keys (`C#`, `Bb`), Unicode key (`D♭`),
-    invalid keys (`H`, `c#`, `Cmaj`, `Z`, `bb`) → **422** VALIDATION_FAILED
-    (the BR-09 AC), missing/empty/whitespace title → 400, title/artist
-    length bounds, `bpm` bounds (non-integer/≤0/>400) and omission, `tags`
-    non-array / non-string elements and empty-array acceptance,
-    missing/malformed JSON body → 400, role gating (`member`/`guest` → 403,
-    `admin`/`set_leader` → allowed), 401 no-JWT, 500 on insert error.
+- **`app/api/events/[id]/route.ts`** (replaced stub): wires `PUT` →
+  `updateEvent`, `DELETE` → `deleteEvent`. No `GET` (event-level read is
+  #60's scope).
 
-- `.pipeline/spec.md` — retained as written by the Planning stage this run
-  for Issue #53 (previously contained the #52 spec from the prior pipeline
-  run; each run overwrites this file per the AGENTS.md contract).
+- **`.pipeline/spec.md`**: committed the planning stage's spec for #59 (was
+  present in the working tree but not yet committed on this branch).
 
-## Verification
+## Out of scope (untouched, per spec)
 
-- `bun run lint` — clean.
-- `bun run typecheck` — clean.
-- `bun run test` (Jest) — full suite: 50 suites / 569 tests passed, including
-  the new 28-test `songs-route.test.ts`.
+- `app/api/events/[id]/attendees/**` (issue #60 stubs) — left as-is.
+- `google_calendar_event_id` (issue #62) — never read or written.
+- No `GET /api/events/:id` was added.
 
-## Follow-up (review #53 nullish)
+## Verification run
 
-- Optional create fields (`artist` / `default_key` / `bpm` / `tags`) now use
-  Zod `.nullish()` so explicit JSON `null` is accepted as omitted → **201**.
-- BR-09 membership check uses `parsed.default_key != null`, so null skips key
-  validation. Closes the reviewer’s blocking item (`.optional()` rejected
-  null → 400 vs spec edge case omit/null → 201).
+- `bun run lint` — clean (no errors/warnings).
+- `bun run typecheck` — clean (`tsc --noEmit`, no errors).
+- `bun run test` — 51 suites / 580 tests, all passing (no existing test
+  touches the new event handlers yet — this repo's convention, per the spec,
+  is for the Tester stage to add the event route tests, copying the harness
+  from `songs-route.test.ts` / `service-weeks-*` tests).
 
-## Notes for the Tester
+## What the Tester should focus on
 
-- The BR-09 422-vs-400 split is the crux of this issue: confirm a malformed
-  body (e.g. missing `title`) is 400, while a syntactically fine but
-  semantically invalid `default_key` (e.g. `"H"`, `"c#"`) is 422.
-- Case sensitivity matters: `Bb` valid, `bb`/`BB` invalid.
-- Confirm `q=""` (present but empty) returns the unfiltered list (no `.or`
-  call), distinct from `q` entirely absent.
-- Confirm role gating is enforced *before* any DB call (test harness asserts
-  `mockGetSupabaseClient` not called for 403 cases).
-- No migration changes were made or needed — `songs` table, RLS policies,
-  and `default_key varchar(5)` column already exist per the spec.
+- BR-10 order edge case: `end_time === start_time` must be 422 (not just
+  `end < start`).
+- BR-10 window edge case: exactly at the 72h boundary (`Math.abs(...) >
+  BR10_WINDOW_MS`, so exactly 72h is valid, one ms over is not).
+- 400 vs 422 split: malformed body (bad enum/uuid/datetime, missing `name`)
+  → 400; syntactically valid body that violates BR-10 → 422.
+- `createEvent` 404 on an unknown or cross-group `serviceWeekId` (must not
+  leak existence).
+- `updateEvent`/`deleteEvent` 404 on unknown/cross-group event `id`.
+- `updateEvent` BR-10 re-check logic when only one of `startTime`/`endTime`
+  is supplied (effective value falls back to the existing row).
+- `listEvents` role scoping: admin sees all; set_leader/member/guest with no
+  invitations get `{ events: [] }`; a non-admin only sees events for weeks
+  they're invited to, never another group's events.
+- `location`/`notes` null-vs-omit semantics on create and update.
+- 401/403 paths (missing Clerk auth, missing supabase JWT, wrong role on
+  POST/PUT/DELETE).

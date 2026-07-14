@@ -1,10 +1,13 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { updateEvent, deleteEvent } from "./handler";
 
-export async function PUT(_req: NextRequest) {
-  return notImplemented("PUT /api/events/[id]");
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function PUT(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return updateEvent(req, id);
 }
-
-export async function DELETE(_req: NextRequest) {
-  return notImplemented("DELETE /api/events/[id]");
+export async function DELETE(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return deleteEvent(req, id);
 }

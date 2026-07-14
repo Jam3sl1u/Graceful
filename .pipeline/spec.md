@@ -1,265 +1,290 @@
-# Spec — Issue #53: Song catalog CRUD + search (BR-09 key validation)
+# Spec — Issue #59: Event CRUD + BR-10 time validation (Sprint 3)
 
-## OPEN QUESTIONS
-
-None blocking. One decision made explicitly (not a blocker):
-
-- **Key representation (ASCII vs Unicode).** PRD §8 BR-09 (line 186 of
-  `documentation/prd/graceful_requirements_v10.md`) enumerates the keys using
-  Unicode musical symbols (`C♯`, `D♭`, …). Real JSON/HTTP clients send ASCII
-  (`C#`, `Db`). To satisfy both the literal PRD list and practical clients,
-  the accepted set below includes **both** the ASCII and Unicode spellings.
-  The value is stored exactly as received (no normalization) — that is all
-  this issue requires; a future transposition engine can normalize later.
+No OPEN QUESTIONS. Two decisions were forced by the DB schema / PRD and are
+documented under "Decisions" below rather than blocked — they are defensible and
+deterministic; a human/reviewer can override if wrong.
 
 ## Scope
 
-Implement the two `/api/songs` endpoints. Everything is at the API layer — the
-`songs` table, its RLS policies (`songs_select_tenant`, `songs_insert_tenant`),
-and the `varchar(5)` `default_key` column already exist (migrations
-`20260702000004_cluster_4_partial_songs.sql` and `20260704000001_rls_policies.sql`).
-**Do not add or modify any migration.** At 40–60 rows an RLS-scoped seq scan is
-already well within the "reasonably fast" AC — no new DB index is required.
+Implement the four event endpoints that are currently `notImplemented` stubs:
 
-Out of scope (do not implement): Spotify enrichment/autocomplete, song
-familiarity, per-song key override (#57), update/delete endpoints (issue only
-asks for list/search + create), song documents (already exist elsewhere).
+- `POST /api/events` — create an event (admin/set_leader), enforce BR-10.
+- `GET  /api/events` — list events, role-scoped.
+- `PUT  /api/events/:id` — update an event (admin/set_leader), re-enforce BR-10.
+- `DELETE /api/events/:id` — hard-delete an event (admin/set_leader).
 
-## Files to create / modify
+Out of scope (do NOT touch): Google Calendar sync (#62 — leave
+`google_calendar_event_id` null, do not read/write it), attendee assignment
+(#60 — do not touch `event_attendees`, do not add a `GET /api/events/:id`).
 
-### 1. `schemas/songs.ts` — REPLACE the placeholder
+## Pattern to copy
 
-Currently just `z.object({})`. Replace with:
+Copy the structure, auth flow, JWT/Supabase acquisition, narrow Insert cast,
+try/catch → `fail(...)` shape, and camelCase request/response convention from
+the **service-weeks** handlers (events is a child of service_weeks and the
+closest analog):
 
-- A `VALID_SONG_KEYS` constant — a `ReadonlySet<string>` (or readonly array +
-  Set) containing every accepted `default_key` string. Include the 17 ASCII
-  spellings AND the 10 Unicode accidental spellings:
+- `app/api/service-weeks/handler.ts` → list + create + `toServiceWeekResponse`.
+- `app/api/service-weeks/[id]/handler.ts` → update + delete.
+- `app/api/service-weeks/[id]/route.ts` → `[id]` route wiring (`Ctx` param).
 
-  ```
-  ASCII:    C  C#  Db  D  D#  Eb  E  F  F#  Gb  G  G#  Ab  A  A#  Bb  B
-  Unicode:  C♯  D♭  D♯  E♭  F♯  G♭  G♯  A♭  A♯  B♭
-  ```
+BR-10 (a business-rule value check that returns **422**, not a Zod shape check
+that returns 400) copies the BR-09 split from `app/api/songs/handler.ts`
+lines 102-106 and `schemas/songs.ts` (`isValidSongKey`): keep the pure check
+helper in `schemas/events.ts`, call it in the handler, return
+`fail(..., ErrorCode.VALIDATION_FAILED, 422)` on violation.
 
-  (These represent the 12 chromatic pitch classes; no `E#`, `B#`, `Cb`, `Fb`.)
-  Match is **case-sensitive and exact** (`Bb` valid, `bb`/`BB` invalid).
-  Export a helper `isValidSongKey(key: string): boolean` returning
-  `VALID_SONG_KEYS.has(key)`.
+Use camelCase body/response keys (like service-weeks: `serviceDate`,
+`sermonTopic`), NOT snake_case.
 
-- `createSongSchema` — Zod object validating request-body **shape only** (NOT
-  key membership; the key-value check happens in the handler so it can return
-  422, see edge cases):
-  - `title`: `z.string().trim().min(1).max(200)` (required)
-  - `artist`: `z.string().trim().min(1).max(200).nullish()`
-  - `default_key`: `z.string().trim().min(1).max(5).nullish()`
-  - `bpm`: `z.number().int().positive().max(400).nullish()`
-  - `tags`: `z.array(z.string().trim().min(1).max(50)).nullish()`
-  - Unknown keys may be ignored (no `.strict()` needed).
-  - Export `type CreateSongInput = z.infer<typeof createSongSchema>`.
+## Files
 
-- `songSearchQuerySchema` — for GET query params (parse from
-  `Object.fromEntries(req.nextUrl.searchParams)`):
-  - `q`: `z.string().trim().max(200).optional()` (search term)
-  - Export `type SongSearchQuery = z.infer<typeof songSearchQuerySchema>`.
+### 1. `schemas/events.ts` — REPLACE the stub entirely
 
-Follow `schemas/instruments.ts` + `schemas/audit-log.ts` for style.
-
-### 2. `app/api/songs/handler.ts` — NEW FILE
-
-Copy the structure/error-handling of `app/api/instruments/handler.ts` exactly
-(same imports: `auth`, `requireAuth`, `requireRole`, `ok`, `fail`,
-`ApiException`, `ErrorCode`, `getSupabaseClient`, `Database` type, plus the new
-song schemas). Same JWT-fetch guard, same `try/catch` → `ApiException`/500
-tail, same `as unknown as Database["public"]["Tables"]["songs"]["Insert"]`
-narrow cast for the insert payload (the hand-rolled Insert type marks
-`created_at` required despite the `now()` default — see the comment in
-`instruments/handler.ts` lines 94-104).
-
-Exports:
+Current content is a placeholder empty object. Replace with:
 
 ```ts
-export type SongResponse = {
-  id: string;
-  title: string;
-  artist: string | null;
-  defaultKey: string | null;   // maps default_key
-  bpm: number | null;
-  tags: string[];              // [] when the column is null
-  createdBy: string | null;    // maps created_by
-  createdAt: string;           // maps created_at (ISO)
-};
+import { z } from "zod";
 
-export async function listSongs(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-export async function createSong(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+export const eventTypeSchema = z.enum([
+  "pre_practice",
+  "rehearsal",
+  "sound_check",
+  "service",
+]);
+
+// POST /api/events body. Shape only. BR-10 time-window/order is enforced in
+// the handler (returns 422, not 400) via validateEventTiming below.
+export const createEventSchema = z.object({
+  serviceWeekId: z.string().uuid(),
+  type: eventTypeSchema,
+  name: z.string().trim().min(1).max(100),
+  location: z.string().trim().min(1).max(200).nullish(),
+  startTime: z.string().datetime({ offset: true }),
+  endTime: z.string().datetime({ offset: true }),
+  notes: z.string().trim().min(1).nullish(),
+});
+export type CreateEventInput = z.infer<typeof createEventSchema>;
+
+// PUT /api/events/:id body — same mutable fields, all optional, at least one
+// present. serviceWeekId is intentionally NOT updatable (moving an event
+// between weeks is out of scope).
+export const updateEventSchema = z
+  .object({
+    type: eventTypeSchema.optional(),
+    name: z.string().trim().min(1).max(100).optional(),
+    location: z.string().trim().min(1).max(200).nullish(),
+    startTime: z.string().datetime({ offset: true }).optional(),
+    endTime: z.string().datetime({ offset: true }).optional(),
+    notes: z.string().trim().min(1).nullish(),
+  })
+  .refine((v) => Object.keys(v).length > 0, "at least one field required");
+export type UpdateEventInput = z.infer<typeof updateEventSchema>;
+
+// BR-10 (PRD §8): end must be after start; both within 72h of service_date.
+// Pure + deterministic so it is unit-testable in isolation. service_date is a
+// DATE (YYYY-MM-DD); anchor it at 00:00:00 UTC (see Decisions in spec).
+// Returns an error message string on violation, or null when valid.
+export const BR10_WINDOW_MS = 72 * 60 * 60 * 1000;
+
+export function validateEventTiming(
+  serviceDate: string,
+  startTime: string,
+  endTime: string,
+): string | null {
+  const start = new Date(startTime).getTime();
+  const end = new Date(endTime).getTime();
+  if (!(end > start)) return "end_time must be after start_time";
+  const anchor = new Date(`${serviceDate}T00:00:00.000Z`).getTime();
+  if (Math.abs(start - anchor) > BR10_WINDOW_MS || Math.abs(end - anchor) > BR10_WINDOW_MS) {
+    return "event times must be within 72 hours of the service date";
+  }
+  return null;
+}
 ```
 
-Plus a private `toSongResponse(row)` mapper (snake_case row → `SongResponse`,
-`tags: row.tags ?? []`).
+Note: `z.string().datetime({ offset: true })` guarantees the strings parse, so
+`new Date(...)` cannot be `NaN` in `validateEventTiming`.
 
-**`listSongs` (GET /api/songs):**
-- `requireAuth`, then `requireRole(ctx, ["admin", "set_leader", "member"])`
-  (mirrors `app/api/church-group/members/handler.ts` — group members read the
-  catalog; guests do not).
-- Parse `songSearchQuerySchema` from `req.nextUrl.searchParams`; on failure →
-  `fail("Validation failed", VALIDATION_FAILED, 400)`.
-- Get JWT (401 if missing), build supabase client.
-- Query: `supabase.from("songs").select("id, title, artist, default_key, bpm, tags, created_by, created_at")`.
-  - RLS already scopes to the caller's church group. For defense-in-depth and
-    consistency with the instruments handler you MAY also add
-    `.eq("church_group_id", ctx.churchGroupId)`. Either is acceptable.
-  - When `q` is present and non-empty: add
-    `.or(\`title.ilike.%${q}%,artist.ilike.%${q}%\`)` for case-insensitive
-    partial match across title and artist. When `q` is absent/empty: no filter.
-  - `.order("title", { ascending: true })`.
-- On error → 500 INTERNAL. Return `ok({ songs: (data ?? []).map(toSongResponse) })`.
+### 2. `app/api/events/handler.ts` — NEW file (mirror `service-weeks/handler.ts`)
 
-**`createSong` (POST /api/songs):**
-- `requireAuth`, then `requireRole(ctx, ["admin", "set_leader"])` — Set Leader /
-  Admin only (403 FORBIDDEN otherwise; the guard runs before any DB call).
-- `const body = await req.json().catch(() => null);` then
-  `createSongSchema.safeParse(body)`; on failure →
-  `fail("Validation failed", VALIDATION_FAILED, 400)`.
-- **BR-09 key check (must produce 422):** if `parsed.default_key` is a
-  non-null string and `!isValidSongKey(parsed.default_key)` →
-  `fail("Invalid musical key", ErrorCode.VALIDATION_FAILED, 422)`.
-  Membership runs only when `default_key` is present and non-null (omit/null
-  skip the check). Keep this in the handler, NOT in Zod, so malformed body =
-  400 but invalid key value = 422. Precedent for 422 + VALIDATION_FAILED:
-  `app/api/church-group/members/[id]/handler.ts` lines 52-56.
-- Get JWT (401 if missing), build supabase client.
-- Insert payload (narrow cast as above):
-  ```
-  church_group_id: ctx.churchGroupId,
-  title: parsed.title,
-  artist: parsed.artist ?? null,
-  default_key: parsed.default_key ?? null,
-  bpm: parsed.bpm ?? null,
-  tags: parsed.tags ?? null,
-  created_by: ctx.userId,
-  ```
-  Do NOT set `spotify_id` (manual entry only; column stays null).
-- `.insert(payload).select("id, title, artist, default_key, bpm, tags, created_by, created_at").single()`.
-- On error/no data → 500 INTERNAL. Return `ok({ song: toSongResponse(data) }, 201)`.
+Export:
 
-No duplicate-title guard — the catalog legitimately allows same-titled songs
-(different arrangements). Do NOT add the instruments-style 409 conflict check.
+- `type EventResponse = { id: string; serviceWeekId: string; type: EventType; name: string; location: string | null; startTime: string; endTime: string; notes: string | null; createdBy: string | null; createdAt: string; }`
+  (Do NOT expose `google_calendar_event_id` — out of scope. Import `EventType`
+  from `@/types/domain`.)
+- `function toEventResponse(row: EventsRow): EventResponse` — snake→camel map.
+  Use `type EventsRow = Database["public"]["Tables"]["events"]["Row"]`.
+- `async function listEvents(req: NextRequest, lookup?: UserLookup): Promise<Response>`
+- `async function createEvent(req: NextRequest, lookup?: UserLookup): Promise<Response>`
 
-### 3. `app/api/songs/route.ts` — REWRITE
+**`listEvents` (role-scoped, see AC):**
+1. `ctx = await requireAuth(req, lookup)` (any authenticated role — no
+   `requireRole`).
+2. Acquire supabase JWT client exactly as service-weeks does (getToken
+   `template: "supabase"`, 401 if missing).
+3. If `ctx.role === "admin"`: select all events where
+   `church_group_id === ctx.churchGroupId`, `.order("start_time", { ascending: true })`.
+4. Else (`set_leader` / `member` / `guest` — ALL non-admins are scoped, unlike
+   service-weeks where only guests are): query `invitations` for
+   `service_week_id` where `user_id === ctx.userId`; dedupe into
+   `serviceWeekIds`; if empty return `ok({ events: [] })`; else select events
+   where `church_group_id === ctx.churchGroupId` AND
+   `.in("service_week_id", serviceWeekIds)`, same ordering.
+5. Return `ok({ events: (data ?? []).map(toEventResponse) })`.
+6. On any supabase `error`: `fail("Internal error", ErrorCode.INTERNAL, 500)`.
 
-Replace the `notImplemented` stubs, mirroring `app/api/instruments/route.ts`:
+**`createEvent` (admin/set_leader):**
+1. `ctx = await requireAuth(req, lookup)`; `requireRole(ctx, ["admin", "set_leader"])`.
+2. `body = await req.json().catch(() => null)`;
+   `createEventSchema.safeParse` → on failure `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)`.
+3. Acquire supabase JWT client (401 if no jwt).
+4. Verify the parent week: select `service_date` from `service_weeks` where
+   `id === parsed.serviceWeekId` AND `church_group_id === ctx.churchGroupId`,
+   `.maybeSingle()`. On error → 500. If not found →
+   `fail("Not found", ErrorCode.NOT_FOUND, 404)` (do not leak existence /
+   cross-group).
+5. **BR-10:** `const msg = validateEventTiming(week.service_date, parsed.startTime, parsed.endTime)`;
+   if `msg` non-null → `fail(msg, ErrorCode.VALIDATION_FAILED, 422)`.
+6. Insert (narrow cast exactly like service-weeks' `weekInsertPayload`
+   `as unknown as Database["public"]["Tables"]["events"]["Insert"]`):
+   ```
+   church_group_id: ctx.churchGroupId,
+   service_week_id: parsed.serviceWeekId,
+   type: parsed.type,
+   name: parsed.name,
+   location: parsed.location ?? null,
+   start_time: parsed.startTime,
+   end_time: parsed.endTime,
+   notes: parsed.notes ?? null,
+   created_by: ctx.userId,
+   ```
+   `.select("*").maybeSingle()`. On error/null → 500.
+7. `return ok({ event: toEventResponse(row) }, 201)`.
+8. Wrap in the standard try/catch: `if (err instanceof ApiException) return fail(err.message, err.code, err.status); return fail("Internal error", ErrorCode.INTERNAL, 500);`.
+
+### 3. `app/api/events/route.ts` — REPLACE the stub
 
 ```ts
 import { NextRequest } from "next/server";
-import { listSongs, createSong } from "./handler";
+import { listEvents, createEvent } from "./handler";
 
 export async function GET(req: NextRequest): Promise<Response> {
-  return listSongs(req);
+  return listEvents(req);
 }
 export async function POST(req: NextRequest): Promise<Response> {
-  return createSong(req);
+  return createEvent(req);
 }
 ```
 
-### 4. `lib/supabase/types.ts` — ADD the `songs` table
+### 4. `app/api/events/[id]/handler.ts` — NEW file (mirror `service-weeks/[id]/handler.ts`)
 
-The `songs` table is not yet in the hand-rolled `Database` type. Add a
-`SongsRow` type and register it in `Tables`, following the existing entries
-(e.g. `instruments`, `service_weeks`):
+Import `toEventResponse` from `../handler` and
+`updateEventSchema, validateEventTiming` from `@/schemas/events`. Export:
+
+- `async function updateEvent(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>`
+- `async function deleteEvent(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>`
+
+**`updateEvent` (admin/set_leader):**
+1. `requireAuth` + `requireRole(ctx, ["admin", "set_leader"])`.
+2. Parse body with `updateEventSchema.safeParse` → 400 on failure.
+3. Acquire supabase JWT client (401 if none).
+4. Fetch existing event: select `*` from `events` where `id === id` AND
+   `church_group_id === ctx.churchGroupId`, `.maybeSingle()`. Error → 500,
+   not found → 404.
+5. **BR-10 re-check when times change:** if `parsed.startTime !== undefined ||
+   parsed.endTime !== undefined`, fetch `service_date` from `service_weeks`
+   (id = `existing.service_week_id`, church_group_id = ctx.churchGroupId;
+   error → 500), compute
+   `effectiveStart = parsed.startTime ?? existing.start_time`,
+   `effectiveEnd = parsed.endTime ?? existing.end_time`, run
+   `validateEventTiming(...)`; non-null → 422 VALIDATION_FAILED. (If neither
+   time field is present, skip BR-10.)
+6. Build `patch: Database["public"]["Tables"]["events"]["Update"] = {}`,
+   assigning only the keys present in `parsed` (mirror
+   `updateServiceWeek`'s `if (parsed.x !== undefined) patch.x = ...` — note
+   `location`/`notes` are `.nullish()`, so guard with `!== undefined` and pass
+   the value through as-is, allowing an explicit `null` to clear the column).
+   Map camelCase → snake_case: `type→type`, `name→name`, `location→location`,
+   `startTime→start_time`, `endTime→end_time`, `notes→notes`.
+7. `.update(patch).eq("id", id).eq("church_group_id", ctx.churchGroupId).select("*").maybeSingle()`.
+   Error → 500, null → 404.
+8. `return ok({ event: toEventResponse(row) })`.
+
+**`deleteEvent` (admin/set_leader):**
+1. `requireAuth` + `requireRole(ctx, ["admin", "set_leader"])`.
+2. Acquire supabase JWT client (401 if none).
+3. `.delete().eq("id", id).eq("church_group_id", ctx.churchGroupId).select("id").maybeSingle()`
+   — select the deleted row so a missing/cross-group id returns 404 rather
+   than a silent 200. Error → 500; null → `fail("Not found", ErrorCode.NOT_FOUND, 404)`.
+   (`event_attendees` children are removed by DB-level cascade — do not delete
+   them here.)
+4. `return ok({ deleted: true })`.
+
+Both wrapped in the standard `ApiException` try/catch.
+
+### 5. `app/api/events/[id]/route.ts` — REPLACE the stub
+
+Mirror `service-weeks/[id]/route.ts` but with only PUT + DELETE (no GET — not
+in AC and #60 owns event-level reads):
 
 ```ts
-type SongsRow = {
-  id: string;
-  church_group_id: string;
-  title: string;
-  artist: string | null;
-  default_key: string | null;
-  bpm: number | null;
-  tags: string[] | null;
-  spotify_id: string | null;
-  created_by: string | null;
-  created_at: string;
-};
+import { NextRequest } from "next/server";
+import { updateEvent, deleteEvent } from "./handler";
+
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function PUT(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return updateEvent(req, id);
+}
+export async function DELETE(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return deleteEvent(req, id);
+}
 ```
-
-`Tables.songs`:
-```ts
-songs: {
-  Row: SongsRow;
-  Insert: Omit<
-    SongsRow,
-    "id" | "created_at" | "artist" | "default_key" | "bpm" | "tags" | "spotify_id" | "created_by"
-  > & {
-    id?: string;
-    created_at?: string;
-    artist?: string | null;
-    default_key?: string | null;
-    bpm?: number | null;
-    tags?: string[] | null;
-    spotify_id?: string | null;
-    created_by?: string | null;
-  };
-  Update: Partial<SongsRow>;
-  Relationships: [];
-};
-```
-
-### 5. `tests/unit/app/api/songs-route.test.ts` — NEW FILE
-
-Follow `tests/unit/app/api/instruments-route.test.ts` exactly (same mock
-harness: `jest.mock("@clerk/nextjs/server")`, `jest.mock("@/lib/supabase/client")`,
-`makeReq`, `makeLookup`, `setUpAuth`, `makeChain`/`makeSupabaseClient`). Add
-`songs` to the fixtures. The chainable mock must also stub `.or(...)` and
-`.ilike(...)` → return the chain (add `or: jest.fn(() => chain)` to `makeChain`;
-`.order`/`.eq`/`.select`/`.single` are already there). GET reads searchParams,
-so `makeReq` for GET must provide `nextUrl.searchParams` — build the request
-with `new NextRequest("http://localhost/api/songs?q=...")` or stub
-`{ nextUrl: { searchParams: new URLSearchParams("q=...") } }`. Cover the edge
-cases below. (The Testing stage independently supplements this; the Coder must
-still ship a passing suite.)
 
 ## Edge cases the implementation MUST handle
 
-GET `/api/songs`:
-- No `q` → returns all songs in the group (200), ordered by title.
-- `q="amaz"` → case-insensitive partial match on title OR artist.
-- Empty `q` (`?q=`) → treated as no filter (return all), not an error.
-- Empty catalog → `200 { songs: [] }`.
-- `tags` column null on a row → response `tags: []`.
-- Caller role `guest` → 403 FORBIDDEN (before DB call).
-- No JWT → 401 UNAUTHENTICATED (before `getSupabaseClient`).
-- DB error → 500 INTERNAL.
+- **BR-10 order:** `end_time <= start_time` (equal or reversed) → 422
+  VALIDATION_FAILED. Equal times are a violation (must be *after*).
+- **BR-10 window:** `start_time` OR `end_time` more than 72h (absolute) from
+  the service_date anchor → 422. A valid event is one where BOTH endpoints are
+  within the window AND end > start.
+- **Malformed body** (bad/missing type enum, missing name, non-ISO datetime,
+  bad uuid) → 400 VALIDATION_FAILED (Zod), NOT 422. Only a syntactically valid
+  body that violates the time *rule* is 422. This 400-vs-422 split is the crux
+  of the issue.
+- **Unknown / cross-group `serviceWeekId` on create** → 404 NOT_FOUND (never
+  leak existence of another group's week).
+- **Unknown / cross-group event id on PUT/DELETE** → 404 NOT_FOUND.
+- **Unauthenticated** (no Clerk user, or no supabase JWT) → 401 UNAUTHENTICATED.
+- **Wrong role** on POST/PUT/DELETE (member/guest) → 403 FORBIDDEN.
+- **GET scoping:** admin sees every event in the group; a non-admin with zero
+  invitations sees `{ events: [] }` (never another member's events, never
+  another group's events).
+- **`location`/`notes`:** omitted → stored `null` on create; on update an
+  explicit `null` clears the column, omission leaves it unchanged.
 
-POST `/api/songs`:
-- Valid minimal body `{ title }` → 201, `artist/defaultKey/bpm` null, `tags: []`.
-- Valid `default_key: "C#"` and `"Bb"` (ASCII) → 201, stored as sent.
-- Valid Unicode `default_key: "D♭"` → 201.
-- `default_key` omitted / null → 201 (allowed).
-- Invalid `default_key` (`"H"`, `"c#"`, `"Cmaj"`, `"Z"`, `"bb"`) → **422**
-  VALIDATION_FAILED (this is the BR-09 AC — must be 422, not 400).
-- Missing/empty/whitespace `title` → 400 VALIDATION_FAILED.
-- `title` > 200 chars → 400.
-- `artist` > 200 chars → 400; `artist` omitted → 201.
-- `bpm` non-integer, ≤ 0, or > 400 → 400; `bpm` omitted → 201.
-- `tags` not an array / non-string elements → 400; `tags: []` → 201.
-- Missing/malformed JSON body (`null`) → 400 VALIDATION_FAILED.
-- Caller role `member` or `guest` → 403 FORBIDDEN (before DB call).
-- `admin` and `set_leader` → allowed.
-- No JWT → 401 UNAUTHENTICATED (before `getSupabaseClient`).
-- Insert DB error / no data returned → 500 INTERNAL.
+## Decisions (forced, documented, not blocking)
 
-## Patterns to copy (named)
+1. **`name` is required on create.** The `events` DB row (`EventsRow.name:
+   string`, non-null; dependency #18) and the `events` Insert type both require
+   `name`, even though the issue's AC parenthetical omits it. It is therefore a
+   required `createEventSchema` field. Not invented — mandated by the schema.
+2. **72h anchor = `service_date` at 00:00:00 UTC.** `service_date` is a DATE
+   with no time/zone. BR-10 / PRD §8 give no timezone. Anchoring at UTC
+   midnight and using an absolute ±72h window is deterministic and testable.
+   The church group's timezone is intentionally NOT used here (keeps this
+   issue self-contained; revisit if a human wants group-tz-relative windows).
 
-- Handler shape, auth/JWT guards, `try/catch` tail, narrow Insert cast:
-  `app/api/instruments/handler.ts`.
-- Role-gated read of the group catalog:
-  `app/api/church-group/members/handler.ts` (`requireRole(["admin","set_leader","member"])`).
-- Query-param Zod parse via `Object.fromEntries(req.nextUrl.searchParams)`:
-  `app/api/church-group/audit-log/handler.ts` + `schemas/audit-log.ts`.
-- 422 + VALIDATION_FAILED response:
-  `app/api/church-group/members/[id]/handler.ts` (line ~52).
-- Route wiring: `app/api/instruments/route.ts`.
-- Unit-test harness: `tests/unit/app/api/instruments-route.test.ts`.
+## Verification (Coder must run before finishing)
 
-## Verify before finishing
+- `bun run lint`
+- `bun run typecheck`
+- `bun run test`
 
-`bun run lint`, `bun run typecheck`, and `bun run test` (Jest) must all pass.
-Do not use `bun test` (native runner). Do not touch migrations or unrelated files.
+Do not use npm/yarn/pnpm. The tester stage will add the event route tests
+(copy the harness from `tests/unit/app/api/songs-route.test.ts` /
+`service-weeks-*` tests, which inject the `lookup` seam and mock
+`@clerk/nextjs/server` + `getSupabaseClient`).
