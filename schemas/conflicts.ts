@@ -1,6 +1,8 @@
 import { z } from "zod";
 
-// TODO(Sprint 2 #37-38): fill in real field-level validation for the
-// conflicts routes in PRD §22.
-export const conflictsSchema = z.object({});
-export type ConflictsInput = z.infer<typeof conflictsSchema>;
+// POST /api/conflicts/:id/resolve body (#47). Three manual resolution paths;
+// AI replacement suggestions (Phase 4) are explicitly out of scope.
+export const resolveConflictSchema = z.object({
+  resolution: z.enum(["withdraw", "member_reconfirmed", "admin_dismissed"]),
+});
+export type ResolveConflictInput = z.infer<typeof resolveConflictSchema>;
