@@ -5,9 +5,10 @@ import { getAnonSupabaseClient } from "@/lib/supabase/client";
 import { sendSms } from "@/lib/pingram/client";
 import { buildMemberReminderSms, formatWeekLabel } from "@/lib/scheduling/reminder";
 
-// GET /api/cron/invitation-reminders (#45) — Vercel Cron hits this hourly
-// (vercel.json) to fire the 24-hour dual-party invitation reminder. No
-// Clerk session exists for a cron trigger, so auth is a shared
+// GET /api/cron/invitation-reminders (#45) — GitHub Actions hits this hourly
+// (.github/workflows/invitation-reminders-cron.yml) to fire the 24-hour
+// dual-party invitation reminder. No Clerk session exists for a cron
+// trigger, so auth is a shared
 // CRON_SECRET bearer token instead. All DB work — selecting due
 // invitations, stamping last_reminded_at, and inserting admin
 // notifications — happens atomically inside the send_invitation_reminders

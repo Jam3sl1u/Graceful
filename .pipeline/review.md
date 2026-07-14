@@ -1,60 +1,45 @@
-# Review — Issue #49: Invitation Response screen (mobile, no-login)
+# Review — Issue #51: Invitation state machine unit tests
 
 ## VERDICT: SHIP
 
-Independently verified in the pinned worktree
-(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-49`):
-`bun run lint` clean, `bun run typecheck` clean, `bun run test` = 33 suites /
-407 tests passing (0 failures). Read the full diff (`git diff main...HEAD`),
-not just the summaries.
+## What I verified (firsthand, not from the summaries)
 
-## What I checked and found correct
+- `git diff main...HEAD --stat`: only 4 files touched — the new module
+  (`lib/invitations/state-machine.ts`), the new test
+  (`tests/unit/lib/invitations/state-machine.test.ts`), and the two pipeline
+  docs (`.pipeline/spec.md`, `.pipeline/changes.md`). No stray changes.
+- `git diff main...HEAD -- app/api/invitations/handler.ts supabase/` is empty:
+  the scope boundary the spec set (no refactor of the route handler or the
+  `accept_invitation` RPC) is genuinely honored, not just claimed.
+- Read the module source: `canTransition` and `applyTransition` are both backed
+  by one shared `TRANSITIONS` table, so they cannot drift apart. Only `pending`
+  has outgoing edges; the other four statuses map to `{}` (terminal).
+  `applyTransition` throws `InvalidInvitationTransitionError` on every illegal
+  cell and never returns the unchanged `from` — the exact silent-failure mode
+  AC2 forbids is closed. Both error classes set a stable `.name` and carry
+  context (`.from`/`.action`, `.priorDenialCount`).
+- BR-08 boundary: module uses `priorDenialCount < MAX_DENIALS_PER_WEEK` (cap 3),
+  and `handler.ts:101` uses `(deniedForWeek ?? []).length >= 3`. These agree —
+  no off-by-one.
+- Read the test: the exhaustive 5×4 loop builds `legalPairs` from the 4
+  `pending:*` combos and asserts the other 16 throw — not vacuous. Boundary
+  tests are driven by the exported `MAX_DENIALS_PER_WEEK` constant, not a magic
+  literal. A runtime-unknown-action cast case is covered.
+- Ran the tools myself: `bun run typecheck` clean; the new suite passes 21/21.
 
-- **Component (`invite-response.tsx`)** matches spec Sections 3.1-3.4: view
-  state machine (loading/ready/unavailable/accepted-success/declined-success),
-  no-session lookup on mount, reveal-then-confirm decline with a "Keep it"
-  back-out, in-flight button disabling, `maxLength={200}` textarea, and #51
-  behavior — expired/used/unknown/500 never surface a raw `error`/`code`/HTTP
-  status. Reuses `InvitationStatus`/`EventType` from `@/types/domain` as asked.
-- **No-session deny backend (spec Section 5, per the human's Option A
-  resolution)** — the new `deny_invitation` RPC is a faithful, line-for-line
-  mirror of `accept_invitation_rpc.sql`: SECURITY DEFINER, `SET search_path =
-  ''`, token-or-JWT authorization, graceful already-responded short-circuit
-  before the expiry check, BR-08 `denial_count`, notify block, direct
-  `audit_logs` insert, `GRANT ... TO anon, authenticated`. Handler token
-  branch maps errors exactly like accept (NOT_FOUND/FORBIDDEN/EXPIRED/500).
-- **Handler reorder** (body-parse before `requireAuth`) is behavior-preserving
-  for the authenticated path — confirmed by the 13 pre-existing deny tests
-  still green plus an explicit reorder spot-check. Auth for the no-token path
-  is still enforced (401), and the token path is authenticated inside the RPC.
-- **Middleware** — both new public routes are additive; the authenticated deny
-  path still self-enforces via `requireAuth`, same pattern as `.../accept`.
-- **Green Accept button** — `.acceptButton` overrides background via the
-  `className` the `Button` component appends after its variant class; the
-  shared `--color-accent` token is untouched. Buttons are full-width, 56px
-  min-height (>= 44px A-08).
-- **Tests are meaningful, not superficial** — the component test covers happy
-  path, all named Section 7 edge cases (empty events, null fields,
-  already-responded on load vs. re-tap, expired-on-load vs. 410-on-submit,
-  double-tap guard, non-terminal 500 stays on ready), and asserts raw codes
-  are never rendered. The deny-route-token test covers happy path, null-reason
-  coercion, validation (bad token, >200 reason), full error mapping, and that
-  the token branch never falls through to Clerk.
+## Judgment on correctness (green tests != correct)
 
-## Non-blocking notes (for the orchestrator / human, not fixes)
+The module is the canonical, throw-on-invalid state machine the issue asked for,
+implemented in isolation and tested exhaustively. Signatures match the spec
+verbatim. The tester's mutation check (flipping `<` to `<=`) failing 2 tests is
+consistent with what I traced by hand. Domain union is imported from
+`types/domain.ts`, not redeclared.
 
-- The two tester files (`tests/unit/app/invite-response.test.tsx`,
-  `tests/unit/app/api/invitations-deny-route-token.test.ts`) are still
-  UNTRACKED at review time — they are not in commit c9c5bee (which is the
-  Coding stage's commit). This is expected at this pipeline point, but the
-  orchestrator MUST commit them (and the updated `test-results.md`) as part of
-  shipping; otherwise the branch ships source without its tests. Worth an
-  explicit check given this repo's history of silent handoff loss.
-- No live-SQL/RPC test harness and no middleware integration test exist —
-  pre-existing repo-wide gaps, not introduced here. The RPC and middleware
-  changes were verified by static review against the established accept
-  pattern only.
-- Minor: in `handleAccept`/`handleDeclineConfirm`, a 200 response with
-  `alreadyResponded: false` and an unexpected non-terminal status is a silent
-  no-op (stays on `ready`, no error). Not reachable given the RPC contract;
-  noting for completeness, not a fix.
+## Notes (non-blocking, for the human)
+
+- The module is intentionally NOT wired into `handler.ts` or the SQL RPC, per
+  the spec's explicit scope guard. That means the canonical machine and the two
+  inline implementations can still diverge in the future; converging them is a
+  deliberate follow-up, not part of this issue.
+
+No changes required. Ship it.

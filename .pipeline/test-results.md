@@ -1,125 +1,104 @@
-# Test Results — Issue #49: Invitation Response screen (mobile, no-login)
+# Test Results — Issue #51: Invitation state machine unit tests
 
 ## Verdict: PASS
 
-All checks re-run independently in the pinned worktree
-(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-49`) using Bun,
-per AGENTS.md. No source files were changed by this stage — only two new
-test files were added. This file overwrites the stale leftover from a prior
-issue (#44) that was still sitting at this path.
+This overwrites the stale `test-results.md` for issue #46 that was still
+sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
+recent run).
 
-## Commands run
+## Commands re-run independently in this worktree
 
-- `bun run lint` (`eslint .`) — clean, no errors.
-- `bun run typecheck` (`tsc --noEmit`) — clean, no errors.
-- `bun run test` (Jest, full suite) — confirmed the pre-existing baseline of
-  **31 suites / 380 tests** passing before adding anything (matches the
-  Coding stage's claim in `changes.md`), then re-ran with the 2 new test
-  files added: **33 suites / 407 tests passed, 0 failures, 0 regressions**.
+- `bun run typecheck` — clean, no errors.
+- `bun run lint` — clean, no errors/warnings.
+- `bun run test` (Jest, full suite) — **33 test suites, 409 tests, all
+  passing.**
+- Re-ran just the new file in isolation
+  (`tests/unit/lib/invitations/state-machine.test.ts`) — 21/21 passing.
 
-## New test files written by this stage
+## Independent verification performed
 
-- `tests/unit/app/api/invitations-deny-route-token.test.ts` (12 tests) —
-  covers the new no-session `responseToken` branch of `denyInvitation`
-  (`app/api/invitations/handler.ts`), mirroring the existing no-session
-  cases in `invitations-accept-route.test.ts`:
-  - Happy path: 200, `getAnonSupabaseClient` used, `getSupabaseClient`/Clerk
-    `auth()` never touched, RPC called with the right `p_invitation_id`/
-    `p_response_token`/`p_reason` params.
-  - Omitted reason is coerced to `null` before being passed to the RPC.
-  - Already-responded: `alreadyResponded: true` with the current (non-denied)
-    status passed through.
-  - Malformed `responseToken` (wrong length, non-hex) → 400
-    `VALIDATION_FAILED`, RPC never called.
-  - `reason` > 200 chars → 400 `VALIDATION_FAILED` even with an otherwise
-    valid token (failure case).
-  - RPC error-message mapping: `NOT_FOUND`→404, `FORBIDDEN`→403,
-    `EXPIRED`→410, unexpected message→500 `INTERNAL`.
-  - Token branch never falls through to the authenticated path (the
-    `lookup` callback and Clerk `auth()` are never invoked when a token is
-    present).
-  - Spot-check that the body-parse-before-`requireAuth` reorder didn't
-    change session-path behavior: no-token + no Clerk session still 401s
-    before ever calling `getSupabaseClient`/`getAnonSupabaseClient`.
-  - Re-ran the 13 pre-existing tests in `invitations-deny-route.test.ts`
-    (the authenticated in-app path) unmodified — still pass, confirming the
-    reorder is behavior-preserving there.
+1. **Domain type source of truth**: confirmed `types/domain.ts:6` declares
+   `InvitationStatus = "pending" | "accepted" | "denied" | "withdrawn" |
+   "expired"`, and `lib/invitations/state-machine.ts` imports it rather than
+   redeclaring the union, as the spec required.
 
-- `tests/unit/app/invite-response.test.tsx` (15 tests) — covers the
-  `InviteResponse` client component
-  (`app/(public)/invite/[token]/invite-response.tsx`) with `fetch` mocked
-  directly, jsdom opted in via `/** @jest-environment jsdom */` per spec
-  Section 6:
-  - Loading state before the lookup resolves.
-  - Happy path: card renders role note / service week title / event
-    name+location from a pending lookup; Accept posts
-    `{ responseToken }` to `/accept` and lands on the accepted-success view
-    with a `/dashboard` link.
-  - Decline flow: tapping Decline does not submit (verified no second
-    fetch call fires); reveals a `maxLength=200` textarea + Confirm/Keep
-    it; Confirm posts `{ responseToken, reason }` to `/deny` and lands on
-    declined-success; "Keep it" cancels back to the two-button state
-    without ever submitting.
-  - Edge case: empty `events` → "Details coming soon", no crash.
-  - Edge case: null `roleNote`/`serviceWeek.title`/event `location` are all
-    omitted cleanly (spec Section 7).
-  - Edge case: already-responded on load (`status: "accepted"`) → friendly
-    unavailable view; raw status string never rendered.
-  - Edge case: `status: "expired"` on load → unavailable view.
-  - Edge case: re-tap after already responding (`alreadyResponded: true`
-    with a non-accepted status on the accept response) → unavailable view.
-  - Edge case: 410 on accept submission (expired-at-submit-time) →
-    unavailable view; raw `EXPIRED`/`410` never rendered.
-  - Edge case: double-tap guard — both buttons disable while an accept is
-    in flight; a second click on the now-disabled button does not issue a
-    second request (fetch call count stays at 2: initial lookup + one
-    accept).
-  - Failure case: network error (`fetch` rejects) on the initial lookup →
-    friendly unavailable view, not a crash or unhandled rejection.
-  - Failure case: 404 on the initial lookup → unavailable view; raw
-    `NOT_FOUND` code never rendered.
-  - Failure case: non-terminal error (500) on accept submission → inline
-    `role="alert"` message that does not leak `INTERNAL`/`500`, and the
-    screen stays on the `ready` view (card + both buttons still present).
+2. **Shared source of truth for `canTransition`/`applyTransition`**: both
+   functions read from the same `TRANSITIONS` lookup table in
+   `lib/invitations/state-machine.ts` (a
+   `Record<InvitationStatus, Partial<Record<InvitationAction,
+   InvitationStatus>>>`), so they cannot be made to disagree independently.
+   Only `pending` has non-empty outgoing entries; the other four statuses map
+   to `{}`, correctly making them terminal.
 
-## Manual / non-automated verification
+3. **Exhaustive 5×4 matrix test is not vacuous**: read
+   `tests/unit/lib/invitations/state-machine.test.ts` lines 98-115. It builds
+   `legalPairs` from all 4 `pending:*` combinations, then loops all 5
+   statuses x 4 actions (20 pairs total), asserting `canTransition` and
+   `applyTransition` agree with set membership. Traced by hand: 4 legal +
+   16 illegal = 20, matching "5 statuses x 4 actions" exactly — no pair is
+   skipped or duplicated.
 
-- `middleware.ts` (`isPublicRoute`) was read directly and confirmed to list
-  both `"/api/invitations/respond/(.*)"` and `"/api/invitations/(.*)/deny"`
-  alongside the pre-existing `"/api/invitations/(.*)/accept"`, matching
-  spec Sections 4 and 5. This repo has no existing middleware unit-test
-  precedent (`find tests -iname '*middleware*'` returns nothing), so this
-  remains a static/config-level check, not an automated test.
-- `supabase/migrations/20260713000001_deny_invitation_rpc.sql` was read in
-  full and compared against `20260712000001_accept_invitation_rpc.sql`'s
-  established pattern (SECURITY DEFINER, `SET search_path = ''`,
-  token-or-JWT authorization, graceful already-responded short-circuit
-  before the expiry check, BR-08 `denial_count` computed the same way as
-  the handler's authenticated path, notify block, direct `audit_logs`
-  insert since `write_audit_log` needs a JWT, `GRANT EXECUTE ... TO anon,
-  authenticated`). Structurally sound and consistent with the accept RPC.
-  No live-SQL test harness exists in this repo for any RPC (same situation
-  the Coding stage flagged for `accept_invitation`/`get_invitation_by_token`
-  before it), so this remains a manual code-review-level check.
-- `jest.config.js` / `tests/mocks/css-module.js` changes (new `.tsx`
-  `testMatch` entry, CSS-module mock, automatic-JSX-runtime transform) were
-  exercised directly by `invite-response.test.tsx` (which would not run at
-  all without them) and confirmed not to affect the pre-existing 380
-  node-environment tests — full suite green with both old and new tests
-  together.
+4. **Scope boundary honored**: `git show --stat HEAD` (commit `30a1db3`,
+   "Add invitation state-machine module and exhaustive unit tests (#51)")
+   touches only `.pipeline/changes.md`, `.pipeline/spec.md`,
+   `lib/invitations/state-machine.ts`, and
+   `tests/unit/lib/invitations/state-machine.test.ts`. Confirmed via `grep`
+   that `app/api/invitations/handler.ts` is untouched and still carries its
+   own inline guards (`status !== "pending"` at lines 239 and 334,
+   `(deniedForWeek ?? []).length >= 3` at line 101) — the new module is
+   additive only, not wired in anywhere. The three route tests named in
+   `changes.md` (`invitations-deny-route.test.ts`,
+   `invitations-withdraw-route.test.ts`, `invitations-accept-route.test.ts`)
+   all still pass unchanged in the full suite run above. The `accept_invitation`
+   SQL RPC migration is untouched (no new/modified migration file in the diff).
 
-## Gaps / things the Reviewer may want to weigh
+5. **BR-08 boundary matches `handler.ts`**: `handler.ts:101` uses
+   `(deniedForWeek ?? []).length >= 3`; `state-machine.ts`'s
+   `canInvite`/`assertCanInvite` use the equivalent `< MAX_DENIALS_PER_WEEK`
+   / cap-at-3 semantics (cap reached exactly at 3, not 4 — confirmed by
+   reading the source, not just trusting the test names).
 
-- No test exercises the real Supabase RPC SQL end-to-end — an existing,
-  repo-wide gap (no live-DB test harness), not specific to this change.
-- No middleware-level integration test exists (asserting an actual request
-  is let through/blocked by `clerkMiddleware`/`isPublicRoute`) — only
-  static confirmation that the route strings were added. This matches the
-  repo's pre-existing lack of middleware test coverage, not a new gap
-  introduced by this issue.
+6. **Mutation check (regression-catching sanity, not part of the shipped
+   diff)**: temporarily changed `canInvite`'s comparison from
+   `< MAX_DENIALS_PER_WEEK` to `<= MAX_DENIALS_PER_WEEK` (an intentional
+   off-by-one bug) and re-ran the state-machine test file in isolation.
+   Result: 2 of 21 tests failed exactly as expected — "blocks invites once
+   the cap is reached" and the `assertCanInvite` throw-at-cap test — proving
+   the boundary tests are not vacuous and would catch a real regression.
+   Reverted immediately afterward; `git status`/`git diff --stat` confirmed
+   the working tree was byte-identical to the committed state (clean, zero
+   diff) before this report was written.
 
-## Failure cases
+## Failure cases covered
 
-None. No test failures encountered in this run — the pre-existing suite
-plus the 27 new tests (12 + 15) all pass. Lint and typecheck are both
-clean.
+- `expect(() => applyTransition("pending", bogusAction)).toThrow(...)` for a
+  runtime-unknown action forced past the type system via a cast, proving the
+  defensive `undefined` fallthrough in `TRANSITIONS` works and doesn't
+  silently no-op or crash uncontrolled.
+- All 16 illegal `(status, action)` pairs in the exhaustive matrix are
+  themselves failure-case assertions (`toThrow(InvalidInvitationTransitionError)`),
+  well beyond the "at least one failure case" requirement.
+- `assertCanInvite` throwing `DenialCapReachedError` at/above the cap, with
+  `.priorDenialCount` asserted on the caught error.
+
+## Edge cases named in the spec, confirmed covered
+
+- All 4 `pending -> *` valid transitions (accept/deny/withdraw/expire).
+- Terminal-source invalid transitions (`accepted->accept`, `denied->accept`,
+  `withdrawn->accept`, `expired->accept`, plus `accepted->deny`,
+  `accepted->withdraw`).
+- Self-loop re-application from a terminal status (`denied->deny`,
+  `withdrawn->withdraw`).
+- Error carries `.from`/`.action`/`.name` context (not a bare `Error`).
+- BR-08 cap boundary at exactly 3 (`canInvite`/`assertCanInvite` for
+  0/1/2/3/4), driven by the exported `MAX_DENIALS_PER_WEEK` constant rather
+  than a hard-coded literal in the boundary-crossing assertions.
+
+## Conclusion
+
+All of the coder's claims in `.pipeline/changes.md` check out under
+independent verification. No discrepancies found. Full suite green (33/33
+suites, 409/409 tests), typecheck and lint clean, the issue's scope boundary
+(no refactor of `handler.ts`/SQL RPC) was honored, and a deliberate mutation
+test confirms the new suite actually catches regressions rather than being
+vacuous. Ready for review.

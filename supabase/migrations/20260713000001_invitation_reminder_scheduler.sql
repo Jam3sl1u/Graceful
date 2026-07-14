@@ -1,7 +1,7 @@
 -- Migration: 24-hour dual-party invitation reminder scheduler — Issue #45
 --
 -- A scheduled job (app/api/cron/invitation-reminders/route.ts, hourly via
--- Vercel Cron) must, on every run, find every `pending` invitation whose
+-- GitHub Actions) must, on every run, find every `pending` invitation whose
 -- last reminder (or creation, if never reminded) is 24h+ in the past, fire
 -- an SMS to the member (stub), and insert an in-app notification to every
 -- admin/set_leader in the group listing all still-pending invitations for
