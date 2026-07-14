@@ -75,18 +75,16 @@ jobs:
       - run: bun install --frozen-lockfile
 
       - name: Apply RLS migration
+        # Applies every up-migration (excludes *.down.sql) in lexicographic
+        # filename order, discovered dynamically rather than hardcoded — a
+        # fixed -f list silently stops covering new migrations the moment
+        # someone adds one and forgets to append it here, which reads as a
+        # green check without actually applying/testing the new SQL.
         run: |
-          psql "$SUPABASE_TEST_DB_URL" \
-            --set=ON_ERROR_STOP=1 \
-            -f supabase/migrations/20260702000001_cluster_1_organization.sql \
-            -f supabase/migrations/20260702000002_cluster_2_instruments.sql \
-            -f supabase/migrations/20260702000003_cluster_3_scheduling_core.sql \
-            -f supabase/migrations/20260702000004_cluster_4_partial_songs.sql \
-            -f supabase/migrations/20260702000005_cluster_5_partial.sql \
-            -f supabase/migrations/20260702000006_cluster6_auth_audit.sql \
-            -f supabase/migrations/20260703000001_users_self_read_rls.sql \
-            -f supabase/migrations/20260704000001_rls_policies.sql \
-            -f supabase/migrations/20260704000002_church_groups_rls.sql
+          for f in $(find supabase/migrations -maxdepth 1 -name '*.sql' ! -name '*.down.sql' | sort); do
+            echo "Applying $f"
+            psql "$SUPABASE_TEST_DB_URL" --set=ON_ERROR_STOP=1 -f "$f"
+          done
 
       - name: Run RLS integration tests
         run: bun run test:rls

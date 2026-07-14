@@ -43,7 +43,7 @@ implement #67/#68 (SMS/email dispatch), which is not currently in scope.
 
 ### OQ3 — AC #3 (24h reminder, both member AND admin): partially untestable
 - Admin side is real: `send_invitation_reminders` RPC
-  (`supabase/migrations/20260713000001_invitation_reminder_scheduler.sql`)
+  (`supabase/migrations/20260713000003_invitation_reminder_scheduler.sql`)
   inserts admin in-app notifications and stamps `last_reminded_at`.
 - Member side is SMS via the same throwing `sendSms` stub; the cron route
   (`app/api/cron/invitation-reminders/route.ts`) deliberately swallows the

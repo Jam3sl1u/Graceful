@@ -5,8 +5,8 @@
 -- loses availability for, but sends no notification — a Set Leader has no
 -- way to learn about the conflict short of noticing it in the UI. Extend
 -- the RPC (CREATE OR REPLACE, same file-per-migration convention as
--- 20260711000001_service_week_notification_types.sql and
--- 20260712000002_invitation_withdrawn_notification_type.sql; the original
+-- 20260711000002_service_week_notification_types.sql and
+-- 20260712000003_invitation_withdrawn_notification_type.sql; the original
 -- 20260711000001_availability_conflict_rpc.sql is left untouched) to also
 -- insert an in-app notification per conflict, for every admin/set_leader in
 -- the church group (excluding the triggering member).
