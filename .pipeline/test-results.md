@@ -1,136 +1,125 @@
-# Test Results — Issue #58: Song-level document attachment (signed URLs)
+# Test Results — Issue #55: Add/remove/reorder setlist songs (BR-07 no duplicates)
 
-This overwrites the stale `test-results.md` for issue #53 that was still
-sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
-recent run).
+## Verdict: PASS
 
-## Summary
+All checks below were re-run independently by the Testing stage (not
+trusted from `.pipeline/changes.md`). Everything is green.
 
-**PASS.** All verification commands are clean and the coder's claims in
-`.pipeline/changes.md` hold up under independent re-verification. One gap
-noted in changes.md ("What the Tester should focus on") — no standalone
-`lib/r2/client.ts` unit test existed — has been filled in with a new test
-file; it passes.
+## Commands run
 
-## Commands re-run independently
+- `bun run lint` — clean, no errors/warnings.
+- `bun run typecheck` — clean, no errors (includes the new test file).
+- `bun run test` — **59 suites / 764 tests pass** (58 suites / 729 tests
+  pre-existing baseline + 1 new suite / 35 new tests added by this stage).
 
-- `bun run lint` — clean, 0 errors / 0 warnings.
-- `bun run typecheck` (`tsc --noEmit`) — clean.
-- `bun run test` — **53 suites / 628 tests pass** (52 suites / 615 tests from
-  the coder's existing work, plus 1 new suite / 13 new tests added by this
-  stage).
+## New test file
 
-## Independent code read
+`tests/unit/app/api/setlists-songs-route.test.ts` — 35 tests covering
+`reorderSetlist` (PUT), `addSetlistSong` (POST), `removeSetlistSong` (DELETE)
+from `app/api/setlists/[id]/handler.ts`.
 
-Read `schemas/song-documents.ts`, `app/api/songs/[id]/documents/handler.ts`,
-`lib/r2/client.ts`, the three `route.ts` wiring files
-(`app/api/songs/[id]/documents/route.ts`, `.../upload-url/route.ts`,
-`.../[docId]/route.ts`), and the `song_documents` table registration in
-`lib/supabase/types.ts` against `.pipeline/spec.md` line by line. Confirmed:
+Rather than reusing the coder's own `songs-route.test.ts`-style mock (whose
+`.eq()` is a no-op passthrough that ignores its arguments), this suite uses a
+small **stateful in-memory fake** for the `setlists` / `songs` /
+`setlist_songs` tables: `.select().eq().eq()`, `.order()`, `.maybeSingle()`,
+`.update()`, `.delete().select()`, and `.insert()` all read/mutate real
+in-memory row arrays. This lets assertions check actual resulting state
+(exact recompacted positions, rejected inserts leaving row count unchanged,
+etc.) instead of just the shape of a canned fixture.
 
-- Role matrix matches spec exactly: `createUploadUrl`/`registerDocument`/
-  `deleteDocument` → `["admin", "set_leader"]`; `listDocuments` →
-  `["admin", "set_leader", "member"]` (guest excluded everywhere).
-- `songExistsInGroup` runs before any R2 call and before any DB insert/delete
-  in all four functions; existing tests assert `getUploadUrl`/`getDownloadUrl`
-  are never invoked on the 404 path (`expect(mockGetUploadUrl).not.toHaveBeenCalled()`),
-  and forbidden roles never reach `getSupabaseClient`
-  (`expect(mockGetSupabaseClient).not.toHaveBeenCalled()`).
-- `file_key` prefix check in `registerDocument` rejects all three malformed
-  cases the spec calls out: an unrelated key, another group's key, and
-  another song's key within the same group — confirmed via
-  `tests/unit/app/api/song-documents-route.test.ts`'s
-  `it.each(["not-prefixed/at/all.pdf", "song-documents/other-group/...", "song-documents/${group}/other-song/..."])`.
-- `file_size_bytes` edge cases (`0`, `-1`, `1.5`, `"2048"` string) all 400 —
-  matches `uploadUrlSchema`'s `z.number().int().positive()`.
-- Delete's 3-way scope (`id` + `song_id` + `church_group_id`) returns 404 on
-  an empty result set rather than silently no-op-succeeding — confirmed in
-  code and test (`delete: { data: [], error: null }` → 404 NOT_FOUND).
-- Response DTOs never leak the raw `file_key`: `listDocuments` and
-  `registerDocument` select `file_key` only to sign it via `getDownloadUrl`,
-  and the mapped `SongDocumentResponse` omits it; tests assert
-  `expect(document).not.toHaveProperty("fileKey")` /
-  `not.toHaveProperty("file_key")`.
-- 401/403 ordering matches the spec and the songs-handler pattern: role check
-  (`requireRole`) happens before the JWT fetch, so a forbidden role never
-  reaches Supabase, and a missing JWT short-circuits before any Supabase call.
-- `lib/r2/client.ts` matches the spec's exact shape: lazy singleton `S3Client`
-  (`region: "auto"`, `forcePathStyle: true`), 30-minute
-  (`SIGNED_URL_EXPIRY_SECONDS = 30 * 60`) expiry on both `getUploadUrl` and
-  `getDownloadUrl`, optional `contentType` param, throws a plain `Error` if
-  any of `R2_ENDPOINT`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`/`R2_BUCKET_NAME`
-  is missing. The stale `Sprint 3 #58` TODO comment is gone, as claimed.
-- `lib/supabase/types.ts`'s new `SongDocumentsRow` / `song_documents` Tables
-  entry matches the spec's exact shape (`Insert` omits `id`/`created_at`/
-  `uploaded_by` as optional, matching the `songs` table's style).
-- Route wiring files correctly unwrap `params: Promise<{...}>` and delegate
-  straight to the handler functions with no extra logic, matching
-  `app/api/service-weeks/[id]/route.ts`'s pattern.
-- No migrations were added/modified and no new dependencies were introduced,
-  per the spec's explicit "do NOT" constraints — `git status` shows only the
-  files `changes.md` lists as created/modified, plus the one new test file
-  added by this stage.
+### Coverage by endpoint
 
-## New tests written by this stage
+**PUT /api/setlists/:id (`reorderSetlist`)** — 13 tests:
+- Happy path: reorder + position derived 1-indexed from array order;
+  verifies `keyOverride` is cleared both by omitting the field and by
+  explicit `null`, and set by a new value — confirms the documented
+  `entry.keyOverride ?? null` behavior in the spec's algorithm.
+- Allows `admin` role.
+- 400 on malformed JSON, on a shape-invalid `songId` (non-UUID), on a body
+  songId set missing an existing song, on a body songId set with an extra
+  song not in the setlist, and on duplicate `songId`s in the body.
+- 422 on a shape-valid but BR-09-invalid `keyOverride`.
+- 404 for a non-existent / other-tenant setlist.
+- 409 CONFLICT for a published setlist.
+- 403 for `member`/`guest` (asserts `getSupabaseClient` never called).
+- 401 when `getToken` yields no JWT (asserts `getSupabaseClient` never
+  called).
+- 500 INTERNAL when the update step errors.
 
-**`tests/unit/lib/r2/client.test.ts`** (13 tests, new) — fills the gap the
-coder flagged in changes.md ("What the Tester should focus on"): a
-standalone unit test for `lib/r2/client.ts` that mocks `@aws-sdk/client-s3`
-and `@aws-sdk/s3-request-presigner` directly (no handler indirection), using
-`jest.isolateModulesAsync` per test to get a fresh lazy-singleton `S3Client`
-each time. Covers:
+**POST /api/setlists/:id/songs (`addSetlistSong`)** — 12 tests:
+- Happy path: 201, song lands at `position = count + 1`.
+- 404 "Song not found" when `songId` isn't in the caller's group catalog
+  (cross-tenant song rejected).
+- 409 BR-07 when the song is already in the setlist; asserts nothing was
+  inserted (`state.setlistSongs` length unchanged).
+- 422 on invalid `keyOverride` (BR-09).
+- 400 on a missing/malformed body.
+- 404 for a non-existent / other-tenant setlist.
+- 409 CONFLICT for a published setlist.
+- 403 for `member`/`guest`.
+- 401 when `getToken` yields no JWT.
+- 500 INTERNAL on a generic insert error.
+- 409 CONFLICT (not 500) when the insert error carries Postgres code
+  `23505` — the documented race-backstop path.
 
-- `getUploadUrl` signs a `PutObjectCommand` with the correct
-  `Bucket`/`Key`/`ContentType` and a 30-minute (`1800`s) `expiresIn`.
-- `getUploadUrl` works with `contentType` omitted (optional param).
-- `getDownloadUrl` signs a `GetObjectCommand` with the correct
-  `Bucket`/`Key` and the same 30-minute expiry.
-- Each of the four required env vars (`R2_ENDPOINT`, `R2_ACCESS_KEY_ID`,
-  `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`), when **missing**, throws
-  `/R2 is not configured/` and never calls `getSignedUrl`.
-- Each of the four required env vars, when **present but an empty string**,
-  also throws — confirms `!endpoint` etc. treats `""` as falsy/missing, not
-  just `undefined`. This was explicitly called out as unverified in
-  changes.md and is now covered.
-- The `S3Client` singleton is constructed exactly once across two calls
-  (`getUploadUrl` then `getDownloadUrl`) with the exact expected config
-  (`region: "auto"`, `endpoint`, `forcePathStyle: true`, `credentials`).
+**DELETE /api/setlists/:id/songs/:songId (`removeSetlistSong`)** — 9 tests:
+- Happy path: removing a middle song recompacts remaining rows to exactly
+  `1..N` in the correct order (asserted against the full response, not just
+  length).
+- Removing the last remaining song returns `{ songs: [] }`.
+- 404 when the `songId` isn't in the setlist.
+- 404 for a non-existent / other-tenant setlist.
+- 409 CONFLICT for a published setlist.
+- 403 for `member`/`guest`.
+- 401 when `getToken` yields no JWT.
+- 500 INTERNAL when the delete step errors.
 
-All 13 pass; `bun run lint` / `bun run typecheck` remain clean with the new
-file included.
+### Failure cases (explicit, per pipeline contract)
 
-## Manual verification of spec edge cases
+Beyond the happy paths, this suite includes numerous failure-path
+assertions: 400 (malformed/shape-invalid bodies, songId-set mismatches,
+duplicate songIds), 401, 403, 404 (missing setlist, missing song,
+cross-tenant), 409 (BR-07 duplicate, published-setlist guard, race
+backstop), and 422 (BR-09 key validation), plus 500 mapping for update,
+insert, and delete errors.
 
-Cross-checked every edge case enumerated in `.pipeline/spec.md` ("Edge cases
-the implementation must handle") against the coder's
-`tests/unit/app/api/song-documents-route.test.ts` and confirmed each has a
-corresponding, passing assertion: unauthenticated 401 (before Supabase/R2
-touch) for all four endpoints; role gating per-endpoint (list allows
-`member`, others don't; `guest` always 403); song-not-in-group 404 (before
-R2 signing and before insert/delete) for all four; malformed/missing JSON
-body → 400; `file_size_bytes` invalid (non-number/0/negative/float) → 400;
-`file_key` prefix mismatch (3 variants) → 400; empty document list → 200
-`{ documents: [] }`; delete-miss (wrong doc/song/group) → 404; Supabase
-query/insert/delete errors → 500; R2 helper throwing → 500 INTERNAL.
+## Independent verification against the spec
 
-## Failure cases exercised
+Cross-checked (by direct file inspection, not by trusting `changes.md`)
+that the implementation matches `.pipeline/spec.md`:
 
-Per the pipeline contract's requirement to cover at least one failure case,
-the following were independently confirmed (both pre-existing in the
-coder's suite and newly added by this stage):
+- `schemas/setlists.ts` — `reorderSetlistSchema` /
+  `addSetlistSongSchema` match the spec's shape exactly.
+- `lib/supabase/types.ts` — `setlist_songs` Row type and Tables entry
+  (Insert/Update/Relationships) added exactly as specified; no migration
+  files touched.
+- `app/api/setlists/[id]/handler.ts` — `reorderSetlist`, `addSetlistSong`,
+  `removeSetlistSong` implement the auth → role → JWT → tenant-scoped
+  editable-setlist guard → business-rule checks → mutation → reload-and-
+  return flow the spec describes, including the BR-07 pre-check + 23505
+  race backstop and the position-recompaction algorithm.
+- `app/api/setlists/[id]/route.ts`,
+  `app/api/setlists/[id]/songs/route.ts`,
+  `app/api/setlists/[id]/songs/[songId]/route.ts` — thin wrappers matching
+  the spec's exact code.
 
-- R2 SDK throwing (e.g. `getUploadUrl` rejecting) is caught by the handler's
-  generic `catch (err)` and surfaces as 500 INTERNAL, not an unhandled
-  rejection (`tests/unit/app/api/song-documents-route.test.ts`, "returns 500
-  INTERNAL when the R2 helper throws").
-- `lib/r2/client.ts` itself throwing synchronously on missing/empty env vars,
-  verified independently of the handler's mocking (new
-  `tests/unit/lib/r2/client.test.ts`).
-- Supabase insert/list/delete query errors all map to 500 INTERNAL in their
-  respective handler functions (pre-existing tests, re-run and confirmed).
+## Notes / caveats
 
-## Verdict
+- No mutation testing could be performed to positively confirm the new
+  tests would fail against a broken implementation: a deliberate attempt to
+  temporarily disable the BR-07 duplicate-check branch in
+  `app/api/setlists/[id]/handler.ts` to verify the test suite catches it
+  was blocked by the sandbox's security classifier (flagged as disabling a
+  validation guard in production code), so it was reverted immediately.
+  `git status --short` / `git diff --stat` confirm
+  `app/api/setlists/[id]/handler.ts` is byte-identical to the tracked
+  version — only the new test file is untracked; no implementation files
+  were modified by this stage. Confidence instead rests on the tests
+  asserting exact resulting state via the stateful fake (e.g., unchanged
+  row count on a rejected duplicate add, exact recompacted position/order
+  arrays) rather than loose shape checks.
 
-No failures found. Nothing was patched around — the implementation matched
-the spec on every point checked, and the one coverage gap the coder itself
-flagged is now closed. Ready for Review.
+## Files touched by this stage
+
+- `tests/unit/app/api/setlists-songs-route.test.ts` (new)
+- `.pipeline/test-results.md` (this file)
