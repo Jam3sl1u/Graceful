@@ -1,10 +1,14 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { getSetlist, createSetlist } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/service-weeks/[id]/setlist");
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function GET(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return getSetlist(req, id);
 }
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/service-weeks/[id]/setlist");
+export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return createSetlist(req, id);
 }
