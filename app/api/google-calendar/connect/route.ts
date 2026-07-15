@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { connect } from "./handler";
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/google-calendar/connect");
+export async function POST(req: NextRequest): Promise<Response> {
+  return connect(req);
 }
