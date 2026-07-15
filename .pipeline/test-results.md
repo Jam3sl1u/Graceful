@@ -1,136 +1,161 @@
-# Test Results — Issue #58: Song-level document attachment (signed URLs)
+# Test Results — Issue #60: Event attendee assignment
 
-This overwrites the stale `test-results.md` for issue #53 that was still
+This overwrites the stale `test-results.md` for issue #58 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
 ## Summary
+All checks pass. Added an independent unit-test suite for the new
+`assignAttendee`/`removeAttendee` handlers and re-ran the full verification
+suite (lint, typecheck, test) against the coder's claims in `changes.md`.
+Nothing in the implementation was patched — only tests were added.
 
-**PASS.** All verification commands are clean and the coder's claims in
-`.pipeline/changes.md` hold up under independent re-verification. One gap
-noted in changes.md ("What the Tester should focus on") — no standalone
-`lib/r2/client.ts` unit test existed — has been filled in with a new test
-file; it passes.
+## What I did
+1. Read `.pipeline/changes.md` and `.pipeline/spec.md` for issue #60.
+2. Read the implementation: `app/api/events/[id]/attendees/handler.ts`,
+   `app/api/events/[id]/attendees/route.ts`,
+   `app/api/events/[id]/attendees/[userId]/route.ts`, and the
+   `assignAttendeeSchema` addition in `schemas/events.ts`.
+3. Read the reference test pattern
+   (`tests/unit/app/api/events-id-route.test.ts`) and the underlying
+   `lib/api/auth.ts` / `lib/api/response.ts` / `lib/api/errors.ts` contracts
+   the mocks need to satisfy.
+4. Wrote a new independent test file:
+   `tests/unit/app/api/events-id-attendees-route.test.ts` (28 tests), using
+   the same `jest.mock`/`makeLookup`/table-fixture harness pattern as the
+   sibling suite, extended with an `insert` fixture (the sibling only needed
+   `select`/`update`/`delete`).
+5. Ran `bun run test` (new suite standalone, then full suite), `bun run
+   lint`, `bun run typecheck`.
 
-## Commands re-run independently
+## New test coverage (`tests/unit/app/api/events-id-attendees-route.test.ts`)
 
-- `bun run lint` — clean, 0 errors / 0 warnings.
-- `bun run typecheck` (`tsc --noEmit`) — clean.
-- `bun run test` — **53 suites / 628 tests pass** (52 suites / 615 tests from
-  the coder's existing work, plus 1 new suite / 13 new tests added by this
-  stage).
+`toAttendeeResponse`:
+- Maps a raw `event_attendees` row to the camelCase `AttendeeResponse` shape.
 
-## Independent code read
+`POST /api/events/[id]/attendees` (`assignAttendee`) — happy path:
+- 201 with the created attendee; insert payload is exactly
+  `{ event_id, user_id }` (no `id`/`created_at` sent).
+- `set_leader` role is also allowed (not just `admin`).
 
-Read `schemas/song-documents.ts`, `app/api/songs/[id]/documents/handler.ts`,
-`lib/r2/client.ts`, the three `route.ts` wiring files
-(`app/api/songs/[id]/documents/route.ts`, `.../upload-url/route.ts`,
-`.../[docId]/route.ts`), and the `song_documents` table registration in
-`lib/supabase/types.ts` against `.pipeline/spec.md` line by line. Confirmed:
+Auth/role (failure cases):
+- 401 UNAUTHENTICATED when Clerk `userId` is null — `lookup` never
+  consulted.
+- 401 UNAUTHENTICATED when `getToken` yields no JWT — `getSupabaseClient`
+  never called.
+- 403 FORBIDDEN for `member` and `guest` roles — `getSupabaseClient` never
+  called.
 
-- Role matrix matches spec exactly: `createUploadUrl`/`registerDocument`/
-  `deleteDocument` → `["admin", "set_leader"]`; `listDocuments` →
-  `["admin", "set_leader", "member"]` (guest excluded everywhere).
-- `songExistsInGroup` runs before any R2 call and before any DB insert/delete
-  in all four functions; existing tests assert `getUploadUrl`/`getDownloadUrl`
-  are never invoked on the 404 path (`expect(mockGetUploadUrl).not.toHaveBeenCalled()`),
-  and forbidden roles never reach `getSupabaseClient`
-  (`expect(mockGetSupabaseClient).not.toHaveBeenCalled()`).
-- `file_key` prefix check in `registerDocument` rejects all three malformed
-  cases the spec calls out: an unrelated key, another group's key, and
-  another song's key within the same group — confirmed via
-  `tests/unit/app/api/song-documents-route.test.ts`'s
-  `it.each(["not-prefixed/at/all.pdf", "song-documents/other-group/...", "song-documents/${group}/other-song/..."])`.
-- `file_size_bytes` edge cases (`0`, `-1`, `1.5`, `"2048"` string) all 400 —
-  matches `uploadUrlSchema`'s `z.number().int().positive()`.
-- Delete's 3-way scope (`id` + `song_id` + `church_group_id`) returns 404 on
-  an empty result set rather than silently no-op-succeeding — confirmed in
-  code and test (`delete: { data: [], error: null }` → 404 NOT_FOUND).
-- Response DTOs never leak the raw `file_key`: `listDocuments` and
-  `registerDocument` select `file_key` only to sign it via `getDownloadUrl`,
-  and the mapped `SongDocumentResponse` omits it; tests assert
-  `expect(document).not.toHaveProperty("fileKey")` /
-  `not.toHaveProperty("file_key")`.
-- 401/403 ordering matches the spec and the songs-handler pattern: role check
-  (`requireRole`) happens before the JWT fetch, so a forbidden role never
-  reaches Supabase, and a missing JWT short-circuits before any Supabase call.
-- `lib/r2/client.ts` matches the spec's exact shape: lazy singleton `S3Client`
-  (`region: "auto"`, `forcePathStyle: true`), 30-minute
-  (`SIGNED_URL_EXPIRY_SECONDS = 30 * 60`) expiry on both `getUploadUrl` and
-  `getDownloadUrl`, optional `contentType` param, throws a plain `Error` if
-  any of `R2_ENDPOINT`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`/`R2_BUCKET_NAME`
-  is missing. The stale `Sprint 3 #58` TODO comment is gone, as claimed.
-- `lib/supabase/types.ts`'s new `SongDocumentsRow` / `song_documents` Tables
-  entry matches the spec's exact shape (`Insert` omits `id`/`created_at`/
-  `uploaded_by` as optional, matching the `songs` table's style).
-- Route wiring files correctly unwrap `params: Promise<{...}>` and delegate
-  straight to the handler functions with no extra logic, matching
-  `app/api/service-weeks/[id]/route.ts`'s pattern.
-- No migrations were added/modified and no new dependencies were introduced,
-  per the spec's explicit "do NOT" constraints — `git status` shows only the
-  files `changes.md` lists as created/modified, plus the one new test file
-  added by this stage.
+Validation (spec-named edge cases):
+- 400 VALIDATION_FAILED for missing `userId`.
+- 400 VALIDATION_FAILED for a non-uuid `userId`.
+- 400 VALIDATION_FAILED for a malformed/non-JSON body.
 
-## New tests written by this stage
+Event scoping (spec-named edge case, ordering assertion):
+- 404 NOT_FOUND when the event is missing/cross-tenant, **and** asserts the
+  `invitations` table was never queried (confirms the 404 check happens
+  before the confirmed-member business rule, per spec Decisions).
+- 500 INTERNAL when the event lookup errors.
 
-**`tests/unit/lib/r2/client.test.ts`** (13 tests, new) — fills the gap the
-coder flagged in changes.md ("What the Tester should focus on"): a
-standalone unit test for `lib/r2/client.ts` that mocks `@aws-sdk/client-s3`
-and `@aws-sdk/s3-request-presigner` directly (no handler indirection), using
-`jest.isolateModulesAsync` per test to get a fresh lazy-singleton `S3Client`
-each time. Covers:
+Confirmed-member rule (spec-named edge case):
+- 422 VALIDATION_FAILED when there's no accepted invitation for the
+  target user on the event's `service_week_id`.
+- 500 INTERNAL when the invitation lookup errors.
 
-- `getUploadUrl` signs a `PutObjectCommand` with the correct
-  `Bucket`/`Key`/`ContentType` and a 30-minute (`1800`s) `expiresIn`.
-- `getUploadUrl` works with `contentType` omitted (optional param).
-- `getDownloadUrl` signs a `GetObjectCommand` with the correct
-  `Bucket`/`Key` and the same 30-minute expiry.
-- Each of the four required env vars (`R2_ENDPOINT`, `R2_ACCESS_KEY_ID`,
-  `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`), when **missing**, throws
-  `/R2 is not configured/` and never calls `getSignedUrl`.
-- Each of the four required env vars, when **present but an empty string**,
-  also throws — confirms `!endpoint` etc. treats `""` as falsy/missing, not
-  just `undefined`. This was explicitly called out as unverified in
-  changes.md and is now covered.
-- The `S3Client` singleton is constructed exactly once across two calls
-  (`getUploadUrl` then `getDownloadUrl`) with the exact expected config
-  (`region: "auto"`, `endpoint`, `forcePathStyle: true`, `credentials`).
+Duplicate assign (spec-named edge case, ordering assertion):
+- 409 CONFLICT when already assigned, **and** asserts `insert` was never
+  called on `event_attendees` (confirms the pre-check runs before the
+  insert attempt).
+- 500 INTERNAL when the duplicate-check lookup errors.
 
-All 13 pass; `bun run lint` / `bun run typecheck` remain clean with the new
-file included.
+Insert failure modes:
+- 500 INTERNAL when the insert itself errors.
+- 500 INTERNAL when the insert returns no row despite no error (defensive
+  branch in the handler).
 
-## Manual verification of spec edge cases
+`DELETE /api/events/[id]/attendees/[userId]` (`removeAttendee`):
+- 200 `{ deleted: true }` happy path; `set_leader` also allowed.
+- 401 UNAUTHENTICATED (no Clerk user; no JWT) — mirrors the same two auth
+  failure cases as POST.
+- 403 FORBIDDEN for `member`/`guest`.
+- 404 NOT_FOUND when the event is missing/cross-tenant, **and** asserts
+  `event_attendees` was never queried (delete never attempted against a
+  foreign/missing event).
+- 500 INTERNAL when the event lookup errors.
+- 404 NOT_FOUND when the delete matches no row (member wasn't assigned).
+- 500 INTERNAL when the delete errors.
 
-Cross-checked every edge case enumerated in `.pipeline/spec.md` ("Edge cases
-the implementation must handle") against the coder's
-`tests/unit/app/api/song-documents-route.test.ts` and confirmed each has a
-corresponding, passing assertion: unauthenticated 401 (before Supabase/R2
-touch) for all four endpoints; role gating per-endpoint (list allows
-`member`, others don't; `guest` always 403); song-not-in-group 404 (before
-R2 signing and before insert/delete) for all four; malformed/missing JSON
-body → 400; `file_size_bytes` invalid (non-number/0/negative/float) → 400;
-`file_key` prefix mismatch (3 variants) → 400; empty document list → 200
-`{ documents: [] }`; delete-miss (wrong doc/song/group) → 404; Supabase
-query/insert/delete errors → 500; R2 helper throwing → 500 INTERNAL.
+## Verification run
+
+- `bun run test -- tests/unit/app/api/events-id-attendees-route.test.ts`
+  → **28/28 passed**.
+- `bun run lint` → clean, no errors/warnings.
+- `bun run typecheck` (`tsc --noEmit`) → clean, no errors.
+- `bun run test` (full suite) → **59 suites / 757 tests, all passing**
+  (58 suites / 729 tests from the coder's baseline in `changes.md`, plus 1
+  new suite / 28 new tests added by this stage: 729 + 28 = 757, consistent).
+
+## Independent code read against spec.md
+
+Read `app/api/events/[id]/attendees/handler.ts` line by line against the
+spec's `assignAttendee`/`removeAttendee` flow descriptions. Confirmed:
+
+- Role matrix matches spec exactly: both endpoints `requireRole(ctx,
+  ["admin", "set_leader"])`; `member`/`guest` are rejected before any
+  Supabase call.
+- Event lookup is scoped by `church_group_id` and checked (404) **before**
+  the confirmed-member/invitation lookup in `assignAttendee`, and before the
+  delete attempt in `removeAttendee` — matches the spec's explicit ordering
+  requirement ("so a foreign event never leaks state"). Verified via tests
+  that assert `invitations`/`event_attendees` are never queried on the 404
+  path.
+- "Confirmed member" query matches spec exactly:
+  `.from("invitations").eq("church_group_id", ...).eq("service_week_id",
+  event.service_week_id).eq("user_id", ...).eq("status", "accepted")` — no
+  row → 422 VALIDATION_FAILED, not 404 or 400.
+- Duplicate-assign check queries `event_attendees` by `event_id`+`user_id`
+  and returns 409 CONFLICT before attempting the insert, exactly as
+  specified (verified the insert mock is never invoked on that path).
+- Insert payload is `{ event_id: eventId, user_id: parsed.userId }` only —
+  matches spec's note that `id`/`created_at` are DB-defaulted, no cast
+  needed.
+- `toAttendeeResponse` maps `id`/`event_id`/`user_id`/`created_at` to the
+  camelCase `AttendeeResponse` shape exactly as the spec's type signature
+  requires.
+- Every Supabase `.error` branch (event lookup x2, invitation lookup,
+  duplicate lookup, insert, delete) maps to `fail("Internal error",
+  ErrorCode.INTERNAL, 500)`, matching the spec and the sibling handler's
+  idiom.
+- Both functions wrap in `try/catch` mapping `ApiException` → `fail(err
+  .message, err.code, err.status)`, else generic 500 — matches spec and
+  sibling handler exactly.
+- Route wiring (`route.ts` files) unwraps `params: Promise<{...}>` and
+  delegates straight to the handler with no extra logic, matching
+  `app/api/events/[id]/route.ts`'s pattern.
+- `schemas/events.ts`'s `assignAttendeeSchema = z.object({ userId:
+  z.string().uuid() })` matches spec exactly; confirmed via the 400 tests
+  for missing/non-uuid `userId`.
+- No DB migrations, no notification/GCal code — `git status`/diff shows
+  only the files `changes.md` lists as created/modified, plus the one new
+  test file added by this stage. Confirms the "out of scope, belongs to
+  #62" constraint was respected.
 
 ## Failure cases exercised
 
 Per the pipeline contract's requirement to cover at least one failure case,
-the following were independently confirmed (both pre-existing in the
-coder's suite and newly added by this stage):
+the following were independently confirmed:
 
-- R2 SDK throwing (e.g. `getUploadUrl` rejecting) is caught by the handler's
-  generic `catch (err)` and surfaces as 500 INTERNAL, not an unhandled
-  rejection (`tests/unit/app/api/song-documents-route.test.ts`, "returns 500
-  INTERNAL when the R2 helper throws").
-- `lib/r2/client.ts` itself throwing synchronously on missing/empty env vars,
-  verified independently of the handler's mocking (new
-  `tests/unit/lib/r2/client.test.ts`).
-- Supabase insert/list/delete query errors all map to 500 INTERNAL in their
-  respective handler functions (pre-existing tests, re-run and confirmed).
+- Malformed/non-JSON POST body → 400 VALIDATION_FAILED (via `req.json()`
+  rejecting, caught by `.catch(() => null)` then failing Zod parse).
+- Non-uuid `userId` → 400 VALIDATION_FAILED (Zod `.uuid()` constraint).
+- Unconfirmed member (no accepted invitation) → 422 VALIDATION_FAILED.
+- Already-assigned member → 409 CONFLICT.
+- Cross-tenant/missing event → 404 NOT_FOUND on both endpoints, without
+  leaking state via a subsequent query.
+- Every Supabase `.error` branch on both endpoints → 500 INTERNAL.
 
 ## Verdict
-
-No failures found. Nothing was patched around — the implementation matched
-the spec on every point checked, and the one coverage gap the coder itself
-flagged is now closed. Ready for Review.
+PASS. No failures found. The implementation matches the spec's decisions
+(confirmed-member definition, 404-before-422/409 ordering, 409-before-insert
+ordering, 500 mapping on every Supabase `.error` branch) and the coder's
+`changes.md` claims hold up under independent testing. Ready for Review.
