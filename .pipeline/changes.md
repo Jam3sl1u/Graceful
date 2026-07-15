@@ -1,105 +1,81 @@
-# Changes — Issue #58: Song-level document attachment (signed URLs)
+# Changes — Issue #60: Event attendee assignment
 
-Implements the four song-document endpoints (previously 501 stubs) and the R2
-presigned-URL helpers they depend on, per `.pipeline/spec.md`. No migrations
-touched (table/RLS already exist) and no new dependencies added
-(`@aws-sdk/client-s3` / `@aws-sdk/s3-request-presigner` were already present).
+## Summary
+Implemented the two `event_attendees` endpoints (assign / remove) that were
+previously 501 stubs, plus the Zod schema for the POST body. No DB
+migrations, no notification/GCal code (explicitly out of scope, belongs to
+#62).
 
-## Files created
+## Files changed
 
-- **`schemas/song-documents.ts`** — `uploadUrlSchema` (name/file_type/
-  file_size_bytes shape validation) and `registerDocumentSchema` (extends it
-  with `file_key`). Mirrors `schemas/songs.ts` style.
+### `app/api/events/[id]/attendees/handler.ts` (NEW)
+- `toAttendeeResponse(row)` — maps an `event_attendees` row to the camelCase
+  `AttendeeResponse` shape (`id`, `eventId`, `userId`, `createdAt`).
+- `assignAttendee(req, eventId, lookup?)` — POST handler, `admin`/`set_leader`
+  only. Flow: auth/role guard → parse `{ userId }` body (400 on failure) →
+  supabase JWT client (401 if missing) → load event scoped by
+  `church_group_id` (404 if absent — checked before any business-rule check
+  so a foreign event never leaks state) → confirmed-member check against
+  `invitations` (`status = 'accepted'`, same `service_week_id`, same
+  `church_group_id`) → 422 if not confirmed → duplicate-assignee check
+  against `event_attendees` → 409 if already assigned → insert row → 201
+  with `{ attendee }`.
+- `removeAttendee(req, eventId, targetUserId, lookup?)` — DELETE handler,
+  same auth/role guard. Loads event scoped by `church_group_id` (404 if
+  absent), then deletes the `event_attendees` row matching
+  `event_id`/`user_id`; 404 if nothing was deleted (member wasn't
+  assigned); otherwise `{ deleted: true }`.
+- Both wrapped in try/catch mapping `ApiException` → `fail(...)`, else a
+  generic 500 INTERNAL, matching the sibling `app/api/events/[id]/handler.ts`
+  idiom exactly.
 
-- **`app/api/songs/[id]/documents/handler.ts`** — single module exporting
-  `createUploadUrl`, `registerDocument`, `listDocuments`, `deleteDocument`,
-  all mirroring the auth → role → jwt/getToken → getSupabaseClient → query →
-  `ok`/`fail` boilerplate from `app/api/songs/handler.ts`, wrapped in
-  try/catch mapping `ApiException` (R2 SDK errors are plain `Error`s and fall
-  through to the generic 500 branch).
-  - Shared `songExistsInGroup` helper checks the song belongs to the caller's
-    `church_group_id` *before* any R2 or document DB work (404 NOT_FOUND if
-    absent) — enforced first in every one of the four functions, right after
-    the JWT is resolved.
-  - `createUploadUrl` (role `admin`/`set_leader`): mints
-    `song-documents/{churchGroupId}/{songId}/{uuid}/{sanitizedName}` as the
-    `file_key`, calls `getUploadUrl(fileKey, file_type)`, returns
-    `{ uploadUrl, fileKey }`.
-  - `registerDocument` (role `admin`/`set_leader`): rejects a `file_key` not
-    prefixed with `song-documents/{churchGroupId}/{songId}/` (400
-    VALIDATION_FAILED, prevents registering another group's/song's object),
-    inserts the metadata row, signs the inserted `file_key` with
-    `getDownloadUrl`, returns `{ document }` (201) with the full DTO — the
-    raw `file_key` is never included in the response.
-  - `listDocuments` (role `admin`/`set_leader`/`member` — guests excluded):
-    selects rows ordered by `created_at` ascending, maps each to the DTO by
-    signing `file_key` via `getDownloadUrl`; empty group/song → `{ documents:
-    [] }`.
-  - `deleteDocument` (role `admin`/`set_leader`): three-way scoped delete
-    (`id` + `song_id` + `church_group_id`) chained with `.select("id")`; an
-    empty result set (wrong doc/song/group) → 404 NOT_FOUND. R2 object
-    cleanup intentionally out of scope per spec.
+### `app/api/events/[id]/attendees/route.ts` (REPLACED stub)
+Wires `POST` to `assignAttendee`, following the `app/api/events/[id]/route.ts`
+params pattern (`{ id }` from `params` promise).
 
-- **`tests/unit/app/api/song-documents-route.test.ts`** (new — not explicitly
-  listed under the spec's "Files to create" but the spec's "Patterns to
-  copy" section calls for handler tests following
-  `tests/unit/app/api/songs-route.test.ts`'s harness, additionally mocking
-  `@/lib/r2/client`). 35 tests covering the happy path, all four
-  role/permission gates, the song-not-in-group 404 (and that it fires before
-  any R2/DB write call), body validation (missing/malformed, non-integer/
-  zero/negative/float `file_size_bytes`), the `file_key` prefix guard (three
-  malformed-prefix cases), the empty-list case, the 3-way-scoped-delete-miss
-  404, unauth 401 (JWT missing), and R2/Supabase failure paths → 500
-  INTERNAL.
+### `app/api/events/[id]/attendees/[userId]/route.ts` (REPLACED stub)
+Wires `DELETE` to `removeAttendee`, passing both `id` and `userId` from the
+route params.
 
-## Files modified
+### `schemas/events.ts` (MODIFIED)
+Added `assignAttendeeSchema = z.object({ userId: z.string().uuid() })` and
+its inferred `AssignAttendeeInput` type, appended at the end of the file
+(after `validateEventTiming`, to avoid splitting the `BR10_WINDOW_MS`
+constant from the function that uses it).
 
-- **`lib/r2/client.ts`** — replaced the two throwing stubs with real
-  presigned-URL generation via `@aws-sdk/client-s3` +
-  `@aws-sdk/s3-request-presigner`. Lazy singleton `S3Client` built from
-  `R2_ENDPOINT`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`/`R2_BUCKET_NAME`
-  (`region: "auto"`, `forcePathStyle: true`); throws a plain `Error` if any
-  is missing (surfaces as 500 via the handler's generic catch). Both
-  `getUploadUrl` (now takes an optional `contentType`) and `getDownloadUrl`
-  use a 30-minute expiry (`SIGNED_URL_EXPIRY_SECONDS = 30 * 60`). Removed the
-  stale `Sprint 3 #58` TODO comment.
+### `.pipeline/spec.md`
+Overwritten by the planning stage for this run with the issue #60 spec
+(per the pipeline contract, each run overwrites the prior stage's file).
 
-- **`app/api/songs/[id]/documents/route.ts`**,
-  **`app/api/songs/[id]/documents/upload-url/route.ts`**,
-  **`app/api/songs/[id]/documents/[docId]/route.ts`** — replaced the
-  `notImplemented` 501 stubs with thin wiring to the new handler functions,
-  unwrapping `params: Promise<{...}>` the same way as
-  `app/api/service-weeks/[id]/route.ts`.
-
-- **`lib/supabase/types.ts`** — added `SongDocumentsRow` and a `song_documents`
-  entry to the hand-rolled `Database["public"]["Tables"]` type (Insert omits
-  `id`/`created_at`/`uploaded_by` as optional, matching the `songs` table's
-  style for DB-defaulted/nullable columns).
-
-## Out of scope (untouched, per spec)
-
+## Verification
 - `bun run lint` — clean.
 - `bun run typecheck` — clean.
-- `bun run test` — 52 suites / 615 tests pass, including the 35 new
-  song-documents tests.
+- `bun run test` — 58 suites / 729 tests, all passing (no new tests were
+  added by this stage; the tester stage owns that per the pipeline
+  contract's test guidance in spec.md).
 
-## What the Tester should focus on
-
-- Role gates for all four endpoints (spec's exact matrix: list allows
-  `member`, the other three do not).
-- The song-in-group 404 guard firing *before* any R2 call (assert
-  `getUploadUrl`/`getDownloadUrl` were never invoked in that path) and before
-  any DB insert/delete.
-- The `file_key` prefix check in `registerDocument` — confirm a `file_key`
-  scoped to a different group or a different song within the same group is
-  rejected (400), not just a totally unrelated key.
-- `file_size_bytes` edge cases (0, negative, float, non-numeric string) all
-  400.
-- The delete 3-way scope: a `docId` that exists but under a different
-  `song_id` or `church_group_id` must 404, not silently no-op-succeed.
-- Response shape: `file_key` must never leak in `listDocuments` /
-  `registerDocument` responses — only `downloadUrl`.
-- `lib/r2/client.ts`'s missing-env-var throw path is only exercised
-  indirectly here (mocked out in the handler tests) — if there's a
-  standalone R2-client unit test worth adding, verify the throw message and
-  that a present-but-empty-string env var also counts as "missing".
+## What the tester should focus on
+- Happy-path assign (201) and remove (`{ deleted: true }`).
+- Confirmed-member rejection (422 VALIDATION_FAILED) — invitation missing,
+  or present but `status` is `pending`/`denied`/`withdrawn`/`expired`, or
+  present but for a different `service_week_id`.
+- Non-leader caller (`member`/`guest`) → 403 FORBIDDEN, and that the
+  supabase client is never reached (mirrors existing sibling-handler tests).
+- Missing/cross-tenant event → 404 NOT_FOUND on BOTH endpoints, checked
+  before the confirmed-member lookup runs (assign should not query
+  `invitations` at all when the event lookup 404s).
+- Duplicate assign → 409 CONFLICT, verifying the pre-insert duplicate check
+  fires before any insert is attempted.
+- DELETE for a user not currently assigned → 404 NOT_FOUND.
+- Malformed POST body (missing/non-uuid `userId`, non-JSON body) → 400
+  VALIDATION_FAILED.
+- Missing Clerk session / missing supabase JWT → 401 UNAUTHENTICATED on both
+  endpoints.
+- All Supabase `.error` branches (event lookup, invitation lookup,
+  duplicate-check lookup, insert, delete) → 500 INTERNAL.
+- Test pattern to reuse: `tests/unit/app/api/events-id-route.test.ts`
+  (`jest.mock` of `@clerk/nextjs/server` and `@/lib/supabase/client`, the
+  `makeChain`/`makeSupabaseClient` table-fixture harness keyed by table
+  name, `makeLookup(role)` helper). This new handler touches three tables
+  (`events`, `invitations`, `event_attendees`), so the fixture map will need
+  entries for all three.

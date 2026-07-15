@@ -1,312 +1,182 @@
-# Spec — Issue #58: Song-level document attachment (signed URLs)
+# Spec — Issue #60: Event attendee assignment
 
-No OPEN QUESTIONS. Two decisions were forced by the DB schema / PRD and are
-documented under "Decisions" below rather than blocked — they are defensible and
-deterministic; a human/reviewer can override if wrong.
-
-None blocking. Non-blocking decisions made below (see "Decisions / assumptions")
-are the obvious reading of the issue + PRD security baseline; downstream stages
-should proceed on them, not stop.
+## OPEN QUESTIONS
+None. Definition of "confirmed member" and duplicate-assign behavior are
+resolved in Decisions below from existing repo patterns.
 
 ## Summary
+Implement the two attendee endpoints on the existing `event_attendees` join
+table. Only members with an **accepted invitation for the event's service
+week** may be assigned. Both endpoints are set_leader/admin only.
 
-Implement the four song-document endpoints that are currently 501 stubs, plus
-the two R2 presigned-URL helpers they depend on. The DB table `song_documents`,
-its indexes, and its tenant-scoped RLS policies already exist (migrations
-`20260702000004_cluster_4_partial_songs.sql` and `20260704000001_rls_policies.sql`
-— do NOT add or modify migrations). The `@aws-sdk/client-s3` and
-`@aws-sdk/s3-request-presigner` packages are already in `package.json` — do NOT
-add dependencies.
+Currently both route files are 501 stubs (`notImplemented`). Everything else
+(DB table, RLS policies, Supabase types) already exists — this is pure handler
+work plus one Zod schema.
 
-Flow is a standard two-step signed upload:
-1. Client asks for a presigned PUT URL (server mints the `file_key`).
-2. Client PUTs the bytes straight to R2.
-3. Client registers the completed upload (metadata row in `song_documents`).
-4. List returns each doc with a fresh presigned GET URL (30-min expiry).
-5. Delete removes the metadata row.
+Out of scope for this issue (belongs to #62): notifying the assigned member and
+Google Calendar sync. Do NOT write notification or GCal code. The AC line about
+notify/sync is explicitly "depends on #62".
 
-## Table already in DB (for reference — do not create)
-
-`song_documents`: `id uuid pk`, `song_id uuid not null → songs(id) on delete cascade`,
-`church_group_id uuid not null → church_groups(id)`, `name varchar(200) not null`,
-`file_key text not null`, `file_type varchar(50) not null`,
-`file_size_bytes integer not null`, `uploaded_by uuid → users(id) on delete set null`,
-`created_at timestamptz not null default now()`. RLS is tenant-scoped on
-`church_group_id` for select/insert/update/delete (all authenticated).
+## Decisions (not ambiguities)
+- **"Confirmed member"** = a row in `invitations` with
+  `status = 'accepted'`, `user_id = <target>`, and
+  `service_week_id = <event.service_week_id>`, in the caller's church group.
+  Pending/denied/withdrawn/expired invitees are NOT confirmed (`invitation_status`
+  enum values, see `lib/invitations/state-machine.ts`).
+- **Duplicate assign** → `409 CONFLICT` (the table has `unique (event_id,
+  user_id)`). Check for an existing attendee row first and return 409 rather
+  than relying on the DB unique-violation error.
+- **Cross-tenant / missing event** → `404 NOT_FOUND` (mirror
+  `app/api/events/[id]/handler.ts`: load the event scoped by
+  `church_group_id` and 404 when absent). This must be checked BEFORE the
+  confirmed-member check so a foreign event never leaks its state.
+- RLS on `event_attendees` only enforces tenant scoping (see
+  `20260704000001_rls_policies.sql` lines 295-343) — it does NOT enforce the
+  confirmed-member rule. That business rule lives entirely in the handler.
 
 ## Files to create
 
-### 1. `schemas/song-documents.ts` (new)
-Follow the style of `schemas/songs.ts`.
+### 1. `app/api/events/[id]/attendees/handler.ts` (NEW)
+Copy the structure/error-handling idiom from
+`app/api/events/[id]/handler.ts` (same auth → jwt → supabase → guard flow,
+same `try/catch` with `ApiException` mapping).
+
+Exports:
 
 ```ts
-import { z } from "zod";
-
-// Body for POST /api/songs/:id/documents/upload-url
-export const uploadUrlSchema = z.object({
-  name: z.string().trim().min(1).max(200),
-  file_type: z.string().trim().min(1).max(50),
-  file_size_bytes: z.number().int().positive().max(2147483647), // int4 column bound
-});
-export type UploadUrlInput = z.infer<typeof uploadUrlSchema>;
-
-// Body for POST /api/songs/:id/documents (register completed upload)
-export const registerDocumentSchema = uploadUrlSchema.extend({
-  file_key: z.string().trim().min(1).max(1024),
-});
-export type RegisterDocumentInput = z.infer<typeof registerDocumentSchema>;
-```
-
-### 2. `app/api/songs/[id]/documents/handler.ts` (new)
-Single handler module for all four operations. Model it on
-`app/api/songs/handler.ts` (auth → role → jwt/getToken → getSupabaseClient →
-query → `ok`/`fail`, wrapped in try/catch that maps `ApiException`). Import the
-R2 helpers from `@/lib/r2/client` so tests can mock that module.
-
-Response DTO:
-```ts
-export type SongDocumentResponse = {
+export type AttendeeResponse = {
   id: string;
-  songId: string;
-  name: string;
-  fileType: string;
-  fileSizeBytes: number;
-  uploadedBy: string | null;
+  eventId: string;
+  userId: string;
   createdAt: string;
-  downloadUrl: string; // presigned GET, 30-min expiry
 };
+
+export function toAttendeeResponse(
+  row: Database["public"]["Tables"]["event_attendees"]["Row"],
+): AttendeeResponse;
+
+// POST /api/events/:id/attendees — set_leader/admin only.
+export async function assignAttendee(
+  req: NextRequest,
+  eventId: string,
+  lookup?: UserLookup,
+): Promise<Response>;
+
+// DELETE /api/events/:id/attendees/:userId — set_leader/admin only.
+export async function removeAttendee(
+  req: NextRequest,
+  eventId: string,
+  targetUserId: string,
+  lookup?: UserLookup,
+): Promise<Response>;
 ```
 
-Exported functions (each mirrors the songs handler's auth/jwt boilerplate):
+Imports needed (same as sibling handler): `NextRequest`, `auth` from
+`@clerk/nextjs/server`, `requireAuth`/`requireRole`/`UserLookup` from
+`@/lib/api/auth`, `ok`/`fail` from `@/lib/api/response`, `ApiException`/
+`ErrorCode` from `@/lib/api/errors`, `getSupabaseClient` from
+`@/lib/supabase/client`, `Database` type from `@/lib/supabase/types`,
+`assignAttendeeSchema` from `@/schemas/events`.
 
-```ts
-export async function createUploadUrl(req: NextRequest, songId: string, lookup?: UserLookup): Promise<Response>;
-export async function registerDocument(req: NextRequest, songId: string, lookup?: UserLookup): Promise<Response>;
-export async function listDocuments(req: NextRequest, songId: string, lookup?: UserLookup): Promise<Response>;
-export async function deleteDocument(req: NextRequest, songId: string, docId: string, lookup?: UserLookup): Promise<Response>;
-```
+`assignAttendee` flow:
+1. `ctx = await requireAuth(req, lookup)`; `requireRole(ctx, ["admin", "set_leader"])`.
+2. Parse body with `assignAttendeeSchema.safeParse(await req.json().catch(() => null))`
+   → on failure `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)`.
+3. Get supabase JWT client (same `getToken({ template: "supabase" })` idiom;
+   missing jwt → 401 UNAUTHENTICATED).
+4. Load event: `.from("events").select("service_week_id")
+   .eq("id", eventId).eq("church_group_id", ctx.churchGroupId).maybeSingle()`.
+   DB error → 500 INTERNAL; no row → 404 NOT_FOUND.
+5. Confirmed-member check: `.from("invitations").select("id")
+   .eq("church_group_id", ctx.churchGroupId)
+   .eq("service_week_id", event.service_week_id)
+   .eq("user_id", parsed.userId).eq("status", "accepted").maybeSingle()`.
+   DB error → 500; no row → `fail("Member is not confirmed for this event",
+   ErrorCode.VALIDATION_FAILED, 422)`.
+6. Duplicate check: `.from("event_attendees").select("id")
+   .eq("event_id", eventId).eq("user_id", parsed.userId).maybeSingle()`.
+   If a row exists → `fail("Member is already assigned to this event",
+   ErrorCode.CONFLICT, 409)`.
+7. Insert: `.from("event_attendees").insert({ event_id: eventId,
+   user_id: parsed.userId }).select("*").maybeSingle()`. Insert payload needs
+   only `event_id`/`user_id` (Insert type makes `id`/`created_at` optional — no
+   cast needed). Error or no row → 500 INTERNAL.
+8. `return ok({ attendee: toAttendeeResponse(row) }, 201)`.
 
-Shared internal helper — verify the song exists in the caller's group BEFORE any
-R2 or document work (satisfies the issue's "belongs to the church group" guard).
-Query the RLS-scoped client:
-```ts
-// returns true if a row exists for songId within ctx.churchGroupId
-const { data } = await supabase
-  .from("songs")
-  .select("id")
-  .eq("id", songId)
-  .eq("church_group_id", ctx.churchGroupId)
-  .maybeSingle();
-```
-If absent → `fail("Song not found", ErrorCode.NOT_FOUND, 404)`.
+`removeAttendee` flow:
+1. `requireAuth` + `requireRole(ctx, ["admin", "set_leader"])`.
+2. Supabase JWT client (missing jwt → 401).
+3. Load event scoped by `church_group_id` (`select("id")...maybeSingle()`);
+   no row → 404 NOT_FOUND (prevents cross-tenant delete probing).
+4. Delete: `.from("event_attendees").delete().eq("event_id", eventId)
+   .eq("user_id", targetUserId).select("id").maybeSingle()`.
+   DB error → 500. No row deleted → 404 NOT_FOUND (member wasn't assigned).
+5. `return ok({ deleted: true })`.
 
-`file_key` generation (used only in `createUploadUrl`):
-```ts
-const safeName = input.name.replace(/[^A-Za-z0-9._-]/g, "_");
-const fileKey = `song-documents/${ctx.churchGroupId}/${songId}/${crypto.randomUUID()}/${safeName}`;
-```
-Use the global `crypto.randomUUID()` (available in the Next.js runtime; no import).
-
-Per-function behavior:
-
-- **createUploadUrl** — role `["admin", "set_leader"]`. Parse body with
-  `uploadUrlSchema` (invalid → 400 VALIDATION_FAILED). Verify song-in-group
-  (else 404). Build `fileKey` as above. Call
-  `getUploadUrl(fileKey, input.file_type)`. Return
-  `ok({ uploadUrl, fileKey }, 200)`.
-
-- **registerDocument** — role `["admin", "set_leader"]`. Parse body with
-  `registerDocumentSchema` (invalid → 400). Verify song-in-group (else 404).
-  Reject a `file_key` the client didn't get from us: require
-  `input.file_key.startsWith(\`song-documents/${ctx.churchGroupId}/${songId}/\`)`
-  — else `fail("Invalid file key", ErrorCode.VALIDATION_FAILED, 400)`. Insert
-  into `song_documents`:
-  ```ts
-  const payload = {
-    song_id: songId,
-    church_group_id: ctx.churchGroupId,
-    name: input.name,
-    file_key: input.file_key,
-    file_type: input.file_type,
-    file_size_bytes: input.file_size_bytes,
-    uploaded_by: ctx.userId,
-  } as unknown as Database["public"]["Tables"]["song_documents"]["Insert"];
-  ```
-  Select back `id, song_id, name, file_key, file_type, file_size_bytes,
-  uploaded_by, created_at` with `.single()`. On error/no data → 500 INTERNAL.
-  Sign the inserted `file_key` with `getDownloadUrl` and return
-  `ok({ document: <full DTO incl. downloadUrl> }, 201)`.
-
-- **listDocuments** — role `["admin", "set_leader", "member"]` (musicians must
-  read; guests excluded). Verify song-in-group (else 404). Query:
-  ```ts
-  supabase.from("song_documents")
-    .select("id, song_id, name, file_key, file_type, file_size_bytes, uploaded_by, created_at")
-    .eq("song_id", songId)
-    .eq("church_group_id", ctx.churchGroupId)
-    .order("created_at", { ascending: true });
-  ```
-  On error → 500. Map each row → DTO, calling `await getDownloadUrl(row.file_key)`
-  per row. Do NOT include the raw `file_key` in the response DTO (it's selected
-  only so it can be signed). Return `ok({ documents: [...] }, 200)`. Empty group
-  → `{ documents: [] }`.
-
-- **deleteDocument** — role `["admin", "set_leader"]`. Verify song-in-group
-  (else 404). Delete the row scoped to all three of `id = docId`,
-  `song_id = songId`, `church_group_id = ctx.churchGroupId`; chain `.select("id")`
-  after `.delete()` so a missing/foreign row comes back empty →
-  `fail("Document not found", ErrorCode.NOT_FOUND, 404)`. On DB error → 500.
-  Success → `ok({ success: true }, 200)`. (R2 object cleanup is out of scope —
-  see decisions.)
+Wrap both in `try/catch` mapping `ApiException` → `fail(err.message, err.code,
+err.status)`, else `fail("Internal error", ErrorCode.INTERNAL, 500)` — exactly
+as in the sibling handler.
 
 ## Files to modify
 
-### 3. `lib/r2/client.ts`
-Replace the two throwing stubs with real presigned-URL generation. Keep
-`import "server-only";` and the exported names already referenced by callers, but
-add an optional `contentType` param to `getUploadUrl`:
-
+### 2. `app/api/events/[id]/attendees/route.ts` (REPLACE stub)
+Follow `app/api/events/[id]/route.ts` wiring:
 ```ts
-import "server-only";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { NextRequest } from "next/server";
+import { assignAttendee } from "./handler";
 
-const SIGNED_URL_EXPIRY_SECONDS = 30 * 60; // 30 min (issue AC + #15 baseline)
-
-// lazy singleton
-let client: S3Client | null = null;
-function getClient(): S3Client { /* build once from env, then reuse */ }
-
-export async function getUploadUrl(key: string, contentType?: string): Promise<string>;
-export async function getDownloadUrl(key: string): Promise<string>;
-```
-
-`getClient()` config: `region: "auto"`, `endpoint: process.env.R2_ENDPOINT`,
-`forcePathStyle: true`, `credentials: { accessKeyId: R2_ACCESS_KEY_ID,
-secretAccessKey: R2_SECRET_ACCESS_KEY }`. If any required env var
-(`R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`) is
-missing, throw a plain `Error` (surfaces as 500 via the handler try/catch).
-
-- `getUploadUrl`: `getSignedUrl(getClient(), new PutObjectCommand({ Bucket:
-  process.env.R2_BUCKET_NAME, Key: key, ContentType: contentType }), {
-  expiresIn: SIGNED_URL_EXPIRY_SECONDS })`.
-- `getDownloadUrl`: `getSignedUrl(getClient(), new GetObjectCommand({ Bucket:
-  process.env.R2_BUCKET_NAME, Key: key }), { expiresIn: SIGNED_URL_EXPIRY_SECONDS })`.
-
-Remove the stale `Sprint 3 #58` TODO comment.
-
-### 4. `app/api/songs/[id]/documents/route.ts`
-Replace stub. Wire params like `app/api/service-weeks/[id]/route.ts`:
-```ts
 type Ctx = { params: Promise<{ id: string }> };
-export async function GET(req, { params }: Ctx) { const { id } = await params; return listDocuments(req, id); }
-export async function POST(req, { params }: Ctx) { const { id } = await params; return registerDocument(req, id); }
+
+export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return assignAttendee(req, id);
+}
 ```
 
-### 5. `app/api/songs/[id]/documents/upload-url/route.ts`
-Replace stub:
+### 3. `app/api/events/[id]/attendees/[userId]/route.ts` (REPLACE stub)
 ```ts
-type Ctx = { params: Promise<{ id: string }> };
-export async function POST(req, { params }: Ctx) { const { id } = await params; return createUploadUrl(req, id); }
+import { NextRequest } from "next/server";
+import { removeAttendee } from "../handler";
+
+type Ctx = { params: Promise<{ id: string; userId: string }> };
+
+export async function DELETE(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id, userId } = await params;
+  return removeAttendee(req, id, userId);
+}
 ```
 
-### 6. `app/api/songs/[id]/documents/[docId]/route.ts`
-Replace stub:
+### 4. `schemas/events.ts` (ADD schema)
+Append (same Zod style as `createEventSchema`):
 ```ts
-type Ctx = { params: Promise<{ id: string; docId: string }> };
-export async function DELETE(req, { params }: Ctx) { const { id, docId } = await params; return deleteDocument(req, id, docId); }
-```
-
-### 7. `lib/supabase/types.ts`
-`song_documents` is missing from the hand-rolled `Database` type. Add it,
-matching the existing style (see `SongsRow` at line ~65 and the `songs` Tables
-entry at line ~224).
-
-Add a row type near `SongsRow`:
-```ts
-type SongDocumentsRow = {
-  id: string;
-  song_id: string;
-  church_group_id: string;
-  name: string;
-  file_key: string;
-  file_type: string;
-  file_size_bytes: number;
-  uploaded_by: string | null;
-  created_at: string;
-};
-```
-Add a Tables entry alongside `songs` (DB defaults `id`/`created_at`; `uploaded_by`
-is nullable — mirror how `songs` marks defaulted/nullable columns optional):
-```ts
-song_documents: {
-  Row: SongDocumentsRow;
-  Insert: Omit<SongDocumentsRow, "id" | "created_at" | "uploaded_by"> & {
-    id?: string;
-    created_at?: string;
-    uploaded_by?: string | null;
-  };
-  Update: Partial<SongDocumentsRow>;
-  Relationships: [];
-};
+// POST /api/events/:id/attendees body.
+export const assignAttendeeSchema = z.object({
+  userId: z.string().uuid(),
+});
+export type AssignAttendeeInput = z.infer<typeof assignAttendeeSchema>;
 ```
 
 ## Edge cases the implementation must handle
+- Unauthenticated / no Clerk user → 401 (via `requireAuth`).
+- Missing supabase JWT → 401 UNAUTHENTICATED.
+- Caller role `member`/`guest` → 403 FORBIDDEN (via `requireRole`).
+- Event not found or in another church group → 404 NOT_FOUND (both endpoints).
+- POST body not `{ userId: <uuid> }` (missing/empty/non-uuid) → 400
+  VALIDATION_FAILED.
+- Target user with no invitation, or invitation status pending/denied/
+  withdrawn/expired for this event's week → 422 VALIDATION_FAILED.
+- Target already assigned → 409 CONFLICT.
+- DELETE for a user who isn't currently assigned → 404 NOT_FOUND.
+- All Supabase `.error` branches → 500 INTERNAL.
 
-- Unauthenticated (no Clerk user, or `getToken` yields no supabase JWT) → 401
-  UNAUTHENTICATED, and do not touch Supabase/R2. Order like the songs handler:
-  role check runs before the JWT fetch, so forbidden roles never reach the DB.
-- Wrong role → 403 FORBIDDEN before any DB/R2 call:
-  - list: allowed `admin`/`set_leader`/`member`; `guest` → 403.
-  - upload-url, register, delete: allowed `admin`/`set_leader`; `member`/`guest` → 403.
-- Song id not in caller's group (or nonexistent) → 404 NOT_FOUND, checked before
-  R2 signing and before insert/delete (the "belongs to the church group" guard).
-- Malformed / missing JSON body, or fields failing the Zod shape → 400
-  VALIDATION_FAILED. (`file_size_bytes` must be a positive integer; non-number,
-  0, negative, or float → 400.)
-- register with a `file_key` not prefixed by `song-documents/<group>/<song>/` →
-  400 VALIDATION_FAILED (prevents registering an object from another group/song).
-- delete of a docId that doesn't exist, belongs to another group, or belongs to a
-  different song → 404 NOT_FOUND (the three-way scoped delete returns no rows).
-- Empty document list → 200 with `{ documents: [] }`.
-- Supabase query/insert/delete error → 500 INTERNAL.
-- R2 helper throwing (missing env, SDK error) → caught by the handler try/catch →
-  500 INTERNAL. (R2 errors are not `ApiException`, so they hit the generic 500
-  branch — keep the existing `catch (err)` shape from songs handler.)
+## Verification
+Run `bun run lint`, `bun run typecheck`, `bun run test` before finishing.
 
-## Patterns to copy (name the file)
-
-- Handler structure, auth/role/jwt boilerplate, `ok`/`fail`, `ApiException`
-  mapping, and the `... as unknown as Database[...]["Insert"]` cast rationale:
-  `app/api/songs/handler.ts`.
-- Zod schema module style: `schemas/songs.ts`.
-- Dynamic-route param unwrapping (`params: Promise<{...}>`, `await params`):
-  `app/api/service-weeks/[id]/route.ts`.
-- Unit-test harness (mock `@clerk/nextjs/server` + `@/lib/supabase/client`,
-  chainable Supabase mock, `makeLookup(role)`, `setUpAuth`):
-  `tests/unit/app/api/songs-route.test.ts`. New handler tests additionally mock
-  `@/lib/r2/client` (`jest.mock("@/lib/r2/client", () => ({ getUploadUrl: jest.fn(),
-  getDownloadUrl: jest.fn() }))`) so no real AWS SDK/network is involved.
-
-## Decisions / assumptions (non-blocking)
-
-- **Attach roles**: acceptance criteria only pin DELETE to Set Leader/Admin.
-  upload-url + register are given the same `admin`/`set_leader` restriction (the
-  goal is a Set Leader attaching); list is opened to `member` so musicians can
-  read their charts. Guests are excluded everywhere.
-- **Expiry**: 30 minutes (1800s) for BOTH upload and download URLs — matches the
-  read-URL AC and #15's baseline; the R2 stub's own TODO already specified 30-min.
-- **No content-type allowlist / product file-size cap**: not requested by the
-  issue. Validation is shape-only (`file_type` a non-empty ≤50-char string,
-  `file_size_bytes` a positive int within the int4 column bound). Do not invent
-  an allowlist or a business size limit.
-- **R2 object deletion on DELETE**: out of scope. DELETE removes the
-  `song_documents` metadata row only (the AC is "removes an attachment"). Do not
-  add an R2 delete helper.
-- **No new migrations, no dependency changes, no public bucket access** — all
-  access is via short-lived presigned URLs generated server-side only after the
-  auth + group + song-ownership checks (PRD §15.2).
-
-## Verify before finishing (Coding stage)
-
-`bun run lint`, `bun run typecheck`, `bun run test`.
+## Test guidance (for the tester stage)
+Unit-test the handlers with the mock pattern in
+`tests/unit/app/api/events-id-route.test.ts` (jest.mock of
+`@clerk/nextjs/server` and `@/lib/supabase/client`, `makeChain` table-fixture
+harness keyed by table name, `makeLookup(role)` for auth context). Cover:
+happy-path assign (201) & remove (deleted:true); confirmed-member rejection
+(422); non-leader 403; missing event 404; duplicate assign 409;
+delete-not-assigned 404.
