@@ -76,7 +76,7 @@ touched (table/RLS already exist) and no new dependencies added
   `id`/`created_at`/`uploaded_by` as optional, matching the `songs` table's
   style for DB-defaulted/nullable columns).
 
-## Verification
+## Out of scope (untouched, per spec)
 
 - `bun run lint` — clean.
 - `bun run typecheck` — clean.

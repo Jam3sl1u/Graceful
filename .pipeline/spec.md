@@ -1,6 +1,8 @@
 # Spec — Issue #58: Song-level document attachment (signed URLs)
 
-## OPEN QUESTIONS
+No OPEN QUESTIONS. Two decisions were forced by the DB schema / PRD and are
+documented under "Decisions" below rather than blocked — they are defensible and
+deterministic; a human/reviewer can override if wrong.
 
 None blocking. Non-blocking decisions made below (see "Decisions / assumptions")
 are the obvious reading of the issue + PRD security baseline; downstream stages
