@@ -1,60 +1,71 @@
-# Review — Issue #58: Song-level document attachment (signed URLs)
+# Review — Issue #61: Google Calendar OAuth connect/disconnect
 
 VERDICT: SHIP
 
-## What I verified (firsthand, not just from the summaries)
+## What I verified (independently, not just from the summaries)
 
-- Ran `git diff main...HEAD` and read the actual source: `handler.ts`,
-  `lib/r2/client.ts`, `schemas/song-documents.ts`, the three `route.ts`
-  wiring files, and the `lib/supabase/types.ts` diff.
-- Re-ran `bun run test` (53 suites / 628 tests pass), `bun run typecheck`
-  (clean), `bun run lint` (clean) myself — not trusting the written report.
-- Confirmed against the existing `app/api/songs/handler.ts` pattern that the
-  auth/role/jwt ordering and `ok`/`fail`/`ApiException` handling match.
+Ran `git diff main...HEAD` and read every implementation and test file directly.
+Re-ran the full gate myself:
+- `bun run test` — 64 suites / 767 tests pass.
+- `bun run lint` — clean.
+- `bun run typecheck` (`tsc --noEmit`) — clean.
+- `bun run check:service-role` — OK (no service-role key usage; RLS-scoped anon
+  client only, exactly as spec/PRD §25.5 requires).
 
-## Correctness / security assessment
+## Spec conformance
 
-- Role matrix is exactly per spec: upload-url / register / delete →
-  `["admin","set_leader"]`; list → `["admin","set_leader","member"]`; guest
-  excluded everywhere. `requireRole` (throws 403 FORBIDDEN) runs before the
-  supabase JWT fetch, so forbidden roles never touch the DB/R2.
-- `songExistsInGroup` runs before any R2 signing and before any insert/delete
-  in all four functions — the "belongs to the church group" guard.
-- `registerDocument` rejects a `file_key` not prefixed with
-  `song-documents/<group>/<song>/` (400) — blocks cross-group/cross-song
-  object registration. All DB queries are additionally `church_group_id`-scoped
-  (defense in depth on top of RLS).
-- Raw `file_key` never leaks in responses — selected only to sign via
-  `getDownloadUrl`, then dropped from the DTO.
-- Delete is 3-way scoped (`id`+`song_id`+`church_group_id`) with `.select("id")`
-  → empty result maps to 404, not a silent no-op success.
-- Presigned URLs: 30-min expiry on both PUT and GET; lazy singleton S3Client;
-  throws plain `Error` on missing/empty required env var (surfaces as 500 via
-  the generic catch). Matches spec exactly.
-- No migrations added/modified, no new dependencies — spec's hard constraints
-  honored.
+- **token-crypto.ts**: AES-256-GCM, key from `TOKEN_ENCRYPTION_KEY` base64-decoded
+  and rejected unless exactly 32 bytes; error messages are static and never
+  include the key. `iv:authTag:ciphertext` (base64) format; fresh random 12-byte
+  IV per call; `decryptToken` validates 3 non-empty parts and lets auth-tag
+  verification throw on tampering. Matches spec §1.
+- **oauth.ts**: `CALENDAR_EVENTS_SCOPE` is exactly the write-only
+  `.../auth/calendar.events` — no `calendar`/`calendar.readonly`. `getAuthUrl`
+  includes `access_type=offline` + `prompt=consent` + `state`, throws on missing
+  client id / redirect URI. `exchangeCode` throws on non-ok and on missing
+  `refresh_token` before returning (protects the NOT NULL column), maps
+  `expires_in` to an ISO `expiryDate`. `revokeToken` never throws; its two
+  `console.warn` calls are static strings with no token interpolated. Matches §2.
+- **Handlers**: connect/callback/disconnect follow the profile handler pattern
+  exactly (thin route → handler, optional `lookup`, `requireAuth`, Clerk
+  `supabase` JWT → `getSupabaseClient(jwt)`). Callback always redirects (307),
+  never JSON; clears the state cookie in every path; upserts with
+  `onConflict: "user_id"`, `calendar_id: "primary"`, encrypted tokens; outer
+  try/catch redirects to error on any unexpected throw. Disconnect is idempotent,
+  best-effort revoke wrapped so a decrypt/revoke failure never blocks the delete,
+  delete errors → 500. Matches §3–5 and edge cases 1–10.
+- **types.ts**: `google_calendar_tokens` Row/Insert/Update added; Insert makes
+  `id`/`created_at`/`updated_at` optional so the upsert can set a fresh
+  `updated_at`. Matches §6.
+- Scope respected: no event sync, no read scope, no `googleapis` dependency, no
+  migration/RLS change.
 
-## Tests are meaningful, not superficial
+## Tests — meaningful, not superficial
 
-- 35 handler tests exercise every role gate, the pre-DB/pre-R2 404 ordering
-  (asserting `getUploadUrl`/`getDownloadUrl`/`getSupabaseClient` were NOT
-  called on rejected paths), the file_key prefix guard (3 malformed variants),
-  `file_size_bytes` edge cases (0/negative/float/string), the empty-list case,
-  the delete-miss 404, unauth 401, and R2/Supabase failure → 500.
-- Tester added 13 standalone `lib/r2/client.ts` tests covering the
-  present-but-empty-string env var falsy path and single-construction of the
-  singleton — a real gap the coder flagged, now closed.
+- Callback tests assert the redirect target for every negative branch
+  (unauthenticated, `?error=`, missing code/state, CSRF mismatch, missing cookie,
+  exchange failure, upsert error) AND that no `exchangeCode`/Supabase call happens
+  on the pre-DB failures. Happy path asserts the encrypted values are NOT the
+  plaintext, the `:` structure is present, and scope/calendar_id/onConflict.
+- token-crypto tests cover round-trip, distinct-IV, tampered/malformed ciphertext,
+  bad key length, and that the key never leaks into an error message.
+- oauth tests cover scope/params, missing-env throws, non-ok and missing-refresh
+  exchange failures, and `revokeToken`'s three never-throw cases.
+- disconnect tests cover 401 (both no-Clerk-id and no-JWT), success+revoke+delete
+  scoped to user_id, idempotent no-row, revoke-fails-still-succeeds, select/delete
+  errors. Tester supplement adds a real (non-mocked) `decryptToken`-throws and
+  `encryptToken`-throws path — genuinely exercising graceful degradation.
 
-## Minor observations (non-blocking, no action required to ship)
+## Minor, non-blocking observations (no change required)
 
-1. `songExistsInGroup` destructures only `{ data }` and ignores `error`, so a
-   DB error during the song lookup surfaces as 404 rather than 500. This is
-   the exact shape the spec dictated, and the only observable difference is a
-   404-vs-500 status on a rare infra error — acceptable.
-2. The tester's new file `tests/unit/lib/r2/client.test.ts` is currently
-   untracked in the worktree. The orchestrator's commit step must `git add`
-   it so those 13 tests are actually captured in the PR; the code under review
-   ships fine either way, but don't lose that file at commit time.
+- `exchangeCode` defaults a missing `access_token` to `""`. Spec only mandates
+  throwing on missing `refresh_token`; Google always returns an access token on a
+  successful exchange, so this is a non-issue.
+- The callback's broad `catch {}` intentionally converts every error into a
+  generic error redirect (spec-mandated: a browser redirect target must never
+  return JSON/500). This is correct here, though it means an unexpected internal
+  bug would surface only as a generic redirect — acceptable for this route type.
 
-The implementation matches the spec on every point I checked, tests reflect
-real behavior, and all gates are green under independent re-run. Ship it.
+Green tests here reflect correct behavior: security-critical paths (CSRF, no
+partial rows, encryption at rest, write-only scope, graceful revoke) are all
+directly asserted. Ready for human sign-off.

@@ -1,136 +1,162 @@
-# Test Results — Issue #58: Song-level document attachment (signed URLs)
+# Test Results — Issue #61: Google Calendar OAuth connect/disconnect
 
-This overwrites the stale `test-results.md` for issue #53 that was still
+This overwrites the stale `test-results.md` for issue #58 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
 ## Summary
 
 **PASS.** All verification commands are clean and the coder's claims in
-`.pipeline/changes.md` hold up under independent re-verification. One gap
-noted in changes.md ("What the Tester should focus on") — no standalone
-`lib/r2/client.ts` unit test existed — has been filled in with a new test
-file; it passes.
+`.pipeline/changes.md` hold up under independent re-verification. One gap the
+coder itself named in changes.md ("What the Tester should focus on") — the
+disconnect handler's `decryptToken`-throws path had no test forcing it — has
+been filled in with a new test file; it passes, along with one additional
+independently-chosen failure case for the callback route.
 
 ## Commands re-run independently
 
 - `bun run lint` — clean, 0 errors / 0 warnings.
 - `bun run typecheck` (`tsc --noEmit`) — clean.
-- `bun run test` — **53 suites / 628 tests pass** (52 suites / 615 tests from
-  the coder's existing work, plus 1 new suite / 13 new tests added by this
+- `bun run test` — **64 suites / 767 tests pass** (63 suites / 765 tests from
+  the coder's existing work, plus 1 new suite / 2 new tests added by this
   stage).
+- `bun run check:service-role` — OK, no service-role key references outside
+  comments in `app/` or `lib/`.
+- `bun run check:workflows` — OK (not a workflow-script change; re-run for
+  parity with the coder's own verification claims).
 
 ## Independent code read
 
-Read `schemas/song-documents.ts`, `app/api/songs/[id]/documents/handler.ts`,
-`lib/r2/client.ts`, the three `route.ts` wiring files
-(`app/api/songs/[id]/documents/route.ts`, `.../upload-url/route.ts`,
-`.../[docId]/route.ts`), and the `song_documents` table registration in
-`lib/supabase/types.ts` against `.pipeline/spec.md` line by line. Confirmed:
+Read `lib/google-calendar/token-crypto.ts`, `lib/google-calendar/oauth.ts`,
+and all three handlers (`app/api/google-calendar/{connect,callback,disconnect}/handler.ts`)
+line-by-line against `.pipeline/spec.md`. Confirmed:
 
-- Role matrix matches spec exactly: `createUploadUrl`/`registerDocument`/
-  `deleteDocument` → `["admin", "set_leader"]`; `listDocuments` →
-  `["admin", "set_leader", "member"]` (guest excluded everywhere).
-- `songExistsInGroup` runs before any R2 call and before any DB insert/delete
-  in all four functions; existing tests assert `getUploadUrl`/`getDownloadUrl`
-  are never invoked on the 404 path (`expect(mockGetUploadUrl).not.toHaveBeenCalled()`),
-  and forbidden roles never reach `getSupabaseClient`
-  (`expect(mockGetSupabaseClient).not.toHaveBeenCalled()`).
-- `file_key` prefix check in `registerDocument` rejects all three malformed
-  cases the spec calls out: an unrelated key, another group's key, and
-  another song's key within the same group — confirmed via
-  `tests/unit/app/api/song-documents-route.test.ts`'s
-  `it.each(["not-prefixed/at/all.pdf", "song-documents/other-group/...", "song-documents/${group}/other-song/..."])`.
-- `file_size_bytes` edge cases (`0`, `-1`, `1.5`, `"2048"` string) all 400 —
-  matches `uploadUrlSchema`'s `z.number().int().positive()`.
-- Delete's 3-way scope (`id` + `song_id` + `church_group_id`) returns 404 on
-  an empty result set rather than silently no-op-succeeding — confirmed in
-  code and test (`delete: { data: [], error: null }` → 404 NOT_FOUND).
-- Response DTOs never leak the raw `file_key`: `listDocuments` and
-  `registerDocument` select `file_key` only to sign it via `getDownloadUrl`,
-  and the mapped `SongDocumentResponse` omits it; tests assert
-  `expect(document).not.toHaveProperty("fileKey")` /
-  `not.toHaveProperty("file_key")`.
-- 401/403 ordering matches the spec and the songs-handler pattern: role check
-  (`requireRole`) happens before the JWT fetch, so a forbidden role never
-  reaches Supabase, and a missing JWT short-circuits before any Supabase call.
-- `lib/r2/client.ts` matches the spec's exact shape: lazy singleton `S3Client`
-  (`region: "auto"`, `forcePathStyle: true`), 30-minute
-  (`SIGNED_URL_EXPIRY_SECONDS = 30 * 60`) expiry on both `getUploadUrl` and
-  `getDownloadUrl`, optional `contentType` param, throws a plain `Error` if
-  any of `R2_ENDPOINT`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`/`R2_BUCKET_NAME`
-  is missing. The stale `Sprint 3 #58` TODO comment is gone, as claimed.
-- `lib/supabase/types.ts`'s new `SongDocumentsRow` / `song_documents` Tables
-  entry matches the spec's exact shape (`Insert` omits `id`/`created_at`/
-  `uploaded_by` as optional, matching the `songs` table's style).
-- Route wiring files correctly unwrap `params: Promise<{...}>` and delegate
-  straight to the handler functions with no extra logic, matching
-  `app/api/service-weeks/[id]/route.ts`'s pattern.
-- No migrations were added/modified and no new dependencies were introduced,
-  per the spec's explicit "do NOT" constraints — `git status` shows only the
-  files `changes.md` lists as created/modified, plus the one new test file
-  added by this stage.
+- `token-crypto.ts`: key is read from `TOKEN_ENCRYPTION_KEY`, base64-decoded,
+  and rejected unless exactly 32 bytes; error messages never include the key
+  value (`"TOKEN_ENCRYPTION_KEY is not set"` /
+  `"TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes"` — both static).
+  `encryptToken` uses a fresh random 12-byte IV per call and joins
+  `iv:authTag:ciphertext` (all base64) with `:`. `decryptToken` splits on
+  `:`, requires exactly 3 non-empty parts, and lets `setAuthTag`/`final()`
+  throw naturally on tampering — matches spec.
+- `oauth.ts`: `CALENDAR_EVENTS_SCOPE` is exactly
+  `https://www.googleapis.com/auth/calendar.events` (write-only, no
+  `calendar`/`calendar.readonly`). `getAuthUrl` throws if `GOOGLE_CLIENT_ID`
+  or `GOOGLE_REDIRECT_URI` is unset, and includes `access_type=offline` +
+  `prompt=consent` + `state`. `exchangeCode` throws on non-ok response and on
+  a response missing `refresh_token` (before ever returning a partial
+  `GoogleTokens` object), maps `expires_in` seconds to an ISO `expiryDate`.
+  `revokeToken` is wrapped so neither a non-2xx response nor a rejected
+  `fetch` ever propagates — confirmed via the `try/catch` around the whole
+  body, and its only `console.warn` calls are static strings with no token
+  interpolated in.
+- `connect/handler.ts`: `requireAuth` first (so the state cookie is only ever
+  set for authenticated callers); cookie is `httpOnly: true, secure: true,
+  sameSite: "lax", path: "/", maxAge: 600`, exactly as spec'd; `ApiException`
+  maps to its own status/code, anything else (including a thrown
+  `getAuthUrl`, e.g. missing env) maps to 500 `INTERNAL`.
+- `callback/handler.ts`: never returns JSON — always
+  `NextResponse.redirect`, and the state cookie is deleted in every returned
+  path (`redirectError`/`redirectConnected` both call `cookieStore.delete`
+  before building the response). Order matches spec exactly: auth → `?error=`
+  → missing `code`/`state` → CSRF cookie check → `exchangeCode` → encrypt →
+  JWT → upsert. The whole body is additionally wrapped in an outer
+  `try {...} catch { return redirectError(); }`, so even an unexpected throw
+  (e.g. `encryptToken` failing on a bad key) still redirects rather than
+  crashing or returning a 500 — this is the belt-and-suspenders behavior
+  changes.md describes, and I independently verified it by forcing
+  `encryptToken` to throw for real (see below).
+- `disconnect/handler.ts`: no-row case short-circuits to
+  `ok({ disconnected: true })` before any revoke/delete; when a row exists,
+  `decryptToken` + `revokeToken` are wrapped in their own inner `try/catch`
+  so a decrypt failure can never block the subsequent `DELETE`; delete errors
+  map to 500 `INTERNAL`; the `DELETE` is scoped with `.eq("user_id",
+  ctx.userId)`, matching the RLS-scoping intent from the spec.
 
-## New tests written by this stage
+Also confirmed via `grep -rn "console\." app/api/google-calendar
+lib/google-calendar` that the only two `console.*` calls in any new/modified
+file are the two static `console.warn` strings in `oauth.ts`'s `revokeToken`
+— no token or key value is ever interpolated into a log call anywhere in
+this feature.
 
-**`tests/unit/lib/r2/client.test.ts`** (13 tests, new) — fills the gap the
-coder flagged in changes.md ("What the Tester should focus on"): a
-standalone unit test for `lib/r2/client.ts` that mocks `@aws-sdk/client-s3`
-and `@aws-sdk/s3-request-presigner` directly (no handler indirection), using
-`jest.isolateModulesAsync` per test to get a fresh lazy-singleton `S3Client`
-each time. Covers:
+## Independent read of the coder's existing tests
 
-- `getUploadUrl` signs a `PutObjectCommand` with the correct
-  `Bucket`/`Key`/`ContentType` and a 30-minute (`1800`s) `expiresIn`.
-- `getUploadUrl` works with `contentType` omitted (optional param).
-- `getDownloadUrl` signs a `GetObjectCommand` with the correct
-  `Bucket`/`Key` and the same 30-minute expiry.
-- Each of the four required env vars (`R2_ENDPOINT`, `R2_ACCESS_KEY_ID`,
-  `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`), when **missing**, throws
-  `/R2 is not configured/` and never calls `getSignedUrl`.
-- Each of the four required env vars, when **present but an empty string**,
-  also throws — confirms `!endpoint` etc. treats `""` as falsy/missing, not
-  just `undefined`. This was explicitly called out as unverified in
-  changes.md and is now covered.
-- The `S3Client` singleton is constructed exactly once across two calls
-  (`getUploadUrl` then `getDownloadUrl`) with the exact expected config
-  (`region: "auto"`, `endpoint`, `forcePathStyle: true`, `credentials`).
+Read all five existing test files
+(`tests/unit/lib/google-calendar/token-crypto.test.ts`,
+`tests/unit/lib/google-calendar/oauth.test.ts`, and the three
+`tests/unit/app/api/google-calendar-{connect,callback,disconnect}-route.test.ts`
+files). Coverage matches what `changes.md` claims — round-trip encryption,
+distinct-IV-per-call, tampered/malformed ciphertext, missing/short key
+(including a "key never appears in the error message" assertion),
+`getAuthUrl`'s scope/access_type/prompt/state and missing-env-var throws,
+`exchangeCode`'s happy path + non-ok + missing-refresh_token + missing-env
+cases, `revokeToken`'s three never-throws cases, connect's 401/200/500
+cases (including asserting the state in the cookie matches the state in the
+returned `authUrl`), callback's full redirect-target matrix (unauthenticated,
+`?error=`, missing code/state, CSRF mismatch, missing cookie, exchange
+failure, upsert success with encrypted-value assertions, upsert error), and
+disconnect's 401 (both no-Clerk-id and no-JWT), success+revoke+delete,
+idempotent-no-row, revoke-fails-but-succeeds, select-error, and delete-error
+cases. No discrepancies found between the code and what these tests assert.
 
-All 13 pass; `bun run lint` / `bun run typecheck` remain clean with the new
-file included.
+## Independent test coverage added
 
-## Manual verification of spec edge cases
+`changes.md`'s own "What the Tester should focus on" section named this gap
+explicitly: "confirm this holds even if `decryptToken` itself throws (e.g. a
+corrupted `refresh_token_encrypted` value), which the handler's inner
+try/catch is intended to cover but has no spec-named edge case forcing it."
+The existing disconnect test suite only ever calls `decryptToken` on values
+produced by the real `encryptToken`, so that specific throw path was never
+actually exercised — it's a materially different behavior than "revoke
+returns ok:false" or "fetch rejects", since here decryption itself fails
+before any token value exists to hand to `revokeToken`.
 
-Cross-checked every edge case enumerated in `.pipeline/spec.md` ("Edge cases
-the implementation must handle") against the coder's
-`tests/unit/app/api/song-documents-route.test.ts` and confirmed each has a
-corresponding, passing assertion: unauthenticated 401 (before Supabase/R2
-touch) for all four endpoints; role gating per-endpoint (list allows
-`member`, others don't; `guest` always 403); song-not-in-group 404 (before
-R2 signing and before insert/delete) for all four; malformed/missing JSON
-body → 400; `file_size_bytes` invalid (non-number/0/negative/float) → 400;
-`file_key` prefix mismatch (3 variants) → 400; empty document list → 200
-`{ documents: [] }`; delete-miss (wrong doc/song/group) → 404; Supabase
-query/insert/delete errors → 500; R2 helper throwing → 500 INTERNAL.
+Added `tests/unit/app/api/google-calendar-tester-supplement.test.ts` with:
+
+1. **Disconnect — corrupted stored ciphertext**: stubs a stored row whose
+   `refresh_token_encrypted` is not valid `iv:authTag:ciphertext` ciphertext,
+   so the real `decryptToken` throws (not mocked). Asserts the handler still
+   returns 200 `{ disconnected: true }`, the row is still deleted
+   (`DELETE ... WHERE user_id = <caller>`), and — since decryption failed
+   before a token value existed — `revokeToken` is never called at all (a
+   stronger assertion than "called and its failure ignored").
+2. **Callback — encryption key failure at encrypt time**: deletes
+   `TOKEN_ENCRYPTION_KEY` so the real `encryptToken` throws inside the
+   handler's try block, after a successful (mocked) `exchangeCode`. Confirms
+   the handler still redirects to `/profile?calendar=error` (never a JSON
+   500 — this route is a browser redirect target and must never return JSON)
+   and never reaches `getSupabaseClient`, i.e. no partial row can be
+   written. This independently verifies spec edge case #9 ("Missing/invalid
+   TOKEN_ENCRYPTION_KEY ... callback redirects to error") at the point in the
+   flow (encrypt, not decrypt) where it's actually most likely to occur.
+
+Both new tests pass against the current implementation with no code changes
+required; they were run standalone and as part of the full suite.
 
 ## Failure cases exercised
 
 Per the pipeline contract's requirement to cover at least one failure case,
-the following were independently confirmed (both pre-existing in the
-coder's suite and newly added by this stage):
+the following were confirmed (both pre-existing in the coder's suite and
+newly added by this stage):
 
-- R2 SDK throwing (e.g. `getUploadUrl` rejecting) is caught by the handler's
-  generic `catch (err)` and surfaces as 500 INTERNAL, not an unhandled
-  rejection (`tests/unit/app/api/song-documents-route.test.ts`, "returns 500
-  INTERNAL when the R2 helper throws").
-- `lib/r2/client.ts` itself throwing synchronously on missing/empty env vars,
-  verified independently of the handler's mocking (new
-  `tests/unit/lib/r2/client.test.ts`).
-- Supabase insert/list/delete query errors all map to 500 INTERNAL in their
-  respective handler functions (pre-existing tests, re-run and confirmed).
+- `exchangeCode` throwing (non-ok token endpoint response) is caught by
+  callback's outer `try/catch` and redirects to error without ever calling
+  `getSupabaseClient` (pre-existing test, re-run and confirmed).
+- A Supabase upsert error redirects to error rather than silently reporting
+  success (pre-existing test, re-run and confirmed).
+- A Supabase select/delete error in disconnect maps to 500 `INTERNAL`
+  (pre-existing tests, re-run and confirmed).
+- `encryptToken` throwing mid-callback (missing `TOKEN_ENCRYPTION_KEY`) still
+  redirects to error rather than crashing or returning JSON (new test, this
+  stage).
+- `decryptToken` throwing mid-disconnect (corrupted stored ciphertext) still
+  completes the delete and returns success, never calling `revokeToken` with
+  a bad value (new test, this stage).
 
 ## Verdict
 
 No failures found. Nothing was patched around — the implementation matched
 the spec on every point checked, and the one coverage gap the coder itself
-flagged is now closed. Ready for Review.
+flagged in changes.md is now closed with a real (non-mocked) throw of
+`decryptToken`/`encryptToken`, plus one additional independently-chosen edge
+case. Ready for Review.
