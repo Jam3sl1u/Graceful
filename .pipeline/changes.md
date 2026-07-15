@@ -1,105 +1,118 @@
-# Changes — Issue #58: Song-level document attachment (signed URLs)
+# Changes — Issue #55: Add/remove/reorder setlist songs (BR-07 no duplicates)
 
-Implements the four song-document endpoints (previously 501 stubs) and the R2
-presigned-URL helpers they depend on, per `.pipeline/spec.md`. No migrations
-touched (table/RLS already exist) and no new dependencies added
-(`@aws-sdk/client-s3` / `@aws-sdk/s3-request-presigner` were already present).
+## Summary
 
-## Files created
+Implemented the three previously-stubbed setlist-editing endpoints per
+`.pipeline/spec.md`, with no migrations and no scope creep.
 
-- **`schemas/song-documents.ts`** — `uploadUrlSchema` (name/file_type/
-  file_size_bytes shape validation) and `registerDocumentSchema` (extends it
-  with `file_key`). Mirrors `schemas/songs.ts` style.
+## Files changed
 
-- **`app/api/songs/[id]/documents/handler.ts`** — single module exporting
-  `createUploadUrl`, `registerDocument`, `listDocuments`, `deleteDocument`,
-  all mirroring the auth → role → jwt/getToken → getSupabaseClient → query →
-  `ok`/`fail` boilerplate from `app/api/songs/handler.ts`, wrapped in
-  try/catch mapping `ApiException` (R2 SDK errors are plain `Error`s and fall
-  through to the generic 500 branch).
-  - Shared `songExistsInGroup` helper checks the song belongs to the caller's
-    `church_group_id` *before* any R2 or document DB work (404 NOT_FOUND if
-    absent) — enforced first in every one of the four functions, right after
-    the JWT is resolved.
-  - `createUploadUrl` (role `admin`/`set_leader`): mints
-    `song-documents/{churchGroupId}/{songId}/{uuid}/{sanitizedName}` as the
-    `file_key`, calls `getUploadUrl(fileKey, file_type)`, returns
-    `{ uploadUrl, fileKey }`.
-  - `registerDocument` (role `admin`/`set_leader`): rejects a `file_key` not
-    prefixed with `song-documents/{churchGroupId}/{songId}/` (400
-    VALIDATION_FAILED, prevents registering another group's/song's object),
-    inserts the metadata row, signs the inserted `file_key` with
-    `getDownloadUrl`, returns `{ document }` (201) with the full DTO — the
-    raw `file_key` is never included in the response.
-  - `listDocuments` (role `admin`/`set_leader`/`member` — guests excluded):
-    selects rows ordered by `created_at` ascending, maps each to the DTO by
-    signing `file_key` via `getDownloadUrl`; empty group/song → `{ documents:
-    [] }`.
-  - `deleteDocument` (role `admin`/`set_leader`): three-way scoped delete
-    (`id` + `song_id` + `church_group_id`) chained with `.select("id")`; an
-    empty result set (wrong doc/song/group) → 404 NOT_FOUND. R2 object
-    cleanup intentionally out of scope per spec.
+- `schemas/setlists.ts` — replaced the `z.object({})` placeholder with
+  `reorderSetlistSchema` (`{ songs: [{ songId, keyOverride? }] }`) and
+  `addSetlistSongSchema` (`{ songId, keyOverride? }`), matching the style of
+  `schemas/songs.ts`. Shape-only validation; BR-09 key membership is checked
+  in the handler (422), shape errors are 400.
 
-- **`tests/unit/app/api/song-documents-route.test.ts`** (new — not explicitly
-  listed under the spec's "Files to create" but the spec's "Patterns to
-  copy" section calls for handler tests following
-  `tests/unit/app/api/songs-route.test.ts`'s harness, additionally mocking
-  `@/lib/r2/client`). 35 tests covering the happy path, all four
-  role/permission gates, the song-not-in-group 404 (and that it fires before
-  any R2/DB write call), body validation (missing/malformed, non-integer/
-  zero/negative/float `file_size_bytes`), the `file_key` prefix guard (three
-  malformed-prefix cases), the empty-list case, the 3-way-scoped-delete-miss
-  404, unauth 401 (JWT missing), and R2/Supabase failure paths → 500
-  INTERNAL.
+- `lib/supabase/types.ts` — added the missing `setlist_songs` row type and
+  `Tables` entry (`id`, `setlist_id`, `song_id`, `position`, `key_override`,
+  `notes`), modeled on the existing `setlists` entry: `id`/`key_override`/
+  `notes` optional on Insert (DB-defaulted / nullable).
 
-## Files modified
+- `app/api/setlists/[id]/handler.ts` (new) — implements all three handlers,
+  modeled on `app/api/service-weeks/[id]/setlist/handler.ts` and
+  `app/api/songs/handler.ts` (`requireAuth` → `requireRole(["admin",
+  "set_leader"])` → `getToken({ template: "supabase" })` (401 if null) →
+  `getSupabaseClient` → queries → `ok`/`fail`, wrapped in the shared
+  `try/catch` that maps `ApiException` and otherwise 500).
+  - `toSetlistSongResponse` maps a `setlist_songs` row to the camelCase DTO
+    (`id`, `setlistId`, `songId`, `position`, `keyOverride`, `notes`).
+  - `loadEditableSetlist` — shared internal helper used by all three
+    handlers: loads the parent `setlists` row scoped to `id` +
+    `church_group_id` (giving correct 404 tenant semantics), and asserts
+    `status === "draft"` (409 CONFLICT "Setlist is published. Unlock it
+    before editing." otherwise). DB error → 500.
+  - `loadOrderedSongs` — shared helper that re-selects all `setlist_songs`
+    rows for a setlist ordered by `position` asc, used to build the response
+    at the end of every handler.
+  - `reorderSetlist` (PUT, 200): parses body → per-entry BR-09 check (422) →
+    editable-setlist guard → rejects duplicate `songId`s in the body (400) →
+    loads current `setlist_songs` and requires the body's songId set to
+    exactly equal the setlist's current songId set (400 "Song set does not
+    match the setlist" otherwise — add/remove is POST/DELETE-only) → updates
+    each row's `position` (1-indexed from array order) and `key_override`
+    (matched by `song_id`, scoped to `setlist_id`) → returns the freshly
+    reloaded, position-ordered list.
+  - `addSetlistSong` (POST, 201): parses body → BR-09 check (422) →
+    editable-setlist guard → verifies the song exists in the caller's group
+    (404 "Song not found" otherwise, preventing cross-tenant adds) → BR-07
+    duplicate pre-check via `.eq("setlist_id", id).eq("song_id",
+    songId).maybeSingle()` (409 CONFLICT "That song is already in the
+    setlist." otherwise) → computes next position as current-count + 1 →
+    inserts, with a race backstop that maps a Postgres unique-violation
+    (`code === "23505"`) to the same 409 rather than a generic 500 → returns
+    the reloaded list.
+  - `removeSetlistSong` (DELETE, 200): editable-setlist guard → deletes the
+    row scoped to `setlist_id` + `song_id`, chaining `.select("id")` after
+    `.delete()` so a missing/foreign row is detected (404 "Song not found in
+    setlist" if nothing was deleted) → recompacts positions by re-selecting
+    remaining rows ordered by `position` and rewriting any row whose
+    `position` no longer matches its 1-indexed slot → returns the reloaded
+    list (`{ songs: [] }` for an emptied setlist).
 
-- **`lib/r2/client.ts`** — replaced the two throwing stubs with real
-  presigned-URL generation via `@aws-sdk/client-s3` +
-  `@aws-sdk/s3-request-presigner`. Lazy singleton `S3Client` built from
-  `R2_ENDPOINT`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`/`R2_BUCKET_NAME`
-  (`region: "auto"`, `forcePathStyle: true`); throws a plain `Error` if any
-  is missing (surfaces as 500 via the handler's generic catch). Both
-  `getUploadUrl` (now takes an optional `contentType`) and `getDownloadUrl`
-  use a 30-minute expiry (`SIGNED_URL_EXPIRY_SECONDS = 30 * 60`). Removed the
-  stale `Sprint 3 #58` TODO comment.
+- `app/api/setlists/[id]/route.ts` — replaced the `PUT` 501 stub with a thin
+  wrapper that awaits `params` and calls `reorderSetlist`.
 
-- **`app/api/songs/[id]/documents/route.ts`**,
-  **`app/api/songs/[id]/documents/upload-url/route.ts`**,
-  **`app/api/songs/[id]/documents/[docId]/route.ts`** — replaced the
-  `notImplemented` 501 stubs with thin wiring to the new handler functions,
-  unwrapping `params: Promise<{...}>` the same way as
-  `app/api/service-weeks/[id]/route.ts`.
+- `app/api/setlists/[id]/songs/route.ts` — replaced the `POST` 501 stub with
+  a thin wrapper calling `addSetlistSong`.
 
-- **`lib/supabase/types.ts`** — added `SongDocumentsRow` and a `song_documents`
-  entry to the hand-rolled `Database["public"]["Tables"]` type (Insert omits
-  `id`/`created_at`/`uploaded_by` as optional, matching the `songs` table's
-  style for DB-defaulted/nullable columns).
+- `app/api/setlists/[id]/songs/[songId]/route.ts` — replaced the `DELETE`
+  501 stub with a thin wrapper calling `removeSetlistSong`.
 
-## Out of scope (untouched, per spec)
+## Not changed (per spec's explicit non-scope)
 
-- `bun run lint` — clean.
-- `bun run typecheck` — clean.
-- `bun run test` — 52 suites / 615 tests pass, including the 35 new
-  song-documents tests.
+- No migrations added or modified — `setlists`/`setlist_songs` DB schema,
+  constraints, and RLS are unchanged.
+- `notes` on `setlist_songs` is not settable through these endpoints.
+- `setlists.updated_at` is not bumped by these mutations.
+- No publish/unlock logic (issue #56) — mutations are gated on
+  `status === 'draft'` only, per the spec's documented non-blocking decision.
+
+## Verification
+
+- `bun run lint` — clean, no errors/warnings.
+- `bun run typecheck` — clean, no errors.
+- `bun run test` — all 58 suites / 729 tests pass (no test file for the new
+  handler exists yet; per the pipeline contract, writing/independently
+  verifying tests for this endpoint is the Testing stage's job, not
+  Coding's).
 
 ## What the Tester should focus on
 
-- Role gates for all four endpoints (spec's exact matrix: list allows
-  `member`, the other three do not).
-- The song-in-group 404 guard firing *before* any R2 call (assert
-  `getUploadUrl`/`getDownloadUrl` were never invoked in that path) and before
-  any DB insert/delete.
-- The `file_key` prefix check in `registerDocument` — confirm a `file_key`
-  scoped to a different group or a different song within the same group is
-  rejected (400), not just a totally unrelated key.
-- `file_size_bytes` edge cases (0, negative, float, non-numeric string) all
-  400.
-- The delete 3-way scope: a `docId` that exists but under a different
-  `song_id` or `church_group_id` must 404, not silently no-op-succeed.
-- Response shape: `file_key` must never leak in `listDocuments` /
-  `registerDocument` responses — only `downloadUrl`.
-- `lib/r2/client.ts`'s missing-env-var throw path is only exercised
-  indirectly here (mocked out in the handler tests) — if there's a
-  standalone R2-client unit test worth adding, verify the throw message and
-  that a present-but-empty-string env var also counts as "missing".
+- Role gating: `member`/`guest` → 403 before any DB call, for all three
+  endpoints; `admin`/`set_leader` allowed.
+- Auth gating: no Clerk user or no Supabase JWT → 401, before any DB call
+  (role check happens first per the songs-handler ordering convention, so a
+  forbidden role never reaches `getToken`).
+- Tenant scoping / 404: setlist id missing or belonging to another
+  `church_group_id` → 404 for all three endpoints.
+- Published-setlist guard: `status = 'published'` → 409 CONFLICT for all
+  three endpoints (PUT, POST, DELETE).
+- PUT: 400 on malformed JSON, on a body songId set that doesn't exactly match
+  the setlist's current songs (both missing an existing song and containing
+  an extra one), and on duplicate songIds within the body; 422 on a
+  shape-valid but BR-09-invalid `keyOverride`; verify positions end up
+  exactly `1..N` matching array order and that `key_override` is set
+  per-entry (including explicit `null` clearing an override).
+- POST: 404 when `songId` doesn't exist in the caller's group catalog; 409
+  BR-07 when the song is already in the setlist; verify the new row lands at
+  `position = count + 1`; 422 on invalid `keyOverride`.
+- DELETE: 404 when the `songId` isn't in the setlist (or belongs to another
+  tenant's setlist via a mismatched `setlist_id`); verify recompaction
+  produces contiguous `1..N` positions after removing a song from the
+  middle, and `{ songs: [] }` after removing the last song.
+- 500 mapping for a Supabase error at each query/insert/update/delete step.
+- Follow the existing mock/test harness pattern in
+  `tests/unit/app/api/songs-route.test.ts` (chainable Supabase mock,
+  `makeLookup(role)`, `setUpAuth`) — note this handler's mock will need
+  `.delete()`, `.update()`, and `.maybeSingle()` chain support in addition to
+  what that file already covers.
