@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { createUploadUrl } from "../handler";
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/songs/[id]/documents/upload-url");
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return createUploadUrl(req, id);
 }

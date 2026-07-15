@@ -1,54 +1,60 @@
-# Review — Issue #59: Event CRUD + BR-10 time validation (Sprint 3)
+# Review — Issue #58: Song-level document attachment (signed URLs)
 
 VERDICT: SHIP
 
-## What I verified (independently, not trusted from prior stages)
+## What I verified (firsthand, not just from the summaries)
 
-- Ran `git diff main...HEAD` and read every changed implementation file
-  firsthand: `schemas/events.ts`, `app/api/events/handler.ts`,
-  `app/api/events/[id]/handler.ts`, and both `route.ts` files.
-- Cross-checked against the reference pattern (`app/api/service-weeks/handler.ts`)
-  — auth flow, JWT acquisition, narrow Insert cast, try/catch → `fail(...)`
-  shape, and camelCase convention all match.
-- Cross-checked types against `lib/supabase/types.ts` (`EventsRow`, `Insert`,
-  `Update`) and `types/domain.ts` (`EventType`): every field `toEventResponse`
-  reads exists and is correctly typed; `google_calendar_event_id` is correctly
-  NOT exposed.
-- Re-ran the full gate myself: `bun run lint` (clean), `bun run typecheck`
-  (clean), `bun run test` (54 suites / 658 tests, all pass, incl. the tester's
-  78 new event tests).
+- Ran `git diff main...HEAD` and read the actual source: `handler.ts`,
+  `lib/r2/client.ts`, `schemas/song-documents.ts`, the three `route.ts`
+  wiring files, and the `lib/supabase/types.ts` diff.
+- Re-ran `bun run test` (53 suites / 628 tests pass), `bun run typecheck`
+  (clean), `bun run lint` (clean) myself — not trusting the written report.
+- Confirmed against the existing `app/api/songs/handler.ts` pattern that the
+  auth/role/jwt ordering and `ok`/`fail`/`ApiException` handling match.
 
-## Correctness assessment (green tests AND correct behavior)
+## Correctness / security assessment
 
-- **400-vs-422 split (the crux):** Zod shape failures return 400; a
-  syntactically valid body that violates BR-10 returns 422. Verified in both
-  the handler code and the route tests, which assert status AND `code`
-  separately so a collapse of the two would be caught.
-- **BR-10 helper:** `end > start` strict (equal times rejected), ±72h absolute
-  window with `>` (exactly 72h valid, +1ms invalid). Unit tests hit the
-  boundary to the millisecond, plus the asymmetric start-ok/end-violates case.
-- **Auth precedence:** `requireRole` runs before body parse, so a wrong-role
-  caller gets 403 (not 400) even with a malformed body — matches the
-  service-weeks precedent; tenant isolation via `church_group_id` on every
-  query; generic 404 (no existence leak) on cross-group ids.
-- **updateEvent BR-10 re-check** correctly uses effective start/end (new value
-  or existing row fallback) and skips the week lookup when neither time
-  changes. Patch is built only from present keys; `updateEventSchema`'s
-  `.refine` guarantees at least one recognized key survives stripping, so no
-  empty `.update({})` can occur.
-- **Null-vs-omit** semantics on `location`/`notes` are correct on both create
-  (omit → null) and update (explicit null clears, omit leaves unchanged).
+- Role matrix is exactly per spec: upload-url / register / delete →
+  `["admin","set_leader"]`; list → `["admin","set_leader","member"]`; guest
+  excluded everywhere. `requireRole` (throws 403 FORBIDDEN) runs before the
+  supabase JWT fetch, so forbidden roles never touch the DB/R2.
+- `songExistsInGroup` runs before any R2 signing and before any insert/delete
+  in all four functions — the "belongs to the church group" guard.
+- `registerDocument` rejects a `file_key` not prefixed with
+  `song-documents/<group>/<song>/` (400) — blocks cross-group/cross-song
+  object registration. All DB queries are additionally `church_group_id`-scoped
+  (defense in depth on top of RLS).
+- Raw `file_key` never leaks in responses — selected only to sign via
+  `getDownloadUrl`, then dropped from the DTO.
+- Delete is 3-way scoped (`id`+`song_id`+`church_group_id`) with `.select("id")`
+  → empty result maps to 404, not a silent no-op success.
+- Presigned URLs: 30-min expiry on both PUT and GET; lazy singleton S3Client;
+  throws plain `Error` on missing/empty required env var (surfaces as 500 via
+  the generic catch). Matches spec exactly.
+- No migrations added/modified, no new dependencies — spec's hard constraints
+  honored.
 
-## Non-blocking notes (for human awareness, not fixes required)
+## Tests are meaningful, not superficial
 
-1. BR-10 anchor is service_date at 00:00:00 UTC with a symmetric ±72h absolute
-   window (spec Decision #2). This is deterministic and documented, but means
-   an event up to 72h *before* the service date is valid and the church
-   group's timezone is ignored. Defensible for this self-contained issue; a
-   human may want group-tz-relative windows later.
-2. `deleteEvent` relies on a DB-level ON DELETE CASCADE for `event_attendees`
-   (per spec, #60's scope). Worth a human confirming the FK is actually
-   defined with cascade in the migration — out of scope to change here.
+- 35 handler tests exercise every role gate, the pre-DB/pre-R2 404 ordering
+  (asserting `getUploadUrl`/`getDownloadUrl`/`getSupabaseClient` were NOT
+  called on rejected paths), the file_key prefix guard (3 malformed variants),
+  `file_size_bytes` edge cases (0/negative/float/string), the empty-list case,
+  the delete-miss 404, unauth 401, and R2/Supabase failure → 500.
+- Tester added 13 standalone `lib/r2/client.ts` tests covering the
+  present-but-empty-string env var falsy path and single-construction of the
+  singleton — a real gap the coder flagged, now closed.
 
-Neither note changes behavior for the AC in scope. Implementation matches the
-spec file-by-file, tests are meaningful and boundary-precise, all gates green.
+## Minor observations (non-blocking, no action required to ship)
+
+1. `songExistsInGroup` destructures only `{ data }` and ignores `error`, so a
+   DB error during the song lookup surfaces as 404 rather than 500. This is
+   the exact shape the spec dictated, and the only observable difference is a
+   404-vs-500 status on a rare infra error — acceptable.
+2. The tester's new file `tests/unit/lib/r2/client.test.ts` is currently
+   untracked in the worktree. The orchestrator's commit step must `git add`
+   it so those 13 tests are actually captured in the PR; the code under review
+   ships fine either way, but don't lose that file at commit time.
+
+The implementation matches the spec on every point I checked, tests reflect
+real behavior, and all gates are green under independent re-run. Ship it.
