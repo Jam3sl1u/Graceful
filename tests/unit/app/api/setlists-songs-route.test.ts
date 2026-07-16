@@ -62,7 +62,7 @@ type QueryResult = { data: unknown; error: unknown };
 type ErrObj = { message: string; code?: string };
 
 type SetlistsRow = { id: string; church_group_id: string; status: string };
-type SongsRow = { id: string; church_group_id: string };
+type SongsRow = { id: string; church_group_id: string; default_key: string | null };
 type SetlistSongsRow = {
   id: string;
   setlist_id: string;
@@ -72,17 +72,24 @@ type SetlistSongsRow = {
   notes: string | null;
 };
 
+type Predicate<T extends AnyRow> = (row: T) => boolean;
+
 function applyFilters<T extends AnyRow>(rows: T[], filters: [string, unknown][]): T[] {
   return rows.filter((r) => filters.every(([f, v]) => r[f] === v));
 }
 
 function makeSelectChain<T extends AnyRow>(rows: T[], error?: ErrObj) {
   const filters: [string, unknown][] = [];
+  const predicates: Predicate<T>[] = [];
   let orderField: string | null = null;
   let orderAsc = true;
   const chain: Record<string, unknown> & PromiseLike<QueryResult> = {
     eq: jest.fn((f: string, v: unknown) => {
       filters.push([f, v]);
+      return chain;
+    }),
+    in: jest.fn((f: string, values: unknown[]) => {
+      predicates.push((row: T) => values.includes(row[f]));
       return chain;
     }),
     order: jest.fn((f: string, opts: { ascending: boolean }) => {
@@ -98,7 +105,7 @@ function makeSelectChain<T extends AnyRow>(rows: T[], error?: ErrObj) {
     then: (resolve: (v: QueryResult) => unknown, reject?: (e: unknown) => unknown) => {
       const run = async (): Promise<QueryResult> => {
         if (error) return { data: null, error };
-        let matched = applyFilters(rows, filters);
+        let matched = applyFilters(rows, filters).filter((r) => predicates.every((p) => p(r)));
         if (orderField) {
           const field = orderField;
           matched = [...matched].sort((a, b) => {
@@ -233,10 +240,10 @@ function baseState(): FakeState {
       { id: PUBLISHED_SETLIST_ID, church_group_id: CHURCH_GROUP_ID, status: "published" },
     ],
     songs: [
-      { id: "11111111-1111-1111-1111-111111111111", church_group_id: CHURCH_GROUP_ID },
-      { id: "22222222-2222-2222-2222-222222222222", church_group_id: CHURCH_GROUP_ID },
-      { id: "33333333-3333-3333-3333-333333333333", church_group_id: CHURCH_GROUP_ID },
-      { id: "44444444-4444-4444-4444-444444444444", church_group_id: OTHER_CHURCH_GROUP_ID },
+      { id: "11111111-1111-1111-1111-111111111111", church_group_id: CHURCH_GROUP_ID, default_key: "C" },
+      { id: "22222222-2222-2222-2222-222222222222", church_group_id: CHURCH_GROUP_ID, default_key: "D" },
+      { id: "33333333-3333-3333-3333-333333333333", church_group_id: CHURCH_GROUP_ID, default_key: "E" },
+      { id: "44444444-4444-4444-4444-444444444444", church_group_id: OTHER_CHURCH_GROUP_ID, default_key: "F" },
     ],
     setlistSongs: [
       {
@@ -299,6 +306,9 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
         songId: "33333333-3333-3333-3333-333333333333",
         position: 1,
         keyOverride: "G",
+        defaultKey: "E",
+        effectiveKey: "G",
+        isOverridden: true,
         notes: null,
       },
       {
@@ -307,6 +317,9 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
         songId: "11111111-1111-1111-1111-111111111111",
         position: 2,
         keyOverride: null,
+        defaultKey: "C",
+        effectiveKey: "C",
+        isOverridden: false,
         notes: null,
       },
       {
@@ -315,6 +328,9 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
         songId: "22222222-2222-2222-2222-222222222222",
         position: 3,
         keyOverride: null,
+        defaultKey: "D",
+        effectiveKey: "D",
+        isOverridden: false,
         notes: null,
       },
     ]);
@@ -522,7 +538,14 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
     const body = await res.json();
     const songs: SetlistSongResponse[] = body.data.songs;
     expect(songs).toHaveLength(3);
-    expect(songs[2]).toMatchObject({ songId: "33333333-3333-3333-3333-333333333333", position: 3, keyOverride: "Bb" });
+    expect(songs[2]).toMatchObject({
+      songId: "33333333-3333-3333-3333-333333333333",
+      position: 3,
+      keyOverride: "Bb",
+      defaultKey: "E",
+      effectiveKey: "Bb",
+      isOverridden: true,
+    });
   });
 
   it("returns 404 'Song not found' when songId is not in the caller's group catalog", async () => {
@@ -669,8 +692,28 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
     const body = await res.json();
     const songs: SetlistSongResponse[] = body.data.songs;
     expect(songs).toEqual([
-      { id: "ss-1", setlistId: SETLIST_ID, songId: "11111111-1111-1111-1111-111111111111", position: 1, keyOverride: "A", notes: null },
-      { id: "ss-3", setlistId: SETLIST_ID, songId: "33333333-3333-3333-3333-333333333333", position: 2, keyOverride: null, notes: null },
+      {
+        id: "ss-1",
+        setlistId: SETLIST_ID,
+        songId: "11111111-1111-1111-1111-111111111111",
+        position: 1,
+        keyOverride: "A",
+        defaultKey: "C",
+        effectiveKey: "A",
+        isOverridden: true,
+        notes: null,
+      },
+      {
+        id: "ss-3",
+        setlistId: SETLIST_ID,
+        songId: "33333333-3333-3333-3333-333333333333",
+        position: 2,
+        keyOverride: null,
+        defaultKey: "E",
+        effectiveKey: "E",
+        isOverridden: false,
+        notes: null,
+      },
     ]);
   });
 
