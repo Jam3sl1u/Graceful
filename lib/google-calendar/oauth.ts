@@ -90,6 +90,67 @@ export async function exchangeCode(code: string): Promise<GoogleTokens> {
   };
 }
 
+// Thrown by refreshAccessToken when Google reports the refresh token itself
+// is revoked/expired (error === "invalid_grant"), as opposed to a transient
+// failure. The sync layer (lib/google-calendar/sync.ts) catches this
+// specifically to flag the token invalid + notify the member (PRD §10),
+// rather than treating it like any other outage.
+export class GoogleTokenInvalidError extends Error {
+  constructor(message = "Google refresh token is invalid or revoked") {
+    super(message);
+    this.name = "GoogleTokenInvalidError";
+  }
+}
+
+export type RefreshedAccessToken = {
+  accessToken: string;
+  expiryDate: string; // ISO timestamptz
+};
+
+// Exchanges a stored refresh token for a new access token (#62 event sync —
+// the original access token from exchangeCode is short-lived). Throws
+// GoogleTokenInvalidError when Google reports invalid_grant (revoked/expired
+// refresh token); throws a plain Error for any other failure (network,
+// missing env vars, unexpected response).
+export async function refreshAccessToken(refreshToken: string): Promise<RefreshedAccessToken> {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error("Missing required env vars: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set");
+  }
+
+  const body = new URLSearchParams({
+    refresh_token: refreshToken,
+    client_id: clientId,
+    client_secret: clientSecret,
+    grant_type: "refresh_token",
+  });
+
+  const res = await fetch(TOKEN_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+
+  if (!res.ok) {
+    const errorJson = (await res.json().catch(() => ({}))) as { error?: string };
+    if (errorJson.error === "invalid_grant") {
+      throw new GoogleTokenInvalidError();
+    }
+    throw new Error("Failed to refresh Google OAuth access token");
+  }
+
+  const json = (await res.json()) as { access_token?: string; expires_in?: number };
+  if (!json.access_token) {
+    throw new Error("Google did not return an access_token on refresh");
+  }
+
+  return {
+    accessToken: json.access_token,
+    expiryDate: new Date(Date.now() + (json.expires_in ?? 0) * 1000).toISOString(),
+  };
+}
+
 // Best-effort revoke, used on disconnect. Never throws — a failed revoke
 // must not block deleting the stored row (graceful degradation, PRD §25.5).
 export async function revokeToken(token: string): Promise<void> {

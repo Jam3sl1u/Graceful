@@ -1,278 +1,312 @@
-# Spec — Issue #61: Google Calendar OAuth connect/disconnect
+# Spec — Issue #62: Google Calendar event sync (create/update/delete + graceful degradation)
 
-## OPEN QUESTIONS
+## OPEN QUESTIONS (pipeline stops here until a human resolves these)
 
-None blocking. Two low-risk decisions made below (documented, coder may keep as-is):
-- `calendar_id` is stored as the literal `"primary"` (the member's primary
-  Google calendar). The PRD column allows any calendar; there is no UI to pick
-  one, so `"primary"` is the MVP value.
-- The `callback` route redirects the browser to `/profile?calendar=connected`
-  on success and `/profile?calendar=error` on failure. There is no dedicated
-  calendar-settings page yet; `/profile` is the existing member settings page.
+These are genuine blocking decisions, not implementation details. Each downstream
+stage should stop until they are answered.
 
-## Scope
+### OQ-1 (BLOCKING) — How does an admin/set_leader-triggered sync read *other members'* Google tokens?
 
-Implement the connect / callback / disconnect plumbing ONLY. Do NOT implement
-event sync (that is #62). Do NOT request calendar read scope. Do NOT add a
-`googleapis` dependency — use `fetch` against Google's HTTP endpoints and Node's
-built-in `crypto`.
+This is the crux of the whole issue and there is no way to guess it safely.
 
-## Current state (already present — do not recreate)
+Facts from the current codebase:
 
-- Route stubs return `notImplemented(...)`:
-  - `app/api/google-calendar/connect/route.ts` (exports `POST`)
-  - `app/api/google-calendar/callback/route.ts` (exports `GET`)
-  - `app/api/google-calendar/disconnect/route.ts` (exports `DELETE`)
-- `lib/google-calendar/oauth.ts` — has `getAuthUrl` and `exchangeCode` stubs
-  that `throw`. Referenced (not yet existing) `lib/google-calendar/token-crypto.ts`.
-- DB table `google_calendar_tokens` exists
-  (`supabase/migrations/20260702000006_cluster6_auth_audit.sql`) with columns:
-  `id, user_id (UNIQUE FK→users.id ON DELETE CASCADE), access_token_encrypted,
-  refresh_token_encrypted, token_expiry, calendar_id, scope, created_at, updated_at`.
-- RLS policies (select/insert/update/delete, all `user_id = auth_user_id()`)
-  exist in `supabase/migrations/20260704000001_rls_policies.sql`.
-- Env vars already declared in `.env.example`: `GOOGLE_CLIENT_ID`,
-  `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY`.
-- `lib/supabase/types.ts` is MISSING a `google_calendar_tokens` table type — must be added.
-- `schemas/google-calendar.ts` is an empty-object stub — leave it alone (no body
-  schema is needed for these routes; input comes from query params / OAuth).
+- Event create/update/delete (`app/api/events/**`) and attendee add/remove
+  (`app/api/events/[id]/attendees/**`) are **admin/set_leader-only** actions
+  (`requireRole(ctx, ["admin", "set_leader"])`). The Supabase client in those
+  handlers runs under the **acting user's** Clerk JWT.
+- `google_calendar_tokens` is **strictly user-scoped** by RLS — policy
+  `google_calendar_tokens_select_own`
+  (`supabase/migrations/20260704000001_rls_policies.sql`) only lets a user
+  read/update **their own** row.
+- There is **no service-role Supabase client** in app code, and adding one is
+  explicitly forbidden: `lib/supabase/client.ts` documents "SUPABASE_SERVICE_ROLE_KEY
+  is never used in user-callable code (PRD §19.3 / issue #23)."
 
-No migration or RLS change is required. No new npm/bun dependency is required.
+Therefore an admin's request **cannot** read the assigned members' encrypted
+tokens to push to their calendars. The repo's established pattern for
+cross-user privileged DB work is a `SECURITY DEFINER` RPC called via the
+user's client (see `record_availability_conflict` in
+`20260713000001_conflict_notification.sql`) or via `getAnonSupabaseClient()`
+for no-session cron (`send_invitation_reminders` in
+`app/api/cron/invitation-reminders/route.ts`).
 
-## Patterns to copy
+Applying that pattern here means a `SECURITY DEFINER` RPC that **returns other
+members' encrypted OAuth tokens** into an admin-triggered request path (the
+server would then decrypt them with `TOKEN_ENCRYPTION_KEY` and call Google).
+That is a real security-posture change (member OAuth credentials become
+reachable from an admin's request) and must be signed off by a human, not
+assumed.
 
-- Route/handler split + auth + error handling: copy the shape of
-  `app/api/profile/route.ts` (thin) + `app/api/profile/handler.ts` (logic).
-- Auth: `requireAuth(req, lookup)` from `lib/api/auth.ts`; take an optional
-  `lookup?: UserLookup` param on every handler for testability (as profile does).
-- Responses: `ok(...)`, `fail(msg, ErrorCode.X, status)` from `lib/api/response.ts`;
-  `ApiException`/`ErrorCode` from `lib/api/errors.ts`.
-- Supabase access: `getSupabaseClient(jwt)` with the Clerk `supabase` template
-  JWT (exactly as profile handler lines 26–31). RLS enforces user scoping.
-- Handler test structure: copy `tests/unit/app/api/profile-route.test.ts`
-  (mock `@clerk/nextjs/server` and `@/lib/supabase/client`, fake `UserLookup`).
+**Decision needed — pick one:**
+- **(A) Inline sync via a `SECURITY DEFINER` token-fetch RPC** (recommended;
+  most consistent with `record_availability_conflict` / `send_invitation_reminders`).
+  Simplest; adds outbound Google latency to event/attendee mutations. Details
+  fully specced below under "Recommended design (pending OQ-1 = A)".
+- **(B) Deferred/async sync** via a job row + a cron route using
+  `getAnonSupabaseClient()` + a `SECURITY DEFINER` RPC (mirrors invitation
+  reminders). No generic job-queue infra exists today, so this is materially
+  larger scope than #62 implies.
+- **(C) Restrict #62 to member-owned-calendar sync only** (reconnect path, where
+  the acting user reads their *own* token — no RLS wall), and move
+  admin-triggered cross-member sync to a follow-up issue.
 
-## Files to create / modify
+### OQ-2 — Confirm the single shared Google event ID design.
 
-### 1. `lib/google-calendar/token-crypto.ts` (CREATE)
+`events.google_calendar_event_id` is a single `varchar(100)` column
+(`20260702000003_cluster_3_scheduling_core.sql`), but each connected member has
+their own calendar/token, so a naive "one Google event per member" would need N
+IDs. The only design that fits the single column: generate **one caller-assigned
+Google event ID** (Google supports client-supplied event IDs) and reuse the same
+ID when inserting/patching/deleting on **every** assigned member's calendar.
+Confirm this is intended (it is assumed by the design below). If per-member IDs
+are wanted instead, a schema change (per-attendee mapping) is required and this
+issue's scope changes.
 
-AES-256-GCM using Node `crypto`. Key from `process.env.TOKEN_ENCRYPTION_KEY`.
+### OQ-3 — Trigger scope.
 
-```ts
-// "server-only" at top
-export function encryptToken(plaintext: string): string;
-export function decryptToken(ciphertext: string): string;
-```
+This spec covers only the triggers named in the issue: event **create/update/delete**
+(#59) and attendee **add/remove** (#60), plus **retroactive sync on reconnect**
+(acceptance criterion). PRD also mentions sync on **invitation accept** (line 158)
+and **service-week cancel** (line 1195, removes synced events). Those belong to
+#59/#57 respectively and are treated as **out of scope** here unless a human says
+otherwise.
 
-- Key: interpret `TOKEN_ENCRYPTION_KEY` as base64; it must decode to exactly 32
-  bytes. If missing or wrong length, `throw new Error(...)` (do NOT include the
-  key value in the message).
-- `encryptToken`: random 12-byte IV via `randomBytes`, `createCipheriv("aes-256-gcm", key, iv)`,
-  produce `iv:authTag:ciphertext` all base64, joined by `:`. Return that string.
-- `decryptToken`: parse the three parts, `createDecipheriv`, verify auth tag.
-  On any parse/auth failure, throw.
-- Never `console.log` plaintext or the key.
+---
 
-### 2. `lib/google-calendar/oauth.ts` (MODIFY — replace the two throwing stubs)
+Everything below is the concrete plan to implement **once OQ-1 is answered (A)**.
+If the answer is B or C, the plan changes and this spec must be revised.
 
-```ts
-export const CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+## Recommended design (pending OQ-1 = A)
 
-// Build the Google consent URL. `state` is the CSRF token (see callback).
-export function getAuthUrl(state: string): string;
+A service layer `lib/google-calendar/sync.ts` that the event and attendee
+handlers call into. It:
+1. Uses a `SECURITY DEFINER` RPC to fetch the encrypted tokens of an event's
+   assigned attendees who have a *connected, valid* calendar.
+2. Refreshes each access token if expired, calls Google Calendar REST, and on a
+   revoked/`invalid_grant` refresh, calls a second `SECURITY DEFINER` RPC to flag
+   the token invalid + insert a re-auth notification (graceful degradation).
+3. Never throws to the caller — a sync failure must not fail the event/attendee
+   HTTP request (the DB write is the source of truth; sync is best-effort).
 
-export type GoogleTokens = {
-  accessToken: string;
-  refreshToken: string;      // required; see edge case below
-  expiryDate: string;        // ISO timestamptz for token_expiry
-  scope: string;
-};
+### Files to CREATE
 
-// Exchange an auth code for tokens at https://oauth2.googleapis.com/token.
-export async function exchangeCode(code: string): Promise<GoogleTokens>;
+1. **`supabase/migrations/20260716000001_google_calendar_sync.sql`**
+   (DOWN block commented out, per repo convention — see
+   `20260713000001_conflict_notification.sql`)
+   - `ALTER TABLE google_calendar_tokens ADD COLUMN is_valid boolean NOT NULL DEFAULT true;`
+     (PRD §10: "Token flagged as invalid in DB"). Reset to `true` on reconnect
+     upsert.
+   - `ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'google_calendar_reauth_required';`
+     (mirror `20260711000002_service_week_notification_types.sql`).
+   - RPC `public.get_event_sync_targets(p_event_id uuid)` — `SECURITY DEFINER`,
+     `SET search_path = ''`, `GRANT EXECUTE ... TO authenticated`. Derives the
+     caller's user + group from `auth.jwt()->>'sub'` exactly like
+     `record_availability_conflict`. Asserts the event belongs to the caller's
+     group and the caller is admin/set_leader (else `RAISE EXCEPTION`). Returns
+     one row per assigned attendee **who has a `google_calendar_tokens` row with
+     `is_valid = true`**: `(user_id uuid, access_token_encrypted text,
+     refresh_token_encrypted text, token_expiry timestamptz, calendar_id text)`.
+   - RPC `public.get_user_sync_targets()` — `SECURITY DEFINER` — same row shape
+     but for the **caller's own** connected+valid token only (used by the
+     reconnect retroactive path; keeps one code path). Returns 0 or 1 row.
+   - RPC `public.flag_calendar_token_invalid(p_user_id uuid)` — `SECURITY DEFINER`.
+     Sets `is_valid = false, updated_at = now()` on that user's token row and
+     inserts one `notifications` row for that user
+     (`type = 'google_calendar_reauth_required'`, title "Reconnect Google Calendar",
+     body per PRD §10 message "Your Google Calendar connection needs to be
+     refreshed. Tap here to reconnect.", `link_entity_type = 'google_calendar'`,
+     `link_entity_id = NULL`). Caller must be admin/set_leader in the same group
+     OR `p_user_id` = the caller themselves (covers member reconnect/self path).
+     Idempotent: only insert + flag when currently `is_valid = true`.
 
-// Best-effort revoke at https://oauth2.googleapis.com/revoke. Never throws.
-export async function revokeToken(token: string): Promise<void>;
-```
+2. **`lib/google-calendar/sync.ts`** (`import "server-only";`) — the service layer.
+   Signatures:
+   ```ts
+   import type { SupabaseClient } from "@supabase/supabase-js";
+   import type { Database } from "@/lib/supabase/types";
 
-Details:
-- `getAuthUrl`: base `https://accounts.google.com/o/oauth2/v2/auth`, query params:
-  `client_id=GOOGLE_CLIENT_ID`, `redirect_uri=GOOGLE_REDIRECT_URI`,
-  `response_type=code`, `scope=CALENDAR_EVENTS_SCOPE`, `access_type=offline`,
-  `prompt=consent`, `state=<state>`. Use `URLSearchParams`. Throw if
-  `GOOGLE_CLIENT_ID` or `GOOGLE_REDIRECT_URI` is unset.
-  (`access_type=offline` + `prompt=consent` are required so Google returns a
-  refresh_token every time.)
-- `exchangeCode`: POST form-urlencoded body (`code`, `client_id`, `client_secret`,
-  `redirect_uri`, `grant_type=authorization_code`) to the token endpoint. Parse
-  JSON. If HTTP not ok, throw. Map `access_token`→accessToken,
-  `refresh_token`→refreshToken, `expires_in` (seconds)→`expiryDate` =
-  `new Date(Date.now() + expires_in*1000).toISOString()`, `scope`→scope. If
-  `refresh_token` is absent in the response, throw (see edge case).
-- `revokeToken`: POST `token=<token>` form-urlencoded to the revoke endpoint;
-  swallow any error / non-2xx (log a non-sensitive warning only). Used for
-  graceful disconnect.
-- Do NOT log token values.
+   type Supabase = SupabaseClient<Database>;
 
-### 3. `app/api/google-calendar/connect/handler.ts` (CREATE) + wire `route.ts`
+   // Event fields Google needs. Map from EventsRow at the call site.
+   export type CalendarEventInput = {
+     googleEventId: string;      // caller-assigned, reused across calendars
+     name: string;
+     location: string | null;
+     notes: string | null;
+     startTime: string;          // ISO tz
+     endTime: string;            // ISO tz
+   };
 
-`export async function connect(req, lookup?): Promise<Response>`
+   // Create/update the event on every assigned attendee's calendar. Best-effort:
+   // never throws. Per attendee, on invalid_grant flags token invalid + notifies.
+   export async function syncEventToAttendees(
+     supabase: Supabase, eventId: string, event: CalendarEventInput,
+   ): Promise<void>;
 
-1. `requireAuth(req, lookup)` (any authenticated member; no role gate).
-2. Generate CSRF `state = randomBytes(32).toString("base64url")`.
-3. Set an httpOnly cookie via `cookies()` from `next/headers`:
-   name `gcal_oauth_state`, value `state`, `httpOnly: true`, `secure: true`,
-   `sameSite: "lax"`, `path: "/"`, `maxAge: 600`. (`sameSite: "lax"` is required
-   so the cookie survives Google's top-level GET redirect back to `callback`.)
-4. `authUrl = getAuthUrl(state)`.
-5. Return `ok({ authUrl })`.
-6. Wrap in try/catch: `ApiException`→`fail(err.message, err.code, err.status)`;
-   anything else (e.g. missing Google env)→`fail("Internal error", ErrorCode.INTERNAL, 500)`.
+   // Delete the event from every assigned attendee's calendar (event delete).
+   export async function unsyncEventFromAttendees(
+     supabase: Supabase, eventId: string, googleEventId: string,
+   ): Promise<void>;
 
-`route.ts`: replace stub with `export async function POST(req: NextRequest) { return connect(req); }`.
+   // Single-attendee variants for attendee add/remove.
+   export async function syncEventToUser(
+     supabase: Supabase, userId: string, event: CalendarEventInput,
+   ): Promise<void>;
+   export async function unsyncEventFromUser(
+     supabase: Supabase, userId: string, googleEventId: string,
+   ): Promise<void>;
 
-### 4. `app/api/google-calendar/callback/handler.ts` (CREATE) + wire `route.ts`
+   // Reconnect retroactive sync: push every event the caller is currently an
+   // attendee of onto their (own) calendar. Uses get_user_sync_targets + the
+   // caller's own attendee rows.
+   export async function syncAllEventsForUser(
+     supabase: Supabase, userId: string,
+   ): Promise<void>;
 
-`export async function callback(req, lookup?): Promise<Response>`
-
-This route is a browser redirect target, so it ALWAYS responds with an HTTP
-redirect (`NextResponse.redirect(new URL(path, req.url))`), never JSON. Use
-`/profile?calendar=connected` on success and `/profile?calendar=error` on any
-failure. Clear the `gcal_oauth_state` cookie in all paths.
-
-1. `requireAuth(req, lookup)`. If it throws → redirect to error.
-2. Read query params from `req.nextUrl.searchParams`: `code`, `state`, `error`.
-   - If `error` present (user denied consent) → redirect error, store nothing.
-   - If `code` or `state` missing → redirect error.
-3. CSRF check: read `gcal_oauth_state` cookie; if missing or `!== state` →
-   redirect error, store nothing.
-4. `tokens = await exchangeCode(code)`.
-5. Encrypt: `encryptToken(tokens.accessToken)`, `encryptToken(tokens.refreshToken)`.
-6. Get the Clerk `supabase` JWT, `getSupabaseClient(jwt)`, and UPSERT into
-   `google_calendar_tokens` with `onConflict: "user_id"`:
+   // Deterministic caller-assigned Google event id. Google requires base32hex
+   // (chars a-v + 0-9), length 5-1024. Derive from the event uuid: strip dashes,
+   // lowercase (hex is already a valid base32hex subset). Prefix "gr".
+   export function toGoogleEventId(eventUuid: string): string;
    ```
-   {
-     user_id: ctx.userId,
-     access_token_encrypted,
-     refresh_token_encrypted,
-     token_expiry: tokens.expiryDate,
-     calendar_id: "primary",
-     scope: tokens.scope,          // will be the calendar.events scope
-     updated_at: new Date().toISOString(),
-   }
-   ```
-   Cast the payload as the profile handler does (`as unknown as
-   Database["public"]["Tables"]["google_calendar_tokens"]["Insert"]`) since the
-   hand-written Insert type marks defaulted columns required.
-7. On any thrown error or a Supabase `error` → redirect error. On success →
-   redirect connected.
-8. Never log token plaintext.
+   - Token refresh: add
+     `refreshAccessToken(refreshToken: string): Promise<{ accessToken: string; expiryDate: string }>`
+     to `lib/google-calendar/oauth.ts` (grant_type=refresh_token against
+     `TOKEN_ENDPOINT`, same env-var guard as `exchangeCode`). If the response is
+     4xx with `error === "invalid_grant"` (revoked/expired), throw a
+     distinguishable error (e.g. a named `GoogleTokenInvalidError`) the sync
+     layer catches to trigger `flag_calendar_token_invalid`.
+   - Decrypt tokens with `decryptToken` (`lib/google-calendar/token-crypto.ts`).
+     Only refresh when `token_expiry` is within ~60s of now; else reuse the
+     stored access token.
+   - Google REST calls (write-only `calendar.events` scope, no SDK — use `fetch`,
+     mirroring `oauth.ts`):
+     - Upsert one calendar: try `PATCH https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events/{googleEventId}`;
+       on **404** (event not yet on that calendar) fall back to
+       `POST https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events`
+       with `"id": googleEventId` in the body. Reusing the same id keeps create
+       idempotent. Body: `{ id?, summary: name, location, description: notes,
+       start: { dateTime: startTime }, end: { dateTime: endTime } }`.
+     - Delete: `DELETE .../calendars/{calendarId}/events/{googleEventId}`; treat
+       404/410 (already gone) as success.
+     - `calendarId` comes from the token row (`"primary"` in current data).
+     - Authorization: `Bearer <decrypted access token>` (refreshed if expired).
+   - Per-attendee isolation: wrap each attendee's sync in try/catch so one bad
+     token never blocks the others (PRD §10 graceful degradation).
 
-`route.ts`: `export async function GET(req: NextRequest) { return callback(req); }`.
+### Files to MODIFY
 
-### 5. `app/api/google-calendar/disconnect/handler.ts` (CREATE) + wire `route.ts`
+3. **`lib/google-calendar/client.ts`** — remove the three throwing stubs
+   (`createEvent`/`updateEvent`/`deleteEvent`, all `TODO(Sprint 3 #62)`). Nothing
+   imports this file (confirmed via grep). Delete the file and put all logic in
+   `sync.ts`.
 
-`export async function disconnect(req, lookup?): Promise<Response>`
+4. **`app/api/events/handler.ts` → `createEvent`** — generate the Google event id
+   up front and store it: generate the row id app-side (or run a follow-up
+   `update` to set `google_calendar_event_id = toGoogleEventId(event.id)`) so the
+   mapping is never null. A brand-new event has no attendees, so a create-time
+   push is typically a no-op — still call `syncEventToAttendees` inside a
+   try/catch for the create-then-immediately-assign ordering. Key requirement:
+   **persist `google_calendar_event_id`** so update/delete/attendee paths have it.
 
-1. `requireAuth(req, lookup)`.
-2. Get the Clerk `supabase` JWT + `getSupabaseClient(jwt)`.
-3. SELECT the caller's row (`refresh_token_encrypted`, `access_token_encrypted`)
-   from `google_calendar_tokens` where `user_id = ctx.userId` (`maybeSingle`).
-   - If no row → return `ok({ disconnected: true })` (idempotent; nothing to do).
-4. Best-effort revoke: `decryptToken(refresh_token_encrypted)` then
-   `await revokeToken(...)`. `revokeToken` never throws; a failed revoke must NOT
-   block deletion (graceful degradation, PRD §25.5).
-5. DELETE the row where `user_id = ctx.userId`. If the delete returns a Supabase
-   `error` → `fail("Internal error", ErrorCode.INTERNAL, 500)`.
-6. Return `ok({ disconnected: true })`.
-7. try/catch same as the other handlers.
+5. **`app/api/events/[id]/handler.ts`**
+   - `updateEvent` — after a successful update, if `google_calendar_event_id` is
+     set, `await syncEventToAttendees(...)` with the merged fields (try/catch,
+     best-effort). If null (legacy row), backfill via `toGoogleEventId(id)` and
+     persist it.
+   - `deleteEvent` — **before** deleting the DB row, capture
+     `google_calendar_event_id` and the sync targets (the DB delete cascades
+     `event_attendees`, so the target list must be read first). After the
+     successful DB delete, delete the event from each captured calendar
+     (try/catch).
 
-`route.ts`: `export async function DELETE(req: NextRequest) { return disconnect(req); }`.
+6. **`app/api/events/[id]/attendees/handler.ts`**
+   - `assignAttendee` — widen the event select to include
+     `google_calendar_event_id, name, location, notes, start_time, end_time`.
+     After the successful attendee insert, if the event has a
+     `google_calendar_event_id`, `await syncEventToUser(supabase, parsed.userId,
+     {...})` (try/catch).
+   - `removeAttendee` — widen the event select to include
+     `google_calendar_event_id`. After the successful delete,
+     `await unsyncEventFromUser(supabase, targetUserId, google_calendar_event_id)`
+     (try/catch).
 
-### 6. `lib/supabase/types.ts` (MODIFY — add the missing table type)
+7. **`app/api/google-calendar/callback/handler.ts` → `callback`** — the upsert
+   represents connect **or reconnect**. (a) add `is_valid: true` to the upsert
+   payload so reconnect clears a prior invalid flag; (b) after a successful
+   upsert, `await syncAllEventsForUser(supabase, ctx.userId)` inside try/catch
+   before `redirectConnected()` (a sync failure still reports "connected"). The
+   acting user is the token owner, so RLS permits reading their own token here.
+   Satisfies "On reconnection, missed events sync retroactively."
 
-Add a row type near the other `*Row` types:
-```ts
-type GoogleCalendarTokensRow = {
-  id: string;
-  user_id: string;
-  access_token_encrypted: string;
-  refresh_token_encrypted: string;
-  token_expiry: string;
-  calendar_id: string;
-  scope: string;
-  created_at: string;
-  updated_at: string;
-};
-```
-Add the `Tables` entry (mirror `audit_logs`, but also make `updated_at` optional
-so the callback upsert can set it):
-```ts
-google_calendar_tokens: {
-  Row: GoogleCalendarTokensRow;
-  Insert: Omit<GoogleCalendarTokensRow, "id" | "created_at" | "updated_at"> & {
-    id?: string;
-    created_at?: string;
-    updated_at?: string;
-  };
-  Update: Partial<GoogleCalendarTokensRow>;
-  Relationships: [];
-};
-```
+8. **`lib/supabase/types.ts`**
+   - Add `is_valid: boolean;` to `GoogleCalendarTokensRow`, and
+     `is_valid?: boolean` to the `google_calendar_tokens` Insert omit-with-default
+     list.
+   - Add the three new RPCs to `Database["public"]["Functions"]`
+     (`get_event_sync_targets`, `get_user_sync_targets`,
+     `flag_calendar_token_invalid`) with `Args`/`Returns` matching the SQL.
+
+9. **`types/domain.ts`** — add `"google_calendar_reauth_required"` to the
+   `NotificationType` union (keep in sync with the enum migration).
+
+### Patterns to copy
+
+- SECURITY DEFINER RPC skeleton (JWT→user/group derivation, `RAISE EXCEPTION
+  'UNAUTHENTICATED'`, `SET search_path = ''`, `GRANT EXECUTE ... TO authenticated`,
+  commented-out DOWN): copy from
+  `supabase/migrations/20260713000001_conflict_notification.sql`.
+- Notification insert columns/shape: copy the `INSERT INTO public.notifications`
+  in that same file.
+- `fetch`-based Google HTTP + env-var guards + never-throw revoke style: copy
+  from `lib/google-calendar/oauth.ts`.
+- Handler try/catch + `ApiException` mapping: keep the existing shape in each
+  handler; the new sync calls go *inside* the existing `try` but each wrapped in
+  its own inner try/catch so sync failure never changes the HTTP result.
 
 ## Edge cases the implementation MUST handle
 
-1. **Unauthenticated** (no Clerk `userId`, or no `supabase` JWT): connect →
-   401 `UNAUTHENTICATED`; disconnect → 401; callback → redirect to error.
-2. **CSRF**: callback with missing/mismatched `gcal_oauth_state` cookie →
-   redirect error, no DB write.
-3. **User denied consent**: callback called with `?error=access_denied` (no
-   `code`) → redirect error, no DB write.
-4. **Token exchange failure** (Google returns non-2xx): `exchangeCode` throws →
-   callback redirects error, no partial row written.
-5. **No refresh_token returned**: `refresh_token_encrypted` is NOT NULL. If
-   Google omits `refresh_token`, `exchangeCode` throws → callback redirects
-   error rather than writing a row with an empty refresh token. (Requesting
-   `prompt=consent` makes this rare, but handle it.)
-6. **Reconnect**: an existing row for the user is overwritten via
-   `upsert(onConflict: "user_id")` with a fresh `updated_at`.
-7. **Disconnect with no stored tokens**: idempotent success (`{ disconnected: true }`).
-8. **Disconnect when Google revoke fails** (token already revoked/expired): row
-   is still deleted and the response is success (graceful degradation).
-9. **Missing/invalid `TOKEN_ENCRYPTION_KEY`** (not 32 bytes): crypto throws →
-   surfaced as 500 `INTERNAL` on connect; callback redirects to error. Never
-   leak the key.
-10. **Never log token plaintext or the encryption key** anywhere.
+1. **Attendee with no connected calendar** — `get_event_sync_targets` omits them;
+   sync is a no-op for that user. Not an error.
+2. **Token invalid/expired (revoked)** — refresh returns `invalid_grant`; catch,
+   call `flag_calendar_token_invalid(userId)` (sets `is_valid=false` + one
+   re-auth notification), skip that user, continue others. The request still
+   succeeds (graceful degradation, PRD §10). Already-invalid tokens are excluded
+   by the RPC filter, so no repeat notifications.
+3. **Access token expired but refresh token valid** — refresh, use new access
+   token for the call. Persisting the refreshed access token back is optional;
+   correctness does not require it.
+4. **PATCH 404 (event not yet on that calendar) / DELETE 404 or 410 (already
+   gone)** — PATCH 404 → fall back to POST insert with the id; DELETE 404/410 →
+   treat as success. Reusing the client-assigned id makes create idempotent.
+5. **Google outage / non-auth error (5xx, network)** — caught per-attendee,
+   logged, swallowed; never fails the HTTP request and never flags the token
+   invalid (only `invalid_grant` does that).
+6. **Legacy event row with null `google_calendar_event_id`** — backfill via
+   `toGoogleEventId(event.id)` on the next update/delete and persist it.
+7. **Delete ordering** — capture sync targets + `google_calendar_event_id`
+   before the DB delete cascades `event_attendees`.
+8. **Reconnect after revoke** — callback upsert resets `is_valid=true`, then
+   retroactively syncs all of the user's assigned events.
+9. **Empty attendee set** — all sync functions no-op cleanly.
+10. **Missing `TOKEN_ENCRYPTION_KEY` / Google env vars** — existing helpers throw;
+    the per-attendee try/catch swallows it (logged), request still succeeds.
+    Never log token plaintext or the key.
 
-## Security requirements (from AC / PRD §25.5)
+## Verification (Coder must run before finishing)
 
-- OAuth scope is EXACTLY `https://www.googleapis.com/auth/calendar.events`
-  (write-only). No `calendar` or `calendar.readonly` scope.
-- Tokens encrypted with AES-256 before storage; key only in
-  `process.env.TOKEN_ENCRYPTION_KEY`, never in DB or source.
-- Use the RLS-scoped anon client (`getSupabaseClient(jwt)`) — never the service
-  role key.
+- `bun run lint`
+- `bun run typecheck`
+- `bun run test`
+- Do not run migrations against a real DB; SQL correctness is verified by review
+  + keeping `lib/supabase/types.ts` hand-updated to match the migration.
 
-## Verification
+## Explicitly OUT OF SCOPE
 
-Run `bun run lint`, `bun run typecheck`, and `bun run test` before finishing.
-
-## Tests to add (unit; mirror `tests/unit/app/api/profile-route.test.ts`)
-
-Place under `tests/unit/`:
-- `token-crypto`: round-trips (`decryptToken(encryptToken(x)) === x`); distinct
-  IV per call (two encryptions of same input differ); throws on tampered
-  ciphertext; throws on bad key length.
-- `oauth`: `getAuthUrl` contains the calendar.events scope, `access_type=offline`,
-  `prompt=consent`, and the state; `exchangeCode` throws when the mocked
-  `fetch` returns non-ok and when `refresh_token` is absent.
-- `connect` handler: 401 when unauthenticated; 200 returns `authUrl` and sets
-  the state cookie.
-- `callback` handler: redirects to error on state mismatch / on `?error=`;
-  redirects to connected on success and upserts encrypted tokens with
-  `scope=calendar.events` and `calendar_id="primary"`.
-- `disconnect` handler: 401 unauthenticated; success + delete when a row exists;
-  idempotent success when no row; still succeeds when revoke fails.
-
-Mock `fetch` via `global.fetch = jest.fn()` and set the Google/`TOKEN_ENCRYPTION_KEY`
-env vars in the test setup.
+- Read access / conflict detection against personal calendar events (PRD open
+  question — write-only only).
+- SMS/email dispatch of the re-auth notification (Sprint 4 #58); in-app
+  notification only, matching every shipped notify path.
+- Invitation-accept sync and service-week-cancel unsync (see OQ-3; belong to
+  #59/#57).
+- Any general async job-queue infrastructure (unless OQ-1 = B).

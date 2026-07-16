@@ -1,15 +1,28 @@
 jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }));
 jest.mock("@/lib/supabase/client", () => ({ getSupabaseClient: jest.fn() }));
+jest.mock("@/lib/google-calendar/sync", () => ({
+  syncEventToAttendees: jest.fn(),
+  unsyncEventFromAttendees: jest.fn(),
+  toGoogleEventId: jest.fn((id: string) => `mock-google-id-${id}`),
+}));
 
 import { auth } from "@clerk/nextjs/server";
 import type { NextRequest } from "next/server";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import { updateEvent, deleteEvent } from "@/app/api/events/[id]/handler";
+import {
+  syncEventToAttendees,
+  unsyncEventFromAttendees,
+  toGoogleEventId,
+} from "@/lib/google-calendar/sync";
 import type { AuthContext, UserLookup } from "@/lib/api/auth";
 import type { UserRole } from "@/types/domain";
 
 const mockAuth = auth as unknown as jest.Mock;
 const mockGetSupabaseClient = getSupabaseClient as unknown as jest.Mock;
+const mockSyncEventToAttendees = syncEventToAttendees as unknown as jest.Mock;
+const mockUnsyncEventFromAttendees = unsyncEventFromAttendees as unknown as jest.Mock;
+const mockToGoogleEventId = toGoogleEventId as unknown as jest.Mock;
 
 const JWT = "supabase-jwt";
 const USER_ID = "user-1";
@@ -60,6 +73,9 @@ const eventRow = {
   notes: "Bring in-ears",
   created_by: USER_ID,
   created_at: "2026-07-01T00:00:00Z",
+  // Already-synced (#62) so unrelated PUT/DELETE tests don't trip the
+  // legacy-row backfill path — that path has its own dedicated tests below.
+  google_calendar_event_id: "grexistingeventid00",
 };
 
 const serviceWeekRow = {
@@ -126,6 +142,9 @@ function makeSupabaseClient(
 beforeEach(() => {
   mockAuth.mockReset();
   mockGetSupabaseClient.mockReset();
+  mockSyncEventToAttendees.mockReset().mockResolvedValue(undefined);
+  mockUnsyncEventFromAttendees.mockReset().mockResolvedValue(undefined);
+  mockToGoogleEventId.mockReset().mockImplementation((id: string) => `mock-google-id-${id}`);
 });
 
 describe("PUT /api/events/[id]", () => {
@@ -403,6 +422,58 @@ describe("PUT /api/events/[id]", () => {
     const body = await res.json();
     expect(body.code).toBe("INTERNAL");
   });
+
+  it("pushes the update to every assigned attendee's calendar when google_calendar_event_id is set (#62)", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
+
+    const res = await updateEvent(makeReq({ name: "New name" }), EVENT_ID, makeLookup("admin"));
+    expect(res.status).toBe(200);
+
+    expect(mockSyncEventToAttendees).toHaveBeenCalledWith(
+      expect.anything(),
+      EVENT_ID,
+      expect.objectContaining({ googleEventId: "grexistingeventid00" }),
+    );
+    // Already synced — no backfill update should have been attempted.
+    expect(mockToGoogleEventId).not.toHaveBeenCalled();
+  });
+
+  it("backfills google_calendar_event_id for a legacy row (null mapping) and still syncs (#62)", async () => {
+    setUpAuth();
+    const updatedLegacyRow = { ...eventRow, google_calendar_event_id: null };
+    const capturedUpdates: unknown[] = [];
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient(
+        { events: { update: { data: updatedLegacyRow, error: null } } },
+        { onUpdate: (_table, payload) => capturedUpdates.push(payload) },
+      ),
+    );
+
+    const res = await updateEvent(makeReq({ name: "New name" }), EVENT_ID, makeLookup("admin"));
+    expect(res.status).toBe(200);
+
+    expect(mockToGoogleEventId).toHaveBeenCalledWith(EVENT_ID);
+    // First call is the requested patch, second is the backfill.
+    expect(capturedUpdates).toEqual([
+      { name: "New name" },
+      { google_calendar_event_id: `mock-google-id-${EVENT_ID}` },
+    ]);
+    expect(mockSyncEventToAttendees).toHaveBeenCalledWith(
+      expect.anything(),
+      EVENT_ID,
+      expect.objectContaining({ googleEventId: `mock-google-id-${EVENT_ID}` }),
+    );
+  });
+
+  it("never fails the update when syncEventToAttendees rejects", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
+    mockSyncEventToAttendees.mockRejectedValue(new Error("google outage"));
+
+    const res = await updateEvent(makeReq({ name: "New name" }), EVENT_ID, makeLookup("admin"));
+    expect(res.status).toBe(200);
+  });
 });
 
 describe("DELETE /api/events/[id]", () => {
@@ -509,5 +580,56 @@ describe("DELETE /api/events/[id]", () => {
 
     const body = await res.json();
     expect(body.code).toBe("INTERNAL");
+  });
+
+  it("returns 500 INTERNAL when the pre-delete google_calendar_event_id lookup errors", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient({
+        events: { select: { data: null, error: { message: "connection refused" } } },
+      }),
+    );
+
+    const res = await deleteEvent(fakeReq, EVENT_ID, makeLookup("admin"));
+    expect(res.status).toBe(500);
+
+    const body = await res.json();
+    expect(body.code).toBe("INTERNAL");
+  });
+
+  it("unsyncs from every assigned attendee's calendar BEFORE deleting the row, when google_calendar_event_id is set (#62)", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
+
+    const res = await deleteEvent(fakeReq, EVENT_ID, makeLookup("admin"));
+    expect(res.status).toBe(200);
+
+    expect(mockUnsyncEventFromAttendees).toHaveBeenCalledWith(
+      expect.anything(),
+      EVENT_ID,
+      "grexistingeventid00",
+    );
+  });
+
+  it("skips unsync when google_calendar_event_id is null", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient({
+        events: { select: { data: { ...eventRow, google_calendar_event_id: null }, error: null } },
+      }),
+    );
+
+    const res = await deleteEvent(fakeReq, EVENT_ID, makeLookup("admin"));
+    expect(res.status).toBe(200);
+    expect(mockUnsyncEventFromAttendees).not.toHaveBeenCalled();
+  });
+
+  it("never fails the delete when unsyncEventFromAttendees rejects", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
+    mockUnsyncEventFromAttendees.mockRejectedValue(new Error("google outage"));
+
+    const res = await deleteEvent(fakeReq, EVENT_ID, makeLookup("admin"));
+    expect(res.status).toBe(200);
   });
 });

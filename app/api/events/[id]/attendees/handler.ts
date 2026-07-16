@@ -6,6 +6,7 @@ import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import { assignAttendeeSchema } from "@/schemas/events";
+import { syncEventToUser, unsyncEventFromUser } from "@/lib/google-calendar/sync";
 
 type EventAttendeesRow = Database["public"]["Tables"]["event_attendees"]["Row"];
 
@@ -53,7 +54,7 @@ export async function assignAttendee(
 
     const { data: event, error: eventError } = await supabase
       .from("events")
-      .select("service_week_id")
+      .select("service_week_id, google_calendar_event_id, name, location, notes, start_time, end_time")
       .eq("id", eventId)
       .eq("church_group_id", ctx.churchGroupId)
       .maybeSingle();
@@ -113,6 +114,23 @@ export async function assignAttendee(
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
+    // Best-effort push onto the newly-assigned member's calendar. Never
+    // blocks the assignment on a sync failure (#62 graceful degradation).
+    if (event.google_calendar_event_id) {
+      try {
+        await syncEventToUser(supabase, eventId, parsed.userId, {
+          googleEventId: event.google_calendar_event_id,
+          name: event.name,
+          location: event.location,
+          notes: event.notes,
+          startTime: event.start_time,
+          endTime: event.end_time,
+        });
+      } catch {
+        // never block attendee assignment on sync failure
+      }
+    }
+
     return ok({ attendee: toAttendeeResponse(attendee) }, 201);
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
@@ -140,7 +158,7 @@ export async function removeAttendee(
 
     const { data: event, error: eventError } = await supabase
       .from("events")
-      .select("id")
+      .select("id, google_calendar_event_id")
       .eq("id", eventId)
       .eq("church_group_id", ctx.churchGroupId)
       .maybeSingle();
@@ -150,6 +168,18 @@ export async function removeAttendee(
     }
     if (!event) {
       return fail("Not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    // Capture + push the calendar removal BEFORE deleting the attendee row —
+    // get_event_sync_targets (inside unsyncEventFromUser) joins on
+    // event_attendees, so this member would no longer be a visible sync
+    // target once the row below is gone (#62).
+    if (event.google_calendar_event_id) {
+      try {
+        await unsyncEventFromUser(supabase, eventId, targetUserId, event.google_calendar_event_id);
+      } catch {
+        // never block removal on sync failure
+      }
     }
 
     const { data, error } = await supabase

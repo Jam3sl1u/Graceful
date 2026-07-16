@@ -7,6 +7,11 @@ import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import { updateEventSchema, validateEventTiming } from "@/schemas/events";
 import { toEventResponse } from "../handler";
+import {
+  syncEventToAttendees,
+  unsyncEventFromAttendees,
+  toGoogleEventId,
+} from "@/lib/google-calendar/sync";
 
 // PUT /api/events/:id — set_leader/admin only. Re-enforces BR-10 whenever
 // startTime and/or endTime change.
@@ -93,6 +98,37 @@ export async function updateEvent(
       return fail("Not found", ErrorCode.NOT_FOUND, 404);
     }
 
+    // Legacy row with no mapping yet — backfill so update/delete/attendee
+    // sync always have a google_calendar_event_id going forward (#62).
+    let googleCalendarEventId = data.google_calendar_event_id;
+    if (!googleCalendarEventId) {
+      googleCalendarEventId = toGoogleEventId(data.id);
+      try {
+        await supabase
+          .from("events")
+          .update({ google_calendar_event_id: googleCalendarEventId })
+          .eq("id", id)
+          .eq("church_group_id", ctx.churchGroupId);
+      } catch {
+        // best-effort backfill; sync below still uses the computed id
+      }
+    }
+
+    // Best-effort push to every assigned attendee's calendar. Never blocks
+    // the update response on a sync failure (#62 graceful degradation).
+    try {
+      await syncEventToAttendees(supabase, data.id, {
+        googleEventId: googleCalendarEventId,
+        name: data.name,
+        location: data.location,
+        notes: data.notes,
+        startTime: data.start_time,
+        endTime: data.end_time,
+      });
+    } catch {
+      // never block the update on sync failure
+    }
+
     return ok({ event: toEventResponse(data) });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
@@ -117,6 +153,29 @@ export async function deleteEvent(
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
     const supabase = getSupabaseClient(jwt);
+
+    // Capture the Google Calendar mapping BEFORE deleting — the DB delete
+    // cascades event_attendees, and get_event_sync_targets (called inside
+    // unsyncEventFromAttendees) joins against that table, so the sync-target
+    // list must be read while the row (and its attendees) still exist (#62).
+    const { data: existing, error: existingError } = await supabase
+      .from("events")
+      .select("google_calendar_event_id")
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .maybeSingle();
+
+    if (existingError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    if (existing?.google_calendar_event_id) {
+      try {
+        await unsyncEventFromAttendees(supabase, id, existing.google_calendar_event_id);
+      } catch {
+        // never block the delete on sync failure
+      }
+    }
 
     const { data, error } = await supabase
       .from("events")
