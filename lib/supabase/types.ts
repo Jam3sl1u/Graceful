@@ -124,6 +124,15 @@ type SetlistsRow = {
   updated_at: string;
 };
 
+type SetlistSongsRow = {
+  id: string;
+  setlist_id: string;
+  song_id: string;
+  position: number;
+  key_override: string | null;
+  notes: string | null;
+};
+
 type InvitationsRow = {
   id: string;
   church_group_id: string;
@@ -291,6 +300,16 @@ export type Database = {
           notes?: string | null;
         };
         Update: Partial<SetlistsRow>;
+        Relationships: [];
+      };
+      setlist_songs: {
+        Row: SetlistSongsRow;
+        Insert: Omit<SetlistSongsRow, "id" | "key_override" | "notes"> & {
+          id?: string;
+          key_override?: string | null;
+          notes?: string | null;
+        };
+        Update: Partial<SetlistSongsRow>;
         Relationships: [];
       };
       invitations: {

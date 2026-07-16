@@ -1,6 +1,21 @@
 import { z } from "zod";
 
-// TODO(Sprint 3 #45-48): fill in real field-level validation for the
-// setlists routes in PRD §22, including BR-01/BR-07/BR-09.
-export const setlistsSchema = z.object({});
-export type SetlistsInput = z.infer<typeof setlistsSchema>;
+// PUT /api/setlists/:id — full desired order of the songs already in the
+// setlist. Position is derived from array index (1-indexed); it is NOT sent by
+// the client. keyOverride null clears any override.
+export const reorderSetlistSchema = z.object({
+  songs: z.array(
+    z.object({
+      songId: z.string().uuid(),
+      keyOverride: z.string().trim().min(1).max(5).nullish(),
+    }),
+  ),
+});
+export type ReorderSetlistInput = z.infer<typeof reorderSetlistSchema>;
+
+// POST /api/setlists/:id/songs — add one song.
+export const addSetlistSongSchema = z.object({
+  songId: z.string().uuid(),
+  keyOverride: z.string().trim().min(1).max(5).nullish(),
+});
+export type AddSetlistSongInput = z.infer<typeof addSetlistSongSchema>;
