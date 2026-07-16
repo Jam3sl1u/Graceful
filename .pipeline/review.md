@@ -1,47 +1,42 @@
-# Review — Issue #56: Publish setlist (BR-01 zero-song publish)
+# Review — Issue #57: Per-song key override validation & default-vs-override distinction (BR-09)
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-## What was reviewed
-- Read `spec.md`, `changes.md`, `test-results.md`.
-- Read the real diff (`git diff main...HEAD`) for `handler.ts` and both `route.ts` files.
-- Compared against the reference patterns: `service-weeks/[id]/handler.ts` notification
-  fan-out, `service-weeks/[id]/setlist/handler.ts` `toSetlistResponse`, and the existing
-  handlers in `setlists/[id]/handler.ts`.
-- Read the test file in full (stateful fake, filters, dedupe fixture).
-- Re-ran `bun run typecheck` (clean) and the two publish/unlock test suites (29 tests pass).
+## What I verified independently
+- Ran `git diff main...HEAD` and read the actual handler + test diffs (not just the summaries).
+- `bun run typecheck` — clean.
+- `bun run lint` — clean.
+- `bun run test tests/unit/app/api/setlists-key-override.test.ts tests/unit/app/api/setlists-songs-route.test.ts` — 51/51 passing.
+- `bun run test` (full suite) — 67 suites / 846 tests passing. Matches the tester's report exactly; no regressions.
 
-## Findings
-- `publishSetlist` matches the spec step-for-step: auth + role gate before any DB work,
-  401 on missing JWT before constructing the client, tenant-scoped load with 404/409,
-  update with fresh `published_at`, non-blocking song count, `Set`-deduped accepted
-  invitations, notification insert guarded on `recipientIds.length > 0`, correct
-  zero-song body copy, `// TODO(#67/#68)` at the fan-out site, and the shared try/catch.
-- `unlockSetlist` correctly resets `status: "draft"` + `published_at: null` (invariant
-  held), sends no notifications, reads no body, and 409s on a draft.
-- Route files are minimal `await params` wrappers mirroring `cancel/route.ts`. `:id` is
-  threaded as the setlist id.
-- The `as unknown as ...Insert[]` cast on the notification payload matches the reference
-  handler's shape (not scope creep). The update omits the cast per spec (Update type is
-  already `Partial<Row>`).
+## Assessment against the spec
+- **AC #4 (the only new code):** `SetlistSongResponse` gained exactly the three spec'd fields
+  (`defaultKey`, `effectiveKey`, `isOverridden`). `toSetlistSongResponse(row, defaultKey)`
+  derives them as spec'd: `effectiveKey = key_override ?? defaultKey`,
+  `isOverridden = key_override != null` (strict non-null, NOT an equality comparison — spec edge
+  case #3 honored). The new `loadSongResponses` helper does a single `.in("id", songIds)` batch
+  query (no N+1), skips the query entirely on empty setlists (edge case #1), and defaults missing
+  songs to `null` (edge case #5). All three handlers route through it while preserving status
+  codes (201 add, 200 elsewhere) and the 500 INTERNAL error mapping.
+- **AC #2 (BR-09):** validation at handler lines 143-149 (422 for shape-valid-but-non-musical key,
+  400 for malformed body) is untouched, per the spec's out-of-scope instruction. Confirmed by
+  reading the code directly.
+- **AC #3:** write paths only ever set `key_override`; `songs.default_key` is never written by any
+  of the three handlers. No insert/update copies default into override (design decision respected).
+- **Out of scope:** no schema/migration/Zod changes, no new GET endpoint, no transposition. Confirmed.
 
-## Test quality (not superficial)
-- The in-memory fake actually applies `.eq()` filters via `applyFilters`, so the
-  `status = "accepted"` filter and tenant/id scoping are genuinely exercised, not stubbed.
-- Dedupe fixture is real: 4 invitation rows (user-a x2 accepted, user-b accepted,
-  user-c pending) -> asserts exactly `["user-a","user-b"]`, proving both status filtering
-  and `Set` dedupe.
-- Five distinct 500 paths are wired to specific step-level error controls (load, update,
-  song-count, invitations, notification insert), not a single generic failure.
-- Every spec edge case (1-11) is covered, plus the tester supplement adds real end-to-end
-  route wiring (two rows, only the target mutated), wrong-id-family 404, combined
-  zero-songs+zero-members BR-01 case, and the unprovisioned-user (lookup->null) 401 branch.
+## Test quality
+Not superficial. The new independent suite (`setlists-key-override.test.ts`, separate fake client
+and fixture IDs from the coder's suite) covers: `toSetlistSongResponse` derivation in isolation,
+the tricky override-equals-default case, `default_key: null` cases, AC #3 non-mutation asserted
+against catalog state, the empty-setlist path asserted via a `from()` call-count spy (proves the
+query is actually skipped, not just that the result is empty), the 400-vs-422 split on both
+endpoints, a Unicode-accidental acceptance case, and a genuine failure case (forced error on the
+post-update songs join surfaces as 500, not a silent partial 200).
 
-## Notes for the human
-- The tester-supplement test file
-  (`tests/unit/app/api/setlists-publish-route-tester-supplement.test.ts`) and the updated
-  `.pipeline/test-results.md` are present in the working tree but NOT yet committed (only
-  the coder's commit `a58794b` is on the branch). Ensure `git add` picks them up before/at
-  PR time so the supplemental coverage actually ships.
-- No security, tenancy-leak, performance, or correctness issues found. Green tests reflect
-  correct behavior here.
+## Notes (non-blocking)
+- The `songs` lookup in `loadSongResponses` has no explicit `church_group_id` filter and relies on
+  RLS for tenant scoping. This matches the spec's explicit design note and the repo's JWT-scoped
+  client pattern; song_ids originate from an already tenant-scoped setlist. Acceptable.
+- The tester's new test file and this stage's `test-results.md` are currently untracked/unstaged in
+  the worktree — they need to be committed as part of shipping this branch.

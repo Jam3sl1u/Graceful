@@ -1,99 +1,77 @@
-# Changes — Issue #56: Publish setlist (BR-01 zero-song publish)
+# Changes — Issue #57: Per-song key override validation & default-vs-override distinction (BR-09)
 
 ## Summary
 
-Implemented the two setlist state-transition endpoints that previously
-returned `501 notImplemented`:
-
-- `POST /api/setlists/:id/publish` — draft -> published, sets `published_at`,
-  and notifies confirmed members (BR-01: a zero-song setlist is still
-  publishable).
-- `POST /api/setlists/:id/unlock` — published -> draft, resets
-  `published_at` to `null`, sends no notifications.
+Most of #57 was already implemented by #55 (BR-09 handler-level key validation
+returning 422, and overrides never touching `songs.default_key`). The only
+missing piece — AC #4, letting clients distinguish "using the song's default
+key" from "overridden this week" — is now implemented.
 
 ## Files changed
 
-- **`app/api/setlists/[id]/handler.ts`**
-  - Added `import { toSetlistResponse } from "@/app/api/service-weeks/[id]/setlist/handler"`.
-  - Added `publishSetlist(req, id, lookup?)`:
-    - `requireAuth` + `requireRole(["admin", "set_leader"])`.
-    - JWT via `auth().getToken({ template: "supabase" })`; missing -> `401`.
-    - Loads the setlist tenant-scoped by `id` + `church_group_id`; DB error ->
-      `500`; missing -> `404 "Setlist not found"`; `status !== "draft"` ->
-      `409 "Setlist is already published."`.
-    - Updates `status: "published"`, `published_at: new Date().toISOString()`
-      (no cast needed — `setlists` `Update` is `Partial<SetlistsRow>`).
-    - Counts `setlist_songs` for the setlist (drives notification copy, never
-      blocks publish).
-    - Loads confirmed members: `invitations` rows for
-      `updated.service_week_id` with `status = "accepted"`, deduped by
-      `user_id` via `Set` (mirrors `setServiceWeekCancelled` in
-      `app/api/service-weeks/[id]/handler.ts`).
-    - Only when `recipientIds.length > 0`, inserts one `notifications` row per
-      recipient (`type: "setlist_released"`, `title: "Setlist published"`,
-      `body` = the "still being added" copy iff `songCount === 0` else
-      `null`, `link_entity_type: "setlist"`, `link_entity_id: id`). Insert
-      error -> `500`. Left a `// TODO(#67/#68): SMS/email fan-out for
-      confirmed members.` comment at the fan-out site (out of scope here).
-    - Returns `ok({ setlist: toSetlistResponse(updated) })`.
-    - Same `try/catch` -> `ApiException` mapping / `500` fallback as the
-      other handlers in this file.
-  - Added `unlockSetlist(req, id, lookup?)`:
-    - Same auth/JWT setup and tenant-scoped load; `status !== "published"` ->
-      `409 "Setlist is not published; nothing to unlock."`.
-    - Updates `status: "draft"`, `published_at: null`; error/`!updated` ->
-      `500`.
-    - Returns `ok({ setlist: toSetlistResponse(updated) })`. No request body,
-      no notifications.
+### `app/api/setlists/[id]/handler.ts`
 
-- **`app/api/setlists/[id]/publish/route.ts`** — replaced the
-  `notImplemented` stub with `POST` wired to `publishSetlist`, mirroring
-  `app/api/service-weeks/[id]/cancel/route.ts`.
+- Extended `SetlistSongResponse` with three derived fields: `defaultKey`
+  (the song's catalog `default_key`), `effectiveKey` (`keyOverride ?? defaultKey`),
+  and `isOverridden` (`keyOverride != null`).
+- Changed `toSetlistSongResponse(row, defaultKey)` to take the song's default
+  key as a second argument and compute the derived fields. `isOverridden` is
+  derived strictly from `key_override != null`, never from comparing values
+  (so a leader-set override equal to the default key still shows
+  `isOverridden: true`, per spec edge case #3).
+- Added a new `loadSongResponses(supabase, setlistId)` helper: loads the
+  ordered `setlist_songs` rows (via the existing `loadOrderedSongs`), collects
+  the distinct `song_id`s, does one `songs.select("id, default_key").in("id", ...)`
+  query to build a `Map<songId, defaultKey>`, and maps each row through
+  `toSetlistSongResponse`. Skips the `songs` query entirely when there are no
+  rows (empty-setlist edge case), returning `{ songs: [] }`.
+- Routed all three handlers (`reorderSetlist`, `addSetlistSong`,
+  `removeSetlistSong`) through `loadSongResponses` instead of
+  `loadOrderedSongs(...).map(toSetlistSongResponse)`, preserving existing
+  status codes (201 for add, default 200 elsewhere) and the existing 500
+  INTERNAL mapping on query error.
+- `loadOrderedSongs` is unchanged and still used internally.
+- No change to BR-09 validation (`isValidSongKey` checks in `reorderSetlist`
+  and `addSetlistSong`), no change to insert/update payload logic (override
+  is never copied into `default_key`, and `default_key` is never written by
+  these handlers), no schema/migration changes.
 
-- **`app/api/setlists/[id]/unlock/route.ts`** — same shape, wired to
-  `unlockSetlist`.
+### `tests/unit/app/api/setlists-songs-route.test.ts` (maintenance, not new coverage)
 
-- **`tests/unit/app/api/setlists-publish-route.test.ts`** (new) — stateful
-  in-memory fake `from()` covering `setlists`, `setlist_songs`,
-  `invitations`, and `notifications` (captures inserted rows). 23 tests
-  across both endpoints:
-  - Happy path (songs + confirmed members -> notified once per user,
-    `body: null`), admin role allowed.
-  - BR-01 zero songs -> `200`, notification body has the "still being added"
-    copy.
-  - Zero confirmed members -> `200`, no notification rows inserted.
-  - Duplicate accepted invitations for the same user -> notified once (`Set`
-    dedupe), verified via the happy-path test's recipient assertion.
-  - Already-published setlist -> `409 CONFLICT`, no notifications inserted.
-  - Missing / other-tenant setlist -> `404 NOT_FOUND`.
-  - `member`/`guest` roles -> `403 FORBIDDEN` (no Supabase call).
-  - Missing JWT -> `401 UNAUTHENTICATED` (no Supabase call).
-  - `500 INTERNAL` for DB errors at load, update, song-count, invitations
-    lookup, and notification insert.
-  - Unlock: happy path (published -> draft, `publishedAt: null`, no
-    notifications), admin role allowed, unlock-a-draft -> `409 CONFLICT`,
-    404/403/401 parity with publish, `500` at load/update.
+Updated to keep this existing suite green against the response shape change:
+
+- Added `default_key: string | null` to the fake `SongsRow` type and gave each
+  fixture song a distinct value (song-1 `"C"`, song-2 `"D"`, song-3 `"E"`,
+  song-4/other-tenant `"F"`).
+- Extended the fake `makeSelectChain` with an `.in(field, values)` method
+  (pushes a predicate matching rows whose `field` is in `values`; applied
+  alongside the existing `eq` filters before `order`), since
+  `loadSongResponses` calls `.from("songs").select("id, default_key").in("id", songIds)`.
+- Updated the three happy-path expected-response assertions (reorder, add,
+  remove) to include `defaultKey`, `effectiveKey`, `isOverridden` consistent
+  with each row's `key_override` and its song's `default_key`.
 
 ## Verification
 
-Ran and confirmed green:
-- `bun run lint` — clean.
 - `bun run typecheck` — clean.
-- `bun run test` — 67 suites / 853 tests passed, including the new 23-test
-  file.
+- `bun run lint` — clean.
+- `bun run test tests/unit/app/api/setlists-songs-route.test.ts` — 35/35 passing.
+- `bun run test` (full suite) — 66 suites / 830 tests passing.
 
-## Notes for the Tester
+## What the Tester should focus on
 
-- `:id` in both routes is the **setlist** id, not the service_week id —
-  confirm request wiring in the route files matches this.
-- The "zero songs" and "zero confirmed members" BR-01 edge cases are
-  independent axes; worth double-checking a case with zero songs AND zero
-  confirmed members together (no notification rows, but still `200`
-  published) if you want an extra combination beyond what's in the test
-  file.
-- Unlock takes no request body and sends no notifications by design (the
-  re-notify happens on the *next* publish) — this is a spec Decision, not an
-  oversight, so don't flag it as missing behavior.
-- `published_at` is null iff status is `draft`, non-null iff `published` —
-  both transitions maintain this invariant; worth a direct assertion if not
-  already covered.
+- Independent coverage of BR-09 (AC #2): malformed body -> 400, shape-valid
+  but non-musical `keyOverride` -> 422, for both `PUT /api/setlists/:id` and
+  `POST /api/setlists/:id/songs`. This was already implemented pre-#57 but the
+  spec calls for independent Tester verification.
+- AC #4 response shape across all three endpoints: `key_override: null` ->
+  `isOverridden: false`, `effectiveKey === defaultKey`; non-null override ->
+  `isOverridden: true`, `effectiveKey === keyOverride` (including the case
+  where the override happens to equal the default — must still be
+  `isOverridden: true`).
+- Edge case: song with `default_key = null` and no override -> `defaultKey`,
+  `effectiveKey` both `null`, `isOverridden: false`.
+- Edge case: removing the last song in a setlist -> `{ songs: [] }`, no
+  `songs` table query attempted (the `songIds.length > 0` guard).
+- Confirm `songs.default_key` is never mutated by any of these three handlers
+  (AC #3) — e.g. an override should not leak into the song catalog.

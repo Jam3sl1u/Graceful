@@ -17,17 +17,26 @@ export type SetlistSongResponse = {
   setlistId: string;
   songId: string;
   position: number;
-  keyOverride: string | null;
+  keyOverride: string | null; // null = using the song's default key
+  defaultKey: string | null; // the song's catalog default_key (songs.default_key)
+  effectiveKey: string | null; // keyOverride ?? defaultKey — the key to actually play
+  isOverridden: boolean; // keyOverride != null
   notes: string | null;
 };
 
-export function toSetlistSongResponse(row: SetlistSongsRow): SetlistSongResponse {
+export function toSetlistSongResponse(
+  row: SetlistSongsRow,
+  defaultKey: string | null,
+): SetlistSongResponse {
   return {
     id: row.id,
     setlistId: row.setlist_id,
     songId: row.song_id,
     position: row.position,
     keyOverride: row.key_override,
+    defaultKey,
+    effectiveKey: row.key_override ?? defaultKey,
+    isOverridden: row.key_override != null,
     notes: row.notes,
   };
 }
@@ -79,6 +88,37 @@ async function loadOrderedSongs(
     .select("*")
     .eq("setlist_id", setlistId)
     .order("position", { ascending: true });
+}
+
+// Loads the setlist's songs (ordered by position) and joins each row to its
+// song's default_key so the response can distinguish "using default" from
+// "overridden this week". Returns fully-formed response objects.
+async function loadSongResponses(
+  supabase: SupabaseClient<Database>,
+  setlistId: string,
+): Promise<{ data: SetlistSongResponse[] | null; error: unknown }> {
+  const { data: rows, error } = await loadOrderedSongs(supabase, setlistId);
+  if (error) return { data: null, error };
+
+  const songRows = rows ?? [];
+  const songIds = [...new Set(songRows.map((r) => r.song_id))];
+
+  const defaultKeyById = new Map<string, string | null>();
+  if (songIds.length > 0) {
+    const { data: songs, error: songsError } = await supabase
+      .from("songs")
+      .select("id, default_key")
+      .in("id", songIds);
+    if (songsError) return { data: null, error: songsError };
+    for (const s of songs ?? []) {
+      defaultKeyById.set(s.id, s.default_key ?? null);
+    }
+  }
+
+  return {
+    data: songRows.map((r) => toSetlistSongResponse(r, defaultKeyById.get(r.song_id) ?? null)),
+    error: null,
+  };
 }
 
 // PUT /api/setlists/:id — set_leader/admin only. Reorders the songs already
@@ -164,12 +204,12 @@ export async function reorderSetlist(
       }
     }
 
-    const { data: rows, error } = await loadOrderedSongs(supabase, id);
+    const { data: songs, error } = await loadSongResponses(supabase, id);
     if (error) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
-    return ok({ songs: (rows ?? []).map(toSetlistSongResponse) });
+    return ok({ songs });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);
@@ -272,12 +312,12 @@ export async function addSetlistSong(
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
-    const { data: rows, error } = await loadOrderedSongs(supabase, id);
+    const { data: songs, error } = await loadSongResponses(supabase, id);
     if (error) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
-    return ok({ songs: (rows ?? []).map(toSetlistSongResponse) }, 201);
+    return ok({ songs }, 201);
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);
@@ -508,12 +548,12 @@ export async function removeSetlistSong(
       }
     }
 
-    const { data: rows, error } = await loadOrderedSongs(supabase, id);
+    const { data: songs, error } = await loadSongResponses(supabase, id);
     if (error) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
-    return ok({ songs: (rows ?? []).map(toSetlistSongResponse) });
+    return ok({ songs });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);

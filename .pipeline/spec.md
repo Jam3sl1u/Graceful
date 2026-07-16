@@ -1,207 +1,207 @@
-# Spec — Issue #56: Publish setlist (BR-01 zero-song publish)
+# Spec — Issue #57: Per-song key override validation & default-vs-override distinction (BR-09)
 
 ## OPEN QUESTIONS
 
-None. This issue is fully specified by the existing code patterns. Two design
-decisions that the issue left implicit are resolved below under **Decisions**;
-follow them exactly rather than re-deriving.
+None blocking. See "Design decision" below for the one interpretation call made — it is
+the only reading consistent with all four acceptance criteria plus the code/tests already
+in the repo, so the pipeline should proceed.
 
-## Summary
+## Summary of current state (already verified in the repo)
 
-Implement two setlist state-transition endpoints that currently return `501 notImplemented`:
+Most of this issue is already implemented by #55. Do not re-plumb storage or re-add
+validation. The state today:
 
-- `POST /api/setlists/:id/publish` — draft → published, set `published_at`,
-  notify confirmed members (BR-01: zero songs is a valid publishable state).
-- `POST /api/setlists/:id/unlock` — published → draft so the setlist can be
-  edited again.
+- `setlist_songs.key_override varchar(5)` exists (migration
+  `supabase/migrations/20260702000003_cluster_3_scheduling_core.sql`), nullable, no
+  server default. The FK `setlist_songs.song_id -> songs(id)` exists
+  (`20260714000001_setlist_songs_song_id_fkey.sql`).
+- BR-09 validation on `keyOverride` is **already done** in
+  `app/api/setlists/[id]/handler.ts` for both `addSetlistSong` (POST) and
+  `reorderSetlist` (PUT): a shape-valid but non-musical key returns `422`
+  (`isValidSongKey` from `schemas/songs.ts`, checked in the handler not in Zod, so a
+  malformed body is `400` and a bad key value is `422`). **AC #2 is satisfied — no code
+  change needed. Tester must still cover it independently.**
+- Overriding never touches `songs.default_key`: the handlers only ever `update`/`insert`
+  the `setlist_songs` table. **AC #3 is satisfied — no code change needed.**
 
-`:id` is the **setlist** id (not the service_week id).
+**The only missing piece is AC #4**: the setlist-song response currently exposes only
+`keyOverride` (`toSetlistSongResponse` in `app/api/setlists/[id]/handler.ts`, lines
+14-32) and gives the client no way to see the song's `default_key`, the effective key to
+play, or whether this week's value is a real override vs. the catalog default.
 
-The in-app `notifications` row IS the "queued/stubbed" notification for this
-issue. The actual SMS/email send is #67/#68 and is OUT OF SCOPE — add a
-`// TODO(#67/#68)` comment at the fan-out site, matching how
-`app/api/service-weeks/[id]/handler.ts` leaves TODOs.
+## Design decision (AC #1 interpretation)
 
-## Decisions (implement exactly)
-
-1. **Publishing an already-published setlist → `409 CONFLICT`.** The
-   re-notify flow is unlock → edit → publish, so `publish` only ever acts on a
-   `draft`. Message: `"Setlist is already published."`
-2. **Unlock sets `published_at` back to `null`** (invariant: `published_at` is
-   non-null iff `status = 'published'`). A subsequent publish sets a fresh
-   timestamp.
-3. **Unlock itself sends no notifications and requires no request body.** The
-   "confirmation step that warns saving will re-notify" is a Setlist Builder
-   (#64) UI concern; the re-notification actually happens on the next
-   `publish`. Do not add a `confirm` flag to the API.
-
-## "Confirmed members" definition
-
-Confirmed members = rows in `invitations` where `service_week_id =
-setlist.service_week_id` AND `status = 'accepted'`. De-duplicate `user_id`
-with a `Set` (a user may have >1 accepted invitation), exactly like
-`setServiceWeekCancelled` in `app/api/service-weeks/[id]/handler.ts:249`.
+"`key_override` defaults to the song's `default_key` but is independently editable"
+means **the resolved/effective key defaults to `default_key`**, not that we copy
+`default_key` into the `key_override` column on insert. `key_override` stays `NULL` to
+mean "using the song's default"; a non-null value means "overridden this week". This is
+the only interpretation that also lets AC #4 distinguish default vs. override, matches
+the existing schema comment ("keyOverride null clears any override") and the existing
+test ("omitted -> clears existing override" stores `null`). **Do NOT change insert/update
+logic to copy `default_key` into `key_override`.**
 
 ## Files to modify
 
-### 1. `app/api/setlists/[id]/handler.ts` (add two exported functions)
+### 1. `app/api/setlists/[id]/handler.ts` (primary change)
 
-Add `publishSetlist` and `unlockSetlist` alongside the existing song
-functions. Import the existing response helper rather than re-declaring it:
+**a. Extend the response type** `SetlistSongResponse` (currently lines 14-21) with three
+derived fields:
 
 ```ts
-import {
-  toSetlistResponse,
-  type SetlistResponse,
-} from "@/app/api/service-weeks/[id]/setlist/handler";
+export type SetlistSongResponse = {
+  id: string;
+  setlistId: string;
+  songId: string;
+  position: number;
+  keyOverride: string | null;   // null = using the song's default key
+  defaultKey: string | null;    // the song's catalog default_key (songs.default_key)
+  effectiveKey: string | null;  // keyOverride ?? defaultKey — the key to actually play
+  isOverridden: boolean;        // keyOverride != null
+  notes: string | null;
+};
 ```
 
-(`SetlistResponse` is only needed if you annotate a local; importing
-`toSetlistResponse` is the required part.)
-
-Signatures (mirror the existing handlers in this file):
+**b. Change `toSetlistSongResponse`** to take the song's default key as a second arg and
+compute the derived fields:
 
 ```ts
-export async function publishSetlist(
-  req: NextRequest,
-  id: string,
-  lookup?: UserLookup,
-): Promise<Response>
-
-export async function unlockSetlist(
-  req: NextRequest,
-  id: string,
-  lookup?: UserLookup,
-): Promise<Response>
-```
-
-**`publishSetlist` logic (in order):**
-
-1. `const ctx = await requireAuth(req, lookup);` then
-   `requireRole(ctx, ["admin", "set_leader"]);`
-2. Get JWT via `auth()` → `getToken({ template: "supabase" })`; if falsy →
-   `fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`.
-   `const supabase = getSupabaseClient(jwt);`
-3. Load the setlist tenant-scoped:
-   `supabase.from("setlists").select("*").eq("id", id).eq("church_group_id", ctx.churchGroupId).maybeSingle()`.
-   - DB error → `500 INTERNAL`.
-   - `!data` → `fail("Setlist not found", ErrorCode.NOT_FOUND, 404)`.
-   - `data.status !== "draft"` → `fail("Setlist is already published.", ErrorCode.CONFLICT, 409)`.
-4. Update status/timestamp (the shared `setlists` `Update` type is
-   `Partial<SetlistsRow>`, so **no cast is needed**):
-   ```ts
-   const { data: updated, error } = await supabase
-     .from("setlists")
-     .update({ status: "published", published_at: new Date().toISOString() })
-     .eq("id", id)
-     .eq("church_group_id", ctx.churchGroupId)
-     .select("*")
-     .maybeSingle();
-   ```
-   error or `!updated` → `500 INTERNAL`.
-5. Count songs (drives notification copy, does NOT block):
-   `supabase.from("setlist_songs").select("id").eq("setlist_id", id)` → error →
-   `500`; `const songCount = (rows ?? []).length;`
-6. Load confirmed members:
-   `supabase.from("invitations").select("user_id").eq("service_week_id", updated.service_week_id).eq("status", "accepted")`
-   → error → `500`. `const recipientIds = [...new Set((rows ?? []).map(r => r.user_id))];`
-7. **Only if `recipientIds.length > 0`**, insert notifications (copy the cast +
-   insert shape from `app/api/service-weeks/[id]/handler.ts:252-268`):
-   - `type: "setlist_released"`
-   - `title: "Setlist published"`
-   - `body: songCount === 0 ? "The setlist has been published — songs are still being added." : null`
-   - `link_entity_type: "setlist"`, `link_entity_id: id`
-   - `church_group_id: ctx.churchGroupId`, `user_id: <each recipient>`
-   - Insert error → `500 INTERNAL`.
-   - Add `// TODO(#67/#68): SMS/email fan-out for confirmed members.` here.
-8. Return `ok({ setlist: toSetlistResponse(updated) })`.
-9. Wrap the whole body in the same `try/catch` the other handlers use
-   (`ApiException` → `fail(err.message, err.code, err.status)`, else `500`).
-
-**`unlockSetlist` logic (in order):**
-
-1. Auth + `requireRole(ctx, ["admin", "set_leader"])` (same as above).
-2. JWT / supabase client (same 401 path).
-3. Load setlist tenant-scoped (same query as publish step 3):
-   - DB error → `500`; `!data` → `404 "Setlist not found"`;
-   - `data.status !== "published"` →
-     `fail("Setlist is not published; nothing to unlock.", ErrorCode.CONFLICT, 409)`.
-4. Update: `.update({ status: "draft", published_at: null })` with the same
-   `.eq("id", id).eq("church_group_id", ctx.churchGroupId).select("*").maybeSingle()`;
-   error/`!updated` → `500`.
-5. Return `ok({ setlist: toSetlistResponse(updated) })`. No notifications.
-6. Same `try/catch` wrapper.
-
-### 2. `app/api/setlists/[id]/publish/route.ts` (replace stub)
-
-Mirror `app/api/service-weeks/[id]/cancel/route.ts` exactly:
-
-```ts
-import { NextRequest } from "next/server";
-import { publishSetlist } from "../handler";
-
-type Ctx = { params: Promise<{ id: string }> };
-
-export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
-  const { id } = await params;
-  return publishSetlist(req, id);
+export function toSetlistSongResponse(
+  row: SetlistSongsRow,
+  defaultKey: string | null,
+): SetlistSongResponse {
+  return {
+    id: row.id,
+    setlistId: row.setlist_id,
+    songId: row.song_id,
+    position: row.position,
+    keyOverride: row.key_override,
+    defaultKey,
+    effectiveKey: row.key_override ?? defaultKey,
+    isOverridden: row.key_override != null,
+    notes: row.notes,
+  };
 }
 ```
 
-### 3. `app/api/setlists/[id]/unlock/route.ts` (replace stub)
+**c. Resolve default keys before mapping.** All three handlers currently end with
+`loadOrderedSongs(...)` then `(rows ?? []).map(toSetlistSongResponse)` (lines 166-171,
+274-279, 353-358). Introduce one helper and route all three through it, replacing that
+tail:
 
-Same shape, calling `unlockSetlist`.
+```ts
+// Loads the setlist's songs (ordered by position) and joins each row to its
+// song's default_key so the response can distinguish "using default" from
+// "overridden this week". Returns fully-formed response objects.
+async function loadSongResponses(
+  supabase: SupabaseClient<Database>,
+  setlistId: string,
+): Promise<{ data: SetlistSongResponse[] | null; error: unknown }> {
+  const { data: rows, error } = await loadOrderedSongs(supabase, setlistId);
+  if (error) return { data: null, error };
 
-## Do NOT touch
+  const songRows = rows ?? [];
+  const songIds = [...new Set(songRows.map((r) => r.song_id))];
 
-- `schemas/setlists.ts` — neither endpoint takes a request body.
-- `types/domain.ts` — `setlist_released` NotificationType and the
-  `SetlistStatus` union already exist.
-- `lib/supabase/types.ts` — `setlists` `Update` already allows `status` /
-  `published_at`; `notifications` `Insert` already exists.
-- Any migration / RLS file — rely on the existing RLS-scoped client.
+  const defaultKeyById = new Map<string, string | null>();
+  if (songIds.length > 0) {
+    const { data: songs, error: songsError } = await supabase
+      .from("songs")
+      .select("id, default_key")
+      .in("id", songIds);
+    if (songsError) return { data: null, error: songsError };
+    for (const s of songs ?? []) {
+      defaultKeyById.set(s.id, s.default_key ?? null);
+    }
+  }
 
-## Pattern sources to copy from
+  return {
+    data: songRows.map((r) => toSetlistSongResponse(r, defaultKeyById.get(r.song_id) ?? null)),
+    error: null,
+  };
+}
+```
 
-- Auth + JWT + tenant-scoped load + 404/409 + try/catch:
-  `app/api/setlists/[id]/handler.ts` (`loadEditableSetlist`, `addSetlistSong`).
-- Notification fan-out (dedupe with `Set`, skip when empty, cast + insert
-  shape, TODO comments): `app/api/service-weeks/[id]/handler.ts:239-269`.
-- `SetlistResponse` / `toSetlistResponse`:
-  `app/api/service-weeks/[id]/setlist/handler.ts:11-33`.
-- Route wiring: `app/api/service-weeks/[id]/cancel/route.ts`.
+Then in each of `reorderSetlist`, `addSetlistSong`, `removeSetlistSong`, replace the
+final `loadOrderedSongs` + `.map(...)` block with:
 
-## Edge cases the implementation MUST handle
+```ts
+const { data: songs, error } = await loadSongResponses(supabase, id);
+if (error) {
+  return fail("Internal error", ErrorCode.INTERNAL, 500);
+}
+return ok({ songs }, /* keep existing status: 201 for addSetlistSong, default 200 elsewhere */);
+```
 
-1. **Zero songs** → publish returns `200`, `status: "published"`,
-   `publishedAt` non-null; notification `body` contains "still being added".
-2. **Zero confirmed members** → publish succeeds but inserts **no**
-   notification rows (guard on `recipientIds.length > 0`).
-3. **Songs present + confirmed members present** → notification rows inserted,
-   `body: null`.
-4. **Duplicate accepted invitations for one user** → that user notified once
-   (Set dedupe).
-5. **Already published** → publish returns `409 CONFLICT`.
-6. **Setlist missing / other tenant** → `404 NOT_FOUND` (do not leak).
-7. **Role `member` / `guest`** → `403 FORBIDDEN` before any DB work.
-8. **No JWT** → `401 UNAUTHENTICATED` before any Supabase call.
-9. **DB error at load / update / count / invitations / notification-insert**
-   → `500 INTERNAL`.
-10. **Unlock a draft** → `409 CONFLICT`.
-11. **Unlock a published setlist** → `200`, `status: "draft"`,
-    `publishedAt: null`.
+Notes:
+- Keep `loadOrderedSongs` as-is (still used inside `loadSongResponses`).
+- Tenant scoping on the `songs` lookup is handled by RLS (the caller already holds a
+  supabase client built from their JWT, and the song_ids come from a tenant-scoped
+  setlist). Do not add an extra `church_group_id` filter — the helper has no `ctx`.
+- `.in(...)` is standard PostgREST; `songs.default_key` and `songs.id` exist on the
+  `songs` Row type in `lib/supabase/types.ts`.
 
-## Tests
+### 2. `tests/unit/app/api/setlists-songs-route.test.ts` (keep existing suite green)
 
-Add `tests/unit/app/api/setlists-publish-route.test.ts`, modeled on the
-stateful-fake approach in `tests/unit/app/api/setlists-songs-route.test.ts`.
-The fake `from()` must additionally handle the `invitations` (select
-`user_id` filtered by `service_week_id` + `status`) and `notifications`
-(capture inserted rows) tables, and `setlist_songs` select for the count. Base
-state needs a `service_week_id` on setlist rows. Cover every edge case above,
-including the happy path, the two named BR-01 edge cases (zero songs, zero
-confirmed members), and at least one `500` failure path.
+The response shape change breaks the current `expect(...).toEqual([...])` / `toMatchObject`
+assertions. The Coder must update this existing suite so it stays green (this is
+maintenance of existing tests, not new coverage — new coverage is the Tester's job):
 
-## Verification
+- Add a `default_key` field to the `SongsRow` fake type (line ~64-65) and to each song in
+  `baseState().songs` (lines 235-240). Give them distinct values so `defaultKey` /
+  `effectiveKey` are meaningfully assertable, e.g. song-1 `"C"`, song-2 `"D"`,
+  song-3 `"E"`, song-4 (other tenant) any value.
+- Extend the fake `makeSelectChain` to support `.in(field, values)` (push a predicate
+  that matches when `values.includes(row[field])`), since `loadSongResponses` calls
+  `.from("songs").select("id, default_key").in("id", songIds)`. Follow the existing
+  `eq`/`order` chain-method pattern in that file.
+- Update the three expected-response objects (reorder happy path lines 295-320, remove
+  happy path lines 671-674, add happy path `toMatchObject` line 525) to include the new
+  `defaultKey`, `effectiveKey`, `isOverridden` fields. Concretely, for a row with
+  `key_override` non-null: `isOverridden: true`, `effectiveKey` = the override; for a row
+  with `key_override: null`: `isOverridden: false`, `effectiveKey` = that song's
+  `default_key`, `keyOverride: null`.
 
-Run `bun run lint`, `bun run typecheck`, and `bun run test` before finishing.
+## Edge cases the implementation must handle
+
+1. **Empty setlist** (removeSetlistSong removes the last song): `songIds` is empty, skip
+   the `songs` query, return `{ songs: [] }`. (Existing test "returns { songs: [] } after
+   removing the last remaining song" must still pass.)
+2. **`key_override` null (using default)**: `effectiveKey` = `defaultKey`,
+   `isOverridden` = `false`.
+3. **`key_override` set to a value that happens to equal `default_key`**: still
+   `isOverridden` = `true` (the leader explicitly set it this week). Derive `isOverridden`
+   from `key_override != null`, NOT from comparing against `default_key`.
+4. **Song has `default_key` = null** (catalog default unset) and no override: `defaultKey`
+   = `null`, `effectiveKey` = `null`, `isOverridden` = `false`.
+5. **Song row missing / default_key not found in the map**: default to `null` (already
+   handled by `defaultKeyById.get(...) ?? null`).
+6. **BR-09 (AC #2) unchanged**: invalid `keyOverride` -> `422` before any DB mutation;
+   malformed body -> `400`. Do not move these checks.
+
+## Out of scope (do NOT implement)
+
+- Actual transposition (Phase 3).
+- Copying `default_key` into `key_override` on insert (see Design decision).
+- A new read-only "list setlist songs" GET endpoint. There is currently no endpoint that
+  returns setlist songs on GET — `GET /api/service-weeks/:id/setlist`
+  (`app/api/service-weeks/[id]/setlist/handler.ts`) returns only setlist metadata, and the
+  three mutating handlers return the `{ songs }` array. Enhancing `SetlistSongResponse`
+  covers every place songs are returned, which satisfies AC #4. Adding a new GET endpoint
+  is not requested by this issue — do not add one.
+- Any change to `schemas/setlists.ts` or `schemas/songs.ts`. The Zod schemas and the
+  `varchar(5)` `keyOverride` shape are already correct.
+
+## Verification (Coder)
+
+Run `bun run lint`, `bun run typecheck`, and
+`bun run test tests/unit/app/api/setlists-songs-route.test.ts` (all green) before
+finishing.
+
+## Pattern references
+
+- Manual join via a fetched map (repo has no PostgREST embeds in handlers — confirmed):
+  follow the explicit second-query style used across `app/api/**/handler.ts`.
+- `default_key` -> `defaultKey` camelCase mapping and `default_key`/`id` select columns:
+  `app/api/songs/handler.ts` (lines 25, 35, 68, 133).
+- BR-09 handler-level key check (leave untouched): `app/api/setlists/[id]/handler.ts`
+  lines 104-109 (reorder) and 196-200 (add), using `isValidSongKey` from `schemas/songs.ts`.
