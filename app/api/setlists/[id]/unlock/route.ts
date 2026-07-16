@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { unlockSetlist } from "../handler";
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/setlists/[id]/unlock");
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function POST(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return unlockSetlist(req, id);
 }
