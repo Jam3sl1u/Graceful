@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { callback } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/google-calendar/callback");
+export async function GET(req: NextRequest): Promise<Response> {
+  return callback(req);
 }

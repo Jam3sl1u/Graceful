@@ -1,59 +1,71 @@
-# Review — Issue #60: Event attendee assignment
+# Review — Issue #61: Google Calendar OAuth connect/disconnect
 
 VERDICT: SHIP
 
 ## What I verified (independently, not just from the summaries)
-- Ran `git diff main...HEAD`: the only production changes are the new
-  `app/api/events/[id]/attendees/handler.ts`, the two route files
-  (stubs → real wiring), and the `assignAttendeeSchema` append in
-  `schemas/events.ts`. No migrations, no notification/GCal code — the
-  "belongs to #62" scope boundary is respected.
-- Confirmed the Supabase types back every query: `EventAttendeesRow`
-  (`id`/`event_id`/`user_id`/`created_at`, Insert makes `id`/`created_at`
-  optional so the bare `{ event_id, user_id }` insert typechecks with no
-  cast), `EventsRow.service_week_id`, and `InvitationsRow`
-  (`service_week_id`/`user_id`/`status`/`church_group_id`).
-- Confirmed `"accepted"` is a valid `InvitationStatus`
-  (`types/domain.ts`: pending|accepted|denied|withdrawn|expired), matching
-  the spec's confirmed-member definition; pending/denied/withdrawn/expired
-  correctly fall through to 422.
-- Ran `bun run typecheck` → clean.
-- Ran the new suite `tests/unit/app/api/events-id-attendees-route.test.ts`
-  → 28/28 pass. The tests import the REAL handler and mock only the
-  Clerk/Supabase boundary (not the handler itself), so they exercise actual
-  handler logic. They include the load-bearing ordering assertions:
-  `invitations` is never queried on the event-404 path, and `insert` is
-  never attempted on the 409 duplicate path.
 
-## Correctness / security assessment
-- Ordering matches spec and is security-correct: event lookup scoped by
-  `church_group_id` runs BEFORE the confirmed-member and duplicate checks
-  on POST, and before the delete on DELETE — a foreign/missing event returns
-  404 without leaking state or allowing cross-tenant delete probing.
-- Role gate (`admin`/`set_leader`) runs before any Supabase call;
-  `member`/`guest` → 403 before the DB is touched.
-- Duplicate assign returns 409 via an explicit pre-insert check rather than
-  relying on the DB unique-violation, exactly as specced.
-- Every Supabase `.error` branch maps to 500 INTERNAL; try/catch maps
-  `ApiException` → `fail(...)` else generic 500, matching the sibling
-  `app/api/events/[id]/handler.ts` idiom.
-- Insert payload is `{ event_id, user_id }` only (no client-supplied
-  `id`/`created_at`); response DTO is camelCase via `toAttendeeResponse`.
+Ran `git diff main...HEAD` and read every implementation and test file directly.
+Re-ran the full gate myself:
+- `bun run test` — 64 suites / 767 tests pass.
+- `bun run lint` — clean.
+- `bun run typecheck` (`tsc --noEmit`) — clean.
+- `bun run check:service-role` — OK (no service-role key usage; RLS-scoped anon
+  client only, exactly as spec/PRD §25.5 requires).
 
-Body-parse (400) precedes the JWT check (401): an authenticated caller with
-a malformed body but no Supabase JWT gets 400 before 401. This is exactly
-the order the spec prescribes (step 2 parse, step 3 jwt) and is harmless —
-noted, not a defect.
+## Spec conformance
 
-## Non-blocking note for the orchestration/human
-The tester's suite
-`tests/unit/app/api/events-id-attendees-route.test.ts` is present on disk
-and green but is still UNTRACKED in git (`git status`: `??`). It therefore
-does not appear in `git diff main...HEAD`. Whoever commits/opens the PR must
-`git add` this file so the coverage actually ships with the change — if it
-is left untracked the PR would merge the handler without its tests.
+- **token-crypto.ts**: AES-256-GCM, key from `TOKEN_ENCRYPTION_KEY` base64-decoded
+  and rejected unless exactly 32 bytes; error messages are static and never
+  include the key. `iv:authTag:ciphertext` (base64) format; fresh random 12-byte
+  IV per call; `decryptToken` validates 3 non-empty parts and lets auth-tag
+  verification throw on tampering. Matches spec §1.
+- **oauth.ts**: `CALENDAR_EVENTS_SCOPE` is exactly the write-only
+  `.../auth/calendar.events` — no `calendar`/`calendar.readonly`. `getAuthUrl`
+  includes `access_type=offline` + `prompt=consent` + `state`, throws on missing
+  client id / redirect URI. `exchangeCode` throws on non-ok and on missing
+  `refresh_token` before returning (protects the NOT NULL column), maps
+  `expires_in` to an ISO `expiryDate`. `revokeToken` never throws; its two
+  `console.warn` calls are static strings with no token interpolated. Matches §2.
+- **Handlers**: connect/callback/disconnect follow the profile handler pattern
+  exactly (thin route → handler, optional `lookup`, `requireAuth`, Clerk
+  `supabase` JWT → `getSupabaseClient(jwt)`). Callback always redirects (307),
+  never JSON; clears the state cookie in every path; upserts with
+  `onConflict: "user_id"`, `calendar_id: "primary"`, encrypted tokens; outer
+  try/catch redirects to error on any unexpected throw. Disconnect is idempotent,
+  best-effort revoke wrapped so a decrypt/revoke failure never blocks the delete,
+  delete errors → 500. Matches §3–5 and edge cases 1–10.
+- **types.ts**: `google_calendar_tokens` Row/Insert/Update added; Insert makes
+  `id`/`created_at`/`updated_at` optional so the upsert can set a fresh
+  `updated_at`. Matches §6.
+- Scope respected: no event sync, no read scope, no `googleapis` dependency, no
+  migration/RLS change.
 
-Verdict: SHIP. Code matches the spec exactly, types and enum values are
-sound, tests are meaningful (real handler, boundary-only mocks, ordering
-assertions) and pass, typecheck is clean. Just ensure the untracked test
-file is committed before the PR is opened.
+## Tests — meaningful, not superficial
+
+- Callback tests assert the redirect target for every negative branch
+  (unauthenticated, `?error=`, missing code/state, CSRF mismatch, missing cookie,
+  exchange failure, upsert error) AND that no `exchangeCode`/Supabase call happens
+  on the pre-DB failures. Happy path asserts the encrypted values are NOT the
+  plaintext, the `:` structure is present, and scope/calendar_id/onConflict.
+- token-crypto tests cover round-trip, distinct-IV, tampered/malformed ciphertext,
+  bad key length, and that the key never leaks into an error message.
+- oauth tests cover scope/params, missing-env throws, non-ok and missing-refresh
+  exchange failures, and `revokeToken`'s three never-throw cases.
+- disconnect tests cover 401 (both no-Clerk-id and no-JWT), success+revoke+delete
+  scoped to user_id, idempotent no-row, revoke-fails-still-succeeds, select/delete
+  errors. Tester supplement adds a real (non-mocked) `decryptToken`-throws and
+  `encryptToken`-throws path — genuinely exercising graceful degradation.
+
+## Minor, non-blocking observations (no change required)
+
+- `exchangeCode` defaults a missing `access_token` to `""`. Spec only mandates
+  throwing on missing `refresh_token`; Google always returns an access token on a
+  successful exchange, so this is a non-issue.
+- The callback's broad `catch {}` intentionally converts every error into a
+  generic error redirect (spec-mandated: a browser redirect target must never
+  return JSON/500). This is correct here, though it means an unexpected internal
+  bug would surface only as a generic redirect — acceptable for this route type.
+
+Green tests here reflect correct behavior: security-critical paths (CSRF, no
+partial rows, encryption at rest, write-only scope, graceful revoke) are all
+directly asserted. Ready for human sign-off.

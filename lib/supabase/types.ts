@@ -209,6 +209,19 @@ type NotificationsRow = {
   created_at: string;
 };
 
+// Added for #61 (Google Calendar OAuth connect/disconnect).
+type GoogleCalendarTokensRow = {
+  id: string;
+  user_id: string;
+  access_token_encrypted: string;
+  refresh_token_encrypted: string;
+  token_expiry: string;
+  calendar_id: string;
+  scope: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -403,6 +416,16 @@ export type Database = {
           is_read?: boolean;
         };
         Update: Partial<NotificationsRow>;
+        Relationships: [];
+      };
+      google_calendar_tokens: {
+        Row: GoogleCalendarTokensRow;
+        Insert: Omit<GoogleCalendarTokensRow, "id" | "created_at" | "updated_at"> & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<GoogleCalendarTokensRow>;
         Relationships: [];
       };
     };

@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { disconnect } from "./handler";
 
-export async function DELETE(_req: NextRequest) {
-  return notImplemented("DELETE /api/google-calendar/disconnect");
+export async function DELETE(req: NextRequest): Promise<Response> {
+  return disconnect(req);
 }

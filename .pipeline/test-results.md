@@ -1,149 +1,157 @@
-# Test Results — Issue #60: Event attendee assignment
+# Test Results — Issue #61: Google Calendar OAuth connect/disconnect
 
 This overwrites the stale `test-results.md` for issue #58 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
 ## Summary
-All checks pass. Added an independent unit-test suite for the new
-`assignAttendee`/`removeAttendee` handlers and re-ran the full verification
-suite (lint, typecheck, test) against the coder's claims in `changes.md`.
-Nothing in the implementation was patched — only tests were added.
 
-## What I did
-1. Read `.pipeline/changes.md` and `.pipeline/spec.md` for issue #60.
-2. Read the implementation: `app/api/events/[id]/attendees/handler.ts`,
-   `app/api/events/[id]/attendees/route.ts`,
-   `app/api/events/[id]/attendees/[userId]/route.ts`, and the
-   `assignAttendeeSchema` addition in `schemas/events.ts`.
-3. Read the reference test pattern
-   (`tests/unit/app/api/events-id-route.test.ts`) and the underlying
-   `lib/api/auth.ts` / `lib/api/response.ts` / `lib/api/errors.ts` contracts
-   the mocks need to satisfy.
-4. Wrote a new independent test file:
-   `tests/unit/app/api/events-id-attendees-route.test.ts` (28 tests), using
-   the same `jest.mock`/`makeLookup`/table-fixture harness pattern as the
-   sibling suite, extended with an `insert` fixture (the sibling only needed
-   `select`/`update`/`delete`).
-5. Ran `bun run test` (new suite standalone, then full suite), `bun run
-   lint`, `bun run typecheck`.
+**PASS.** All verification commands are clean and the coder's claims in
+`.pipeline/changes.md` hold up under independent re-verification. One gap the
+coder itself named in changes.md ("What the Tester should focus on") — the
+disconnect handler's `decryptToken`-throws path had no test forcing it — has
+been filled in with a new test file; it passes, along with one additional
+independently-chosen failure case for the callback route.
 
-## New test coverage (`tests/unit/app/api/events-id-attendees-route.test.ts`)
+## Commands re-run independently
 
-`toAttendeeResponse`:
-- Maps a raw `event_attendees` row to the camelCase `AttendeeResponse` shape.
+- `bun run lint` — clean, 0 errors / 0 warnings.
+- `bun run typecheck` (`tsc --noEmit`) — clean.
+- `bun run test` — **64 suites / 767 tests pass** (63 suites / 765 tests from
+  the coder's existing work, plus 1 new suite / 2 new tests added by this
+  stage).
+- `bun run check:service-role` — OK, no service-role key references outside
+  comments in `app/` or `lib/`.
+- `bun run check:workflows` — OK (not a workflow-script change; re-run for
+  parity with the coder's own verification claims).
 
-`POST /api/events/[id]/attendees` (`assignAttendee`) — happy path:
-- 201 with the created attendee; insert payload is exactly
-  `{ event_id, user_id }` (no `id`/`created_at` sent).
-- `set_leader` role is also allowed (not just `admin`).
+## Independent code read
 
-Auth/role (failure cases):
-- 401 UNAUTHENTICATED when Clerk `userId` is null — `lookup` never
-  consulted.
-- 401 UNAUTHENTICATED when `getToken` yields no JWT — `getSupabaseClient`
-  never called.
-- 403 FORBIDDEN for `member` and `guest` roles — `getSupabaseClient` never
-  called.
+Read `lib/google-calendar/token-crypto.ts`, `lib/google-calendar/oauth.ts`,
+and all three handlers (`app/api/google-calendar/{connect,callback,disconnect}/handler.ts`)
+line-by-line against `.pipeline/spec.md`. Confirmed:
 
-Validation (spec-named edge cases):
-- 400 VALIDATION_FAILED for missing `userId`.
-- 400 VALIDATION_FAILED for a non-uuid `userId`.
-- 400 VALIDATION_FAILED for a malformed/non-JSON body.
+- `token-crypto.ts`: key is read from `TOKEN_ENCRYPTION_KEY`, base64-decoded,
+  and rejected unless exactly 32 bytes; error messages never include the key
+  value (`"TOKEN_ENCRYPTION_KEY is not set"` /
+  `"TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes"` — both static).
+  `encryptToken` uses a fresh random 12-byte IV per call and joins
+  `iv:authTag:ciphertext` (all base64) with `:`. `decryptToken` splits on
+  `:`, requires exactly 3 non-empty parts, and lets `setAuthTag`/`final()`
+  throw naturally on tampering — matches spec.
+- `oauth.ts`: `CALENDAR_EVENTS_SCOPE` is exactly
+  `https://www.googleapis.com/auth/calendar.events` (write-only, no
+  `calendar`/`calendar.readonly`). `getAuthUrl` throws if `GOOGLE_CLIENT_ID`
+  or `GOOGLE_REDIRECT_URI` is unset, and includes `access_type=offline` +
+  `prompt=consent` + `state`. `exchangeCode` throws on non-ok response and on
+  a response missing `refresh_token` (before ever returning a partial
+  `GoogleTokens` object), maps `expires_in` seconds to an ISO `expiryDate`.
+  `revokeToken` is wrapped so neither a non-2xx response nor a rejected
+  `fetch` ever propagates — confirmed via the `try/catch` around the whole
+  body, and its only `console.warn` calls are static strings with no token
+  interpolated in.
+- `connect/handler.ts`: `requireAuth` first (so the state cookie is only ever
+  set for authenticated callers); cookie is `httpOnly: true, secure: true,
+  sameSite: "lax", path: "/", maxAge: 600`, exactly as spec'd; `ApiException`
+  maps to its own status/code, anything else (including a thrown
+  `getAuthUrl`, e.g. missing env) maps to 500 `INTERNAL`.
+- `callback/handler.ts`: never returns JSON — always
+  `NextResponse.redirect`, and the state cookie is deleted in every returned
+  path (`redirectError`/`redirectConnected` both call `cookieStore.delete`
+  before building the response). Order matches spec exactly: auth → `?error=`
+  → missing `code`/`state` → CSRF cookie check → `exchangeCode` → encrypt →
+  JWT → upsert. The whole body is additionally wrapped in an outer
+  `try {...} catch { return redirectError(); }`, so even an unexpected throw
+  (e.g. `encryptToken` failing on a bad key) still redirects rather than
+  crashing or returning a 500 — this is the belt-and-suspenders behavior
+  changes.md describes, and I independently verified it by forcing
+  `encryptToken` to throw for real (see below).
+- `disconnect/handler.ts`: no-row case short-circuits to
+  `ok({ disconnected: true })` before any revoke/delete; when a row exists,
+  `decryptToken` + `revokeToken` are wrapped in their own inner `try/catch`
+  so a decrypt failure can never block the subsequent `DELETE`; delete errors
+  map to 500 `INTERNAL`; the `DELETE` is scoped with `.eq("user_id",
+  ctx.userId)`, matching the RLS-scoping intent from the spec.
 
-Event scoping (spec-named edge case, ordering assertion):
-- 404 NOT_FOUND when the event is missing/cross-tenant, **and** asserts the
-  `invitations` table was never queried (confirms the 404 check happens
-  before the confirmed-member business rule, per spec Decisions).
-- 500 INTERNAL when the event lookup errors.
+Also confirmed via `grep -rn "console\." app/api/google-calendar
+lib/google-calendar` that the only two `console.*` calls in any new/modified
+file are the two static `console.warn` strings in `oauth.ts`'s `revokeToken`
+— no token or key value is ever interpolated into a log call anywhere in
+this feature.
 
-Confirmed-member rule (spec-named edge case):
-- 422 VALIDATION_FAILED when there's no accepted invitation for the
-  target user on the event's `service_week_id`.
-- 500 INTERNAL when the invitation lookup errors.
+## Independent read of the coder's existing tests
 
-Duplicate assign (spec-named edge case, ordering assertion):
-- 409 CONFLICT when already assigned, **and** asserts `insert` was never
-  called on `event_attendees` (confirms the pre-check runs before the
-  insert attempt).
-- 500 INTERNAL when the duplicate-check lookup errors.
+Read all five existing test files
+(`tests/unit/lib/google-calendar/token-crypto.test.ts`,
+`tests/unit/lib/google-calendar/oauth.test.ts`, and the three
+`tests/unit/app/api/google-calendar-{connect,callback,disconnect}-route.test.ts`
+files). Coverage matches what `changes.md` claims — round-trip encryption,
+distinct-IV-per-call, tampered/malformed ciphertext, missing/short key
+(including a "key never appears in the error message" assertion),
+`getAuthUrl`'s scope/access_type/prompt/state and missing-env-var throws,
+`exchangeCode`'s happy path + non-ok + missing-refresh_token + missing-env
+cases, `revokeToken`'s three never-throws cases, connect's 401/200/500
+cases (including asserting the state in the cookie matches the state in the
+returned `authUrl`), callback's full redirect-target matrix (unauthenticated,
+`?error=`, missing code/state, CSRF mismatch, missing cookie, exchange
+failure, upsert success with encrypted-value assertions, upsert error), and
+disconnect's 401 (both no-Clerk-id and no-JWT), success+revoke+delete,
+idempotent-no-row, revoke-fails-but-succeeds, select-error, and delete-error
+cases. No discrepancies found between the code and what these tests assert.
 
-Insert failure modes:
-- 500 INTERNAL when the insert itself errors.
-- 500 INTERNAL when the insert returns no row despite no error (defensive
-  branch in the handler).
+## Independent test coverage added
 
-`DELETE /api/events/[id]/attendees/[userId]` (`removeAttendee`):
-- 200 `{ deleted: true }` happy path; `set_leader` also allowed.
-- 401 UNAUTHENTICATED (no Clerk user; no JWT) — mirrors the same two auth
-  failure cases as POST.
-- 403 FORBIDDEN for `member`/`guest`.
-- 404 NOT_FOUND when the event is missing/cross-tenant, **and** asserts
-  `event_attendees` was never queried (delete never attempted against a
-  foreign/missing event).
-- 500 INTERNAL when the event lookup errors.
-- 404 NOT_FOUND when the delete matches no row (member wasn't assigned).
-- 500 INTERNAL when the delete errors.
+`changes.md`'s own "What the Tester should focus on" section named this gap
+explicitly: "confirm this holds even if `decryptToken` itself throws (e.g. a
+corrupted `refresh_token_encrypted` value), which the handler's inner
+try/catch is intended to cover but has no spec-named edge case forcing it."
+The existing disconnect test suite only ever calls `decryptToken` on values
+produced by the real `encryptToken`, so that specific throw path was never
+actually exercised — it's a materially different behavior than "revoke
+returns ok:false" or "fetch rejects", since here decryption itself fails
+before any token value exists to hand to `revokeToken`.
 
-## Verification run
+Added `tests/unit/app/api/google-calendar-tester-supplement.test.ts` with:
 
-- `bun run test -- tests/unit/app/api/events-id-attendees-route.test.ts`
-  → **28/28 passed**.
-- `bun run lint` → clean, no errors/warnings.
-- `bun run typecheck` (`tsc --noEmit`) → clean, no errors.
-- `bun run test` (full suite) → **59 suites / 757 tests, all passing**
-  (58 suites / 729 tests from the coder's baseline in `changes.md`, plus 1
-  new suite / 28 new tests added by this stage: 729 + 28 = 757, consistent).
+1. **Disconnect — corrupted stored ciphertext**: stubs a stored row whose
+   `refresh_token_encrypted` is not valid `iv:authTag:ciphertext` ciphertext,
+   so the real `decryptToken` throws (not mocked). Asserts the handler still
+   returns 200 `{ disconnected: true }`, the row is still deleted
+   (`DELETE ... WHERE user_id = <caller>`), and — since decryption failed
+   before a token value existed — `revokeToken` is never called at all (a
+   stronger assertion than "called and its failure ignored").
+2. **Callback — encryption key failure at encrypt time**: deletes
+   `TOKEN_ENCRYPTION_KEY` so the real `encryptToken` throws inside the
+   handler's try block, after a successful (mocked) `exchangeCode`. Confirms
+   the handler still redirects to `/profile?calendar=error` (never a JSON
+   500 — this route is a browser redirect target and must never return JSON)
+   and never reaches `getSupabaseClient`, i.e. no partial row can be
+   written. This independently verifies spec edge case #9 ("Missing/invalid
+   TOKEN_ENCRYPTION_KEY ... callback redirects to error") at the point in the
+   flow (encrypt, not decrypt) where it's actually most likely to occur.
 
-## Independent code read against spec.md
-
-Read `app/api/events/[id]/attendees/handler.ts` line by line against the
-spec's `assignAttendee`/`removeAttendee` flow descriptions. Confirmed:
-
-- Role matrix matches spec exactly: both endpoints `requireRole(ctx,
-  ["admin", "set_leader"])`; `member`/`guest` are rejected before any
-  Supabase call.
-- Event lookup is scoped by `church_group_id` and checked (404) **before**
-  the confirmed-member/invitation lookup in `assignAttendee`, and before the
-  delete attempt in `removeAttendee` — matches the spec's explicit ordering
-  requirement ("so a foreign event never leaks state"). Verified via tests
-  that assert `invitations`/`event_attendees` are never queried on the 404
-  path.
-- "Confirmed member" query matches spec exactly:
-  `.from("invitations").eq("church_group_id", ...).eq("service_week_id",
-  event.service_week_id).eq("user_id", ...).eq("status", "accepted")` — no
-  row → 422 VALIDATION_FAILED, not 404 or 400.
-- Duplicate-assign check queries `event_attendees` by `event_id`+`user_id`
-  and returns 409 CONFLICT before attempting the insert, exactly as
-  specified (verified the insert mock is never invoked on that path).
-- Insert payload is `{ event_id: eventId, user_id: parsed.userId }` only —
-  matches spec's note that `id`/`created_at` are DB-defaulted, no cast
-  needed.
-- `toAttendeeResponse` maps `id`/`event_id`/`user_id`/`created_at` to the
-  camelCase `AttendeeResponse` shape exactly as the spec's type signature
-  requires.
-- Every Supabase `.error` branch (event lookup x2, invitation lookup,
-  duplicate lookup, insert, delete) maps to `fail("Internal error",
-  ErrorCode.INTERNAL, 500)`, matching the spec and the sibling handler's
-  idiom.
-- Both functions wrap in `try/catch` mapping `ApiException` → `fail(err
-  .message, err.code, err.status)`, else generic 500 — matches spec and
-  sibling handler exactly.
-- Route wiring (`route.ts` files) unwraps `params: Promise<{...}>` and
-  delegates straight to the handler with no extra logic, matching
-  `app/api/events/[id]/route.ts`'s pattern.
-- `schemas/events.ts`'s `assignAttendeeSchema = z.object({ userId:
-  z.string().uuid() })` matches spec exactly; confirmed via the 400 tests
-  for missing/non-uuid `userId`.
-- No DB migrations, no notification/GCal code — `git status`/diff shows
-  only the files `changes.md` lists as created/modified, plus the one new
-  test file added by this stage. Confirms the "out of scope, belongs to
-  #62" constraint was respected.
+Both new tests pass against the current implementation with no code changes
+required; they were run standalone and as part of the full suite.
 
 ## Failure cases exercised
 
 Per the pipeline contract's requirement to cover at least one failure case,
-the following were independently confirmed:
+the following were confirmed (both pre-existing in the coder's suite and
+newly added by this stage):
+
+- `exchangeCode` throwing (non-ok token endpoint response) is caught by
+  callback's outer `try/catch` and redirects to error without ever calling
+  `getSupabaseClient` (pre-existing test, re-run and confirmed).
+- A Supabase upsert error redirects to error rather than silently reporting
+  success (pre-existing test, re-run and confirmed).
+- A Supabase select/delete error in disconnect maps to 500 `INTERNAL`
+  (pre-existing tests, re-run and confirmed).
+- `encryptToken` throwing mid-callback (missing `TOKEN_ENCRYPTION_KEY`) still
+  redirects to error rather than crashing or returning JSON (new test, this
+  stage).
+- `decryptToken` throwing mid-disconnect (corrupted stored ciphertext) still
+  completes the delete and returns success, never calling `revokeToken` with
+  a bad value (new test, this stage).
 
 - Malformed/non-JSON POST body → 400 VALIDATION_FAILED (via `req.json()`
   rejecting, caught by `.catch(() => null)` then failing Zod parse).
@@ -154,8 +162,8 @@ the following were independently confirmed:
   leaking state via a subsequent query.
 - Every Supabase `.error` branch on both endpoints → 500 INTERNAL.
 
-## Verdict
-PASS. No failures found. The implementation matches the spec's decisions
-(confirmed-member definition, 404-before-422/409 ordering, 409-before-insert
-ordering, 500 mapping on every Supabase `.error` branch) and the coder's
-`changes.md` claims hold up under independent testing. Ready for Review.
+No failures found. Nothing was patched around — the implementation matched
+the spec on every point checked, and the one coverage gap the coder itself
+flagged in changes.md is now closed with a real (non-mocked) throw of
+`decryptToken`/`encryptToken`, plus one additional independently-chosen edge
+case. Ready for Review.
