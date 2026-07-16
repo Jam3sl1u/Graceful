@@ -153,7 +153,14 @@ newly added by this stage):
   completes the delete and returns success, never calling `revokeToken` with
   a bad value (new test, this stage).
 
-## Verdict
+- Malformed/non-JSON POST body → 400 VALIDATION_FAILED (via `req.json()`
+  rejecting, caught by `.catch(() => null)` then failing Zod parse).
+- Non-uuid `userId` → 400 VALIDATION_FAILED (Zod `.uuid()` constraint).
+- Unconfirmed member (no accepted invitation) → 422 VALIDATION_FAILED.
+- Already-assigned member → 409 CONFLICT.
+- Cross-tenant/missing event → 404 NOT_FOUND on both endpoints, without
+  leaking state via a subsequent query.
+- Every Supabase `.error` branch on both endpoints → 500 INTERNAL.
 
 No failures found. Nothing was patched around — the implementation matched
 the spec on every point checked, and the one coverage gap the coder itself

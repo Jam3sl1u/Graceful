@@ -4,7 +4,7 @@ Implements the connect / callback / disconnect plumbing only, per
 `.pipeline/spec.md`. No event sync (that's #62), no calendar read scope, no
 `googleapis` dependency, no migration/RLS changes.
 
-## Files created
+## Files changed
 
 - **`app/api/google-calendar/connect/handler.ts`** — `connect(req, lookup?)`:
   `requireAuth`, generates a CSRF `state` via `randomBytes(32).toString("base64url")`,
@@ -70,7 +70,11 @@ Implements the connect / callback / disconnect plumbing only, per
   "fails" (per its own no-throw contract); 500 `INTERNAL` on a select error
   and on a delete error.
 
-## Files modified
+### `schemas/events.ts` (MODIFIED)
+Added `assignAttendeeSchema = z.object({ userId: z.string().uuid() })` and
+its inferred `AssignAttendeeInput` type, appended at the end of the file
+(after `validateEventTiming`, to avoid splitting the `BR10_WINDOW_MS`
+constant from the function that uses it).
 
 - **`lib/google-calendar/token-crypto.ts`** — replaced the throwing stubs
   with real AES-256-GCM encrypt/decrypt. Key: `TOKEN_ENCRYPTION_KEY`
@@ -118,6 +122,7 @@ Implements the connect / callback / disconnect plumbing only, per
 
 ## Verification
 
+## Verification
 - `bun run lint` — clean.
 - `bun run typecheck` — clean.
 - `bun run test` — 63 suites / 765 tests pass, including the 5 new/expanded

@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { removeSetlistSong } from "../../handler";
 
-export async function DELETE(_req: NextRequest) {
-  return notImplemented("DELETE /api/setlists/[id]/songs/[songId]");
+type Ctx = { params: Promise<{ id: string; songId: string }> };
+
+export async function DELETE(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id, songId } = await params;
+  return removeSetlistSong(req, id, songId);
 }
