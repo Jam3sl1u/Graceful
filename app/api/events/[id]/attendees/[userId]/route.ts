@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { removeAttendee } from "../handler";
 
-export async function DELETE(_req: NextRequest) {
-  return notImplemented("DELETE /api/events/[id]/attendees/[userId]");
+type Ctx = { params: Promise<{ id: string; userId: string }> };
+
+export async function DELETE(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id, userId } = await params;
+  return removeAttendee(req, id, userId);
 }

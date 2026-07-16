@@ -55,3 +55,9 @@ export function validateEventTiming(
   }
   return null;
 }
+
+// POST /api/events/:id/attendees body.
+export const assignAttendeeSchema = z.object({
+  userId: z.string().uuid(),
+});
+export type AssignAttendeeInput = z.infer<typeof assignAttendeeSchema>;

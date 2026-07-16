@@ -1,125 +1,161 @@
-# Test Results — Issue #55: Add/remove/reorder setlist songs (BR-07 no duplicates)
+# Test Results — Issue #60: Event attendee assignment
 
-## Verdict: PASS
+This overwrites the stale `test-results.md` for issue #58 that was still
+sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
+recent run).
 
-All checks below were re-run independently by the Testing stage (not
-trusted from `.pipeline/changes.md`). Everything is green.
+## Summary
+All checks pass. Added an independent unit-test suite for the new
+`assignAttendee`/`removeAttendee` handlers and re-ran the full verification
+suite (lint, typecheck, test) against the coder's claims in `changes.md`.
+Nothing in the implementation was patched — only tests were added.
 
-## Commands run
+## What I did
+1. Read `.pipeline/changes.md` and `.pipeline/spec.md` for issue #60.
+2. Read the implementation: `app/api/events/[id]/attendees/handler.ts`,
+   `app/api/events/[id]/attendees/route.ts`,
+   `app/api/events/[id]/attendees/[userId]/route.ts`, and the
+   `assignAttendeeSchema` addition in `schemas/events.ts`.
+3. Read the reference test pattern
+   (`tests/unit/app/api/events-id-route.test.ts`) and the underlying
+   `lib/api/auth.ts` / `lib/api/response.ts` / `lib/api/errors.ts` contracts
+   the mocks need to satisfy.
+4. Wrote a new independent test file:
+   `tests/unit/app/api/events-id-attendees-route.test.ts` (28 tests), using
+   the same `jest.mock`/`makeLookup`/table-fixture harness pattern as the
+   sibling suite, extended with an `insert` fixture (the sibling only needed
+   `select`/`update`/`delete`).
+5. Ran `bun run test` (new suite standalone, then full suite), `bun run
+   lint`, `bun run typecheck`.
 
-- `bun run lint` — clean, no errors/warnings.
-- `bun run typecheck` — clean, no errors (includes the new test file).
-- `bun run test` — **59 suites / 764 tests pass** (58 suites / 729 tests
-  pre-existing baseline + 1 new suite / 35 new tests added by this stage).
+## New test coverage (`tests/unit/app/api/events-id-attendees-route.test.ts`)
 
-## New test file
+`toAttendeeResponse`:
+- Maps a raw `event_attendees` row to the camelCase `AttendeeResponse` shape.
 
-`tests/unit/app/api/setlists-songs-route.test.ts` — 35 tests covering
-`reorderSetlist` (PUT), `addSetlistSong` (POST), `removeSetlistSong` (DELETE)
-from `app/api/setlists/[id]/handler.ts`.
+`POST /api/events/[id]/attendees` (`assignAttendee`) — happy path:
+- 201 with the created attendee; insert payload is exactly
+  `{ event_id, user_id }` (no `id`/`created_at` sent).
+- `set_leader` role is also allowed (not just `admin`).
 
-Rather than reusing the coder's own `songs-route.test.ts`-style mock (whose
-`.eq()` is a no-op passthrough that ignores its arguments), this suite uses a
-small **stateful in-memory fake** for the `setlists` / `songs` /
-`setlist_songs` tables: `.select().eq().eq()`, `.order()`, `.maybeSingle()`,
-`.update()`, `.delete().select()`, and `.insert()` all read/mutate real
-in-memory row arrays. This lets assertions check actual resulting state
-(exact recompacted positions, rejected inserts leaving row count unchanged,
-etc.) instead of just the shape of a canned fixture.
+Auth/role (failure cases):
+- 401 UNAUTHENTICATED when Clerk `userId` is null — `lookup` never
+  consulted.
+- 401 UNAUTHENTICATED when `getToken` yields no JWT — `getSupabaseClient`
+  never called.
+- 403 FORBIDDEN for `member` and `guest` roles — `getSupabaseClient` never
+  called.
 
-### Coverage by endpoint
+Validation (spec-named edge cases):
+- 400 VALIDATION_FAILED for missing `userId`.
+- 400 VALIDATION_FAILED for a non-uuid `userId`.
+- 400 VALIDATION_FAILED for a malformed/non-JSON body.
 
-**PUT /api/setlists/:id (`reorderSetlist`)** — 13 tests:
-- Happy path: reorder + position derived 1-indexed from array order;
-  verifies `keyOverride` is cleared both by omitting the field and by
-  explicit `null`, and set by a new value — confirms the documented
-  `entry.keyOverride ?? null` behavior in the spec's algorithm.
-- Allows `admin` role.
-- 400 on malformed JSON, on a shape-invalid `songId` (non-UUID), on a body
-  songId set missing an existing song, on a body songId set with an extra
-  song not in the setlist, and on duplicate `songId`s in the body.
-- 422 on a shape-valid but BR-09-invalid `keyOverride`.
-- 404 for a non-existent / other-tenant setlist.
-- 409 CONFLICT for a published setlist.
-- 403 for `member`/`guest` (asserts `getSupabaseClient` never called).
-- 401 when `getToken` yields no JWT (asserts `getSupabaseClient` never
-  called).
-- 500 INTERNAL when the update step errors.
+Event scoping (spec-named edge case, ordering assertion):
+- 404 NOT_FOUND when the event is missing/cross-tenant, **and** asserts the
+  `invitations` table was never queried (confirms the 404 check happens
+  before the confirmed-member business rule, per spec Decisions).
+- 500 INTERNAL when the event lookup errors.
 
-**POST /api/setlists/:id/songs (`addSetlistSong`)** — 12 tests:
-- Happy path: 201, song lands at `position = count + 1`.
-- 404 "Song not found" when `songId` isn't in the caller's group catalog
-  (cross-tenant song rejected).
-- 409 BR-07 when the song is already in the setlist; asserts nothing was
-  inserted (`state.setlistSongs` length unchanged).
-- 422 on invalid `keyOverride` (BR-09).
-- 400 on a missing/malformed body.
-- 404 for a non-existent / other-tenant setlist.
-- 409 CONFLICT for a published setlist.
-- 403 for `member`/`guest`.
-- 401 when `getToken` yields no JWT.
-- 500 INTERNAL on a generic insert error.
-- 409 CONFLICT (not 500) when the insert error carries Postgres code
-  `23505` — the documented race-backstop path.
+Confirmed-member rule (spec-named edge case):
+- 422 VALIDATION_FAILED when there's no accepted invitation for the
+  target user on the event's `service_week_id`.
+- 500 INTERNAL when the invitation lookup errors.
 
-**DELETE /api/setlists/:id/songs/:songId (`removeSetlistSong`)** — 9 tests:
-- Happy path: removing a middle song recompacts remaining rows to exactly
-  `1..N` in the correct order (asserted against the full response, not just
-  length).
-- Removing the last remaining song returns `{ songs: [] }`.
-- 404 when the `songId` isn't in the setlist.
-- 404 for a non-existent / other-tenant setlist.
-- 409 CONFLICT for a published setlist.
-- 403 for `member`/`guest`.
-- 401 when `getToken` yields no JWT.
-- 500 INTERNAL when the delete step errors.
+Duplicate assign (spec-named edge case, ordering assertion):
+- 409 CONFLICT when already assigned, **and** asserts `insert` was never
+  called on `event_attendees` (confirms the pre-check runs before the
+  insert attempt).
+- 500 INTERNAL when the duplicate-check lookup errors.
 
-### Failure cases (explicit, per pipeline contract)
+Insert failure modes:
+- 500 INTERNAL when the insert itself errors.
+- 500 INTERNAL when the insert returns no row despite no error (defensive
+  branch in the handler).
 
-Beyond the happy paths, this suite includes numerous failure-path
-assertions: 400 (malformed/shape-invalid bodies, songId-set mismatches,
-duplicate songIds), 401, 403, 404 (missing setlist, missing song,
-cross-tenant), 409 (BR-07 duplicate, published-setlist guard, race
-backstop), and 422 (BR-09 key validation), plus 500 mapping for update,
-insert, and delete errors.
+`DELETE /api/events/[id]/attendees/[userId]` (`removeAttendee`):
+- 200 `{ deleted: true }` happy path; `set_leader` also allowed.
+- 401 UNAUTHENTICATED (no Clerk user; no JWT) — mirrors the same two auth
+  failure cases as POST.
+- 403 FORBIDDEN for `member`/`guest`.
+- 404 NOT_FOUND when the event is missing/cross-tenant, **and** asserts
+  `event_attendees` was never queried (delete never attempted against a
+  foreign/missing event).
+- 500 INTERNAL when the event lookup errors.
+- 404 NOT_FOUND when the delete matches no row (member wasn't assigned).
+- 500 INTERNAL when the delete errors.
 
-## Independent verification against the spec
+## Verification run
 
-Cross-checked (by direct file inspection, not by trusting `changes.md`)
-that the implementation matches `.pipeline/spec.md`:
+- `bun run test -- tests/unit/app/api/events-id-attendees-route.test.ts`
+  → **28/28 passed**.
+- `bun run lint` → clean, no errors/warnings.
+- `bun run typecheck` (`tsc --noEmit`) → clean, no errors.
+- `bun run test` (full suite) → **59 suites / 757 tests, all passing**
+  (58 suites / 729 tests from the coder's baseline in `changes.md`, plus 1
+  new suite / 28 new tests added by this stage: 729 + 28 = 757, consistent).
 
-- `schemas/setlists.ts` — `reorderSetlistSchema` /
-  `addSetlistSongSchema` match the spec's shape exactly.
-- `lib/supabase/types.ts` — `setlist_songs` Row type and Tables entry
-  (Insert/Update/Relationships) added exactly as specified; no migration
-  files touched.
-- `app/api/setlists/[id]/handler.ts` — `reorderSetlist`, `addSetlistSong`,
-  `removeSetlistSong` implement the auth → role → JWT → tenant-scoped
-  editable-setlist guard → business-rule checks → mutation → reload-and-
-  return flow the spec describes, including the BR-07 pre-check + 23505
-  race backstop and the position-recompaction algorithm.
-- `app/api/setlists/[id]/route.ts`,
-  `app/api/setlists/[id]/songs/route.ts`,
-  `app/api/setlists/[id]/songs/[songId]/route.ts` — thin wrappers matching
-  the spec's exact code.
+## Independent code read against spec.md
 
-## Notes / caveats
+Read `app/api/events/[id]/attendees/handler.ts` line by line against the
+spec's `assignAttendee`/`removeAttendee` flow descriptions. Confirmed:
 
-- No mutation testing could be performed to positively confirm the new
-  tests would fail against a broken implementation: a deliberate attempt to
-  temporarily disable the BR-07 duplicate-check branch in
-  `app/api/setlists/[id]/handler.ts` to verify the test suite catches it
-  was blocked by the sandbox's security classifier (flagged as disabling a
-  validation guard in production code), so it was reverted immediately.
-  `git status --short` / `git diff --stat` confirm
-  `app/api/setlists/[id]/handler.ts` is byte-identical to the tracked
-  version — only the new test file is untracked; no implementation files
-  were modified by this stage. Confidence instead rests on the tests
-  asserting exact resulting state via the stateful fake (e.g., unchanged
-  row count on a rejected duplicate add, exact recompacted position/order
-  arrays) rather than loose shape checks.
+- Role matrix matches spec exactly: both endpoints `requireRole(ctx,
+  ["admin", "set_leader"])`; `member`/`guest` are rejected before any
+  Supabase call.
+- Event lookup is scoped by `church_group_id` and checked (404) **before**
+  the confirmed-member/invitation lookup in `assignAttendee`, and before the
+  delete attempt in `removeAttendee` — matches the spec's explicit ordering
+  requirement ("so a foreign event never leaks state"). Verified via tests
+  that assert `invitations`/`event_attendees` are never queried on the 404
+  path.
+- "Confirmed member" query matches spec exactly:
+  `.from("invitations").eq("church_group_id", ...).eq("service_week_id",
+  event.service_week_id).eq("user_id", ...).eq("status", "accepted")` — no
+  row → 422 VALIDATION_FAILED, not 404 or 400.
+- Duplicate-assign check queries `event_attendees` by `event_id`+`user_id`
+  and returns 409 CONFLICT before attempting the insert, exactly as
+  specified (verified the insert mock is never invoked on that path).
+- Insert payload is `{ event_id: eventId, user_id: parsed.userId }` only —
+  matches spec's note that `id`/`created_at` are DB-defaulted, no cast
+  needed.
+- `toAttendeeResponse` maps `id`/`event_id`/`user_id`/`created_at` to the
+  camelCase `AttendeeResponse` shape exactly as the spec's type signature
+  requires.
+- Every Supabase `.error` branch (event lookup x2, invitation lookup,
+  duplicate lookup, insert, delete) maps to `fail("Internal error",
+  ErrorCode.INTERNAL, 500)`, matching the spec and the sibling handler's
+  idiom.
+- Both functions wrap in `try/catch` mapping `ApiException` → `fail(err
+  .message, err.code, err.status)`, else generic 500 — matches spec and
+  sibling handler exactly.
+- Route wiring (`route.ts` files) unwraps `params: Promise<{...}>` and
+  delegates straight to the handler with no extra logic, matching
+  `app/api/events/[id]/route.ts`'s pattern.
+- `schemas/events.ts`'s `assignAttendeeSchema = z.object({ userId:
+  z.string().uuid() })` matches spec exactly; confirmed via the 400 tests
+  for missing/non-uuid `userId`.
+- No DB migrations, no notification/GCal code — `git status`/diff shows
+  only the files `changes.md` lists as created/modified, plus the one new
+  test file added by this stage. Confirms the "out of scope, belongs to
+  #62" constraint was respected.
 
-## Files touched by this stage
+## Failure cases exercised
 
-- `tests/unit/app/api/setlists-songs-route.test.ts` (new)
-- `.pipeline/test-results.md` (this file)
+Per the pipeline contract's requirement to cover at least one failure case,
+the following were independently confirmed:
+
+- Malformed/non-JSON POST body → 400 VALIDATION_FAILED (via `req.json()`
+  rejecting, caught by `.catch(() => null)` then failing Zod parse).
+- Non-uuid `userId` → 400 VALIDATION_FAILED (Zod `.uuid()` constraint).
+- Unconfirmed member (no accepted invitation) → 422 VALIDATION_FAILED.
+- Already-assigned member → 409 CONFLICT.
+- Cross-tenant/missing event → 404 NOT_FOUND on both endpoints, without
+  leaking state via a subsequent query.
+- Every Supabase `.error` branch on both endpoints → 500 INTERNAL.
+
+## Verdict
+PASS. No failures found. The implementation matches the spec's decisions
+(confirmed-member definition, 404-before-422/409 ordering, 409-before-insert
+ordering, 500 mapping on every Supabase `.error` branch) and the coder's
+`changes.md` claims hold up under independent testing. Ready for Review.
