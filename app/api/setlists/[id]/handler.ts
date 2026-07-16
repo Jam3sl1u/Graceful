@@ -8,6 +8,7 @@ import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import { isValidSongKey } from "@/schemas/songs";
 import { reorderSetlistSchema, addSetlistSongSchema } from "@/schemas/setlists";
+import { toSetlistResponse } from "@/app/api/service-weeks/[id]/setlist/handler";
 
 type SetlistSongsRow = Database["public"]["Tables"]["setlist_songs"]["Row"];
 
@@ -16,17 +17,26 @@ export type SetlistSongResponse = {
   setlistId: string;
   songId: string;
   position: number;
-  keyOverride: string | null;
+  keyOverride: string | null; // null = using the song's default key
+  defaultKey: string | null; // the song's catalog default_key (songs.default_key)
+  effectiveKey: string | null; // keyOverride ?? defaultKey — the key to actually play
+  isOverridden: boolean; // keyOverride != null
   notes: string | null;
 };
 
-export function toSetlistSongResponse(row: SetlistSongsRow): SetlistSongResponse {
+export function toSetlistSongResponse(
+  row: SetlistSongsRow,
+  defaultKey: string | null,
+): SetlistSongResponse {
   return {
     id: row.id,
     setlistId: row.setlist_id,
     songId: row.song_id,
     position: row.position,
     keyOverride: row.key_override,
+    defaultKey,
+    effectiveKey: row.key_override ?? defaultKey,
+    isOverridden: row.key_override != null,
     notes: row.notes,
   };
 }
@@ -78,6 +88,37 @@ async function loadOrderedSongs(
     .select("*")
     .eq("setlist_id", setlistId)
     .order("position", { ascending: true });
+}
+
+// Loads the setlist's songs (ordered by position) and joins each row to its
+// song's default_key so the response can distinguish "using default" from
+// "overridden this week". Returns fully-formed response objects.
+async function loadSongResponses(
+  supabase: SupabaseClient<Database>,
+  setlistId: string,
+): Promise<{ data: SetlistSongResponse[] | null; error: unknown }> {
+  const { data: rows, error } = await loadOrderedSongs(supabase, setlistId);
+  if (error) return { data: null, error };
+
+  const songRows = rows ?? [];
+  const songIds = [...new Set(songRows.map((r) => r.song_id))];
+
+  const defaultKeyById = new Map<string, string | null>();
+  if (songIds.length > 0) {
+    const { data: songs, error: songsError } = await supabase
+      .from("songs")
+      .select("id, default_key")
+      .in("id", songIds);
+    if (songsError) return { data: null, error: songsError };
+    for (const s of songs ?? []) {
+      defaultKeyById.set(s.id, s.default_key ?? null);
+    }
+  }
+
+  return {
+    data: songRows.map((r) => toSetlistSongResponse(r, defaultKeyById.get(r.song_id) ?? null)),
+    error: null,
+  };
 }
 
 // PUT /api/setlists/:id — set_leader/admin only. Reorders the songs already
@@ -163,12 +204,12 @@ export async function reorderSetlist(
       }
     }
 
-    const { data: rows, error } = await loadOrderedSongs(supabase, id);
+    const { data: songs, error } = await loadSongResponses(supabase, id);
     if (error) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
-    return ok({ songs: (rows ?? []).map(toSetlistSongResponse) });
+    return ok({ songs });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);
@@ -271,12 +312,169 @@ export async function addSetlistSong(
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
-    const { data: rows, error } = await loadOrderedSongs(supabase, id);
+    const { data: songs, error } = await loadSongResponses(supabase, id);
     if (error) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
-    return ok({ songs: (rows ?? []).map(toSetlistSongResponse) }, 201);
+    return ok({ songs }, 201);
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
+// POST /api/setlists/:id/publish — set_leader/admin only. draft -> published
+// (BR-01: zero songs is a valid publishable state). Notifies confirmed
+// members (accepted invitations for the parent service week). Re-notifying
+// is done via unlock -> edit -> publish, so this only ever acts on a draft;
+// an already-published setlist is a 409.
+export async function publishSetlist(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+    requireRole(ctx, ["admin", "set_leader"]);
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data, error } = await supabase
+      .from("setlists")
+      .select("*")
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .maybeSingle();
+
+    if (error) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if (!data) {
+      return fail("Setlist not found", ErrorCode.NOT_FOUND, 404);
+    }
+    if (data.status !== "draft") {
+      return fail("Setlist is already published.", ErrorCode.CONFLICT, 409);
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from("setlists")
+      .update({ status: "published", published_at: new Date().toISOString() })
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .select("*")
+      .maybeSingle();
+
+    if (updateError || !updated) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    const { data: songRows, error: songsError } = await supabase
+      .from("setlist_songs")
+      .select("id")
+      .eq("setlist_id", id);
+
+    if (songsError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    const songCount = (songRows ?? []).length;
+
+    const { data: invitations, error: invitationsError } = await supabase
+      .from("invitations")
+      .select("user_id")
+      .eq("service_week_id", updated.service_week_id)
+      .eq("status", "accepted");
+
+    if (invitationsError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    const recipientIds = [...new Set((invitations ?? []).map((i) => i.user_id))];
+
+    if (recipientIds.length > 0) {
+      const notificationInsertPayload = recipientIds.map((userId) => ({
+        church_group_id: ctx.churchGroupId,
+        user_id: userId,
+        type: "setlist_released",
+        title: "Setlist published",
+        body:
+          songCount === 0 ? "The setlist has been published — songs are still being added." : null,
+        link_entity_type: "setlist",
+        link_entity_id: id,
+      })) as unknown as Database["public"]["Tables"]["notifications"]["Insert"][];
+
+      const { error: notificationsError } = await supabase
+        .from("notifications")
+        .insert(notificationInsertPayload);
+
+      if (notificationsError) {
+        return fail("Internal error", ErrorCode.INTERNAL, 500);
+      }
+
+      // TODO(#67/#68): SMS/email fan-out for confirmed members.
+    }
+
+    return ok({ setlist: toSetlistResponse(updated) });
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
+// POST /api/setlists/:id/unlock — set_leader/admin only. published -> draft
+// so the setlist can be edited again. Sends no notifications and takes no
+// request body — the next publish re-notifies confirmed members.
+export async function unlockSetlist(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+    requireRole(ctx, ["admin", "set_leader"]);
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data, error } = await supabase
+      .from("setlists")
+      .select("*")
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .maybeSingle();
+
+    if (error) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if (!data) {
+      return fail("Setlist not found", ErrorCode.NOT_FOUND, 404);
+    }
+    if (data.status !== "published") {
+      return fail("Setlist is not published; nothing to unlock.", ErrorCode.CONFLICT, 409);
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from("setlists")
+      .update({ status: "draft", published_at: null })
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .select("*")
+      .maybeSingle();
+
+    if (updateError || !updated) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    return ok({ setlist: toSetlistResponse(updated) });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);
@@ -350,12 +548,12 @@ export async function removeSetlistSong(
       }
     }
 
-    const { data: rows, error } = await loadOrderedSongs(supabase, id);
+    const { data: songs, error } = await loadSongResponses(supabase, id);
     if (error) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
-    return ok({ songs: (rows ?? []).map(toSetlistSongResponse) });
+    return ok({ songs });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);
