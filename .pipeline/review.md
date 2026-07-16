@@ -1,67 +1,66 @@
-# Review — Issue #62: Google Calendar event sync
+# Review — Issue #63: iCal (.ics) export fallback
 
-## VERDICT: SHIP
+VERDICT: SHIP
 
-Independently verified (re-run, not trusted from test-results.md):
-- `bun run typecheck` — clean
-- `bun run lint` — clean
-- `bun run test` — 70 suites / 880 tests pass
-- `bun run check:service-role` — no service-role key usage introduced
+## What I checked
+- Read spec.md, changes.md, test-results.md.
+- Read the actual diff (`git diff main...HEAD`) and every created file:
+  `lib/ical/generate.ts`, both `ics/handler.ts` + `route.ts` pairs, and both
+  test files (coder's + tester's supplements).
+- Re-ran independently: `bun run lint` (0 errors), `bun run typecheck`
+  (0 errors), `bun run test` (77 suites / 968 tests pass, 0 failures).
+- Scanned the diff for network/exfil patterns — none (no `fetch`, no beacon,
+  no dynamic `require`/`eval`); only a benign code comment matched.
 
-## Assessment
+## Spec conformance (verified against the code, not just the summaries)
+- Generator emits the exact VCALENDAR/VEVENT structure, order, PRODID, CRLF
+  line endings + trailing CRLF as specced.
+- `formatIcsDate` uses the exact `toISOString()` UTC-basic transform → no
+  local-time drift (verified by the offset-normalization test).
+- `escapeIcsText` escapes backslash-first, then `;` `,` then CR/LF → `\n`, in
+  the required order.
+- `foldLine` folds at 75 octets (74 for continuation to account for the
+  leading space), backs off on UTF-8 continuation bytes so multibyte chars
+  aren't split. Escape-then-fold ordering round-trips (tester verified an
+  escape sequence straddling a fold boundary still unfolds losslessly).
+- `null`/empty/whitespace LOCATION/DESCRIPTION lines are omitted, not emitted
+  empty.
+- Both handlers mirror the existing auth/JWT/try-catch shape: `requireAuth`
+  (no role gate, correct per spec), explicit 401 on missing JWT, 500 on any
+  Supabase error, `ApiException` → `fail(...)` else 500.
+- Single-event handler checks `event_attendees` (the #60 attendee model, not
+  the invitation-scoped list) before fetching the event, and returns 404
+  without distinguishing "not yours" from "doesn't exist" — no info leak.
+- Full-export handler: optional `?serviceWeekId` validated as uuid (400 on
+  invalid), dedupes attendee event_ids, 404 on zero attendee rows AND 404 on
+  empty post-filter result (Decision 2 honored in both branches), orders by
+  start_time asc, filename `graceful-events.ics`.
+- No new dependency (`bun.lock` untouched), no UI (correct — member-week
+  screen is still a placeholder), no scope creep.
 
-The implementation faithfully realizes the spec's "Recommended design (OQ-1 = A)":
-inline best-effort sync driven by three `SECURITY DEFINER` RPCs, never touching a
-service-role client. Every claim in changes.md checks out against the actual diff.
+## Tests — meaningful, not superficial
+- Route tests cover every named edge case: 401 (null Clerk id / null JWT,
+  asserting lookup + supabase client are NOT consulted early), 404 (not an
+  attendee / event missing / zero assigned / serviceWeekId matches none), 400
+  (invalid serviceWeekId), 500 (both query error paths), and 200 happy paths
+  asserting Content-Type, Content-Disposition filename, and VEVENT count.
+- Tester supplements add genuine coverage the coder's suite structurally
+  couldn't reach: multibyte UTF-8 fold safety, escape-then-fold ordering
+  end-to-end, the attendee-vs-invitation scoping distinction (asserts the
+  handler never queries an `invitations` table), and a real failure case —
+  a malformed `start_time` throws `RangeError` inside `generateIcs` and the
+  outer try/catch correctly converts it to a 500 rather than crashing.
 
-Security boundary (the crux of this issue) is correct:
-- `get_event_sync_targets` derives caller from `auth.jwt()->>'sub'`, requires
-  `admin`/`set_leader`, and requires the event to belong to the caller's own
-  group before returning any encrypted token row. All handlers that call it are
-  already role-gated to admin/set_leader.
-- `get_user_sync_targets` is strictly self-scoped (`user_id = v_caller_id`).
-- `flag_calendar_token_invalid` requires self OR admin/set_leader-in-same-group,
-  and is idempotent (no repeat notification once `is_valid = false`).
-- All three use `SECURITY DEFINER`, `SET search_path = ''`, `GRANT EXECUTE ...
-  TO authenticated`, mirroring `record_availability_conflict`.
+## Notes (non-blocking)
+- The two `*-tester-supplement.test.ts` files and the updated
+  `test-results.md` are present in the worktree but not yet committed (only
+  the implementation commit exists). Orchestration should commit them with
+  the rest before the PR; they pass as-is.
+- The handlers rely on RLS + `user_id`/attendee scoping for tenancy rather
+  than an explicit `.eq("church_group_id", ...)` like sibling handlers. This
+  is an explicit, defensible spec decision and is safe here: the full-export
+  events query only fetches ids drawn from the caller's own attendee rows,
+  and the single-event path gates on an attendee check first. Called out for
+  human awareness, not a blocker.
 
-Correctness details verified:
-- `toGoogleEventId` output (`gr` + 32 lowercase hex chars) is a valid base32hex
-  id in Google's required range.
-- PATCH→404→POST-with-id fallback keeps create idempotent; DELETE treats 404/410
-  as success. `invalid_grant` is the only failure that flags a token invalid;
-  5xx/network/decrypt failures are logged and swallowed without flagging.
-- Ordering constraints are honored: `deleteEvent` and `removeAttendee` read sync
-  targets (which join `event_attendees`) BEFORE the cascading DB delete.
-- `is_valid: true` on the callback upsert clears a prior revoke on reconnect,
-  followed by best-effort retroactive `syncAllEventsForUser`.
-- `notifications` insert shape matches the table (`link_entity_type varchar(50)`
-  accepts `'google_calendar'`; `church_group_id`/`user_id`/`type` NOT NULLs all
-  supplied). Enum value added via `ADD VALUE IF NOT EXISTS`, only referenced in
-  deferred function bodies (not at migration time), consistent with
-  20260711000002.
-- Hand-maintained `lib/supabase/types.ts` matches the migration (new `is_valid`
-  column + three RPC signatures); `types/domain.ts` union updated.
-
-Tests are meaningful, not superficial: `sync.test.ts` uses a real encrypt/decrypt
-round-trip, asserts exact Google REST URLs/methods/bodies/auth headers, and covers
-PATCH/POST fallback, DELETE 404/410, per-attendee isolation, invalid_grant → flag +
-notify, non-auth-failure → no-flag, RPC-error → no-op, and refresh gating. The
-tester-supplement suites add real call-order proof for the delete/remove ordering
-and a distinct corrupted-ciphertext decrypt-failure path.
-
-## Notes for the human sign-off (non-blocking, by-design)
-
-1. OQ-1 was a genuine BLOCKING security-posture question. changes.md states a
-   human resolved it as (A). The code correctly implements (A), but confirm that
-   sign-off did happen: with (A), an admin's request can reach other members'
-   encrypted OAuth tokens through `get_event_sync_targets`. This is intentional
-   and matches the repo's established `SECURITY DEFINER` cross-user pattern.
-2. `syncAllEventsForUser` runs inline in the OAuth callback and syncs every event
-   the member attends sequentially before the redirect — added latency for members
-   with many events. Inline design is per spec; acceptable, worth awareness.
-3. The `syncEventToUser`/`unsyncEventFromUser` signature gained an `eventId` param
-   vs. the spec's literal snippet — documented and necessary given the RPC takes an
-   event id; sensible.
-4. The migration was not run against a real Postgres instance (per spec). SQL was
-   reviewed statically only.
+Green tests here reflect genuinely correct behavior. Ship it.
