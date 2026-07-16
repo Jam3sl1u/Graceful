@@ -1,108 +1,139 @@
-# Test Results — Issue #57: Per-song key override validation & default-vs-override distinction (BR-09)
+# Test Results — Issue #62: Google Calendar event sync
 
-This overwrites the stale `test-results.md` for issue #61 that was still sitting at
-this path (per AGENTS.md, `.pipeline/` files reflect only the most recent run).
+This overwrites the stale `test-results.md` for issue #61 that was still
+sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
+recent run).
 
 ## Verdict: PASS
 
-## Verification performed
+All independently-run verification commands are clean, and new tests written
+by this stage (independent of the coder's own suite) pass, including the two
+"ordering-dependent path" checks the coder's changes.md flagged as needing
+integration-style (not just mock-argument) proof.
+
+## Commands re-run independently
 
 - `bun run lint` — clean, no errors/warnings.
-- `bun run typecheck` (`tsc --noEmit`) — clean.
-- `bun run test tests/unit/app/api/setlists-songs-route.test.ts` (Coder's maintained
-  suite) — 35/35 passing, independently re-run.
-- `bun run test tests/unit/app/api/setlists-key-override.test.ts` (new, written this
-  stage) — 16/16 passing.
-- `bun run test` (full suite) — **67 suites / 846 tests passing** (66 suites / 830 tests
-  baseline from the coder's work, plus 1 new suite / 16 new tests added by this stage).
-  No regressions.
+- `bun run typecheck` — clean, no errors.
+- `bun run check:service-role` — `OK: no service-role key references found
+  outside comments in app/ or lib/.` Confirms the OQ-1 = A design never
+  introduces a service-role client; cross-user token reads go only through
+  the new `SECURITY DEFINER` RPCs called via the acting user's own client.
+- `bun run test` (full suite, including new tests below): **70 suites / 880
+  tests pass** (coder's baseline was 67 suites / 873 tests; this stage added
+  3 suites / 7 tests, all passing).
 
-## Independent code read
+## New tests written this stage
 
-Read `app/api/setlists/[id]/handler.ts` in full against `.pipeline/spec.md`. Confirmed:
+### `tests/unit/app/api/events-id-route-tester-supplement.test.ts` (2 tests)
+Independently proves the delete-ordering claim in changes.md item #1 ("worth
+an integration-style check that the RPC call genuinely happens first, not
+just that the mocked function was called with the right arguments"). Uses a
+shared `callOrder` marker array pushed to by both `unsyncEventFromAttendees`
+and the real `events.delete()` call inside a hand-built fake Supabase client,
+so the assertion is about *real invocation order*, not just call arguments.
+- Confirms `unsyncEventFromAttendees` is invoked strictly before
+  `events.delete()` is issued.
+- Confirms the same ordering holds, and the DB delete still proceeds (200,
+  `{ deleted: true }`), even when `unsyncEventFromAttendees` rejects
+  (graceful degradation under real ordering, not just "sync mocked to
+  resolve").
 
-- `SetlistSongResponse` gained exactly the three spec'd fields (`defaultKey`,
-  `effectiveKey`, `isOverridden`), and `toSetlistSongResponse` derives them as spec'd:
-  `effectiveKey = row.key_override ?? defaultKey`, `isOverridden = row.key_override != null`
-  (a strict non-null check, not an equality comparison against `defaultKey` — matches the
-  spec's edge case #3 requirement exactly).
-- The new `loadSongResponses` helper correctly skips the `songs` query when `songIds` is
-  empty (`if (songIds.length > 0)`), builds a `Map<songId, defaultKey>` via a single
-  `.in("id", songIds)` call, and defaults to `null` via `defaultKeyById.get(r.song_id) ??
-  null` when a song row is somehow missing from the map.
-- All three handlers (`reorderSetlist`, `addSetlistSong`, `removeSetlistSong`) now route
-  through `loadSongResponses` instead of the old `loadOrderedSongs(...).map(...)` tail,
-  preserving their existing status codes (201 add, default 200 elsewhere) and existing
-  500 `INTERNAL` mapping on query error.
-- BR-09 validation (`isValidSongKey` checks, 422 for a shape-valid-but-non-musical key,
-  400 for a malformed/shape-invalid body) is untouched in both `reorderSetlist` and
-  `addSetlistSong` — confirmed no code was moved or altered there, per the spec's explicit
-  "out of scope" instruction.
-- No insert/update payload logic copies `default_key` into `key_override` anywhere in the
-  file (`key_override: entry.keyOverride ?? null` / `parsed.keyOverride ?? null` in both
-  write paths) — `default_key` is never written by any of these three handlers, satisfying
-  AC #3.
-- No schema, migration, or Zod (`schemas/setlists.ts`, `schemas/songs.ts`) changes were
-  made, matching the spec's explicit out-of-scope list.
+### `tests/unit/app/api/events-id-attendees-route-tester-supplement.test.ts` (3 tests)
+Same ordering concern for `removeAttendee` (unsync must happen before the
+`event_attendees` row is deleted, since `get_event_sync_targets` joins on
+that table).
+- Confirms `unsyncEventFromUser` is invoked strictly before
+  `event_attendees.delete()` is issued.
+- Independently re-verifies the spec-deviation signature documented in
+  changes.md — `unsyncEventFromUser(supabase, eventId, userId,
+  googleEventId)` — is exactly what the handler passes (a real call-shape
+  check, distinct from the coder's own suite asserting the same thing).
+- Confirms the ordering + 200 response hold even when `unsyncEventFromUser`
+  rejects.
 
-## New independent test coverage added
+### `tests/unit/lib/google-calendar/sync-tester-supplement.test.ts` (2 tests)
+Independently covers spec edge case #10 ("Missing TOKEN_ENCRYPTION_KEY /
+Google env vars — existing helpers throw; the per-attendee try/catch
+swallows it (logged), request still succeeds. Never log token plaintext or
+the key.") via a corrupted `access_token_encrypted` value (a plain decrypt
+error, distinct from the `GoogleTokenInvalidError`/5xx-shaped failures the
+coder's own `sync.test.ts` exercises) — this is the genuine failure case for
+this stage:
+- A corrupted ciphertext causes `decryptToken` to throw; `syncEventToAttendees`
+  swallows it, never calls Google, and — critically — **never calls
+  `flag_calendar_token_invalid`** (a corrupt DB value is not the same failure
+  mode as a revoked refresh token; flagging it would incorrectly prompt the
+  member to reconnect Google Calendar when the real bug is elsewhere).
+  Also asserts the logged `console.error` output never contains the
+  plaintext access/refresh token or the encryption key.
+- Per-attendee isolation re-verified independently: one corrupted target and
+  one healthy target in the same `syncEventToAttendees` call — only the
+  healthy target's calendar actually receives the Google API call.
 
-New file: `tests/unit/app/api/setlists-key-override.test.ts` (16 tests), written with a
-separate fake-Supabase-client implementation and separate fixture IDs from the Coder's
-maintained suite, so a bug that happens to cancel out against the Coder's own test file
-wouldn't also cancel out here.
+## Coverage against the spec / changes.md checklist
 
-**Pure unit coverage of `toSetlistSongResponse` (AC #4 derivation logic in isolation):**
-- override `null` -> `isOverridden: false`, `effectiveKey` falls back to `defaultKey`.
-- override set to a value different from `defaultKey` -> `isOverridden: true`,
-  `effectiveKey` = the override.
-- **spec edge case #3**: override value equals `defaultKey` exactly -> still
-  `isOverridden: true` (confirms the field is derived from `key_override != null`, not
-  from an equality comparison).
-- **spec edge case #4**: `defaultKey` null and no override -> `defaultKey`,
-  `effectiveKey` both `null`, `isOverridden: false`.
-- `defaultKey` null but override set -> `effectiveKey` = the override, `isOverridden: true`.
+1. **Ordering-dependent paths** (delete/remove before DB write) — independently
+   verified with real call-order tracking, not just mock-argument assertions.
+   PASS.
+2. **`syncEventToUser`/`unsyncEventFromUser` signature deviation** (added
+   `eventId` param) — independently re-confirmed at the handler call site;
+   matches `lib/google-calendar/sync.ts`'s actual exported signatures. No
+   conflict found with the spec's literal snippet beyond what changes.md
+   already discloses as a documented, necessary deviation. PASS.
+3. **Graceful degradation** — spot-checked with a real rejection
+   (`unsyncEventFromAttendees`/`unsyncEventFromUser` throwing) at both
+   ordering-sensitive call sites: HTTP status stays 200 in both cases. Also
+   independently exercised a genuinely different failure mode (decrypt
+   failure, not the coder's already-covered `GoogleTokenInvalidError`/5xx
+   cases) in `sync.ts` directly. PASS.
+4. **RLS/security boundary** — read
+   `supabase/migrations/20260716000001_google_calendar_sync.sql` in full.
+   `get_event_sync_targets` checks caller role (`admin`/`set_leader`) and
+   that the event's `church_group_id` matches the caller's group before
+   returning any token row; `get_user_sync_targets` scopes strictly to the
+   caller's own `user_id`; `flag_calendar_token_invalid` requires either
+   self or admin/set_leader-in-same-group, and is idempotent (no-op + no
+   duplicate notification when already invalid). All three use `SECURITY
+   DEFINER`, `SET search_path = ''`, and `GRANT EXECUTE ... TO authenticated`,
+   consistent with the `record_availability_conflict` pattern cited in the
+   spec. Not covered by `bun run test` (this is SQL, not executed against a
+   real DB per the spec's own instruction) — this is a static read-through,
+   not a live-DB verification.
+5. **Token refresh / invalid_grant path** — confirmed `sync.test.ts` mocks
+   `refreshAccessToken` (unit-level), and the 400/`invalid_grant` →
+   `GoogleTokenInvalidError` mapping itself is separately covered in
+   `oauth.test.ts`; spot-checked `oauth.ts`'s `refreshAccessToken` reads as
+   claimed (throws `GoogleTokenInvalidError` specifically on
+   `error === "invalid_grant"`, a plain `Error` otherwise).
 
-**AC #4 through the actual route handlers (integration-style, exercises the full
-`loadSongResponses` join):**
-- PUT reorder: override equal to default still reports `isOverridden: true` end-to-end.
-- PUT reorder: song with `default_key: null` and no override reports both derived key
-  fields as `null` and `isOverridden: false`.
-- **AC #3**: after setting overrides via PUT, the underlying `songs.default_key` catalog
-  rows are asserted unchanged, and the response's `defaultKey` field still reflects the
-  catalog value, not the override — confirms overrides never leak into the catalog.
-- POST add: happy path reports correct `defaultKey`/`effectiveKey`/`isOverridden` for the
-  newly inserted row.
-- DELETE remove: removing the last remaining song returns `{ songs: [] }` **and** asserts
-  (via a `from()` call-count spy) that the `songs` table is never queried in that case —
-  confirms the `songIds.length > 0` guard actually skips the query, not just that the
-  response happens to be empty.
+## Files independently re-read (not just changes.md's claims about them)
 
-**BR-09 / AC #2 independent verification (both endpoints, per changes.md's explicit
-request that the Tester cover this independently):**
-- PUT: malformed JSON body -> 400 `VALIDATION_FAILED`, no DB call attempted.
-- PUT: shape-valid but non-musical `keyOverride` ("H") -> 422, and the underlying fake
-  state is asserted to still have `key_override: null` (no partial mutation before the
-  validation short-circuit).
-- POST: malformed body (missing `songId`) -> 400.
-- POST: shape-valid but non-musical `keyOverride` ("Zz") -> 422, and the fake
-  `setlistSongs` array length is asserted unchanged (nothing inserted).
-- PUT: a valid Unicode-accidental key spelling ("F♯") is accepted (200), confirming
-  BR-09's dual ASCII/Unicode key set from `schemas/songs.ts` is honored end-to-end.
+- `lib/google-calendar/sync.ts`, `lib/google-calendar/oauth.ts`,
+  `lib/google-calendar/token-crypto.ts`
+- `app/api/events/handler.ts`, `app/api/events/[id]/handler.ts`,
+  `app/api/events/[id]/attendees/handler.ts`,
+  `app/api/google-calendar/callback/handler.ts`
+- `supabase/migrations/20260716000001_google_calendar_sync.sql`
+- Existing test suites: `tests/unit/lib/google-calendar/sync.test.ts`,
+  `tests/unit/app/api/events-id-route.test.ts`,
+  `tests/unit/app/api/events-id-attendees-route.test.ts`
 
-**Failure case:**
-- PUT reorder: forces the second-stage `songs` join query (inside `loadSongResponses`,
-  after the `setlist_songs` update has already succeeded) to return a Supabase error, and
-  asserts the handler surfaces this as 500 `INTERNAL` rather than a silent/partial 200
-  response.
+## Not independently verified (documented limitation, matches spec instruction)
 
-## Notes for Reviewer
+- The migration was not run against a real Postgres/Supabase instance (per
+  the spec's explicit instruction not to). SQL correctness is judged by
+  static read-through only, same limitation the coder's own changes.md
+  discloses.
+- `lib/supabase/types.ts` hand-updated types were spot-checked for the three
+  new RPC names and the `is_valid` column, but their exact `Args`/`Returns`
+  shapes were not checked against a live-generated Supabase type dump (none
+  exists in this repo's tooling to diff against).
 
-- No code changes were made by this stage; only tests were added
-  (`tests/unit/app/api/setlists-key-override.test.ts`). All findings are PASS.
-- The `console.warn` lines seen in the full-suite output (Google Calendar token revoke,
-  Node 20 deprecation notice) are pre-existing, expected output from other suites'
-  mocked error paths, unrelated to this issue and not new failures.
-- Nothing was patched around — the implementation matched the spec on every point
-  checked, including the trickiest edge case (override value equal to default still
-  reporting `isOverridden: true`). Ready for Review.
+## Conclusion
+
+No failing tests. No regressions. The two explicitly-flagged
+ordering-dependent paths now have real integration-style ordering proof (not
+just mock-argument assertions), and one additional genuine failure mode
+(corrupted-ciphertext decrypt failure) was exercised beyond what the coder's
+own suite covers. Ready for Review.

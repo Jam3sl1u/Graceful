@@ -1,7 +1,14 @@
 // Tests for lib/google-calendar/oauth.ts (connect URL + code exchange +
 // revoke, #61). Mocks global.fetch; sets Google env vars in beforeEach.
 
-import { getAuthUrl, exchangeCode, revokeToken, CALENDAR_EVENTS_SCOPE } from "@/lib/google-calendar/oauth";
+import {
+  getAuthUrl,
+  exchangeCode,
+  revokeToken,
+  refreshAccessToken,
+  GoogleTokenInvalidError,
+  CALENDAR_EVENTS_SCOPE,
+} from "@/lib/google-calendar/oauth";
 
 const ENV = {
   GOOGLE_CLIENT_ID: "client-id-123",
@@ -104,6 +111,69 @@ describe("exchangeCode", () => {
     delete process.env.GOOGLE_CLIENT_SECRET;
     await expect(exchangeCode("auth-code")).rejects.toThrow();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("refreshAccessToken", () => {
+  it("returns the refreshed access token + expiry on success", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({
+        access_token: "refreshed-access-token",
+        expires_in: 3600,
+      }),
+    });
+
+    const before = Date.now();
+    const result = await refreshAccessToken("refresh-token-value");
+    const after = Date.now();
+
+    expect(result.accessToken).toBe("refreshed-access-token");
+    const expiry = new Date(result.expiryDate).getTime();
+    expect(expiry).toBeGreaterThanOrEqual(before + 3600 * 1000);
+    expect(expiry).toBeLessThanOrEqual(after + 3600 * 1000);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://oauth2.googleapis.com/token",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("throws GoogleTokenInvalidError when Google reports invalid_grant", async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      json: jest.fn().mockResolvedValue({ error: "invalid_grant" }),
+    });
+
+    await expect(refreshAccessToken("revoked-refresh-token")).rejects.toBeInstanceOf(
+      GoogleTokenInvalidError,
+    );
+  });
+
+  it("throws a plain Error for a non-invalid_grant failure", async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      json: jest.fn().mockResolvedValue({ error: "server_error" }),
+    });
+
+    await expect(refreshAccessToken("refresh-token-value")).rejects.not.toBeInstanceOf(
+      GoogleTokenInvalidError,
+    );
+  });
+
+  it("throws when required Google env vars are unset", async () => {
+    delete process.env.GOOGLE_CLIENT_SECRET;
+    await expect(refreshAccessToken("refresh-token-value")).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("throws when Google omits access_token on an ok response", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ expires_in: 3600 }),
+    });
+
+    await expect(refreshAccessToken("refresh-token-value")).rejects.toThrow();
   });
 });
 

@@ -33,4 +33,5 @@ export type NotificationType =
   | "new_church_document"
   | "google_calendar_event"
   | "service_week_cancelled"
-  | "service_week_reactivated";
+  | "service_week_reactivated"
+  | "google_calendar_reauth_required";

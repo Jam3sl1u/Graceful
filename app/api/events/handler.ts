@@ -7,6 +7,7 @@ import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import type { EventType } from "@/types/domain";
 import { createEventSchema, validateEventTiming } from "@/schemas/events";
+import { syncEventToAttendees, toGoogleEventId } from "@/lib/google-calendar/sync";
 
 type EventsRow = Database["public"]["Tables"]["events"]["Row"];
 
@@ -140,11 +141,19 @@ export async function createEvent(req: NextRequest, lookup?: UserLookup): Promis
       return fail(timingError, ErrorCode.VALIDATION_FAILED, 422);
     }
 
+    // Generate the row id app-side so the Google Calendar event id
+    // (deterministic from the event uuid) can be persisted in the same
+    // insert — the mapping must never be null (#62), and update/delete/
+    // attendee sync all depend on it being set up front.
+    const eventId = crypto.randomUUID();
+    const googleCalendarEventId = toGoogleEventId(eventId);
+
     // The hand-rolled Insert type in lib/supabase/types.ts marks some
     // DB-defaulted columns as required even though they have defaults —
     // cast narrowly here rather than widening the shared type (mirrors
     // app/api/service-weeks/handler.ts createServiceWeek).
     const eventInsertPayload = {
+      id: eventId,
       church_group_id: ctx.churchGroupId,
       service_week_id: parsed.serviceWeekId,
       type: parsed.type,
@@ -154,6 +163,7 @@ export async function createEvent(req: NextRequest, lookup?: UserLookup): Promis
       end_time: parsed.endTime,
       notes: parsed.notes ?? null,
       created_by: ctx.userId,
+      google_calendar_event_id: googleCalendarEventId,
     } as unknown as Database["public"]["Tables"]["events"]["Insert"];
 
     const { data: event, error: eventError } = await supabase
@@ -164,6 +174,22 @@ export async function createEvent(req: NextRequest, lookup?: UserLookup): Promis
 
     if (eventError || !event) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    // Best-effort push to any already-assigned attendees. A brand-new event
+    // typically has none yet, so this is usually a no-op — never fails event
+    // creation on a sync failure (#62 graceful degradation).
+    try {
+      await syncEventToAttendees(supabase, event.id, {
+        googleEventId: event.google_calendar_event_id ?? googleCalendarEventId,
+        name: event.name,
+        location: event.location,
+        notes: event.notes,
+        startTime: event.start_time,
+        endTime: event.end_time,
+      });
+    } catch {
+      // never block event creation on sync failure
     }
 
     return ok({ event: toEventResponse(event) }, 201);

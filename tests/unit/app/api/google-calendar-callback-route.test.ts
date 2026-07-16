@@ -7,12 +7,16 @@ jest.mock("@/lib/supabase/client", () => ({ getSupabaseClient: jest.fn() }));
 jest.mock("@/lib/google-calendar/oauth", () => ({
   exchangeCode: jest.fn(),
 }));
+jest.mock("@/lib/google-calendar/sync", () => ({
+  syncAllEventsForUser: jest.fn(),
+}));
 
 import type { NextRequest } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { cookies } from "next/headers";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import { exchangeCode } from "@/lib/google-calendar/oauth";
+import { syncAllEventsForUser } from "@/lib/google-calendar/sync";
 import { callback } from "@/app/api/google-calendar/callback/handler";
 import type { AuthContext, UserLookup } from "@/lib/api/auth";
 
@@ -20,6 +24,7 @@ const mockAuth = auth as unknown as jest.Mock;
 const mockCookies = cookies as unknown as jest.Mock;
 const mockGetSupabaseClient = getSupabaseClient as unknown as jest.Mock;
 const mockExchangeCode = exchangeCode as unknown as jest.Mock;
+const mockSyncAllEventsForUser = syncAllEventsForUser as unknown as jest.Mock;
 
 const BASE_URL = "https://app.example.com/api/google-calendar/callback";
 const USER_ID = "user-1";
@@ -74,6 +79,7 @@ describe("GET /api/google-calendar/callback", () => {
     mockAuth.mockReset();
     mockGetSupabaseClient.mockReset();
     mockExchangeCode.mockReset();
+    mockSyncAllEventsForUser.mockReset().mockResolvedValue(undefined);
     process.env.TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
   });
 
@@ -167,10 +173,47 @@ describe("GET /api/google-calendar/callback", () => {
     expect(capturedPayload!.calendar_id).toBe("primary");
     expect(capturedPayload!.scope).toBe("https://www.googleapis.com/auth/calendar.events");
     expect(capturedPayload!.token_expiry).toBe("2026-08-01T00:00:00.000Z");
+    // is_valid: true covers both a fresh connect and a reconnect that clears
+    // a prior revoke flag (#62).
+    expect(capturedPayload!.is_valid).toBe(true);
     // Tokens must be encrypted, never stored/logged in plaintext.
     expect(capturedPayload!.access_token_encrypted).not.toBe("access-token-value");
     expect(capturedPayload!.refresh_token_encrypted).not.toBe("refresh-token-value");
     expect(String(capturedPayload!.access_token_encrypted)).toContain(":");
+  });
+
+  it("retroactively syncs every event the member is an attendee of after a successful (re)connect (#62)", async () => {
+    setUpAuth();
+    setUpCookies(STATE);
+    mockExchangeCode.mockResolvedValue({
+      accessToken: "access-token-value",
+      refreshToken: "refresh-token-value",
+      expiryDate: "2026-08-01T00:00:00.000Z",
+      scope: "https://www.googleapis.com/auth/calendar.events",
+    });
+    mockGetSupabaseClient.mockReturnValue(makeUpsertingSupabase(() => {}));
+
+    const res = await callback(makeReq({ code: "abc", state: STATE }), makeLookup());
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toBe("https://app.example.com/profile?calendar=connected");
+    expect(mockSyncAllEventsForUser).toHaveBeenCalledWith(expect.anything(), USER_ID);
+  });
+
+  it("still redirects to connected when the retroactive sync fails (#62 graceful degradation)", async () => {
+    setUpAuth();
+    setUpCookies(STATE);
+    mockExchangeCode.mockResolvedValue({
+      accessToken: "access-token-value",
+      refreshToken: "refresh-token-value",
+      expiryDate: "2026-08-01T00:00:00.000Z",
+      scope: "https://www.googleapis.com/auth/calendar.events",
+    });
+    mockGetSupabaseClient.mockReturnValue(makeUpsertingSupabase(() => {}));
+    mockSyncAllEventsForUser.mockRejectedValue(new Error("google outage"));
+
+    const res = await callback(makeReq({ code: "abc", state: STATE }), makeLookup());
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toBe("https://app.example.com/profile?calendar=connected");
   });
 
   it("redirects to error when the upsert returns a Supabase error", async () => {

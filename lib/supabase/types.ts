@@ -210,6 +210,8 @@ type NotificationsRow = {
 };
 
 // Added for #61 (Google Calendar OAuth connect/disconnect).
+// is_valid added for #62 (event sync): flips to false when a refresh is
+// revoked/expired (invalid_grant), reset to true on reconnect.
 type GoogleCalendarTokensRow = {
   id: string;
   user_id: string;
@@ -218,6 +220,7 @@ type GoogleCalendarTokensRow = {
   token_expiry: string;
   calendar_id: string;
   scope: string;
+  is_valid: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -420,10 +423,11 @@ export type Database = {
       };
       google_calendar_tokens: {
         Row: GoogleCalendarTokensRow;
-        Insert: Omit<GoogleCalendarTokensRow, "id" | "created_at" | "updated_at"> & {
+        Insert: Omit<GoogleCalendarTokensRow, "id" | "created_at" | "updated_at" | "is_valid"> & {
           id?: string;
           created_at?: string;
           updated_at?: string;
+          is_valid?: boolean;
         };
         Update: Partial<GoogleCalendarTokensRow>;
         Relationships: [];
@@ -524,6 +528,30 @@ export type Database = {
           service_date: string;
           week_title: string | null;
         }>;
+      };
+      get_event_sync_targets: {
+        Args: { p_event_id: string };
+        Returns: Array<{
+          user_id: string;
+          access_token_encrypted: string;
+          refresh_token_encrypted: string;
+          token_expiry: string;
+          calendar_id: string;
+        }>;
+      };
+      get_user_sync_targets: {
+        Args: Record<string, never>;
+        Returns: Array<{
+          user_id: string;
+          access_token_encrypted: string;
+          refresh_token_encrypted: string;
+          token_expiry: string;
+          calendar_id: string;
+        }>;
+      };
+      flag_calendar_token_invalid: {
+        Args: { p_user_id: string };
+        Returns: boolean;
       };
     };
     Enums: {

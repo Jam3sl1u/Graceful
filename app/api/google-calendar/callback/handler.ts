@@ -6,6 +6,7 @@ import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import { exchangeCode } from "@/lib/google-calendar/oauth";
 import { encryptToken } from "@/lib/google-calendar/token-crypto";
+import { syncAllEventsForUser } from "@/lib/google-calendar/sync";
 
 const STATE_COOKIE = "gcal_oauth_state";
 const CONNECTED_PATH = "/profile?calendar=connected";
@@ -67,7 +68,8 @@ export async function callback(req: NextRequest, lookup?: UserLookup): Promise<R
 
     // The hand-written Insert type marks defaulted columns as required even
     // though the DB has defaults; cast narrowly here (mirrors the profile
-    // handler's upsert cast).
+    // handler's upsert cast). is_valid: true covers both a fresh connect and
+    // a reconnect after a prior revoke (#62 — clears the invalid flag).
     const upsertPayload = {
       user_id: ctx.userId,
       access_token_encrypted: accessTokenEncrypted,
@@ -75,6 +77,7 @@ export async function callback(req: NextRequest, lookup?: UserLookup): Promise<R
       token_expiry: tokens.expiryDate,
       calendar_id: "primary",
       scope: tokens.scope,
+      is_valid: true,
       updated_at: new Date().toISOString(),
     } as unknown as Database["public"]["Tables"]["google_calendar_tokens"]["Insert"];
 
@@ -84,6 +87,15 @@ export async function callback(req: NextRequest, lookup?: UserLookup): Promise<R
 
     if (upsertError) {
       return redirectError();
+    }
+
+    // Retroactive sync: push every event the member is already an attendee
+    // of onto their (newly connected/reconnected) calendar. Best-effort — a
+    // sync failure still reports "connected" (#62).
+    try {
+      await syncAllEventsForUser(supabase, ctx.userId);
+    } catch {
+      // never block the connected redirect on sync failure
     }
 
     return redirectConnected();

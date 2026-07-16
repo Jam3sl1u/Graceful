@@ -1,15 +1,22 @@
 jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn() }));
 jest.mock("@/lib/supabase/client", () => ({ getSupabaseClient: jest.fn() }));
+jest.mock("@/lib/google-calendar/sync", () => ({
+  syncEventToAttendees: jest.fn(),
+  toGoogleEventId: jest.fn((id: string) => `mock-google-id-${id}`),
+}));
 
 import { auth } from "@clerk/nextjs/server";
 import type { NextRequest } from "next/server";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import { listEvents, createEvent, type EventResponse } from "@/app/api/events/handler";
+import { syncEventToAttendees, toGoogleEventId } from "@/lib/google-calendar/sync";
 import type { AuthContext, UserLookup } from "@/lib/api/auth";
 import type { UserRole } from "@/types/domain";
 
 const mockAuth = auth as unknown as jest.Mock;
 const mockGetSupabaseClient = getSupabaseClient as unknown as jest.Mock;
+const mockSyncEventToAttendees = syncEventToAttendees as unknown as jest.Mock;
+const mockToGoogleEventId = toGoogleEventId as unknown as jest.Mock;
 
 const JWT = "supabase-jwt";
 const USER_ID = "user-1";
@@ -138,6 +145,8 @@ function makeSupabaseClient(
 beforeEach(() => {
   mockAuth.mockReset();
   mockGetSupabaseClient.mockReset();
+  mockSyncEventToAttendees.mockReset().mockResolvedValue(undefined);
+  mockToGoogleEventId.mockReset().mockImplementation((id: string) => `mock-google-id-${id}`);
 });
 
 describe("GET /api/events", () => {
@@ -505,5 +514,35 @@ describe("POST /api/events", () => {
 
     const body = await res.json();
     expect(body.code).toBe("INTERNAL");
+  });
+
+  it("persists a caller-assigned google_calendar_event_id on insert and best-effort syncs it (#62)", async () => {
+    setUpAuth();
+    const capturedInserts: Record<string, unknown> = {};
+    mockGetSupabaseClient.mockReturnValue(
+      makeSupabaseClient({}, { onInsert: (table, payload) => (capturedInserts[table] = payload) }),
+    );
+
+    const res = await createEvent(makeReq(validBody), makeLookup("admin"));
+    expect(res.status).toBe(201);
+
+    const insertPayload = capturedInserts.events as Record<string, unknown>;
+    expect(insertPayload.id).toEqual(expect.any(String));
+    expect(insertPayload.google_calendar_event_id).toBe(`mock-google-id-${insertPayload.id}`);
+    expect(mockToGoogleEventId).toHaveBeenCalledWith(insertPayload.id);
+    expect(mockSyncEventToAttendees).toHaveBeenCalledWith(
+      expect.anything(),
+      eventRow.id,
+      expect.objectContaining({ googleEventId: `mock-google-id-${insertPayload.id}` }),
+    );
+  });
+
+  it("never fails event creation when syncEventToAttendees rejects", async () => {
+    setUpAuth();
+    mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
+    mockSyncEventToAttendees.mockRejectedValue(new Error("google outage"));
+
+    const res = await createEvent(makeReq(validBody), makeLookup("admin"));
+    expect(res.status).toBe(201);
   });
 });

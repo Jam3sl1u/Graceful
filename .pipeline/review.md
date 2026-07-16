@@ -1,42 +1,67 @@
-# Review — Issue #57: Per-song key override validation & default-vs-override distinction (BR-09)
+# Review — Issue #62: Google Calendar event sync
 
 ## VERDICT: SHIP
 
-## What I verified independently
-- Ran `git diff main...HEAD` and read the actual handler + test diffs (not just the summaries).
-- `bun run typecheck` — clean.
-- `bun run lint` — clean.
-- `bun run test tests/unit/app/api/setlists-key-override.test.ts tests/unit/app/api/setlists-songs-route.test.ts` — 51/51 passing.
-- `bun run test` (full suite) — 67 suites / 846 tests passing. Matches the tester's report exactly; no regressions.
+Independently verified (re-run, not trusted from test-results.md):
+- `bun run typecheck` — clean
+- `bun run lint` — clean
+- `bun run test` — 70 suites / 880 tests pass
+- `bun run check:service-role` — no service-role key usage introduced
 
-## Assessment against the spec
-- **AC #4 (the only new code):** `SetlistSongResponse` gained exactly the three spec'd fields
-  (`defaultKey`, `effectiveKey`, `isOverridden`). `toSetlistSongResponse(row, defaultKey)`
-  derives them as spec'd: `effectiveKey = key_override ?? defaultKey`,
-  `isOverridden = key_override != null` (strict non-null, NOT an equality comparison — spec edge
-  case #3 honored). The new `loadSongResponses` helper does a single `.in("id", songIds)` batch
-  query (no N+1), skips the query entirely on empty setlists (edge case #1), and defaults missing
-  songs to `null` (edge case #5). All three handlers route through it while preserving status
-  codes (201 add, 200 elsewhere) and the 500 INTERNAL error mapping.
-- **AC #2 (BR-09):** validation at handler lines 143-149 (422 for shape-valid-but-non-musical key,
-  400 for malformed body) is untouched, per the spec's out-of-scope instruction. Confirmed by
-  reading the code directly.
-- **AC #3:** write paths only ever set `key_override`; `songs.default_key` is never written by any
-  of the three handlers. No insert/update copies default into override (design decision respected).
-- **Out of scope:** no schema/migration/Zod changes, no new GET endpoint, no transposition. Confirmed.
+## Assessment
 
-## Test quality
-Not superficial. The new independent suite (`setlists-key-override.test.ts`, separate fake client
-and fixture IDs from the coder's suite) covers: `toSetlistSongResponse` derivation in isolation,
-the tricky override-equals-default case, `default_key: null` cases, AC #3 non-mutation asserted
-against catalog state, the empty-setlist path asserted via a `from()` call-count spy (proves the
-query is actually skipped, not just that the result is empty), the 400-vs-422 split on both
-endpoints, a Unicode-accidental acceptance case, and a genuine failure case (forced error on the
-post-update songs join surfaces as 500, not a silent partial 200).
+The implementation faithfully realizes the spec's "Recommended design (OQ-1 = A)":
+inline best-effort sync driven by three `SECURITY DEFINER` RPCs, never touching a
+service-role client. Every claim in changes.md checks out against the actual diff.
 
-## Notes (non-blocking)
-- The `songs` lookup in `loadSongResponses` has no explicit `church_group_id` filter and relies on
-  RLS for tenant scoping. This matches the spec's explicit design note and the repo's JWT-scoped
-  client pattern; song_ids originate from an already tenant-scoped setlist. Acceptable.
-- The tester's new test file and this stage's `test-results.md` are currently untracked/unstaged in
-  the worktree — they need to be committed as part of shipping this branch.
+Security boundary (the crux of this issue) is correct:
+- `get_event_sync_targets` derives caller from `auth.jwt()->>'sub'`, requires
+  `admin`/`set_leader`, and requires the event to belong to the caller's own
+  group before returning any encrypted token row. All handlers that call it are
+  already role-gated to admin/set_leader.
+- `get_user_sync_targets` is strictly self-scoped (`user_id = v_caller_id`).
+- `flag_calendar_token_invalid` requires self OR admin/set_leader-in-same-group,
+  and is idempotent (no repeat notification once `is_valid = false`).
+- All three use `SECURITY DEFINER`, `SET search_path = ''`, `GRANT EXECUTE ...
+  TO authenticated`, mirroring `record_availability_conflict`.
+
+Correctness details verified:
+- `toGoogleEventId` output (`gr` + 32 lowercase hex chars) is a valid base32hex
+  id in Google's required range.
+- PATCH→404→POST-with-id fallback keeps create idempotent; DELETE treats 404/410
+  as success. `invalid_grant` is the only failure that flags a token invalid;
+  5xx/network/decrypt failures are logged and swallowed without flagging.
+- Ordering constraints are honored: `deleteEvent` and `removeAttendee` read sync
+  targets (which join `event_attendees`) BEFORE the cascading DB delete.
+- `is_valid: true` on the callback upsert clears a prior revoke on reconnect,
+  followed by best-effort retroactive `syncAllEventsForUser`.
+- `notifications` insert shape matches the table (`link_entity_type varchar(50)`
+  accepts `'google_calendar'`; `church_group_id`/`user_id`/`type` NOT NULLs all
+  supplied). Enum value added via `ADD VALUE IF NOT EXISTS`, only referenced in
+  deferred function bodies (not at migration time), consistent with
+  20260711000002.
+- Hand-maintained `lib/supabase/types.ts` matches the migration (new `is_valid`
+  column + three RPC signatures); `types/domain.ts` union updated.
+
+Tests are meaningful, not superficial: `sync.test.ts` uses a real encrypt/decrypt
+round-trip, asserts exact Google REST URLs/methods/bodies/auth headers, and covers
+PATCH/POST fallback, DELETE 404/410, per-attendee isolation, invalid_grant → flag +
+notify, non-auth-failure → no-flag, RPC-error → no-op, and refresh gating. The
+tester-supplement suites add real call-order proof for the delete/remove ordering
+and a distinct corrupted-ciphertext decrypt-failure path.
+
+## Notes for the human sign-off (non-blocking, by-design)
+
+1. OQ-1 was a genuine BLOCKING security-posture question. changes.md states a
+   human resolved it as (A). The code correctly implements (A), but confirm that
+   sign-off did happen: with (A), an admin's request can reach other members'
+   encrypted OAuth tokens through `get_event_sync_targets`. This is intentional
+   and matches the repo's established `SECURITY DEFINER` cross-user pattern.
+2. `syncAllEventsForUser` runs inline in the OAuth callback and syncs every event
+   the member attends sequentially before the redirect — added latency for members
+   with many events. Inline design is per spec; acceptable, worth awareness.
+3. The `syncEventToUser`/`unsyncEventFromUser` signature gained an `eventId` param
+   vs. the spec's literal snippet — documented and necessary given the RPC takes an
+   event id; sensible.
+4. The migration was not run against a real Postgres instance (per spec). SQL was
+   reviewed statically only.
