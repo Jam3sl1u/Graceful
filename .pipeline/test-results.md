@@ -1,100 +1,125 @@
-# Test Results — Issue #63: iCal (.ics) export fallback
+# Test Results — Issue #65: Build Member Week View screen
 
-This overwrites the stale `test-results.md` for issue #62 that was still
+This overwrites the stale `test-results.md` for issue #63 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
 ## Verdict: ALL PASS
 
-`bun run lint`, `bun run typecheck`, and `bun run test` were re-run
-independently (not trusted from `.pipeline/changes.md`):
+## Summary
 
-- `bun run lint` (eslint .) — 0 errors.
-- `bun run typecheck` (tsc --noEmit) — 0 errors.
-- `bun run test` (Jest, full suite including new tests below) — **77 suites /
-  968 tests passed**, 0 failures. Coder's baseline was 75 suites / 960 tests;
-  this stage added 2 suites / 8 tests, all passing, no other file touched.
+All checks pass. Two new test files were written (as named in `.pipeline/spec.md`
+under "Tests for the Testing stage") and independently verify the coder's
+claims — the coder's `changes.md` explicitly deferred writing these to this
+stage, which matches the pipeline contract.
 
-## What I independently verified (beyond re-running the coder's own suite)
+## Commands run
 
-I read `lib/ical/generate.ts`, `app/api/events/[id]/ics/handler.ts`,
-`app/api/events/[id]/ics/route.ts`, `app/api/events/ics/handler.ts`,
-`app/api/events/ics/route.ts`, and both of the coder's own test files
-(`tests/unit/lib/ical/generate.test.ts`,
-`tests/unit/app/api/events-ics-route.test.ts`) against `.pipeline/spec.md`.
-The coder's own suite is thorough and all of it passes unmodified. I then
-added two new `*-tester-supplement.test.ts` files (matching this repo's
-existing convention for tester-added coverage, e.g.
-`events-id-attendees-route-tester-supplement.test.ts`) targeting the exact
-"What the Tester should focus on" list in `.pipeline/changes.md`, plus one
-case the coder's suite structurally could not reach.
+- `bun run typecheck` — clean, no errors.
+- `bun run lint` — clean, no errors/warnings.
+- `bun run test` — **79 suites / 1004 tests pass**, 0 failures (77 suites /
+  968 tests pre-existing per the coder's baseline + 2 new suites / 36 new
+  tests added by this stage). No regressions in any pre-existing suite.
 
-### `tests/unit/lib/ical/generate-tester-supplement.test.ts` (3 new tests)
-- **Multi-byte UTF-8 fold safety.** The coder's own `foldLine` tests only use
-  repeated ASCII (`"x"`/`"A"`), which can never exercise the "back off while
-  the next byte is a UTF-8 continuation byte" branch. I forced folds
-  mid-character using 4-byte emoji and 3-byte CJK text, and confirmed every
-  physical line is valid, round-trippable UTF-8 (no `U+FFFD` replacement
-  characters introduced) and that de-folding reconstructs the exact original
-  string. **Pass** — the byte-boundary backoff logic is correct.
-- **Escape-then-fold ordering.** Built a long description containing `,` `;`
-  `\` and embedded newlines, ran it through the real `generateIcs`, and
-  confirmed the folded+rejoined DESCRIPTION value equals `escapeIcsText`
-  applied once to the whole raw string — i.e. escaping happens on the full
-  value before folding, not per-chunk after folding (which would risk
-  double-escaping or corrupting an escape sequence at a chunk boundary).
-  **Pass.**
+## New test files written
 
-### `tests/unit/app/api/events-ics-route-tester-supplement.test.ts` (5 new tests)
-- **Attendee-scoping distinction** (changes.md focus item #1). For both
-  endpoints, built a Supabase mock where `event_attendees` returns "not
-  assigned"/"zero rows" while an `invitations` table (if ever queried) would
-  wrongly grant access. Asserted `supabase.from(...)` is **never** called
-  with `"invitations"` and that both endpoints still return 404. This
-  confirms — in the actual code, not just the coder's documentation claim —
-  that both handlers are genuinely scoped to the #60 attendee model and
-  cannot be satisfied by an invitation alone. **Pass.**
-- **End-to-end escaping** (focus item #3). Fed a DB row with `,` `;` `\` and
-  embedded `\n`/`\r\n` in `name`/`location`/`notes` through the real
-  `exportEventIcs` handler (not just the pure generator) and asserted the
-  escaped forms appear correctly in the response body. **Pass.**
-- **End-to-end long-notes folding** (focus item #4). Fed a >75-octet `notes`
-  value through the real handler, confirmed the DESCRIPTION line folds with
-  a continuation line, and that every physical line in the entire response
-  body respects the 75-octet limit. **Pass.**
-- **Genuine failure case beyond "Supabase returned an error object".** Fed a
-  malformed `start_time` (`"not-a-real-date"`) through the real handler.
-  `new Date(...).toISOString()` throws a `RangeError` inside `generateIcs`,
-  which is not a Supabase-error-shaped failure and is not exercised anywhere
-  in the coder's own suite (which only tests `{ error: {...} }` responses
-  from Supabase). Confirmed the handler's outer `try/catch` still turns this
-  into a well-formed `500 INTERNAL` response rather than an unhandled
-  exception or a corrupted 200 body. **Pass.**
+### `tests/unit/app/api/service-weeks-member-view-route.test.ts` (20 tests)
 
-All 8 new tests pass against the existing implementation as-is — no code
-changes were needed or made.
+Mirrors `tests/unit/app/api/song-documents-route.test.ts` / the setlist route
+test's `makeChain`/`makeLookup`/`setUpAuth` helpers, with a per-table
+`from(table)` dispatcher covering all 12 tables the handler touches
+(`service_weeks`, `invitations`, `setlists`, `setlist_songs`, `songs`,
+`events`, `event_attendees`, `users`, `member_profiles`, `member_instruments`,
+`instruments`, `song_documents`).
 
-## Spec cross-check (no discrepancies found)
+Covers:
+- Auth/authz: 401 (no Clerk user, no JWT), 403 for guest (and confirms
+  `getSupabaseClient` is never constructed for a rejected role), 200 for each
+  of admin/set_leader/member.
+- Happy path: full aggregate payload — `serviceWeek` summary, `confirmationStatus`,
+  `setlist.songs` with correct `effectiveKey` resolution and ordering, `events`
+  with per-event `assigned`, `team` sorted by name with correct
+  `vocalCapability`/`instruments` per member (including the "no profile" →
+  `vocalCapability: "none"`, `instruments: []` case), `documents` with a
+  freshly-minted `downloadUrl` and **no `file_key` anywhere in the response**
+  (spec edge case 13).
+- Edge case 1 (404 for missing/other-tenant week) + a 500 path when the
+  `service_weeks` query itself errors.
+- Edge case 2 (no setlist row → `null`; **draft** setlist row → `null`, as a
+  defense-in-depth check beyond RLS).
+- Edge case 3 (published setlist, zero songs → `{status:"published",songs:[]}`,
+  distinct from `null`).
+- Edge case 4 (`effectiveKey` null when both `key_override` and `default_key`
+  are null).
+- Edge case 5 / 8 (no events → `events: []`, `team: []`, and — verified via a
+  `from` spy — the handler never calls `.from("event_attendees")` or
+  `.from("users")` when there are no events, i.e. the empty-`.in()` guard is
+  real, not just claimed).
+- Edge case 6 (member assigned to only some events — per-event `assigned`
+  differs, but `team` still reflects the full attendee set across all events).
+- Edge case 9 (`getDownloadUrl` rejecting → `documents: []`, endpoint still
+  200) plus an additional case: documents query is skipped entirely (`from`
+  never called with `"song_documents"`) when the published setlist has zero
+  songs.
+- Edge case 10 (no invitation row → `confirmationStatus: null`, still 200).
+- Edge case 11 (cancelled week → `isCancelled: true` passed through).
+- Re-invite safety: multiple `invitations` rows for the caller → the one with
+  the latest `created_at` wins.
+- A general 500 path (events query error) to confirm the fail-fast pattern
+  holds beyond the week/setlist checks already covered by the sibling tests.
 
-- CRLF everywhere + trailing CRLF: confirmed by the coder's own tests and
-  re-verified independently in the end-to-end folding supplement test
-  (byte-length check over every non-empty line of a real handler response).
-- 404 (never a 200-with-empty-calendar) on zero assigned events, and on
-  `serviceWeekId` matching none of the caller's events: present in the
-  coder's suite; re-read the handler logic directly and it matches spec
-  Decision 2 exactly (both the zero-attendee-rows short-circuit and the
-  post-filter empty-result check return the same 404).
-- No role gate on either endpoint: confirmed — neither handler calls
-  `requireRole`, matching the spec's "any authenticated member" scope.
-- No new dependency added: `bun.lock` is unmodified; `git status` shows only
-  the files listed in `changes.md` plus the two new test files added by this
-  stage.
-- No UI added or wired: confirmed no changes under `app/(app)/member-week/`
-  or any other app route.
+### `tests/unit/app/member-week-view.test.tsx` (16 tests)
+
+Mirrors `tests/unit/app/week-view.test.tsx` (jsdom, `fetch` mocked and keyed
+by URL).
+
+Covers:
+- Loading state before the fetch resolves.
+- Happy path: header (title/date), confirmation badge, setlist list (scoped
+  via `within()` to disambiguate from the Documents section's same song
+  title), assigned-only events section (unassigned event correctly excluded),
+  team roster (incl. an instrument-less member rendering "—"), documents
+  section with a working download link, and the floating chat button present
+  but `disabled`.
+- Event detail panel: clicking an assigned event opens the panel with a Maps
+  link built from the event's location (percent-encoded), and the close
+  button clears it (edge case 7's positive case).
+- Edge case 7: an event with `location: null` opens a detail panel with **no**
+  Maps link.
+- Edge case 3 vs 2: zero-songs published setlist renders "No songs added yet"
+  and explicitly asserts the "not yet released" copy is absent (and vice
+  versa for a null setlist).
+- Empty-state messages for events, team, and documents sections.
+- Edge case 10: `confirmationStatus: null` renders the "Not invited" badge and
+  the rest of the screen still renders (not gated on confirmation).
+- Edge case 11: cancelled week renders the Cancelled badge.
+- View-state branches: 404 → not-found, 403 → forbidden, network throw →
+  error, unexpected 500 → error.
+
+## Notes for the Reviewer
+
+- No failures were found; nothing was patched around. The implementation
+  matches every edge case named in `.pipeline/spec.md`'s "Edge cases the
+  implementation MUST handle" list (1–11 directly tested here; 12 — guest
+  403 — is covered; 13 — no `file_key` leakage / fresh signed URL per request
+  — is asserted via `JSON.stringify` + a `getDownloadUrl` call-argument check).
+- One thing worth a second look in review, not a test failure: the spec's
+  Decisions section already flags that a member confirmed for a week with no
+  events yet won't show in `team` — this is by design (documented limitation),
+  and the "no events" test in this suite confirms that behavior is what's
+  actually implemented, not accidental.
+- Test-file-only fix made during this stage: the component test's fixture
+  data originally had an event named "Sunday Service" that collided with the
+  service week's title "Sunday Service", making some queries ambiguous
+  (`getByText`/`getByRole` matching two elements). Renamed the fixture event
+  to "Sunday Gathering" and scoped the setlist-song assertions with
+  `within()` to avoid a separate collision with an identically-titled
+  Documents heading. This was a test-fixture naming fix only — no production
+  code was touched.
 
 ## Files added by this stage (Testing)
 
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-63/tests/unit/lib/ical/generate-tester-supplement.test.ts`
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-63/tests/unit/app/api/events-ics-route-tester-supplement.test.ts`
+- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-65/tests/unit/app/api/service-weeks-member-view-route.test.ts`
+- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-65/tests/unit/app/member-week-view.test.tsx`
 
 No implementation files were modified. Ready for Review.
