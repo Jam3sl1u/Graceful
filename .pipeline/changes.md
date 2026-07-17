@@ -1,181 +1,103 @@
-# Changes — Issue #62: Google Calendar event sync (create/update/delete + graceful degradation)
+# Changes — Issue #63: iCal (.ics) export fallback
 
-Implements the fully-specced inline-sync design from `.pipeline/spec.md`
-("Recommended design (pending OQ-1 = A)"), per the human resolution of OQ-1:
-**(A) Inline sync via a `SECURITY DEFINER` token-fetch RPC**, mirroring
-`record_availability_conflict` / `send_invitation_reminders`. OQ-2 (single
-shared Google event id) and OQ-3 (trigger scope limited to create/update/
-delete + attendee add/remove + reconnect) were non-blocking assumptions in
-the spec and are implemented as written.
+Implements the export-only `.ics` download endpoints exactly as specced in
+`.pipeline/spec.md`. No UI, no new dependency, no scope creep beyond the two
+GET endpoints and the pure generator they share.
 
 ## Files created
 
-- **`supabase/migrations/20260716000001_google_calendar_sync.sql`** — adds
-  `google_calendar_tokens.is_valid boolean NOT NULL DEFAULT true`; adds
-  `notification_type` value `google_calendar_reauth_required`; adds three
-  `SECURITY DEFINER` RPCs (JWT→user/group derivation, `RAISE EXCEPTION ...
-  USING ERRCODE = 'P0001'`, `SET search_path = ''`, `GRANT EXECUTE ... TO
-  authenticated`, commented-out DOWN — mirrors
-  `20260713000001_conflict_notification.sql` / `20260710000001_member_removal_rpc.sql`):
-  - `get_event_sync_targets(p_event_id uuid)` — admin/set_leader-only, event
-    must belong to caller's group; returns one row per assigned attendee
-    (`event_attendees` join `google_calendar_tokens`) with `is_valid = true`.
-  - `get_user_sync_targets()` — caller's own connected+valid token only (0/1
-    row), same row shape.
-  - `flag_calendar_token_invalid(p_user_id uuid)` — admin/set_leader-in-group
-    OR self; idempotent (no-op when already invalid or no row); sets
-    `is_valid = false` and inserts one `google_calendar_reauth_required`
-    notification.
+- **`lib/ical/generate.ts`** — pure, framework-light RFC 5545 generator (no
+  `server-only`, so it's unit-testable without a request context). Exports:
+  - `generateIcs(events, opts?)` — builds a full `VCALENDAR` string with one
+    `VEVENT` per input event, CRLF line endings throughout plus a trailing
+    CRLF, `DTSTAMP` driven by an injectable `opts.now` (defaults to
+    `new Date()`).
+  - `formatIcsDate(date)` — `Date` -> UTC basic format
+    (`toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")`).
+  - `escapeIcsText(value)` — RFC 5545 §3.3.11 escaping, in the required order
+    (backslash, then `;`, then `,`, then CRLF/CR/LF -> literal `\n`).
+  - `foldLine(line)` — 75-octet content-line folding. First chunk gets 75
+    octets, continuation chunks get 74 (since the leading `" "` on each
+    continuation line counts toward that line's 75-octet budget). Splits on
+    byte boundaries without cutting a multi-byte UTF-8 character.
+  - `icsResponse(ics, filename)` — builds the `text/calendar` attachment
+    `Response` (imports `NextResponse` from `next/server`; this is the one
+    piece of this file that isn't purely framework-free, per the spec's
+    explicit allowance).
+  - `icsFilename(name)` — safe download filename: lowercase, non-alphanumeric
+    runs collapsed to a single `-`, leading/trailing `-` trimmed, falls back
+    to `"event"` for an empty/all-symbol name, appends `.ics`.
+  - `LOCATION`/`DESCRIPTION` lines are omitted entirely when the source value
+    is `null`/empty/whitespace-only (never emitted as an empty-value line).
 
-- **`lib/google-calendar/sync.ts`** (`import "server-only"`) — the service
-  layer. Exports `CalendarEventInput`, `toGoogleEventId`,
-  `syncEventToAttendees`, `unsyncEventFromAttendees`, `syncEventToUser`,
-  `unsyncEventFromUser`, `syncAllEventsForUser`. Every export is best-effort
-  and never throws (each attendee's sync is isolated in its own try/catch;
-  a revoked/expired refresh token — `GoogleTokenInvalidError` — calls
-  `flag_calendar_token_invalid` and is skipped; any other failure, e.g. a
-  Google 5xx, is logged and skipped without touching `is_valid`). Google REST
-  calls use `fetch` (PATCH → 404 fallback to POST with the client-assigned
-  id; DELETE treats 404/410 as success), mirroring `oauth.ts`'s style.
-  **Deviation from the spec's literal signatures, required by the RPC
-  design**: `syncEventToUser`/`unsyncEventFromUser` take an additional
-  `eventId` parameter (`(supabase, eventId, userId, event)` /
-  `(supabase, eventId, userId, googleEventId)`) — `get_event_sync_targets`
-  only accepts an event id (there is no per-arbitrary-user RPC), so these
-  need the event id to look up that one member's token via the same
-  attendee-join RPC used for the bulk paths. This was the only way to
-  implement the "single-attendee variant" as specced without adding a new
-  RPC the spec didn't ask for.
+- **`app/api/events/[id]/ics/handler.ts`** — `exportEventIcs(req, id, lookup?)`.
+  Mirrors the auth/JWT/try-catch shape of `app/api/events/[id]/handler.ts`:
+  `requireAuth` (no role gate) -> resolve Supabase JWT (401 if missing) ->
+  confirm the caller is an attendee via `event_attendees` (`event_id` +
+  `user_id`, `maybeSingle`) -> 404 if not assigned (never distinguishes
+  "not yours" from "doesn't exist") -> fetch the `events` row -> 404 if
+  missing -> map to `IcalEventInput` -> `generateIcs([...])` ->
+  `icsResponse(ics, icsFilename(event.name))`.
 
-- **`tests/unit/lib/google-calendar/sync.test.ts`** — unit coverage for all
-  six sync.ts exports (PATCH/POST fallback, DELETE 404/410-as-success,
-  per-attendee isolation, invalid_grant → flag + notify, non-auth failure →
-  no flag, RPC error → no-op, token refresh gating, legacy-row skip in
-  `syncAllEventsForUser`).
+- **`app/api/events/[id]/ics/route.ts`** — `GET` wrapper unwrapping the async
+  `params`, mirrors `app/api/events/[id]/route.ts`.
 
-## Files modified
+- **`app/api/events/ics/handler.ts`** — `exportEventsIcs(req, lookup?)`.
+  `requireAuth` -> parse optional `?serviceWeekId=<uuid>` (`z.string().uuid()`,
+  400 `VALIDATION_FAILED` if present but invalid) -> resolve Supabase JWT
+  (401 if missing) -> collect the caller's assigned event ids from
+  `event_attendees` (deduped via `Set`) -> 404 `"No events to export"` if
+  zero -> fetch matching `events` rows (`.in("id", eventIds)`, optionally
+  `.eq("service_week_id", serviceWeekId)`, `.order("start_time", { ascending:
+  true })`) -> 404 if the (possibly filtered) result is empty -> map every row
+  to `IcalEventInput` -> `generateIcs(...)` -> `icsResponse(ics,
+  "graceful-events.ics")`. The optional filter is applied before
+  `.order(...)` (mirrors `app/api/songs/handler.ts`'s conditional-builder
+  pattern) to keep the Supabase query-builder typing happy.
 
-- **`lib/google-calendar/oauth.ts`** — adds `GoogleTokenInvalidError` and
-  `refreshAccessToken(refreshToken)` (grant_type=refresh_token against the
-  existing `TOKEN_ENDPOINT`; throws `GoogleTokenInvalidError` on
-  `invalid_grant`, a plain `Error` otherwise). Tests added to
-  `tests/unit/lib/google-calendar/oauth.test.ts`.
+- **`app/api/events/ics/route.ts`** — thin `GET` wrapper, mirrors
+  `app/api/events/[id]/route.ts`'s style (no params to unwrap here since
+  there's no dynamic segment).
 
-- **`lib/google-calendar/client.ts`** — deleted (confirmed unimported); its
-  three throwing stubs are superseded by `sync.ts`.
+- **`tests/unit/lib/ical/generate.test.ts`** — unit tests for
+  `formatIcsDate`, `escapeIcsText`, `foldLine`, `generateIcs`, and
+  `icsFilename`: UTC conversion (including a non-UTC-offset input), escaping
+  order/edge cases, CRLF-only line endings + trailing CRLF, VEVENT field
+  correctness, `DTSTAMP` via injected `now` and via the real-clock default,
+  omission of null/empty `LOCATION`/`DESCRIPTION`, long-description folding
+  (every physical line <= 75 octets, continuation lines start with a single
+  space, and the folded text round-trips back to the original), multi-event
+  output, and filename sanitization.
 
-- **`app/api/events/handler.ts`** (`createEvent`) — generates the event's
-  `id` app-side (`crypto.randomUUID()`) so `google_calendar_event_id =
-  toGoogleEventId(id)` can be persisted in the same insert (mapping is never
-  null). Best-effort `syncEventToAttendees` call after insert (typically a
-  no-op — a brand-new event has no attendees yet), wrapped so a sync failure
-  never fails event creation.
-
-- **`app/api/events/[id]/handler.ts`**:
-  - `updateEvent` — after a successful update, backfills
-    `google_calendar_event_id` via `toGoogleEventId(id)` for a legacy
-    (null-mapping) row, then best-effort `syncEventToAttendees`.
-  - `deleteEvent` — **capture-before-delete**: selects
-    `google_calendar_event_id` and calls `unsyncEventFromAttendees` (which
-    internally reads sync targets via `get_event_sync_targets`, joined on
-    `event_attendees`) *before* the DB delete, since the DB delete cascades
-    `event_attendees` and would otherwise make the target list unreadable
-    afterward. This differs from the spec's literal phrasing ("after the
-    successful DB delete, delete from each captured calendar") but is
-    required for the chosen RPC design to work at all — the spec's own edge
-    case #7 ("target list must be read first") confirms the ordering
-    constraint, and this deletes from every calendar target that ordering
-    exposes rather than only reading the list beforehand and discarding it.
-
-- **`app/api/events/[id]/attendees/handler.ts`**:
-  - `assignAttendee` — widens the event select to include
-    `google_calendar_event_id, name, location, notes, start_time, end_time`;
-    after a successful insert, best-effort `syncEventToUser`.
-  - `removeAttendee` — widens the event select to include
-    `google_calendar_event_id`; **before** deleting the attendee row (same
-    cascade-ordering reasoning as `deleteEvent`), best-effort
-    `unsyncEventFromUser`.
-
-- **`app/api/google-calendar/callback/handler.ts`** (`callback`) — upsert
-  payload now includes `is_valid: true` (clears a prior revoke flag on
-  reconnect); after a successful upsert, best-effort
-  `syncAllEventsForUser(supabase, ctx.userId)` before redirecting to
-  `?calendar=connected` (a sync failure still reports connected).
-
-- **`lib/supabase/types.ts`** — `GoogleCalendarTokensRow` gains
-  `is_valid: boolean` (Insert omits it, defaultable); adds
-  `get_event_sync_targets`, `get_user_sync_targets`,
-  `flag_calendar_token_invalid` to `Database["public"]["Functions"]`.
-
-- **`types/domain.ts`** — `NotificationType` gains
-  `"google_calendar_reauth_required"`.
-
-- **Existing tests updated** to accommodate the new required behavior
-  (rather than being broken by it):
-  - `tests/unit/app/api/events-route.test.ts` — mocks
-    `lib/google-calendar/sync`; new tests assert the generated
-    `id`/`google_calendar_event_id` insert payload and the best-effort
-    `syncEventToAttendees` wiring (including a sync-rejection case that must
-    still return 201).
-  - `tests/unit/app/api/events-id-route.test.ts` — `eventRow` fixture now
-    carries a pre-existing `google_calendar_event_id` so the many
-    unrelated PUT/DELETE assertions (which check exact update payloads)
-    don't trip the new legacy-row backfill path; dedicated new tests cover
-    the sync/backfill/unsync wiring and its ordering.
-  - `tests/unit/app/api/events-id-attendees-route.test.ts` — mocks
-    `syncEventToUser`/`unsyncEventFromUser`; new tests cover the
-    push-on-assign and unsync-before-delete wiring, the no-op case (no
-    `google_calendar_event_id`), and best-effort failure handling.
-  - `tests/unit/app/api/google-calendar-callback-route.test.ts` — asserts
-    `is_valid: true` on the upsert payload and the retroactive
-    `syncAllEventsForUser` call (including a graceful-degradation case where
-    the sync rejects but the redirect still reports connected).
-
-## Untouched, per spec
-
-- Read access / conflict detection against personal calendar events —
-  out of scope (write-only).
-- SMS/email dispatch of the re-auth notification — Sprint 4 #58, in-app
-  notification only.
-- Invitation-accept sync and service-week-cancel unsync — belong to #59/#57
-  (OQ-3).
-- No general async job-queue infrastructure (OQ-1 = A, not B).
-
-## Verification
-
-- `bun run lint` — clean.
-- `bun run typecheck` — clean.
-- `bun run test` — 67 suites / 873 tests pass, including the new/expanded
-  suites for this issue (`sync.test.ts`, plus updated `oauth.test.ts`,
-  `events-route.test.ts`, `events-id-route.test.ts`,
-  `events-id-attendees-route.test.ts`, `google-calendar-callback-route.test.ts`).
-- `bun run check:service-role` — passes (no service-role key usage
-  introduced; every cross-user token read goes through a `SECURITY DEFINER`
-  RPC called via the acting user's own client, per the OQ-1 resolution).
-- Did not run migrations against a real DB, per the spec's instruction — SQL
-  correctness relies on this review plus keeping `lib/supabase/types.ts`
-  hand-updated to match.
+- **`tests/unit/app/api/events-ics-route.test.ts`** — route-handler tests for
+  both endpoints, mirroring the `jest.mock`/chainable-Supabase-mock style of
+  `tests/unit/app/api/events-route.test.ts`: 401 (no Clerk userId / no JWT),
+  404 (not an attendee / event doesn't exist / zero assigned events /
+  `serviceWeekId` matches nothing), 400 (invalid `serviceWeekId`), 500 on any
+  Supabase error, and 200 happy paths asserting `Content-Type: text/calendar;
+  charset=utf-8`, the `Content-Disposition: attachment` filename, and VEVENT
+  count/content (including the `serviceWeekId`-scoped case and confirming
+  null location/notes don't produce empty `LOCATION:`/`DESCRIPTION:` lines).
 
 ## What the Tester should focus on
 
-1. **Ordering-dependent paths**: `deleteEvent` and `removeAttendee` both read
-   Google Calendar sync targets *before* the destructive DB write (because
-   `event_attendees` cascades/rows disappear after). Worth an integration-
-   style check that the RPC call genuinely happens first, not just that the
-   mocked function was called with the right arguments.
-2. **The `syncEventToUser`/`unsyncEventFromUser` signature deviation**
-   (added `eventId` param, documented above and in `sync.ts`'s doc comments)
-   — confirm this doesn't conflict with anything the Review stage expects
-   from the spec's literal snippet.
-3. **Graceful degradation**: every sync call site is wrapped so a Google
-   failure (mocked as a rejection in tests) never changes the HTTP status of
-   the underlying event/attendee/reconnect request — spot-check at least one
-   real end-to-end failure path per handler, not just the wiring assertion.
-4. **RLS/security boundary**: `get_event_sync_targets` and
-   `flag_calendar_token_invalid` are the only way an admin's request reaches
-   another member's encrypted token — worth re-reading the migration's
-   caller-role checks (this is SQL, not covered by `bun run test`).
-5. **Token refresh / invalid_grant path** in `sync.test.ts` mocks
-   `refreshAccessToken` rather than hitting a real Google endpoint — the
-   400/`invalid_grant` → `GoogleTokenInvalidError` mapping itself is covered
-   separately in `oauth.test.ts`.
+- The empty-export decision: zero matching assigned events is a 404
+  (`"No events to export"`), not a 200 with an empty calendar — both for the
+  full-export endpoint (zero attendee rows) and the `serviceWeekId`-filtered
+  case (attendee rows exist but none match the week).
+- The attendee-scoping distinction: both endpoints check `event_attendees`
+  (the #60 attendee model), not the invitation-scoped list used by
+  `GET /api/events` — confirm a caller who has an *invitation* but is not an
+  assigned *attendee* still gets a 404 from `GET /api/events/:id/ics`.
+- `escapeIcsText`/`foldLine` correctness on the actual `generateIcs` output
+  (not just the pure functions in isolation) — e.g. a `notes`/`location`
+  value containing `,`, `;`, `\`, or embedded newlines, run through the full
+  handler.
+- Line folding on a genuinely long `notes` value end-to-end through the
+  handler (schema allows unbounded length; the generator must fold it).
+- No new dependency was added — `bun.lock` is untouched; confirm
+  `bun run lint && bun run typecheck && bun run test` all still pass clean
+  (they did in this stage: 75 suites / 960 tests passed, 0 lint errors, 0
+  typecheck errors).
+- No UI was added or wired — this is intentionally out of scope per the
+  spec (member-week screen is still a placeholder).
