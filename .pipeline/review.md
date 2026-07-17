@@ -1,66 +1,78 @@
-# Review — Issue #63: iCal (.ics) export fallback
+# Review — Issue #64: Setlist Builder screen
 
-VERDICT: SHIP
+## VERDICT: NEEDS WORK
 
-## What I checked
-- Read spec.md, changes.md, test-results.md.
-- Read the actual diff (`git diff main...HEAD`) and every created file:
-  `lib/ical/generate.ts`, both `ics/handler.ts` + `route.ts` pairs, and both
-  test files (coder's + tester's supplements).
-- Re-ran independently: `bun run lint` (0 errors), `bun run typecheck`
-  (0 errors), `bun run test` (77 suites / 968 tests pass, 0 failures).
-- Scanned the diff for network/exfil patterns — none (no `fetch`, no beacon,
-  no dynamic `require`/`eval`); only a benign code comment matched.
+One concrete, spec-mandated behavior is broken and is backed by a genuine
+failing test. Everything else (backend endpoint, notes guard, schema/export
+changes, and the rest of the UI) is correct and matches the spec. The fix is
+small and localized.
 
-## Spec conformance (verified against the code, not just the summaries)
-- Generator emits the exact VCALENDAR/VEVENT structure, order, PRODID, CRLF
-  line endings + trailing CRLF as specced.
-- `formatIcsDate` uses the exact `toISOString()` UTC-basic transform → no
-  local-time drift (verified by the offset-normalization test).
-- `escapeIcsText` escapes backslash-first, then `;` `,` then CR/LF → `\n`, in
-  the required order.
-- `foldLine` folds at 75 octets (74 for continuation to account for the
-  leading space), backs off on UTF-8 continuation bytes so multibyte chars
-  aren't split. Escape-then-fold ordering round-trips (tester verified an
-  escape sequence straddling a fold boundary still unfolds losslessly).
-- `null`/empty/whitespace LOCATION/DESCRIPTION lines are omitted, not emitted
-  empty.
-- Both handlers mirror the existing auth/JWT/try-catch shape: `requireAuth`
-  (no role gate, correct per spec), explicit 401 on missing JWT, 500 on any
-  Supabase error, `ApiException` → `fail(...)` else 500.
-- Single-event handler checks `event_attendees` (the #60 attendee model, not
-  the invitation-scoped list) before fetching the event, and returns 404
-  without distinguishing "not yours" from "doesn't exist" — no info leak.
-- Full-export handler: optional `?serviceWeekId` validated as uuid (400 on
-  invalid), dedupes attendee event_ids, 404 on zero attendee rows AND 404 on
-  empty post-filter result (Decision 2 honored in both branches), orders by
-  start_time asc, filename `graceful-events.ics`.
-- No new dependency (`bun.lock` untouched), no UI (correct — member-week
-  screen is still a placeholder), no scope creep.
+## What to fix
 
-## Tests — meaningful, not superficial
-- Route tests cover every named edge case: 401 (null Clerk id / null JWT,
-  asserting lookup + supabase client are NOT consulted early), 404 (not an
-  attendee / event missing / zero assigned / serviceWeekId matches none), 400
-  (invalid serviceWeekId), 500 (both query error paths), and 200 happy paths
-  asserting Content-Type, Content-Disposition filename, and VEVENT count.
-- Tester supplements add genuine coverage the coder's suite structurally
-  couldn't reach: multibyte UTF-8 fold safety, escape-then-fold ordering
-  end-to-end, the attendee-vs-invitation scoping distinction (asserts the
-  handler never queries an `invitations` table), and a real failure case —
-  a malformed `start_time` throws `RangeError` inside `generateIcs` and the
-  outer try/catch correctly converts it to a 500 rather than crashing.
+### 1. Quick-add Title must be prefilled with the search term (REQUIRED)
 
-## Notes (non-blocking)
-- The two `*-tester-supplement.test.ts` files and the updated
-  `test-results.md` are present in the worktree but not yet committed (only
-  the implementation commit exists). Orchestration should commit them with
-  the rest before the PR; they pass as-is.
-- The handlers rely on RLS + `user_id`/attendee scoping for tenancy rather
-  than an explicit `.eq("church_group_id", ...)` like sibling handlers. This
-  is an explicit, defensible spec decision and is safe here: the full-export
-  events query only fetches ids drawn from the caller's own attendee rows,
-  and the single-event path gates on an attendee check first. Called out for
-  human awareness, not a blocker.
+- **File:** `app/(app)/setlists/[id]/setlist-builder.tsx`
+- **Spec:** "Left panel — search + quick-add" — *"title (prefilled with the
+  search term, required)"*. Also an edge case: *"Search no match: show the
+  quick-add form (title required; ...)"*.
+- **Problem:** `quickAddTitle` is an independent `useState("")` (line 46) that
+  is never seeded or synced from `searchTerm`. When a search matches no catalog
+  song the quick-add form appears (correct), but the Title field renders empty.
+  A user who then clicks "Add song" without retyping hits the client-side
+  "Title is required." guard (`handleQuickAdd`, line 199) and no POST fires —
+  the create-then-add flow is dead unless the user retypes the exact title they
+  already typed in the search box.
+- **Failing test (legitimate, re-run and confirmed here):**
+  `tests/unit/app/setlist-builder.test.tsx` ›
+  "search no match: shows the quick-add form prefilled with the search term"
+  asserts `getByLabelText(/title/i)` has value `"Totally New Song"`; actual
+  value is empty. Not a flake, not a test-authoring error — the assertion
+  matches the spec verbatim.
+- **Suggested fix:** derive/seed the Title field from `searchTerm` when the
+  quick-add form is shown — e.g. an effect keyed on `showQuickAdd`/`searchTerm`
+  that seeds `quickAddTitle`, or render the input's value from `searchTerm`
+  when the field hasn't been independently edited. After the fix, re-run the
+  full `setlist-builder.test.tsx` suite (the "quick-add flow" test currently
+  side-steps this by typing the title directly; both should pass once seeded).
 
-Green tests here reflect genuinely correct behavior. Ship it.
+## What is correct (verified against the actual diff, not just the summaries)
+
+- **Backend `GET /api/setlists/:id` (`getSetlistWithSongs`)** matches spec:
+  `requireAuth` + `requireRole(["admin","set_leader"])`, JWT check, tenant-scoped
+  load (`church_group_id` eq), missing/other-tenant → 404 (never 403, no
+  existence leak), DB errors → 500, reuses `loadSongResponses`, returns
+  `{ setlist, songs }` for draft AND published. `route.ts` GET export wired
+  correctly, PUT unchanged.
+- **Notes persistence guard** in `reorderSetlist` is exactly as speced:
+  `notes` only added to the update payload when `entry.notes !== undefined`
+  (absent → column untouched; `null` → clear; string → set). Existing
+  reorder/key-override callers that omit notes are unaffected.
+- **`schemas/setlists.ts`** — `notes: z.string().trim().max(1000).nullish()`
+  added to the reorder per-song object only; `addSetlistSongSchema` untouched.
+- **`schemas/songs.ts`** — `SONG_KEY_OPTIONS = ASCII_SONG_KEYS` exported;
+  `VALID_SONG_KEYS`/`isValidSongKey` untouched. `toSetlistSongResponse` /
+  `SetlistSongResponse` shapes untouched (out-of-scope respected).
+- **Frontend** otherwise faithful: parallel load with `cancelled` guard,
+  403/404/error view routing, non-fatal catalog degradation, client-side
+  case-insensitive search scoped to the catalog panel, duplicate-add 409
+  inline message, key "equals default → null" logic (incl. `defaultKey: null`),
+  notes persist-on-blur only (uncontrolled input keyed by songId), full-set
+  PUT via a single `persistSongs` with resync-on-failure, native HTML5 drag,
+  zero-songs empty state, Publish never disabled with "no songs yet" modal
+  copy, published/locked disabling + Unlock affordance.
+
+## Test quality
+
+The Testing stage's coverage is substantive and independent, not superficial:
+19 backend tests (tenant scoping, role/auth gating, draft+published, DB-error
+500s, the full notes-guard matrix incl. >1000-char 400) and 19 frontend tests
+covering the spec's named edge cases plus failure paths (PUT-failure resync,
+network-error view, catalog-degradation). The single red test is a real
+spec/behavior gap, correctly left unpatched per the pipeline contract.
+
+## Process note (non-blocking, for the human/orchestration)
+
+The two new test files are currently untracked (`git status`: `??`) and the
+implementation commit `118765c` does not include them. They should be committed
+alongside the implementation before the PR is finalized so the failing test —
+and, once fixed, the passing coverage — travels with the change.

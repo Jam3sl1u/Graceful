@@ -1,100 +1,151 @@
-# Test Results — Issue #63: iCal (.ics) export fallback
+# Test Results — Issue #64: Setlist Builder screen
 
-This overwrites the stale `test-results.md` for issue #62 that was still
+This overwrites the stale `test-results.md` for issue #63 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
-## Verdict: ALL PASS
+## Verdict: 1 FAILING TEST — pipeline paused for Review (not fixed here, per contract)
 
-`bun run lint`, `bun run typecheck`, and `bun run test` were re-run
-independently (not trusted from `.pipeline/changes.md`):
+## What I did
 
-- `bun run lint` (eslint .) — 0 errors.
-- `bun run typecheck` (tsc --noEmit) — 0 errors.
-- `bun run test` (Jest, full suite including new tests below) — **77 suites /
-  968 tests passed**, 0 failures. Coder's baseline was 75 suites / 960 tests;
-  this stage added 2 suites / 8 tests, all passing, no other file touched.
+Independently re-ran the coder's claimed verification and added new,
+independent test coverage (`changes.md` states no tests were added in the
+Coding stage for this issue):
 
-## What I independently verified (beyond re-running the coder's own suite)
+- `bun run lint` — clean (after fixing lint issues in my own new test file:
+  no `any`, no unused vars).
+- `bun run typecheck` — clean.
+- `bun run test` (full suite) — **78 suites / 1001 tests: 1000 passed, 1
+  failed.** The single failure is a genuine spec-vs-implementation
+  discrepancy found by my new frontend test (see below), not a flake and not
+  a bug in the test itself. All 3 pre-existing setlist suites named in the
+  spec (`setlists-songs-route.test.ts`, `setlists-key-override.test.ts`,
+  `setlists-publish-route.test.ts`) still pass unmodified.
 
-I read `lib/ical/generate.ts`, `app/api/events/[id]/ics/handler.ts`,
-`app/api/events/[id]/ics/route.ts`, `app/api/events/ics/handler.ts`,
-`app/api/events/ics/route.ts`, and both of the coder's own test files
-(`tests/unit/lib/ical/generate.test.ts`,
-`tests/unit/app/api/events-ics-route.test.ts`) against `.pipeline/spec.md`.
-The coder's own suite is thorough and all of it passes unmodified. I then
-added two new `*-tester-supplement.test.ts` files (matching this repo's
-existing convention for tester-added coverage, e.g.
-`events-id-attendees-route-tester-supplement.test.ts`) targeting the exact
-"What the Tester should focus on" list in `.pipeline/changes.md`, plus one
-case the coder's suite structurally could not reach.
+## New test files added
 
-### `tests/unit/lib/ical/generate-tester-supplement.test.ts` (3 new tests)
-- **Multi-byte UTF-8 fold safety.** The coder's own `foldLine` tests only use
-  repeated ASCII (`"x"`/`"A"`), which can never exercise the "back off while
-  the next byte is a UTF-8 continuation byte" branch. I forced folds
-  mid-character using 4-byte emoji and 3-byte CJK text, and confirmed every
-  physical line is valid, round-trippable UTF-8 (no `U+FFFD` replacement
-  characters introduced) and that de-folding reconstructs the exact original
-  string. **Pass** — the byte-boundary backoff logic is correct.
-- **Escape-then-fold ordering.** Built a long description containing `,` `;`
-  `\` and embedded newlines, ran it through the real `generateIcs`, and
-  confirmed the folded+rejoined DESCRIPTION value equals `escapeIcsText`
-  applied once to the whole raw string — i.e. escaping happens on the full
-  value before folding, not per-chunk after folding (which would risk
-  double-escaping or corrupting an escape sequence at a chunk boundary).
-  **Pass.**
+### `tests/unit/app/api/setlists-get-route.test.ts` (backend, 19 tests, all passing)
 
-### `tests/unit/app/api/events-ics-route-tester-supplement.test.ts` (5 new tests)
-- **Attendee-scoping distinction** (changes.md focus item #1). For both
-  endpoints, built a Supabase mock where `event_attendees` returns "not
-  assigned"/"zero rows" while an `invitations` table (if ever queried) would
-  wrongly grant access. Asserted `supabase.from(...)` is **never** called
-  with `"invitations"` and that both endpoints still return 404. This
-  confirms — in the actual code, not just the coder's documentation claim —
-  that both handlers are genuinely scoped to the #60 attendee model and
-  cannot be satisfied by an invitation alone. **Pass.**
-- **End-to-end escaping** (focus item #3). Fed a DB row with `,` `;` `\` and
-  embedded `\n`/`\r\n` in `name`/`location`/`notes` through the real
-  `exportEventIcs` handler (not just the pure generator) and asserted the
-  escaped forms appear correctly in the response body. **Pass.**
-- **End-to-end long-notes folding** (focus item #4). Fed a >75-octet `notes`
-  value through the real handler, confirmed the DESCRIPTION line folds with
-  a continuation line, and that every physical line in the entire response
-  body respects the 75-octet limit. **Pass.**
-- **Genuine failure case beyond "Supabase returned an error object".** Fed a
-  malformed `start_time` (`"not-a-real-date"`) through the real handler.
-  `new Date(...).toISOString()` throws a `RangeError` inside `generateIcs`,
-  which is not a Supabase-error-shaped failure and is not exercised anywhere
-  in the coder's own suite (which only tests `{ error: {...} }` responses
-  from Supabase). Confirmed the handler's outer `try/catch` still turns this
-  into a well-formed `500 INTERNAL` response rather than an unhandled
-  exception or a corrupted 200 body. **Pass.**
+Covers the new `GET /api/setlists/:id` (`getSetlistWithSongs`) and the
+`notes`-persistence guard added to `reorderSetlist`, using the same stateful
+in-memory fake-Supabase pattern as the existing
+`setlists-songs-route.test.ts`:
 
-All 8 new tests pass against the existing implementation as-is — no code
-changes were needed or made.
+- Happy path: returns the setlist + ordered songs (joined to `defaultKey`)
+  for a **draft** setlist.
+- Also returns songs for a **published** setlist (client needs status to
+  render the locked state) — spec's explicit acceptance criterion.
+- Allows both `admin` and `set_leader` roles.
+- Tenant scoping: a setlist belonging to another `church_group_id`, and a
+  wholly nonexistent id, both return **404 NOT_FOUND** (never 403 — does not
+  leak existence), matching the spec's explicit requirement.
+- `member`/`guest` roles → 403 FORBIDDEN (Supabase never called).
+- No JWT → 401 UNAUTHENTICATED (Supabase never called).
+- DB error on the setlist lookup → 500 INTERNAL.
+- DB error on the songs/defaultKey join → 500 INTERNAL.
+- `notes` guard on `PUT /api/setlists/:id`: omitting `notes` on an entry
+  leaves the existing note untouched; `notes: null` clears it; a string sets
+  it; an overlong (>1000 char) note is rejected as 400 VALIDATION_FAILED
+  (Zod `.max(1000)`).
 
-## Spec cross-check (no discrepancies found)
+### `tests/unit/app/setlist-builder.test.tsx` (frontend, 18 of 19 tests passing)
 
-- CRLF everywhere + trailing CRLF: confirmed by the coder's own tests and
-  re-verified independently in the end-to-end folding supplement test
-  (byte-length check over every non-empty line of a real handler response).
-- 404 (never a 200-with-empty-calendar) on zero assigned events, and on
-  `serviceWeekId` matching none of the caller's events: present in the
-  coder's suite; re-read the handler logic directly and it matches spec
-  Decision 2 exactly (both the zero-attendee-rows short-circuit and the
-  post-filter empty-result check return the same 404).
-- No role gate on either endpoint: confirmed — neither handler calls
-  `requireRole`, matching the spec's "any authenticated member" scope.
-- No new dependency added: `bun.lock` is unmodified; `git status` shows only
-  the files listed in `changes.md` plus the two new test files added by this
-  stage.
-- No UI added or wired: confirmed no changes under `app/(app)/member-week/`
-  or any other app route.
+Covers `app/(app)/setlists/[id]/setlist-builder.tsx`, mirroring
+`week-view.test.tsx`'s URL-keyed `fetch` mock pattern:
+
+- Loading state, happy path (renders catalog search results + setlist rows +
+  song count), zero-songs empty state with Publish still enabled and the
+  "no songs yet" confirmation copy.
+- Search: case-insensitive substring filter scoped to the catalog panel only
+  (a song already in the setlist still shows in the right-hand setlist panel
+  even when filtered out of the left-hand search results — that is correct,
+  expected behavior, not a bug).
+- Search-no-match quick-add form: **FAILS** — see "Bug found" below.
+- Duplicate-add 409 → inline "already in the setlist" message, no state
+  mutation.
+- Quick-add flow: create a catalog song then auto-add it to the setlist
+  (deliberately isolated from the prefill bug below by typing the title
+  directly, so this test exercises the create-then-add mechanics on their
+  own).
+- Key override: choosing a non-default key sends that `keyOverride`;
+  re-choosing the song's own default key sends `keyOverride: null`.
+- A song whose `defaultKey` is `null`: blank select option round-trips to a
+  `null` override.
+- Notes: typing alone does **not** PUT (only on blur); blur sends the
+  trimmed value.
+- PUT failure: shows an inline alert and resyncs via a follow-up `GET
+  /api/setlists/:id`.
+- Remove: DELETE removes the row from the setlist panel and updates the
+  count (song remains visible in the catalog/search panel, as expected).
+- Publish: happy path (confirmation modal → POST → locked/published state
+  with Unlock banner) and 409 → "Setlist is already published."
+- Published/locked state on initial load: all editing controls (Add,
+  key select, notes input, Remove, Publish) disabled; Unlock re-enables them.
+- 403/404 on initial load → forbidden/not-found views.
+- Catalog load failure (non-403) degrades to an empty catalog (search still
+  renders; setlist rows fall back to "Unknown song") rather than failing the
+  whole screen.
+- Network error on load → generic error view.
+
+## Bug found (the 1 failing test) — NOT fixed here, per pipeline contract
+
+**Test:** `SetlistBuilder › search no match: shows the quick-add form
+prefilled with the search term`
+(`tests/unit/app/setlist-builder.test.tsx`)
+
+**Spec requirement** (`.pipeline/spec.md`, "Left panel — search + quick-add"):
+> Quick-add form shown when the search term is non-empty and no catalog row
+> matches: **title (prefilled with the search term, required)**, artist
+> (optional), key `<select>`...
+
+**Actual behavior:** `app/(app)/setlists/[id]/setlist-builder.tsx` maintains
+`quickAddTitle` as an independent `useState("")` that is never initialized or
+synced from `searchTerm`:
+
+```tsx
+const [searchTerm, setSearchTerm] = useState("");
+...
+const [quickAddTitle, setQuickAddTitle] = useState("");
+```
+
+There is no effect or derived value that seeds `quickAddTitle` from
+`searchTerm` when the quick-add form appears. Typing a search term that
+matches no catalog song correctly reveals the quick-add form (`showQuickAdd`
+logic itself is correct), but the Title field renders empty instead of
+prefilled with what the user just typed — the user has to retype the title
+they already entered in the search box. This is a real, reproducible
+spec/behavior gap, confirmed by reading the component source, not a
+test-authoring mistake.
+
+This also would have caused a second, cascading test failure ("quick-add
+flow" happy path — empty title triggers the client-side "Title is required."
+validation, blocking the submit so no POST ever fires) had I not
+deliberately typed the title directly in that test to isolate the
+create-then-add flow from this prefill bug. I kept the two as separate tests
+so the review stage can see the prefill gap in isolation rather than have it
+masked by a second, unrelated-looking failure.
+
+## Recommendation
+
+Per AGENTS.md's testing-stage contract ("A failing test pauses the pipeline
+for review; it is not something this stage patches around"), I have not
+modified `setlist-builder.tsx`. A minimal fix would be seeding
+`quickAddTitle` from `searchTerm` at the point the quick-add form becomes
+visible (e.g. an effect keyed on `showQuickAdd`/`searchTerm`, or deriving the
+input's displayed value directly), then re-running this test.
+
+## Everything else checked and not touched
+
+Per spec's "Explicitly out of scope": Spotify enrichment, the `TODO(#64)`
+"Edit setlist" button wiring in `week-view.tsx`, and the shapes of
+`toSetlistSongResponse` / `SetlistSongResponse` / `addSetlistSongSchema` were
+left untouched by the Coding stage and I did not test them further (already
+covered by pre-existing suites, all still green).
 
 ## Files added by this stage (Testing)
 
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-63/tests/unit/lib/ical/generate-tester-supplement.test.ts`
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-63/tests/unit/app/api/events-ics-route-tester-supplement.test.ts`
+- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-64/tests/unit/app/api/setlists-get-route.test.ts`
+- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-64/tests/unit/app/setlist-builder.test.tsx`
 
-No implementation files were modified. Ready for Review.
+No implementation files were modified. Ready for Review, with the one bug
+flagged above.
