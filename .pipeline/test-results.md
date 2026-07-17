@@ -1,100 +1,162 @@
-# Test Results — Issue #63: iCal (.ics) export fallback
+# Test Results — Issue #142: Provision Google OAuth credentials & Cloudflare R2 bucket
 
-This overwrites the stale `test-results.md` for issue #62 that was still
+This overwrites the stale `test-results.md` for issue #63 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
-## Verdict: ALL PASS
+## Verdict: PASS (post-fix) — see "Post-review fix" note at bottom
 
-`bun run lint`, `bun run typecheck`, and `bun run test` were re-run
-independently (not trusted from `.pipeline/changes.md`):
+Original Testing-stage run (below) found one failing test. The Reviewer
+confirmed it as a genuine content defect (not a test bug) and it has since
+been fixed; see the "Post-review fix" section at the end of this file for
+the corrected result. The rest of this document is preserved as originally
+written by the Testing stage.
 
-- `bun run lint` (eslint .) — 0 errors.
-- `bun run typecheck` (tsc --noEmit) — 0 errors.
-- `bun run test` (Jest, full suite including new tests below) — **77 suites /
-  968 tests passed**, 0 failures. Coder's baseline was 75 suites / 960 tests;
-  this stage added 2 suites / 8 tests, all passing, no other file touched.
+## Verdict: FAIL — one failing test, pipeline paused for Reviewer
 
-## What I independently verified (beyond re-running the coder's own suite)
+This issue is a docs-only deliverable (per spec.md's "Scope note" and
+changes.md — no application code was touched). New tests were added at
+`tests/unit/documentation/google-oauth-r2-provisioning-tester-supplement.test.ts`
+to independently verify the runbook's content against the actual code it
+describes (`lib/google-calendar/oauth.ts`, `lib/google-calendar/token-crypto.ts`,
+`lib/r2/client.ts`, `app/api/google-calendar/callback/route.ts`), plus the
+no-secrets / placeholder-integrity invariant the issue itself requires.
 
-I read `lib/ical/generate.ts`, `app/api/events/[id]/ics/handler.ts`,
-`app/api/events/[id]/ics/route.ts`, `app/api/events/ics/handler.ts`,
-`app/api/events/ics/route.ts`, and both of the coder's own test files
-(`tests/unit/lib/ical/generate.test.ts`,
-`tests/unit/app/api/events-ics-route.test.ts`) against `.pipeline/spec.md`.
-The coder's own suite is thorough and all of it passes unmodified. I then
-added two new `*-tester-supplement.test.ts` files (matching this repo's
-existing convention for tester-added coverage, e.g.
-`events-id-attendees-route-tester-supplement.test.ts`) targeting the exact
-"What the Tester should focus on" list in `.pipeline/changes.md`, plus one
-case the coder's suite structurally could not reach.
+## Standard checks (re-run independently, not trusted from changes.md)
 
-### `tests/unit/lib/ical/generate-tester-supplement.test.ts` (3 new tests)
-- **Multi-byte UTF-8 fold safety.** The coder's own `foldLine` tests only use
-  repeated ASCII (`"x"`/`"A"`), which can never exercise the "back off while
-  the next byte is a UTF-8 continuation byte" branch. I forced folds
-  mid-character using 4-byte emoji and 3-byte CJK text, and confirmed every
-  physical line is valid, round-trippable UTF-8 (no `U+FFFD` replacement
-  characters introduced) and that de-folding reconstructs the exact original
-  string. **Pass** — the byte-boundary backoff logic is correct.
-- **Escape-then-fold ordering.** Built a long description containing `,` `;`
-  `\` and embedded newlines, ran it through the real `generateIcs`, and
-  confirmed the folded+rejoined DESCRIPTION value equals `escapeIcsText`
-  applied once to the whole raw string — i.e. escaping happens on the full
-  value before folding, not per-chunk after folding (which would risk
-  double-escaping or corrupting an escape sequence at a chunk boundary).
-  **Pass.**
+- `bun run lint` (eslint .) — clean, 0 errors.
+- `bun run typecheck` (tsc --noEmit) — clean, 0 errors.
+- `bun run test` (full suite, including new tests) — **78 suites total: 77
+  passed, 1 failed. 983 tests total: 982 passed, 1 failed.** Before adding
+  the new test file: 77 suites / 968 tests, all passing — matches the
+  coder's claim in changes.md for the pre-existing suite exactly.
+- `git diff origin/main...HEAD --stat` confirms only the claimed files
+  changed: `.env.example`, `README.md`,
+  `documentation/google-oauth-r2-provisioning.md` (new),
+  `documentation/staging-environment.md`, plus `.pipeline/*.md` handoff
+  files. No application code, tests, or CI workflows were touched.
+- Grepped the diff for secret-shaped strings (`AIza`, `ya29.`, `GOCSPX`,
+  `-----BEGIN`, `AKIA`, long opaque tokens) — none found. All Google
+  Calendar/R2 placeholder lines in `.env.example` remain exactly `VAR=`
+  (empty).
 
-### `tests/unit/app/api/events-ics-route-tester-supplement.test.ts` (5 new tests)
-- **Attendee-scoping distinction** (changes.md focus item #1). For both
-  endpoints, built a Supabase mock where `event_attendees` returns "not
-  assigned"/"zero rows" while an `invitations` table (if ever queried) would
-  wrongly grant access. Asserted `supabase.from(...)` is **never** called
-  with `"invitations"` and that both endpoints still return 404. This
-  confirms — in the actual code, not just the coder's documentation claim —
-  that both handlers are genuinely scoped to the #60 attendee model and
-  cannot be satisfied by an invitation alone. **Pass.**
-- **End-to-end escaping** (focus item #3). Fed a DB row with `,` `;` `\` and
-  embedded `\n`/`\r\n` in `name`/`location`/`notes` through the real
-  `exportEventIcs` handler (not just the pure generator) and asserted the
-  escaped forms appear correctly in the response body. **Pass.**
-- **End-to-end long-notes folding** (focus item #4). Fed a >75-octet `notes`
-  value through the real handler, confirmed the DESCRIPTION line folds with
-  a continuation line, and that every physical line in the entire response
-  body respects the 75-octet limit. **Pass.**
-- **Genuine failure case beyond "Supabase returned an error object".** Fed a
-  malformed `start_time` (`"not-a-real-date"`) through the real handler.
-  `new Date(...).toISOString()` throws a `RangeError` inside `generateIcs`,
-  which is not a Supabase-error-shaped failure and is not exercised anywhere
-  in the coder's own suite (which only tests `{ error: {...} }` responses
-  from Supabase). Confirmed the handler's outer `try/catch` still turns this
-  into a well-formed `500 INTERNAL` response rather than an unhandled
-  exception or a corrupted 200 body. **Pass.**
+## New tests added (happy path / named edge cases / failure case)
 
-All 8 new tests pass against the existing implementation as-is — no code
-changes were needed or made.
+File: `tests/unit/documentation/google-oauth-r2-provisioning-tester-supplement.test.ts`
+(15 tests, Jest, matches this repo's `tests/unit/**/*.test.ts` layout and its
+existing `-tester-supplement.test.ts` naming convention).
 
-## Spec cross-check (no discrepancies found)
+**Happy path:**
+- Runbook exists and documents the real env vars consumed by
+  `lib/google-calendar/oauth.ts` and `lib/r2/client.ts`.
+- Runbook has a `## Verification checklist` section with `- [ ]` items.
+- README links to the runbook; `staging-environment.md` cross-references it.
 
-- CRLF everywhere + trailing CRLF: confirmed by the coder's own tests and
-  re-verified independently in the end-to-end folding supplement test
-  (byte-length check over every non-empty line of a real handler response).
-- 404 (never a 200-with-empty-calendar) on zero assigned events, and on
-  `serviceWeekId` matching none of the caller's events: present in the
-  coder's suite; re-read the handler logic directly and it matches spec
-  Decision 2 exactly (both the zero-attendee-rows short-circuit and the
-  post-filter empty-result check return the same 404).
-- No role gate on either endpoint: confirmed — neither handler calls
-  `requireRole`, matching the spec's "any authenticated member" scope.
-- No new dependency added: `bun.lock` is unmodified; `git status` shows only
-  the files listed in `changes.md` plus the two new test files added by this
-  stage.
-- No UI added or wired: confirmed no changes under `app/(app)/member-week/`
-  or any other app route.
+**Edge cases named in spec.md's "Edge cases / must-get-right details":**
+- OAuth scope is exactly the write-only `calendar.events` URL, matching
+  `oauth.ts`'s `CALENDAR_EVENTS_SCOPE`; any mention of `calendar.readonly`
+  only appears as a "do not use this" caution, never as a recommendation.
+- Redirect URI path is exactly `/api/google-calendar/callback` (fixed by
+  the route file).
+- `TOKEN_ENCRYPTION_KEY` documented as base64 (not hex), exactly 32 decoded
+  bytes, generated via `openssl rand -base64 32`.
+- Staging/production get distinct OAuth clients and encryption keys.
+- R2 bucket must be private / no public access; API token scoped to a
+  single bucket, not account-wide.
+- R2 endpoint is the account-level shape
+  (`https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`), no bucket in the
+  host.
+- `.env.example`'s nine Google Calendar / R2 placeholder lines remain
+  exactly `VAR=` (empty) — no real values were introduced; only comment
+  lines were added above the two blocks.
+
+**Failure case (this is the one that FAILS):**
+- A consistency check that the runbook's own claim in §6 — *"The ten
+  variables provisioned by this runbook"* — matches the number of rows
+  actually tabulated there.
+
+## FAILING TEST — real content defect, not a test bug
+
+```
+● documentation/google-oauth-r2-provisioning.md › the 'ten variables' claim
+  in §6 matches the actual number of variables tabulated
+
+  expect(received).toBe(expected)
+  Expected: 10
+  Received: 9
+```
+
+**Root cause (verified by direct inspection, not just the failing test):**
+`documentation/google-oauth-r2-provisioning.md` §6 says *"The ten variables
+provisioned by this runbook:"* immediately above a table that lists only
+**9** variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+`GOOGLE_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY` (4 Google Calendar vars) +
+`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+`R2_BUCKET_NAME`, `R2_ENDPOINT` (5 R2 vars) = 9. This matches the actual
+`.env.example` contents (also exactly 9 vars across the Google Calendar and
+Cloudflare R2 blocks, confirmed by direct read of `.env.example` lines
+34–50) and the env vars actually read by `lib/r2/client.ts` /
+`lib/google-calendar/oauth.ts` / `lib/google-calendar/token-crypto.ts`.
+There is no tenth variable anywhere in the codebase's Google
+Calendar/R2 integration.
+
+This traces back to `.pipeline/spec.md` itself, which independently says
+"already has all ten variables as empty placeholders" (line 30) and "a
+table mapping each of the ten variables" (line 117) — the miscount
+originated in the planning stage and was faithfully carried into the
+coding stage's runbook. It is a small but genuine factual inaccuracy in a
+document whose whole purpose is to be an authoritative, followable runbook
+for a human operator, and changes.md itself flagged "Runbook accuracy" as
+something the Tester should specifically check.
+
+Per AGENTS.md's pipeline contract ("A failing test pauses the pipeline for
+review; it is not something this stage patches around"), this is not
+something the Testing stage fixes. Flagging for the Reviewer/human: the
+runbook's "ten variables" wording in §6 (its §1 intro doesn't state a
+count, so that's unaffected) should be corrected to "nine" (or the
+sentence reworded to avoid a count), and `.pipeline/spec.md`'s two "ten
+variables" mentions carry the same latent error, worth fixing for
+consistency if this pipeline stage is ever re-run from spec.md.
+
+## Everything else: PASS
+
+All other new assertions pass (14/15), and the pre-existing 77 suites /
+968 tests are unaffected and still fully green. No secrets found anywhere
+in the diff. `.env.example` placeholder integrity holds (all nine
+Google Calendar/R2 vars still empty; only comment lines were added).
+README and `staging-environment.md` cross-references are present and
+correctly scoped (pointers only, no duplicated runbook content). Lint and
+typecheck are both clean.
 
 ## Files added by this stage (Testing)
 
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-63/tests/unit/lib/ical/generate-tester-supplement.test.ts`
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-63/tests/unit/app/api/events-ics-route-tester-supplement.test.ts`
+- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-142/tests/unit/documentation/google-oauth-r2-provisioning-tester-supplement.test.ts`
 
-No implementation files were modified. Ready for Review.
+No implementation or documentation files were modified by this stage — the
+one failing test surfaces a pre-existing defect in the coder's
+`documentation/google-oauth-r2-provisioning.md`, it is not something this
+stage patched around. Not ready for Review sign-off until the "ten
+variables" discrepancy is resolved (either fix the wording or fix the
+table — both should say the same number).
+
+## Post-review fix
+
+Per `review.md`'s verdict (NEEDS WORK, one MUST FIX): changed
+`documentation/google-oauth-r2-provisioning.md` §6 "The ten variables
+provisioned by this runbook:" to "The nine variables provisioned by this
+runbook:" — matching the 9 rows actually tabulated. Also corrected the same
+latent miscount in `.pipeline/spec.md` (lines 30 and 117, "ten" → "nine")
+per the review's SHOULD FIX, so a future re-run from spec.md doesn't
+reintroduce it.
+
+Re-ran the full suite after the fix:
+
+```
+Test Suites: 78 passed, 78 total
+Tests:       983 passed, 983 total
+```
+
+`bun run lint` and `bun run typecheck` both clean, 0 errors. All 15 tests in
+`tests/unit/documentation/google-oauth-r2-provisioning-tester-supplement.test.ts`
+now pass, including the previously-failing "ten variables" consistency
+check. No other files changed. Ready to ship.

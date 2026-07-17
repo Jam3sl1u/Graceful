@@ -107,7 +107,7 @@ Vercel setup follows the same native per-Environment scoping convention as
 identical variable names across environments, only the values differ. Never
 name-prefix a variable (e.g. no `STAGING_GOOGLE_CLIENT_ID`).
 
-The ten variables provisioned by this runbook:
+The nine variables provisioned by this runbook:
 
 | Variable | Source |
 | --- | --- |

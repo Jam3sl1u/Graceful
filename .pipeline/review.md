@@ -1,66 +1,72 @@
-# Review — Issue #63: iCal (.ics) export fallback
+# Review — Issue #142: Provision Google OAuth credentials & Cloudflare R2 bucket
 
-VERDICT: SHIP
+## VERDICT: NEEDS WORK
 
-## What I checked
-- Read spec.md, changes.md, test-results.md.
-- Read the actual diff (`git diff main...HEAD`) and every created file:
-  `lib/ical/generate.ts`, both `ics/handler.ts` + `route.ts` pairs, and both
-  test files (coder's + tester's supplements).
-- Re-ran independently: `bun run lint` (0 errors), `bun run typecheck`
-  (0 errors), `bun run test` (77 suites / 968 tests pass, 0 failures).
-- Scanned the diff for network/exfil patterns — none (no `fetch`, no beacon,
-  no dynamic `require`/`eval`); only a benign code comment matched.
+One real, well-localized factual error in the authoritative runbook, surfaced
+by a legitimate failing test. Everything else is sound. This is a one-word
+documentation fix, not a design or security problem — hence NEEDS WORK, not
+BLOCK.
 
-## Spec conformance (verified against the code, not just the summaries)
-- Generator emits the exact VCALENDAR/VEVENT structure, order, PRODID, CRLF
-  line endings + trailing CRLF as specced.
-- `formatIcsDate` uses the exact `toISOString()` UTC-basic transform → no
-  local-time drift (verified by the offset-normalization test).
-- `escapeIcsText` escapes backslash-first, then `;` `,` then CR/LF → `\n`, in
-  the required order.
-- `foldLine` folds at 75 octets (74 for continuation to account for the
-  leading space), backs off on UTF-8 continuation bytes so multibyte chars
-  aren't split. Escape-then-fold ordering round-trips (tester verified an
-  escape sequence straddling a fold boundary still unfolds losslessly).
-- `null`/empty/whitespace LOCATION/DESCRIPTION lines are omitted, not emitted
-  empty.
-- Both handlers mirror the existing auth/JWT/try-catch shape: `requireAuth`
-  (no role gate, correct per spec), explicit 401 on missing JWT, 500 on any
-  Supabase error, `ApiException` → `fail(...)` else 500.
-- Single-event handler checks `event_attendees` (the #60 attendee model, not
-  the invitation-scoped list) before fetching the event, and returns 404
-  without distinguishing "not yours" from "doesn't exist" — no info leak.
-- Full-export handler: optional `?serviceWeekId` validated as uuid (400 on
-  invalid), dedupes attendee event_ids, 404 on zero attendee rows AND 404 on
-  empty post-filter result (Decision 2 honored in both branches), orders by
-  start_time asc, filename `graceful-events.ics`.
-- No new dependency (`bun.lock` untouched), no UI (correct — member-week
-  screen is still a placeholder), no scope creep.
+## What I verified firsthand (not just trusting the summaries)
 
-## Tests — meaningful, not superficial
-- Route tests cover every named edge case: 401 (null Clerk id / null JWT,
-  asserting lookup + supabase client are NOT consulted early), 404 (not an
-  attendee / event missing / zero assigned / serviceWeekId matches none), 400
-  (invalid serviceWeekId), 500 (both query error paths), and 200 happy paths
-  asserting Content-Type, Content-Disposition filename, and VEVENT count.
-- Tester supplements add genuine coverage the coder's suite structurally
-  couldn't reach: multibyte UTF-8 fold safety, escape-then-fold ordering
-  end-to-end, the attendee-vs-invitation scoping distinction (asserts the
-  handler never queries an `invitations` table), and a real failure case —
-  a malformed `start_time` throws `RangeError` inside `generateIcs` and the
-  outer try/catch correctly converts it to a 500 rather than crashing.
+- Ran `git diff main...HEAD` and read every changed file directly.
+- Confirmed the scope framing: this is a provisioning/ops issue whose only
+  legitimate in-repo deliverable is a human-operator runbook plus link wiring.
+  No application code was touched. Correct call.
+- Counted the real integration env vars against source, not the summaries:
+  `lib/google-calendar/oauth.ts` (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+  `GOOGLE_REDIRECT_URI`), `lib/google-calendar/token-crypto.ts`
+  (`TOKEN_ENCRYPTION_KEY`), `lib/r2/client.ts` (`R2_ACCOUNT_ID`,
+  `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT`).
+  That is exactly **nine** variables. `.env.example` also lists exactly nine.
+  There is no tenth variable anywhere in the Google Calendar / R2 integration.
+- Runbook technical accuracy checks out: OAuth scope is write-only
+  `calendar.events` only (no read scope), redirect path is exactly
+  `/api/google-calendar/callback`, `TOKEN_ENCRYPTION_KEY` is base64 / exactly
+  32 decoded bytes via `openssl rand -base64 32`, R2 bucket must be private,
+  R2 endpoint is the account-level `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`
+  shape. All match the code.
+- `.env.example` edit is comment-only; all nine placeholder lines remain
+  exactly `VAR=` (empty). No secrets anywhere in the diff. README and
+  `staging-environment.md` cross-references are minimal pointers, not
+  duplicated content.
+- The tester's new test file is meaningful, not superficial: it reads the
+  actual committed files and cross-checks them against the code and the
+  no-secrets invariant. The failing test is honest — it is not a test bug.
 
-## Notes (non-blocking)
-- The two `*-tester-supplement.test.ts` files and the updated
-  `test-results.md` are present in the worktree but not yet committed (only
-  the implementation commit exists). Orchestration should commit them with
-  the rest before the PR; they pass as-is.
-- The handlers rely on RLS + `user_id`/attendee scoping for tenancy rather
-  than an explicit `.eq("church_group_id", ...)` like sibling handlers. This
-  is an explicit, defensible spec decision and is safe here: the full-export
-  events query only fetches ids drawn from the caller's own attendee rows,
-  and the single-event path gates on an attendee check first. Called out for
-  human awareness, not a blocker.
+## Must fix (blocking the SHIP)
 
-Green tests here reflect genuinely correct behavior. Ship it.
+1. `documentation/google-oauth-r2-provisioning.md` line 110: the sentence
+   **"The ten variables provisioned by this runbook:"** sits directly above a
+   table that lists **nine** variables. There is no tenth variable in the
+   codebase, `.env.example`, or the table. Change "ten" to "nine" (or reword
+   to drop the count). This is the single failing test and a genuine accuracy
+   defect in a document whose entire purpose is to be a followable, correct
+   operator runbook — an operator would waste time hunting for a nonexistent
+   tenth variable.
+
+## Should fix (same root miscount, for consistency)
+
+2. `.pipeline/spec.md` carries the same latent error at line 30 ("already has
+   all ten variables as empty placeholders") and line 117 ("a table mapping
+   each of the ten variables"). The planner introduced the miscount; the coder
+   faithfully copied it. Correct these to "nine" too so a re-run from spec does
+   not reintroduce the defect. (Spec is a handoff artifact, so this is
+   secondary to fix #1, but it is the actual source.)
+
+## Process note (not blocking, for the human/orchestrator)
+
+- The tester's test file `tests/unit/documentation/
+  google-oauth-r2-provisioning-tester-supplement.test.ts` is currently
+  **untracked**, and `.pipeline/test-results.md` is **modified but
+  uncommitted**. Whoever applies fix #1 should also stage/commit the test file
+  so the failing-then-passing test travels with the change; otherwise the PR
+  would ship the doc without the test that guards it.
+
+## After the fix
+
+Once "ten" → "nine" is corrected and the suite is green (the consistency test
+is written to pass when the count is not claimed as ten, or when the table has
+the claimed number of rows), this is a clean, correctly-scoped, secret-free
+docs deliverable that satisfies the issue. Re-run `bun run test` to confirm
+78 suites / all green, then this is SHIP-able.

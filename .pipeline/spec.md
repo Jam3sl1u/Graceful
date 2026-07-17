@@ -27,7 +27,7 @@ Two facts confirmed by reading the current tree that narrow scope further:
    needed to construct `R2_ENDPOINT`.)
    Do **not** modify these files — implementing them is #58/#61/#62, and
    they're already done.
-2. `.env.example` already has all ten variables as empty placeholders and a
+2. `.env.example` already has all nine variables as empty placeholders and a
    header forbidding real values in the repo. Do **not** put values there.
 
 **Therefore the concrete in-repo deliverable for this issue is a
@@ -114,7 +114,7 @@ Required content, section by section:
    - Use a **separate bucket + separate token per environment** (staging vs
      production), per §25.7 and `staging-environment.md` §3's R2 row.
 
-6. **Where to set the values** — a table mapping each of the ten variables to
+6. **Where to set the values** — a table mapping each of the nine variables to
    its destinations:
    - Local: `.env.local` (git-ignored; never `.env.example`).
    - Vercel: **Preview** environment for staging, **Production** for
