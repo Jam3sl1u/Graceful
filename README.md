@@ -8,6 +8,10 @@ Graceful runs in three environments: development, staging, and production.
 See [`documentation/staging-environment.md`](documentation/staging-environment.md)
 for how the staging environment is configured and verified.
 
+For provisioning the Google OAuth client and Cloudflare R2 bucket that
+Sprint 3 (#58/#61/#62) depends on, see
+[`documentation/google-oauth-r2-provisioning.md`](documentation/google-oauth-r2-provisioning.md).
+
 ## Prerequisites
 
 Requires [Bun](https://bun.sh) (CI pins `1.2.x` via `oven-sh/setup-bun`).

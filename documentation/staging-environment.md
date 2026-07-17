@@ -59,8 +59,8 @@ production) versus which may be shared across environments.
 | Clerk | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET` | Distinct — Clerk test instance/test mode keys (see §4) |
 | Pingram | `PINGRAM_API_KEY`, `PINGRAM_WEBHOOK_SECRET` | Distinct — Pingram test environment keys (see §4) |
 | Resend | `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET` | Distinct — Resend test/sandbox key (see §4) |
-| Google Calendar | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY` | Distinct — `GOOGLE_REDIRECT_URI` must point at the staging host; use a dedicated OAuth client and encryption key for staging |
-| Cloudflare R2 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT` | Distinct — separate staging R2 bucket and credentials (PRD §25.7) |
+| Google Calendar | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY` | Distinct — `GOOGLE_REDIRECT_URI` must point at the staging host; use a dedicated OAuth client and encryption key for staging (step-by-step: `google-oauth-r2-provisioning.md` §3–§4) |
+| Cloudflare R2 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT` | Distinct — separate staging R2 bucket and credentials (PRD §25.7) (step-by-step: `google-oauth-r2-provisioning.md` §5) |
 | Upstash Redis | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Distinct — dedicated staging Redis instance |
 | Upstash QStash | `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | Distinct — dedicated staging QStash credentials |
 | Modal | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `MODAL_WEBHOOK_SECRET` | Distinct — dedicated staging Modal token/webhook secret |
