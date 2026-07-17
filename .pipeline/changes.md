@@ -1,103 +1,95 @@
-# Changes — Issue #63: iCal (.ics) export fallback
+# Changes — Issue #142: Provision Google OAuth credentials & Cloudflare R2 bucket
 
-Implements the export-only `.ics` download endpoints exactly as specced in
-`.pipeline/spec.md`. No UI, no new dependency, no scope creep beyond the two
-GET endpoints and the pure generator they share.
+## Summary
 
-## Files created
+This issue is a provisioning/ops task, not a code task (per spec.md's "Scope
+note"). The concrete in-repo deliverable is a human-operator runbook plus
+small wiring to link it — no application code was touched, and no real
+secrets or credential values were added anywhere.
 
-- **`lib/ical/generate.ts`** — pure, framework-light RFC 5545 generator (no
-  `server-only`, so it's unit-testable without a request context). Exports:
-  - `generateIcs(events, opts?)` — builds a full `VCALENDAR` string with one
-    `VEVENT` per input event, CRLF line endings throughout plus a trailing
-    CRLF, `DTSTAMP` driven by an injectable `opts.now` (defaults to
-    `new Date()`).
-  - `formatIcsDate(date)` — `Date` -> UTC basic format
-    (`toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")`).
-  - `escapeIcsText(value)` — RFC 5545 §3.3.11 escaping, in the required order
-    (backslash, then `;`, then `,`, then CRLF/CR/LF -> literal `\n`).
-  - `foldLine(line)` — 75-octet content-line folding. First chunk gets 75
-    octets, continuation chunks get 74 (since the leading `" "` on each
-    continuation line counts toward that line's 75-octet budget). Splits on
-    byte boundaries without cutting a multi-byte UTF-8 character.
-  - `icsResponse(ics, filename)` — builds the `text/calendar` attachment
-    `Response` (imports `NextResponse` from `next/server`; this is the one
-    piece of this file that isn't purely framework-free, per the spec's
-    explicit allowance).
-  - `icsFilename(name)` — safe download filename: lowercase, non-alphanumeric
-    runs collapsed to a single `-`, leading/trailing `-` trimmed, falls back
-    to `"event"` for an empty/all-symbol name, appends `.ics`.
-  - `LOCATION`/`DESCRIPTION` lines are omitted entirely when the source value
-    is `null`/empty/whitespace-only (never emitted as an empty-value line).
+## Files changed
 
-- **`app/api/events/[id]/ics/handler.ts`** — `exportEventIcs(req, id, lookup?)`.
-  Mirrors the auth/JWT/try-catch shape of `app/api/events/[id]/handler.ts`:
-  `requireAuth` (no role gate) -> resolve Supabase JWT (401 if missing) ->
-  confirm the caller is an attendee via `event_attendees` (`event_id` +
-  `user_id`, `maybeSingle`) -> 404 if not assigned (never distinguishes
-  "not yours" from "doesn't exist") -> fetch the `events` row -> 404 if
-  missing -> map to `IcalEventInput` -> `generateIcs([...])` ->
-  `icsResponse(ics, icsFilename(event.name))`.
+- **`documentation/google-oauth-r2-provisioning.md`** (NEW) — the
+  provisioning runbook, mirroring `documentation/staging-environment.md`'s
+  structure (numbered `##` sections, tables, `## Verification checklist`).
+  Covers: purpose/context, prerequisites (issue #10's existing GCP project
+  and Cloudflare account), creating a Web-application OAuth 2.0 client
+  scoped to `calendar.events` only with a redirect URI matching
+  `/api/google-calendar/callback` per environment, generating
+  `TOKEN_ENCRYPTION_KEY` via `openssl rand -base64 32` (must decode to
+  exactly 32 bytes), creating a private R2 bucket with a bucket-scoped API
+  token, mapping all ten env vars to their destinations (`.env.local` /
+  Vercel Preview+Production / no GitHub Actions secrets needed), a free-tier
+  cost note, and a verification checklist restating the issue's acceptance
+  criteria.
+- **`README.md`** — added one sentence under `## Environments` linking the
+  new runbook, in the same style as the existing `staging-environment.md`
+  link. No restructuring.
+- **`documentation/staging-environment.md`** — appended a short
+  cross-reference to the new runbook in the Google Calendar and Cloudflare
+  R2 rows of §3's env-var table (pointing at the runbook's §3–§4 and §5
+  respectively). No other edits; existing sections not renumbered or
+  rewritten.
+- **`.env.example`** — comment-only edit. Added a couple of comment lines
+  above the `# Google Calendar (OAuth sync)` block (redirect URI shape,
+  `TOKEN_ENCRYPTION_KEY` = base64 of 32 random bytes via `openssl rand
+  -base64 32`, pointer to the runbook) and above the `#Cloudflare R2 (file
+  storage)` block (`R2_ENDPOINT` shape, pointer to the runbook). All
+  existing placeholder lines (`VAR=`) are unchanged and still empty — no
+  values were added.
+- **`.pipeline/spec.md`** — staged/committed alongside the above as it was
+  the planning stage's output already present (uncommitted) in the working
+  tree at the start of this coding pass, not authored by this stage.
 
-- **`app/api/events/[id]/ics/route.ts`** — `GET` wrapper unwrapping the async
-  `params`, mirrors `app/api/events/[id]/route.ts`.
+## Files explicitly NOT touched (out of scope, per spec)
 
-- **`app/api/events/ics/handler.ts`** — `exportEventsIcs(req, lookup?)`.
-  `requireAuth` -> parse optional `?serviceWeekId=<uuid>` (`z.string().uuid()`,
-  400 `VALIDATION_FAILED` if present but invalid) -> resolve Supabase JWT
-  (401 if missing) -> collect the caller's assigned event ids from
-  `event_attendees` (deduped via `Set`) -> 404 `"No events to export"` if
-  zero -> fetch matching `events` rows (`.in("id", eventIds)`, optionally
-  `.eq("service_week_id", serviceWeekId)`, `.order("start_time", { ascending:
-  true })`) -> 404 if the (possibly filtered) result is empty -> map every row
-  to `IcalEventInput` -> `generateIcs(...)` -> `icsResponse(ics,
-  "graceful-events.ics")`. The optional filter is applied before
-  `.order(...)` (mirrors `app/api/songs/handler.ts`'s conditional-builder
-  pattern) to keep the Supabase query-builder typing happy.
+- `lib/google-calendar/oauth.ts`, `lib/google-calendar/token-crypto.ts`,
+  `lib/google-calendar/sync.ts`, `lib/r2/client.ts`, and the
+  `app/api/google-calendar/*` route handlers — already fully implemented
+  (#58/#61/#62); verified by reading them, confirmed they consume exactly
+  the env-var names and formats documented in the runbook.
+- No `.env.local`, Vercel, GitHub Actions, or any actual credential/secret
+  was created or set — those are human dashboard actions per the issue's own
+  "never in the repo" instruction.
+- iCal `.ics` export (#63) — unrelated, not touched.
 
-- **`app/api/events/ics/route.ts`** — thin `GET` wrapper, mirrors
-  `app/api/events/[id]/route.ts`'s style (no params to unwrap here since
-  there's no dynamic segment).
+## Verification performed
 
-- **`tests/unit/lib/ical/generate.test.ts`** — unit tests for
-  `formatIcsDate`, `escapeIcsText`, `foldLine`, `generateIcs`, and
-  `icsFilename`: UTC conversion (including a non-UTC-offset input), escaping
-  order/edge cases, CRLF-only line endings + trailing CRLF, VEVENT field
-  correctness, `DTSTAMP` via injected `now` and via the real-clock default,
-  omission of null/empty `LOCATION`/`DESCRIPTION`, long-description folding
-  (every physical line <= 75 octets, continuation lines start with a single
-  space, and the folded text round-trips back to the original), multi-event
-  output, and filename sanitization.
-
-- **`tests/unit/app/api/events-ics-route.test.ts`** — route-handler tests for
-  both endpoints, mirroring the `jest.mock`/chainable-Supabase-mock style of
-  `tests/unit/app/api/events-route.test.ts`: 401 (no Clerk userId / no JWT),
-  404 (not an attendee / event doesn't exist / zero assigned events /
-  `serviceWeekId` matches nothing), 400 (invalid `serviceWeekId`), 500 on any
-  Supabase error, and 200 happy paths asserting `Content-Type: text/calendar;
-  charset=utf-8`, the `Content-Disposition: attachment` filename, and VEVENT
-  count/content (including the `serviceWeekId`-scoped case and confirming
-  null location/notes don't produce empty `LOCATION:`/`DESCRIPTION:` lines).
+- `bun run lint` — clean (ESLint, no errors).
+- `bun run typecheck` — clean (`tsc --noEmit`, no errors).
+- `bun run test` — 77 suites / 968 tests, all passing (docs-only change, no
+  test behavior affected).
+- `bun run check:service-role` — OK, no service-role key references found
+  outside comments in `app/` or `lib/` (unaffected by this change, run as a
+  sanity check since `.env.example` was touched).
+- Confirmed via `git diff origin/main...HEAD` (before committing) that HEAD
+  and `origin/main` were identical — i.e. no prior commit on this branch had
+  already implemented this issue, so this pass's commit is genuinely new
+  work.
+- Cross-checked every concrete claim in spec.md against the actual files:
+  `lib/google-calendar/oauth.ts` (`CALENDAR_EVENTS_SCOPE`, env var names),
+  `lib/google-calendar/token-crypto.ts` (base64 / 32-byte / AES-256-GCM
+  requirement), `lib/r2/client.ts` (env var names, `region: "auto"`,
+  `forcePathStyle: true`, 30-minute presign expiry), and
+  `app/api/google-calendar/callback/route.ts` (confirms the fixed callback
+  path). All matched the spec's description.
 
 ## What the Tester should focus on
 
-- The empty-export decision: zero matching assigned events is a 404
-  (`"No events to export"`), not a 200 with an empty calendar — both for the
-  full-export endpoint (zero attendee rows) and the `serviceWeekId`-filtered
-  case (attendee rows exist but none match the week).
-- The attendee-scoping distinction: both endpoints check `event_attendees`
-  (the #60 attendee model), not the invitation-scoped list used by
-  `GET /api/events` — confirm a caller who has an *invitation* but is not an
-  assigned *attendee* still gets a 404 from `GET /api/events/:id/ics`.
-- `escapeIcsText`/`foldLine` correctness on the actual `generateIcs` output
-  (not just the pure functions in isolation) — e.g. a `notes`/`location`
-  value containing `,`, `;`, `\`, or embedded newlines, run through the full
-  handler.
-- Line folding on a genuinely long `notes` value end-to-end through the
-  handler (schema allows unbounded length; the generator must fold it).
-- No new dependency was added — `bun.lock` is untouched; confirm
-  `bun run lint && bun run typecheck && bun run test` all still pass clean
-  (they did in this stage: 75 suites / 960 tests passed, 0 lint errors, 0
-  typecheck errors).
-- No UI was added or wired — this is intentionally out of scope per the
-  spec (member-week screen is still a placeholder).
+- **No secrets leaked**: grep the diff for anything that looks like a real
+  key/token/id (there should be none — only placeholder text, prose, and
+  comment lines).
+- **`.env.example` placeholder lines are unchanged and still empty** — only
+  comments were added above the Google Calendar and Cloudflare R2 blocks.
+- **Runbook accuracy**: the redirect URI path
+  (`/api/google-calendar/callback`), the scope
+  (`https://www.googleapis.com/auth/calendar.events`, write-only, no read
+  scope), the `TOKEN_ENCRYPTION_KEY` format (base64, exactly 32 decoded
+  bytes, `openssl rand -base64 32`), and the R2 endpoint shape
+  (`https://<account-id>.r2.cloudflarestorage.com`, account-level not
+  bucket-level) all need to match the actual code paths referenced above.
+- **README and staging-environment.md cross-references** render correctly
+  and don't duplicate the runbook's content (they're pointers only).
+- **This is a docs-only change** — confirm no application code, tests, or
+  CI workflows were modified (the diff should only touch the four
+  documentation/config files listed above, plus `.pipeline/spec.md`).
