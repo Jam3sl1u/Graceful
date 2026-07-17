@@ -1,316 +1,164 @@
-# Spec — Issue #63: iCal (.ics) export fallback
+# Spec — Issue #64: Build Setlist Builder screen
+
+Two-panel Set Leader screen at `/setlists/[id]` (`[id]` = **setlist id**): left =
+song search + quick-add; right = ordered setlist with per-song key/notes/drag/remove;
+bottom bar = song count + Publish (with confirmation). Wires to the already-built
+#55/#56/#57 endpoints, plus two small enabling backend changes noted below.
 
 ## OPEN QUESTIONS
 
-None. This is buildable as specified. See **Decisions** for two choices I made
-that are defensible without human sign-off (both are implementation choices,
-not product decisions requiring a human).
+None blocking. Two deliberate, low-risk decisions are called out inline (a new
+read endpoint, and per-song notes persistence) — both are required to satisfy the
+acceptance criteria and are speced concretely below rather than left ambiguous.
 
-## Goal (scope)
+## Current state (verified)
 
-Let a member download their **assigned** events as a valid `.ics` file so they
-can import into any calendar app, independent of Google Calendar connection
-status. Export-only. Two-way sync is out of scope.
+- `app/(app)/setlists/[id]/page.tsx` is a stub: `<h1>Setlist Builder — coming soon</h1>`.
+- Backend for editing already exists in `app/api/setlists/[id]/handler.ts`:
+  - `POST /api/setlists/:id/songs` (`addSetlistSong`) — adds one song, BR-07 dup → 409, returns `{ songs }` (201).
+  - `DELETE /api/setlists/:id/songs/:songId` (`removeSetlistSong`) — removes + recompacts positions, returns `{ songs }`.
+  - `PUT /api/setlists/:id` (`reorderSetlist`) — full reorder + key overrides, returns `{ songs }`. Body must contain **exactly** the setlist's current song set; position is derived from array index (1-based). Editing 409s if the setlist is published.
+  - `POST /api/setlists/:id/publish` (`publishSetlist`) — draft→published, BR-01 zero songs is valid.
+  - `POST /api/setlists/:id/unlock` (`unlockSetlist`) — published→draft.
+- `GET /api/songs?q=` (`listSongs`) returns the whole catalog (`{ songs: [{id,title,artist,defaultKey,bpm,tags,...}] }`), optional case-insensitive title/artist filter. `POST /api/songs` (`createSong`) creates a catalog song (201, `{ song }`).
+- **Gap 1:** there is NO endpoint that returns a setlist + its ordered songs by setlist id. `setlist_songs` are only ever returned as a side effect of add/remove/reorder. The builder needs an initial read → add `GET /api/setlists/:id` (below).
+- **Gap 2:** `setlist_songs.notes` is returned in responses but NO endpoint accepts writing it. `reorderSetlistSchema` and `addSetlistSongSchema` have no `notes`. The AC requires an editable per-song notes field → extend the PUT reorder path to persist notes (below).
+- `SetlistSongResponse` (from `app/api/setlists/[id]/handler.ts`) has NO `title`/`artist` — only `songId`, `position`, `keyOverride`, `defaultKey`, `effectiveKey`, `isOverridden`, `notes`. The builder must map title/artist by `songId` from the `/api/songs` catalog it already loads. Do NOT change `toSetlistSongResponse` / `SetlistSongResponse` shape — existing tests assert both directly.
+- Response envelope: success `{ data: ... }`, error `{ error, code }` (`lib/api/response.ts`). Client reads `body.data.*`.
+- No drag-and-drop library is installed. Use **native HTML5 DnD** (`draggable`, `onDragStart`/`onDragOver`/`onDrop`). Do NOT add any dependency.
+- UI kit: `components/ui/Button.tsx` (`variant="primary"|"secondary"`), `components/ui/Badge.tsx` (`tone`), `components/ui/Modal.tsx` (`{ open, onClose, children }`).
+- Valid key list lives in `schemas/songs.ts` as the ordered `ASCII_SONG_KEYS` (17 keys) — currently NOT exported.
 
-"Assigned events" = rows in `event_attendees` where `user_id` is the caller
-(the attendee model from #60), NOT the invitation-scoped list used by
-`GET /api/events`. This matches the AC wording ("a member's assigned events").
+## Backend changes
 
-Two entry points, both scoped to the caller's own attendee rows:
-- **Single event**: `GET /api/events/[id]/ics`
-- **Full schedule / week**: `GET /api/events/ics` (optional `?serviceWeekId=<uuid>`
-  filter narrows it to one service week — this is the "full week" case).
+### 1. Add `GET /api/setlists/:id` → returns setlist + ordered songs
 
-No role gate: any authenticated member (`guest`/`member`/`set_leader`/`admin`)
-may export their own assigned events. RLS already tenant-scopes `events` and
-`event_attendees`, so the caller's own JWT-scoped Supabase client is sufficient
-(no SECURITY DEFINER RPC needed here).
+`app/api/setlists/[id]/handler.ts` — add exported `getSetlistWithSongs(req, id, lookup?)`:
+- `requireAuth`; `requireRole(ctx, ["admin", "set_leader"])` (this is the Set Leader editing surface).
+- Get supabase JWT client (same `auth()`/`getToken({ template: "supabase" })` pattern as siblings).
+- Load setlist tenant-scoped: `.from("setlists").select("*").eq("id", id).eq("church_group_id", ctx.churchGroupId).maybeSingle()`. Missing → `fail("Setlist not found", ErrorCode.NOT_FOUND, 404)`. DB error → 500.
+- Reuse the existing private `loadSongResponses(supabase, id)` helper for the ordered songs; on error → 500.
+- Return `ok({ setlist: toSetlistResponse(data), songs })`. (Return for both draft and published — the client needs status to render the locked state.)
+- Wrap in the same `try/catch` mapping `ApiException` → `fail(err.message, err.code, err.status)`, else 500.
 
-## Decisions
-
-- **DECISION 1 — hand-rolled generator, no new dependency.** The issue says a
-  library is "sufficient", not required. The repo already hand-rolls its
-  Google Calendar integration via `fetch` (`lib/google-calendar/sync.ts`) and
-  avoids unnecessary deps. A minimal, single-`VEVENT`-per-event RFC 5545
-  generator is small, fully unit-testable with no network, and avoids adding a
-  package + `bun.lock` churn during the coding stage. Build it in `lib/ical/`.
-  Do NOT run `bun add`.
-- **DECISION 2 — empty export is a 404, not an empty calendar.** RFC 5545
-  requires a `VCALENDAR` to contain at least one component, and some importers
-  reject a component-less calendar. So when the caller has zero matching
-  assigned events, return `404 NOT_FOUND` ("No events to export") rather than a
-  200 with an empty file.
-
-## UI scope
-
-**No UI in this issue.** The member week screen
-(`app/(app)/member-week/[id]/page.tsx`) is still a `"coming soon"` placeholder,
-so there is nowhere to correctly place a member-facing download button yet. The
-endpoints below set `Content-Disposition: attachment`, so hitting the URL
-directly downloads the file — that is the deliverable download mechanism.
-Wiring a button belongs with the member-week screen build (separate issue). Do
-not build a new screen here.
-
-## Files to create
-
-### 1. `lib/ical/generate.ts` — pure ICS generator (no `server-only`; keep unit-testable)
-
-Follow the pure-function + heavy-comment style of `schemas/events.ts`.
-
+`app/api/setlists/[id]/route.ts` — add:
 ```ts
-export type IcalEventInput = {
-  uid: string;          // globally-unique, stable per event
-  title: string;        // maps to SUMMARY
-  start: string;        // ISO 8601 with offset (events.start_time)
-  end: string;          // ISO 8601 with offset (events.end_time)
-  location?: string | null;   // omit LOCATION line when null/empty
-  description?: string | null; // omit DESCRIPTION line when null/empty
-};
-
-// Serializes one or more events into a single RFC 5545 VCALENDAR string.
-// `now` is injectable so DTSTAMP is deterministic in tests.
-export function generateIcs(
-  events: IcalEventInput[],
-  opts?: { now?: Date },
-): string;
-
-// Exported for unit testing:
-export function formatIcsDate(date: Date): string;   // -> "YYYYMMDDTHHMMSSZ" (UTC)
-export function escapeIcsText(value: string): string; // RFC 5545 3.3.11
-export function foldLine(line: string): string;       // 75-octet folding
-```
-
-Required output rules (all mandatory for a valid, importable file):
-
-- **CRLF (`\r\n`) line endings everywhere**, including a trailing CRLF after the
-  final `END:VCALENDAR`.
-- Calendar wrapper, in order:
-  - `BEGIN:VCALENDAR`
-  - `VERSION:2.0`
-  - `PRODID:-//Graceful//Graceful//EN`
-  - `CALSCALE:GREGORIAN`
-  - `METHOD:PUBLISH`
-  - ...one `VEVENT` block per event...
-  - `END:VCALENDAR`
-- Each `VEVENT`, in order:
-  - `BEGIN:VEVENT`
-  - `UID:<uid>`
-  - `DTSTAMP:<formatIcsDate(now)>`  (now defaults to `new Date()`)
-  - `DTSTART:<formatIcsDate(new Date(start))>`
-  - `DTEND:<formatIcsDate(new Date(end))>`
-  - `SUMMARY:<escapeIcsText(title)>`
-  - `LOCATION:<escapeIcsText(location)>`  (omit line entirely if null/empty/whitespace)
-  - `DESCRIPTION:<escapeIcsText(description)>`  (omit line entirely if null/empty/whitespace)
-  - `END:VEVENT`
-- `formatIcsDate`: convert to UTC basic format. Implementation:
-  `date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")`
-  e.g. `2026-07-12T09:00:00.000Z` -> `20260712T090000Z`.
-- `escapeIcsText`: escape in this order — backslash `\` -> `\\`, then `;` -> `\;`,
-  `,` -> `\,`, and CRLF/CR/LF -> `\n`.
-- `foldLine`: any content line longer than 75 octets must be folded — split into
-  <=75-octet chunks joined by `\r\n ` (CRLF + single space). Apply folding to
-  each assembled content line (property name + value) before joining. Simplest
-  correct approach: build each property line as a string, run `foldLine` on it,
-  then join all lines with CRLF.
-
-### 2. `app/api/events/[id]/ics/handler.ts` — single-event export
-
-Mirror the auth/JWT boilerplate of `app/api/events/[id]/handler.ts`.
-
-```ts
-export async function exportEventIcs(
-  req: NextRequest,
-  id: string,
-  lookup?: UserLookup,
-): Promise<Response>;
-```
-
-Logic:
-1. `ctx = await requireAuth(req, lookup)` (no `requireRole`).
-2. Resolve Supabase JWT exactly like existing handlers; missing JWT ->
-   `fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401)`.
-3. Verify the caller is an attendee of this event:
-   ```ts
-   supabase.from("event_attendees").select("id")
-     .eq("event_id", id).eq("user_id", ctx.userId).maybeSingle()
-   ```
-   On error -> 500. On no row -> `fail("Not found", ErrorCode.NOT_FOUND, 404)`
-   (do not leak events the caller is not assigned to).
-4. Fetch the event row:
-   ```ts
-   supabase.from("events")
-     .select("id, name, location, notes, start_time, end_time")
-     .eq("id", id).maybeSingle()
-   ```
-   On error -> 500. On no row -> 404.
-5. Build one `IcalEventInput` (see mapping below), call `generateIcs([...])`,
-   return via `icsResponse(ics, filename)` (see helper below). Filename:
-   `icsFilename(event.name)`.
-
-### 3. `app/api/events/[id]/ics/route.ts`
-
-Mirror `app/api/events/[id]/route.ts`:
-
-```ts
-import { NextRequest } from "next/server";
-import { exportEventIcs } from "./handler";
-
-type Ctx = { params: Promise<{ id: string }> };
-
 export async function GET(req: NextRequest, { params }: Ctx): Promise<Response> {
   const { id } = await params;
-  return exportEventIcs(req, id);
+  return getSetlistWithSongs(req, id);
+}
+```
+Keep the existing `PUT` export unchanged.
+
+### 2. Persist per-song `notes` through the PUT reorder path
+
+`schemas/setlists.ts` — extend `reorderSetlistSchema`'s per-song object with an optional notes field:
+```ts
+notes: z.string().trim().max(1000).nullish(),
+```
+(Leave `addSetlistSongSchema` unchanged — notes are added via PUT after a song is in the setlist.)
+
+`app/api/setlists/[id]/handler.ts`, inside `reorderSetlist`'s per-song update loop — only touch `notes` when the client actually sent it, so existing reorder callers (that omit notes) do NOT wipe notes:
+```ts
+const update: Record<string, unknown> = {
+  position: i + 1,
+  key_override: entry.keyOverride ?? null,
+};
+if (entry.notes !== undefined) update.notes = entry.notes ?? null;
+// ...supabase.from("setlist_songs").update(update as unknown as ...Update)
+```
+`entry.notes === undefined` (field absent) → leave the column as-is; `null` → clear it; string → set it. Do not change any other reorder behavior (membership check, position rewrite, response).
+
+### 3. Export the ordered key list for the dropdown
+
+`schemas/songs.ts` — add `export const SONG_KEY_OPTIONS = ASCII_SONG_KEYS;` (the ordered 17-key ASCII array). Do NOT change `VALID_SONG_KEYS` / `isValidSongKey`.
+
+## Frontend
+
+### `app/(app)/setlists/[id]/page.tsx` (replace the stub)
+
+Server wrapper mirroring `app/(app)/week/[id]/page.tsx`:
+```tsx
+import SetlistBuilder from "./setlist-builder";
+export default async function SetlistBuilderPage({
+  params,
+}: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  return <SetlistBuilder setlistId={id} />;
 }
 ```
 
-### 4. `app/api/events/ics/handler.ts` — full schedule / week export
+### `app/(app)/setlists/[id]/setlist-builder.tsx` (new, `"use client"`)
 
+Follow `app/(app)/week/[id]/week-view.tsx` for structure: local minimal types, `ViewState` union, `useEffect` load with a `cancelled` guard, view-state early returns, CSS module.
+
+Signature: `export default function SetlistBuilder({ setlistId }: { setlistId: string })`.
+
+Local types (subset of the envelopes above):
 ```ts
-export async function exportEventsIcs(
-  req: NextRequest,
-  lookup?: UserLookup,
-): Promise<Response>;
+type CatalogSong = { id: string; title: string; artist: string | null; defaultKey: string | null };
+type SetlistSong = { songId: string; position: number; keyOverride: string | null; defaultKey: string | null; effectiveKey: string | null; notes: string | null };
+type SetlistMeta = { id: string; status: "draft" | "published" };
+type ViewState = "loading" | "ready" | "forbidden" | "not-found" | "error";
 ```
 
-Logic:
-1. `ctx = await requireAuth(req, lookup)` (no role gate).
-2. Read optional filter: `const serviceWeekId = req.nextUrl.searchParams.get("serviceWeekId")`.
-   If present, validate it is a uuid (reuse `z.string().uuid()` from zod, or a
-   simple regex). Invalid -> `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)`.
-3. Resolve Supabase JWT (same 401 path as above).
-4. Get the caller's assigned event ids:
-   ```ts
-   supabase.from("event_attendees").select("event_id").eq("user_id", ctx.userId)
-   ```
-   -> `eventIds = [...new Set(rows.map(r => r.event_id))]`.
-   If `eventIds.length === 0` -> `fail("No events to export", ErrorCode.NOT_FOUND, 404)`.
-5. Fetch those events, newest-first-agnostic ordering by start time ascending:
-   ```ts
-   let q = supabase.from("events")
-     .select("id, name, location, notes, start_time, end_time")
-     .in("id", eventIds)
-     .order("start_time", { ascending: true });
-   if (serviceWeekId) q = q.eq("service_week_id", serviceWeekId);
-   ```
-   On error -> 500. If the result is empty (e.g. `serviceWeekId` matched none of
-   their events) -> `fail("No events to export", ErrorCode.NOT_FOUND, 404)`.
-6. Map every row to `IcalEventInput`, `generateIcs(...)`, return via
-   `icsResponse(ics, filename)`. Filename: `graceful-events.ics` (or
-   `graceful-week-<serviceWeekId truncation not needed>` — keep it simple, use
-   `graceful-events.ics` in both cases).
+**Initial load** (`Promise.all`):
+- `GET /api/setlists/${setlistId}` → 403 → `forbidden`; 404 → `not-found`; other non-ok → `error`. On ok, set `songs = body.data.songs`, `meta = { id, status } = body.data.setlist`.
+- `GET /api/songs` → catalog for title/artist lookup + search. If it 403s treat as forbidden; other failure → degrade search to empty (non-critical), still render.
+- Build `catalogById: Map<songId, CatalogSong>` so the right panel can resolve title/artist (and defaultKey) per setlist song.
 
-### 5. `app/api/events/ics/route.ts`
+**Left panel — search + quick-add:**
+- Text input filtering the catalog client-side (case-insensitive substring on title OR artist). (Server `?q=` is available but client-side filter over the already-loaded catalog is sufficient and simpler.)
+- Each result row: title, artist, defaultKey, and an "Add" button (disabled if the song's `id` is already in `songs`). Add → `POST /api/setlists/${setlistId}/songs` `{ songId }`; on 409 show inline "That song is already in the setlist."; on ok replace `songs` from `body.data.songs`.
+- Quick-add form shown when the search term is non-empty and no catalog row matches: title (prefilled with the search term, required), artist (optional), key `<select>` from `SONG_KEY_OPTIONS` plus a blank "— none —" option (optional). Submit → `POST /api/songs` `{ title, artist?, default_key? }`; on ok, add the returned `body.data.song` to the local catalog AND immediately `POST .../songs { songId }` to put it in the setlist, then refresh `songs` from that response. Surface a validation/failure message inline.
 
-```ts
-import { NextRequest } from "next/server";
-import { exportEventsIcs } from "./handler";
+**Right panel — the setlist (ordered):**
+- Empty state when `songs.length === 0`.
+- Each row (ordered by `position`): position number, title + artist (from `catalogById`), a key `<select>` (options = `SONG_KEY_OPTIONS`, plus a blank option meaning "no key"/null), a notes text input, a drag handle, and a Remove button.
+  - **Key select** value = `effectiveKey ?? ""`. On change: compute the song's `defaultKey`; if the chosen value equals `defaultKey` (or both empty) send `keyOverride: null` (using default), otherwise send the chosen key. Persist via the reorder PUT (below) with the updated per-song `keyOverride`.
+  - **Notes input** — persist on blur (not per keystroke) via the reorder PUT, sending that song's `notes`.
+  - **Remove** → `DELETE /api/setlists/${setlistId}/songs/${songId}`; on ok replace `songs` from `body.data.songs`.
+- **Drag reorder** (native HTML5): dragging a row and dropping onto another reorders the local array, then persist via the reorder PUT.
 
-export async function GET(req: NextRequest): Promise<Response> {
-  return exportEventsIcs(req);
-}
-```
+**Persistence via PUT (single mechanism for reorder + key + notes):**
+`PUT /api/setlists/${setlistId}` body `{ songs: [{ songId, keyOverride, notes }, ...] }` in the desired display order — always send the **full current** song set (the endpoint requires exact membership match and derives position from array index). On ok, replace local `songs` from `body.data.songs` (authoritative positions/keys/notes). On non-ok show a non-blocking inline error and reload from `GET /api/setlists/:id` to resync.
 
-Note: `ics` is a static segment sibling of `[id]` under `app/api/events/`; Next
-resolves the static `ics` path before `[id]`, and no real event UUID equals
-"ics", so there is no route collision.
+**Bottom bar:**
+- Song count (e.g. `songs.length === 1 ? "1 song" : \`${songs.length} songs\``).
+- **Publish** button — NOT disabled at zero songs (BR-01). Clicking opens a confirmation step (use `components/ui/Modal.tsx`): confirm copy that, when `songs.length === 0`, explicitly notes the setlist will be published with no songs yet. Confirm → `POST /api/setlists/${setlistId}/publish`; on ok set `meta.status = "published"` and render the locked state; on 409 show "Setlist is already published."; other failure → inline error.
 
-## Shared helpers (put in the two handlers or a tiny local module)
+**Published (locked) state:** when `meta.status === "published"`, disable all editing controls (add / key / notes / drag / remove / publish) and show a banner with an **Unlock to edit** button → `POST /api/setlists/${setlistId}/unlock`; on ok set `meta.status = "draft"` and re-enable editing. (All the editing endpoints already 409 on a published setlist; this just makes the UI coherent instead of letting the user hit dead 409s.)
 
-Add these small helpers. Simplest: define once in `lib/ical/generate.ts` and
-import into both handlers (keeps handlers thin). Your call, but do not duplicate
-divergent copies.
+**View-state renders** (copy the loading/forbidden/not-found/error blocks from `week-view.tsx`):
+- `forbidden`: "This screen is available to Set Leaders and Admins only."
+- `not-found`: "Setlist not found".
+- `error`: generic "Something went wrong".
 
-```ts
-// Builds the text/calendar attachment Response.
-export function icsResponse(ics: string, filename: string): Response {
-  return new NextResponse(ics, {
-    status: 200,
-    headers: {
-      "Content-Type": "text/calendar; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${filename}"`,
-    },
-  });
-}
+### `app/(app)/setlists/[id]/setlist-builder.module.css` (new)
 
-// Safe download filename from an event name: lowercase, non-alnum -> "-",
-// collapse repeats, trim leading/trailing "-", fall back to "event", add ".ics".
-export function icsFilename(name: string): string;
-```
+Desktop-first two-column layout (left search panel / right setlist), a sticky/fixed bottom bar, and row styling. Copy variable usage + container conventions from `app/(app)/week/[id]/week-view.module.css` (`.container` max-width, `var(--color-*)`). No global style changes.
 
-`NextResponse` is imported from `next/server`. `icsResponse` uses `NextResponse`,
-so if you place it in `lib/ical/generate.ts` keep that file free of `server-only`
-but importing `next/server` is fine. (Alternative: keep `icsResponse`/`icsFilename`
-inline in each handler and keep `generate.ts` framework-free. Either is acceptable
-— pick one and be consistent.)
+## Edge cases the implementation must handle
 
-## Row -> IcalEventInput mapping (identical in both handlers)
+- **Zero songs:** right panel empty state; Publish still enabled; confirmation still shown with the "no songs yet" wording.
+- **Search no match:** show the quick-add form (title required; artist + key optional).
+- **Duplicate add:** POST songs → 409 → inline "already in the setlist"; do not mutate local state.
+- **Published setlist on load:** render locked/read-only with an Unlock affordance; editing controls disabled.
+- **Key = default:** selecting the option equal to the song's `defaultKey` clears the override (send `keyOverride: null`). Song with `defaultKey === null`: blank option = null.
+- **Notes:** empty notes → `null`; persist on blur only; never wipe another song's notes (PUT always sends every song's current notes).
+- **Reorder to same slot / no-op drag:** harmless; safe to skip the PUT or send it — either is fine.
+- **403 / 404 / 500** on initial load → `forbidden` / `not-found` / `error` views. Mutation failures → non-blocking inline error, and on PUT failure resync from GET.
+- **Backend:** `getSetlistWithSongs` must be tenant-scoped (404 for other-tenant/missing, never leak existence via 403). PUT reorder must NOT wipe `notes` when the client omits the field (`entry.notes === undefined` → leave column unchanged).
 
-```ts
-{
-  uid: `${row.id}@graceful.app`, // stable + globally unique per event
-  title: row.name,
-  start: row.start_time,
-  end: row.end_time,
-  location: row.location,   // may be null
-  description: row.notes,   // may be null
-}
-```
+## Explicitly out of scope
 
-## Edge cases the implementation MUST handle
+- Spotify autocomplete / metadata enrichment (issue: nice-to-have, Phase-1 optional).
+- Wiring the "Edit setlist" button in `app/(app)/week/[id]/week-view.tsx` (it has a `TODO(#64)`) — the builder is reachable directly by setlist id; entry-point wiring is not in this issue's AC. Leave the TODO as-is.
+- Any change to `toSetlistSongResponse` / `SetlistSongResponse` shape, or to `addSetlistSongSchema`.
 
-1. **Unauthenticated / missing JWT** -> 401 (`requireAuth` throws
-   `ApiException`; missing supabase JWT -> explicit 401 `fail`), matching every
-   existing events handler.
-2. **Single event the caller is not assigned to (or nonexistent)** -> 404
-   (do not distinguish "exists but not yours" from "doesn't exist").
-3. **Zero assigned events (full export)** -> 404 "No events to export".
-4. **`serviceWeekId` filter matches none of the caller's assigned events** -> 404.
-5. **Invalid `serviceWeekId` query param** -> 400 VALIDATION_FAILED.
-6. **null `location` / `notes`** -> omit the `LOCATION` / `DESCRIPTION` line
-   entirely (do not emit an empty-value line).
-7. **Text with `,` `;` `\` or newlines** in name/location/notes -> escaped per
-   `escapeIcsText`.
-8. **Long `notes`** (schema allows unbounded length) -> line-folded at 75 octets.
-9. **Timezone correctness** -> stored times are `timestamptz` ISO strings;
-   `DTSTART`/`DTEND` must be emitted in UTC `...Z` basic format (no local-time
-   drift). `formatIcsDate` handles this via `toISOString()`.
-10. **CRLF endings + trailing CRLF** — required; LF-only files fail strict parsers.
-11. **Supabase query error** at any step -> `fail("Internal error", ErrorCode.INTERNAL, 500)`.
-12. Wrap each handler body in `try/catch`, ending with the standard
-    `if (err instanceof ApiException) return fail(...)` / else 500, exactly like
-    the existing events handlers.
+## Verify before finishing
 
-## Tests to add (tester stage will also add its own)
-
-Mirror the mocking style of `tests/unit/app/api/events-route.test.ts`
-(`jest.mock` for `@clerk/nextjs/server` and `@/lib/supabase/client`; fake
-`UserLookup`).
-
-- `tests/unit/lib/ical/generate.test.ts`:
-  - happy path: known event -> asserts VCALENDAR/VEVENT structure, correct
-    `DTSTART`/`DTEND` UTC values, CRLF endings, `DTSTAMP` via injected `now`.
-  - escaping: `,`/`;`/`\`/newline in title & description.
-  - null location/notes -> lines omitted.
-  - long description -> folded lines (each physical line <= 75 octets, folded
-    continuation starts with a single space).
-- `tests/unit/app/api/events-ics-route.test.ts`:
-  - single event happy path -> 200, `Content-Type: text/calendar; charset=utf-8`,
-    `Content-Disposition` attachment header, body contains one `VEVENT`.
-  - single event, caller not an attendee -> 404.
-  - full export happy path (multiple events) -> 200, body contains N `VEVENT`s.
-  - full export, zero assigned events -> 404.
-  - unauthenticated (null JWT) -> 401.
-  - invalid `serviceWeekId` -> 400.
-
-## Patterns to copy (named files)
-
-- Handler auth/JWT/try-catch/`ok`/`fail` shape: `app/api/events/[id]/handler.ts`
-  and `app/api/events/handler.ts`.
-- Attendee lookup by `event_id`+`user_id`: `app/api/events/[id]/attendees/handler.ts`.
-- Route `params` unwrapping: `app/api/events/[id]/route.ts`.
-- Pure, heavily-commented, unit-testable helper module: `schemas/events.ts`.
-- Test mocking harness: `tests/unit/app/api/events-route.test.ts`.
-
-## Verify before finishing (coding stage)
-
-`bun run lint`, `bun run typecheck`, `bun run test`. Do not use npm/npx.
+`bun run lint`, `bun run typecheck`, `bun run test` (Jest). Existing setlist route tests
+(`tests/unit/app/api/setlists-songs-route.test.ts`, `setlists-key-override.test.ts`,
+`setlists-publish-route.test.ts`) must still pass — the notes change is additive/guarded and
+`toSetlistSongResponse` is untouched.
