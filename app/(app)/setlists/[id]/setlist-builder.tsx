@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type DragEvent, type FormEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
@@ -47,6 +47,7 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
   const [quickAddArtist, setQuickAddArtist] = useState("");
   const [quickAddKey, setQuickAddKey] = useState("");
   const [quickAddError, setQuickAddError] = useState<string | null>(null);
+  const wasQuickAddShownRef = useRef(false);
 
   const [persistError, setPersistError] = useState<string | null>(null);
   const [draggedSongId, setDraggedSongId] = useState<string | null>(null);
@@ -117,6 +118,19 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
       cancelled = true;
     };
   }, [setlistId]);
+
+  useEffect(() => {
+    const term = searchTerm.trim().toLowerCase();
+    const hasMatch = catalog.some(
+      (c) => c.title.toLowerCase().includes(term) || (c.artist ?? "").toLowerCase().includes(term),
+    );
+    const showQuickAdd = term !== "" && !hasMatch;
+
+    if (showQuickAdd && !wasQuickAddShownRef.current) {
+      setQuickAddTitle(searchTerm);
+    }
+    wasQuickAddShownRef.current = showQuickAdd;
+  }, [searchTerm, catalog]);
 
   const isLocked = meta?.status === "published";
   const catalogById = new Map(catalog.map((c) => [c.id, c]));
