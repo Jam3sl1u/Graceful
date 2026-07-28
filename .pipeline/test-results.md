@@ -1,125 +1,129 @@
-# Test Results — Issue #65: Build Member Week View screen
+# Test Results — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
 
-This overwrites the stale `test-results.md` for issue #63 that was still
-sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
-recent run).
+## Summary: ALL PASS
 
-## Verdict: ALL PASS
+Independently re-ran every verification the Coding stage claimed, and added
+the Jest unit coverage the spec explicitly assigned to the Testing stage
+(`.pipeline/spec.md` "For the Testing stage (not the Coder's job)" and
+`.pipeline/changes.md` "For the Testing stage to focus on").
 
-## Summary
+## New test file added by this stage
 
-All checks pass. Two new test files were written (as named in `.pipeline/spec.md`
-under "Tests for the Testing stage") and independently verify the coder's
-claims — the coder's `changes.md` explicitly deferred writing these to this
-stage, which matches the pipeline contract.
+### `tests/unit/e2e-support/google.test.ts` (new)
 
-## Commands run
+Covers `tests/e2e/support/google.ts`'s two hand-duplicated pure functions
+(`toGoogleEventId`, `encryptE2EToken`) plus its env-gating (`googleSyncEnabled`,
+`e2eCalendarId`) — per the spec's explicit assignment of this file to the
+Testing stage, since Jest (unlike Playwright) maps `server-only` to a mock and
+can therefore import both the real `lib/google-calendar/` implementations and
+the `tests/e2e/support/` duplicates side by side.
 
-- `bun run typecheck` — clean, no errors.
-- `bun run lint` — clean, no errors/warnings.
-- `bun run test` — **79 suites / 1004 tests pass**, 0 failures (77 suites /
-  968 tests pre-existing per the coder's baseline + 2 new suites / 36 new
-  tests added by this stage). No regressions in any pre-existing suite.
+- **Happy path**: `toGoogleEventId` agrees with `lib/google-calendar/sync.ts`'s
+  version for a representative uuid; `encryptE2EToken` round-trips through
+  `lib/google-calendar/token-crypto.ts`'s `decryptToken`; `googleSyncEnabled`
+  is `true` when all base E2E vars + the four Google vars are set;
+  `e2eCalendarId()` returns the env var when set.
+- **Edge cases (named/implied by the spec)**:
+  - `toGoogleEventId` agreement holds for a uuid with uppercase hex digits
+    (both sides lowercase).
+  - `encryptE2EToken` produces a distinct ciphertext (distinct IV) for two
+    encryptions of the same plaintext (mirrors the analogous test in
+    `tests/unit/lib/google-calendar/token-crypto.test.ts`).
+  - `googleSyncEnabled` is `false` when any one of the four Google-specific
+    vars is missing.
+  - `googleSyncEnabled` is `false` when the Google vars are all set but a base
+    `REQUIRED_VARS` var (e.g. `STAGING_APP_URL`) is missing — verifies
+    `checkEnv(GOOGLE_SYNC_VARS)`'s actual AND semantics with the base vars
+    (discovered by writing the test — see "Note" below).
+  - `e2eCalendarId()` defaults to `"primary"` when unset.
+- **Failure cases**:
+  - `encryptE2EToken` throws `"E2E_TOKEN_ENCRYPTION_KEY must decode to exactly
+    32 bytes"` for a malformed key.
+  - `encryptE2EToken` throws `"Missing required env var for E2E tests:
+    E2E_TOKEN_ENCRYPTION_KEY"` when the key env var is unset.
 
-## New test files written
+Result: **11/11 passed** (`bun run test -- tests/unit/e2e-support/google.test.ts`).
 
-### `tests/unit/app/api/service-weeks-member-view-route.test.ts` (20 tests)
+**Note (not a bug):** my first draft assumed `googleSyncEnabled` only depended
+on the four `GOOGLE_SYNC_VARS`. It also requires the base `REQUIRED_VARS` from
+`tests/e2e/support/env.ts`, because `checkEnv(extra)` always ANDs
+`REQUIRED_VARS` with whatever `extra` array is passed — `google.ts` calls
+`checkEnv(GOOGLE_SYNC_VARS)`, so both sets are required together. This matches
+the spec's description ("checked via `checkEnv`") and `calendar-sync.spec.ts`'s
+own `calendarSyncReady = e2eAuthEnabled && googleSyncEnabled` (redundant-looking
+but consistent with this semantics). I corrected the test to assert the actual
+(correct) behavior rather than my initial wrong assumption.
 
-Mirrors `tests/unit/app/api/song-documents-route.test.ts` / the setlist route
-test's `makeChain`/`makeLookup`/`setUpAuth` helpers, with a per-table
-`from(table)` dispatcher covering all 12 tables the handler touches
-(`service_weeks`, `invitations`, `setlists`, `setlist_songs`, `songs`,
-`events`, `event_attendees`, `users`, `member_profiles`, `member_instruments`,
-`instruments`, `song_documents`).
+## Independent re-verification of the Coding stage's claims
 
-Covers:
-- Auth/authz: 401 (no Clerk user, no JWT), 403 for guest (and confirms
-  `getSupabaseClient` is never constructed for a rejected role), 200 for each
-  of admin/set_leader/member.
-- Happy path: full aggregate payload — `serviceWeek` summary, `confirmationStatus`,
-  `setlist.songs` with correct `effectiveKey` resolution and ordering, `events`
-  with per-event `assigned`, `team` sorted by name with correct
-  `vocalCapability`/`instruments` per member (including the "no profile" →
-  `vocalCapability: "none"`, `instruments: []` case), `documents` with a
-  freshly-minted `downloadUrl` and **no `file_key` anywhere in the response**
-  (spec edge case 13).
-- Edge case 1 (404 for missing/other-tenant week) + a 500 path when the
-  `service_weeks` query itself errors.
-- Edge case 2 (no setlist row → `null`; **draft** setlist row → `null`, as a
-  defense-in-depth check beyond RLS).
-- Edge case 3 (published setlist, zero songs → `{status:"published",songs:[]}`,
-  distinct from `null`).
-- Edge case 4 (`effectiveKey` null when both `key_override` and `default_key`
-  are null).
-- Edge case 5 / 8 (no events → `events: []`, `team: []`, and — verified via a
-  `from` spy — the handler never calls `.from("event_attendees")` or
-  `.from("users")` when there are no events, i.e. the empty-`.in()` guard is
-  real, not just claimed).
-- Edge case 6 (member assigned to only some events — per-event `assigned`
-  differs, but `team` still reflects the full attendee set across all events).
-- Edge case 9 (`getDownloadUrl` rejecting → `documents: []`, endpoint still
-  200) plus an additional case: documents query is skipped entirely (`from`
-  never called with `"song_documents"`) when the published setlist has zero
-  songs.
-- Edge case 10 (no invitation row → `confirmationStatus: null`, still 200).
-- Edge case 11 (cancelled week → `isCancelled: true` passed through).
-- Re-invite safety: multiple `invitations` rows for the caller → the one with
-  the latest `created_at` wins.
-- A general 500 path (events query error) to confirm the fail-fast pattern
-  holds beyond the week/setlist checks already covered by the sibling tests.
+All run fresh in this worktree (`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-66`):
 
-### `tests/unit/app/member-week-view.test.tsx` (16 tests)
+| Check | Command | Result |
+|---|---|---|
+| Typecheck | `bun run typecheck` | PASS — no errors |
+| Lint | `bun run lint` | PASS — no errors/warnings |
+| Unit tests | `bun run test` | PASS — **82 suites, 1051 tests** (1040 baseline + 11 new in `google.test.ts`; confirms the new file is collected and green, and nothing else regressed) |
+| Workflow-script check | `bun run check:workflows` | PASS — "1 workflow script(s) checked — syntax valid, all agent() calls pinned." |
+| E2E local run (no staging/Google secrets) | `bun run test:e2e` | PASS — **1 passed, 10 skipped**: `health.spec.ts` passes; all 4 new specs (`calendar-sync.spec.ts` ×1, `setlist-publish.spec.ts` ×2, `setlist-duplicate-song.spec.ts` ×1) skip cleanly via `test.skip`, no import/collect-time errors; pre-existing specs skip as before |
 
-Mirrors `tests/unit/app/week-view.test.tsx` (jsdom, `fetch` mocked and keyed
-by URL).
+Confirmed no `env` vars for staging/Google were present in this shell
+(`env | grep -iE "STAGING|E2E_|CLERK"` returned nothing), so the skip behavior
+above is a genuine "secrets absent" run, not an accidental pass.
 
-Covers:
-- Loading state before the fetch resolves.
-- Happy path: header (title/date), confirmation badge, setlist list (scoped
-  via `within()` to disambiguate from the Documents section's same song
-  title), assigned-only events section (unassigned event correctly excluded),
-  team roster (incl. an instrument-less member rendering "—"), documents
-  section with a working download link, and the floating chat button present
-  but `disabled`.
-- Event detail panel: clicking an assigned event opens the panel with a Maps
-  link built from the event's location (percent-encoded), and the close
-  button clears it (edge case 7's positive case).
-- Edge case 7: an event with `location: null` opens a detail panel with **no**
-  Maps link.
-- Edge case 3 vs 2: zero-songs published setlist renders "No songs added yet"
-  and explicitly asserts the "not yet released" copy is absent (and vice
-  versa for a null setlist).
-- Empty-state messages for events, team, and documents sections.
-- Edge case 10: `confirmationStatus: null` renders the "Not invited" badge and
-  the rest of the screen still renders (not gated on confirmation).
-- Edge case 11: cancelled week renders the Cancelled badge.
-- View-state branches: 404 → not-found, 403 → forbidden, network throw →
-  error, unexpected 500 → error.
+## Manual code review (spot-checked against spec.md, not just trusted changes.md)
 
-## Notes for the Reviewer
+- `tests/e2e/support/fixtures.ts`: `seedSong`, `seedSyntheticUser`,
+  `TeardownIds` extensions, and `teardownFixtures` ordering all match the
+  spec's field-by-field description (unique song title generator, synthetic
+  user's `clerk_id`/`email` shape, FK-safe teardown order, and the guarding
+  comment on `userIds` never receiving `FIXTURE` ids).
+- `tests/e2e/support/google.ts`: no `lib/`/`app/` imports (confirmed via
+  read); `toGoogleEventId` and `encryptE2EToken` are byte-for-byte consistent
+  with `lib/google-calendar/sync.ts` / `lib/google-calendar/token-crypto.ts`
+  (now also machine-verified by the new unit test, not just read-verified).
+- `tests/e2e/setlist-publish.spec.ts`: both tests match the spec's numbered
+  steps, including the two-buttons-named-Publish disambiguation
+  (`toHaveCount(2)` then `.last()`), the exact zero-song notification body
+  string (em dash), and `notificationLinkEntityIds` guarded by
+  `setlistId ? [setlistId] : []` so teardown is safe even if setlist creation
+  fails.
+- `tests/e2e/setlist-duplicate-song.spec.ts`: matches spec — 201 then 409 with
+  the exact error/code, `setlist_songs` row-count assertion, UI `Added`+
+  disabled assertion, role restore as the first `finally` statement.
+- `tests/e2e/calendar-sync.spec.ts`: matches spec — invitation seeded
+  `accepted` before the event (BR-10-safe timestamps), attendee-POST as the
+  create-propagation trigger, `expect.poll` (not `waitForTimeout`) for both
+  create and update propagation, fully failure-tolerant `finally` (each step
+  independently try/caught) with both app-side DELETE and a direct Google
+  delete fallback, `googleTokenUserIds` teardown.
+- `.github/workflows/ci.yml`: the five new secrets are appended to the `e2e`
+  job's existing `env:` block only; `check-secrets` gate on `STAGING_APP_URL`
+  is unchanged.
+- `documentation/staging-environment.md`: five new secrets documented in the
+  §7 table (each marked optional/skips-when-absent) plus a new §7.1 with the
+  human setup steps (shared OAuth client, one-time consent flow,
+  `E2E_TOKEN_ENCRYPTION_KEY` must equal staging's, `E2E_GOOGLE_CALENDAR_ID`
+  default, "Testing" publishing-status refresh-token-expiry caveat).
+- Confirmed no changes touch `app/`, `lib/`, `schemas/`, `components/`, or
+  `supabase/migrations/` (`git status`/`git diff --stat` show only `tests/`,
+  `.github/workflows/ci.yml`, `documentation/staging-environment.md`, and
+  `.pipeline/` changed — scope matches the spec's "tests only" constraint).
 
-- No failures were found; nothing was patched around. The implementation
-  matches every edge case named in `.pipeline/spec.md`'s "Edge cases the
-  implementation MUST handle" list (1–11 directly tested here; 12 — guest
-  403 — is covered; 13 — no `file_key` leakage / fresh signed URL per request
-  — is asserted via `JSON.stringify` + a `getDownloadUrl` call-argument check).
-- One thing worth a second look in review, not a test failure: the spec's
-  Decisions section already flags that a member confirmed for a week with no
-  events yet won't show in `team` — this is by design (documented limitation),
-  and the "no events" test in this suite confirms that behavior is what's
-  actually implemented, not accidental.
-- Test-file-only fix made during this stage: the component test's fixture
-  data originally had an event named "Sunday Service" that collided with the
-  service week's title "Sunday Service", making some queries ambiguous
-  (`getByText`/`getByRole` matching two elements). Renamed the fixture event
-  to "Sunday Gathering" and scoped the setlist-song assertions with
-  `within()` to avoid a separate collision with an identically-titled
-  Documents heading. This was a test-fixture naming fix only — no production
-  code was touched.
+## Not independently exercised (as the spec anticipated)
 
-## Files added by this stage (Testing)
+- `calendar-sync.spec.ts`'s actual assertions against a real Google Calendar
+  were not exercised — no `E2E_GOOGLE_*` secrets exist in this environment
+  (by design; §7.1 requires human provisioning). Verified instead that it
+  skips cleanly, which is the correct behavior in this state, per spec OPEN
+  QUESTION 2.
+- `setlist-publish.spec.ts` / `setlist-duplicate-song.spec.ts` against real
+  staging (no `E2E_ADMIN_EMAIL`/staging secrets in this environment either) —
+  same treatment: verified clean skip, matching the established issue #52
+  precedent this repo already relies on for the rest of the authenticated E2E
+  suite.
 
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-65/tests/unit/app/api/service-weeks-member-view-route.test.ts`
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-65/tests/unit/app/member-week-view.test.tsx`
+## Verdict
 
-No implementation files were modified. Ready for Review.
+No product bugs found. No failing tests. All checks the spec and changes.md
+called for are green, including the one new test file this stage was
+responsible for adding. Ready for Review.
