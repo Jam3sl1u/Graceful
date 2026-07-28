@@ -1,138 +1,122 @@
-# Changes — Issue #65: Build Member Week View screen
+# Changes — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
 
-- `app/api/setlists/[id]/handler.ts`
-  - Added `getSetlistWithSongs(req, id, lookup?)`: `GET /api/setlists/:id`
-    handler. `requireAuth` + `requireRole(["admin", "set_leader"])`, loads the
-    setlist tenant-scoped (`church_group_id` match), 404s if missing/other
-    tenant, 500 on DB error, reuses the existing private `loadSongResponses`
-    helper for the ordered songs, and returns
-    `{ setlist: toSetlistResponse(data), songs }` for both draft and
-    published setlists (client needs status to render the locked state).
-  - `reorderSetlist`'s per-song update loop now conditionally includes
-    `notes` in the Supabase update payload only when `entry.notes !== undefined`
-    (i.e. the client actually sent it), so existing reorder callers that omit
-    notes do not wipe them. `null` clears notes, a string sets them.
-- `app/api/setlists/[id]/route.ts` — added `export async function GET` wired
-  to `getSetlistWithSongs`; `PUT` export unchanged.
-- `schemas/setlists.ts` — `reorderSetlistSchema`'s per-song object gained an
-  optional `notes: z.string().trim().max(1000).nullish()` field.
-  `addSetlistSongSchema` left unchanged (notes are only added via PUT after a
-  song is in the setlist).
-- `schemas/songs.ts` — added `export const SONG_KEY_OPTIONS = ASCII_SONG_KEYS;`
-  (the ordered 17-key ASCII list) for the frontend key `<select>`. Left
-  `VALID_SONG_KEYS` / `isValidSongKey` untouched.
+Implemented exactly per `.pipeline/spec.md`. Tests only — no `app/`, `lib/`,
+`schemas/`, `components/`, or `supabase/migrations/` changes.
 
-- `app/api/service-weeks/[id]/member-view/handler.ts` — new
-  `getMemberWeekView(req, id, lookup?)` handler exporting
-  `MemberWeekViewResponse` (and its constituent types `MemberWeekEvent`,
-  `MemberWeekSong`, `MemberWeekTeamMember`, `MemberWeekDocumentGroup`).
-  Aggregates, via the caller's RLS-scoped Supabase client only (no
-  service-role, no new RPC):
-  - `requireAuth` + `requireRole(["admin", "set_leader", "member"])` (guest
-    excluded — #72 is out of scope).
-  - Service week lookup by `id` + `church_group_id` → 404 if missing.
-  - Caller's own `invitations` row for the week, picking the latest by
-    `created_at` when multiple exist → `confirmationStatus` (null if none).
-  - `setlists` row for the week; only treated as present when
-    `status === "published"` (drafts filtered by RLS anyway for members, but
-    checked explicitly) → `setlist: null` otherwise. When published, reads
-    `setlist_songs` ordered by `position`, then `songs` for the distinct song
-    ids, building `effectiveKey = key_override ?? default_key`. Zero songs
-    still yields `{ status: "published", songs: [] }`, not `null`.
-  - `events` for the week ordered by `start_time asc`.
-  - `event_attendees` for the week's event ids (query skipped entirely when
-    there are no events, to avoid an empty `.in()`), used to compute each
-    event's `assigned` flag (caller present as an attendee) and the distinct
-    `teamUserIds`.
-  - Team directory scoped to `teamUserIds` only (mirrors
-    `getChurchGroupMembers`'s users/member_profiles/member_instruments/
-    instruments assembly), sorted by name; no email/phone included.
-  - Documents: only queried when there's a published setlist with songs;
-    `song_documents` rows grouped by `song_id` with freshly minted
-    `getDownloadUrl` per file (`@/lib/r2/client`, 30-min presigned GET); the
-    whole block is wrapped in try/catch so an R2/query failure degrades to
-    `documents: []` with a 200, not a 500.
-  - Returns `ok<MemberWeekViewResponse>(...)`; catches `ApiException` →
-    `fail(...)`, else 500 — same pattern as sibling handlers.
+## Files changed
 
-- `app/api/service-weeks/[id]/member-view/route.ts` — `GET` route wiring,
-  copied from the `setlist` route's shape (await `params`, delegate to the
-  handler).
+### `tests/e2e/support/fixtures.ts` (modified)
+- Added `seedSong(svc, churchGroupId, opts?)` — inserts one `songs` row with a
+  unique default title (`E2E Song ${randomSuffix}`), returns `{ id, title }`.
+- Added `seedSyntheticUser(svc, churchGroupId, opts?)` — inserts a `users` row
+  with no real Clerk identity (`clerk_id: e2e_synthetic_<uuid-no-dashes>`),
+  used only as a notification recipient / invitation target; documented that
+  it must never be signed in via `signInAs`.
+- Extended `TeardownIds` with `invitationIds`, `songIds`,
+  `googleTokenUserIds`, `userIds`.
+- Extended `teardownFixtures` to delete, in FK-safe order (children first):
+  each id in `invitationIds` (alongside the existing single `invitationId`),
+  then `songs` (`in songIds`), `google_calendar_tokens` (`in
+  googleTokenUserIds`), and finally `users` (`in userIds`) — commented that
+  `userIds` must only ever contain ids from `seedSyntheticUser`, never the
+  stable `FIXTURE.adminUserId`/`FIXTURE.memberUserId`.
 
-- `app/(app)/member-week/[id]/member-week-view.tsx` (`"use client"`) — the
-  screen component. `ViewState` machine (`loading | ready | forbidden |
-  not-found | error`), single `useEffect` with a `cancelled` guard fetching
-  `GET /api/service-weeks/:id/member-view` once. Renders, in order:
-  - Header: title, `formatServiceDate`, confirmation `Badge` (mapped per
-    spec: accepted→Confirmed/success, pending→Pending/warning,
-    denied→Declined/neutral, withdrawn/expired→Not serving/neutral,
-    null→Not invited/neutral) plus a `Cancelled`/danger badge when
-    `isCancelled`.
-  - Setlist section: not-released vs. zero-songs vs. song list w/
-    title/artist/effectiveKey (`—` placeholder when null) — these are
-    distinct states per the spec's edge cases 2 and 3.
-  - Events section: only `assigned === true` events, each a `type="button"`
-    row opening an in-page detail panel (`selectedEventId` state, no new
-    route) showing name/type/start–end/notes, and a Maps link
-    (`https://www.google.com/maps/search/?api=1&query=...`) only when
-    `location` is non-empty.
-  - Team section: avatar (`getInitials`), name, instruments joined by ", "
-    (or "—" when empty); empty-team message when `team.length === 0`.
-  - Documents section: per-song-group heading + file links (`downloadUrl`,
-    opened in a new tab); empty-state message when none.
-  - A disabled, inert floating "chat" button (`aria-label="Week chat (coming
-    soon)"`, `disabled`, no `onClick`) as the Phase 2 placeholder.
-  - Loading/forbidden/not-found/error branches mirror `week-view.tsx`'s
-    `<main>` blocks (forbidden copy adjusted to a member context).
+### `tests/e2e/support/google.ts` (new)
+Google-side helpers for the calendar sync spec. Does not import from `lib/`
+or `app/` (those start with `import "server-only"`, which throws under the
+plain-Node Playwright runner) — `toGoogleEventId` and the AES-256-GCM
+`encryptE2EToken` are hand-duplicated from `lib/google-calendar/sync.ts` and
+`lib/google-calendar/token-crypto.ts` respectively, each commented with its
+source of truth. Also exports `GOOGLE_SYNC_VARS`/`googleSyncEnabled` (checked
+via `checkEnv`, deliberately not added to `env.ts`'s `REQUIRED_VARS`),
+`e2eCalendarId`, `seedGoogleCalendarToken` (upserts a
+`google_calendar_tokens` row with `token_expiry` in the past so the app
+always takes the refresh-token path), `getGoogleAccessToken` (test-side
+refresh-token exchange), `getGoogleCalendarEvent`, and
+`deleteGoogleCalendarEvent` (never throws — cleanup-only).
 
-- `app/(app)/member-week/[id]/member-week-view.module.css` — mobile-first,
-  single-column styles (container/header/card/date/error mirrored from
-  `week-view.module.css`'s conventions, using the existing `--color-fg`/
-  `--color-border`/`--color-bg` variables), plus new `.chatButton` (fixed
-  bottom-right) and `.detail`/`.detailOverlay` (bottom-sheet-style event
-  detail panel).
+### `tests/e2e/setlist-publish.spec.ts` (new, AC #1/#2)
+- Test A: admin builds a setlist in `/setlists/[id]` (search → Add → 1 song →
+  Publish → confirm-modal Publish), asserts `setlists.status === "published"`
+  and `published_at` truthy, asserts the confirmed member (`accepted`
+  invitation) gets exactly one `setlist_released` notification with
+  `body === null`, asserts a synthetic **pending**-invitation member gets
+  **zero** notifications, then confirms the member sees the song + `Confirmed`
+  badge on `/member-week/[id]`.
+- Test B: same flow with zero songs — asserts the zero-song copy in both the
+  publish confirm modal and the resulting notification `body` (exact string,
+  em dash included), and that the member view shows `No songs added yet`
+  (not `Setlist not yet released`).
+- Both resolve the "two buttons named Publish" ambiguity (bottom bar + modal,
+  `Modal` has no `role="dialog"`) by asserting `toHaveCount(2)` then clicking
+  `.last()`, per spec edge case 3.
+- Header comment documents OPEN QUESTION 1's resolution (published setlists
+  are tenant-readable per RLS; the actual confirmed/pending distinction is in
+  notification recipients, not read access).
 
-## Files modified
+### `tests/e2e/setlist-duplicate-song.spec.ts` (new, AC #3)
+One test, driven by the member fixture temporarily elevated to `set_leader`
+(restored in `finally`, first statement, mirroring
+`conflict-detection.spec.ts`'s self-exclusion test). Adds a song via
+`POST /api/setlists/:id/songs` (201), repeats the same request (409,
+`error: "That song is already in the setlist.", code: "CONFLICT"`), asserts
+exactly one `setlist_songs` row persisted, then confirms the builder UI shows
+the catalog row's button as `Added` and disabled.
 
-- `app/(app)/member-week/[id]/page.tsx` — replaced the "coming soon" stub
-  with a server wrapper that awaits `params` and renders
-  `<MemberWeekView serviceWeekId={id} />`, matching
-  `app/(app)/week/[id]/page.tsx`'s shape exactly.
+### `tests/e2e/calendar-sync.spec.ts` (new, AC #4)
+Gated on `e2eAuthEnabled && googleSyncEnabled` (`calendarSyncReady`) — skips
+without both the base E2E secrets and the five new Google secrets. Seeds an
+accepted invitation + a Google Calendar token for the member, creates an
+event as admin, assigns the member as attendee (the create-propagation
+trigger — a brand-new event has no attendees, so creation alone syncs
+nothing), polls the real Google Calendar API (`expect.poll`, 30s timeout)
+until the event appears with the right `summary`/`location`/`start.dateTime`,
+then `PUT`s an update and polls again until the summary/start reflect the
+change (proving update propagation, not just create). `finally` is fully
+failure-tolerant: best-effort `DELETE /api/events/:id` (app-side unsync),
+then a direct Google delete as a belt-and-braces cleanup, then context close,
+then `teardownFixtures`.
 
-- `.pipeline/spec.md` — this was already updated in the working tree (issue
-  #65's spec, produced by the Planning stage) before this Coding session
-  started; included in this commit as part of the normal pipeline handoff.
-  No further edits made to it by the Coding stage.
+### `.github/workflows/ci.yml` (modified)
+Appended the five new `E2E_GOOGLE_*`/`E2E_TOKEN_ENCRYPTION_KEY` secrets to
+the `e2e` job's `env:` block (the `check-secrets` gate on `STAGING_APP_URL`
+is unchanged — `calendar-sync.spec.ts` self-gates on top of that via
+`googleSyncEnabled`). Updated the job's leading comment to mention the
+setlist publish and Google Calendar sync coverage (issue #66).
 
-## Verification
+### `documentation/staging-environment.md` (modified)
+Added the five new secrets to §7's table (each marked "optional —
+`calendar-sync.spec.ts` skips when absent"), a note that the setlist specs
+need no secrets beyond the existing seven, and a new **§7.1 Google Calendar
+E2E (issue #66)** subsection with the human setup steps (dedicated Google
+test account + same OAuth client as staging, one-time consent flow for
+`calendar.events` scope with `access_type=offline`/`prompt=consent`,
+`E2E_TOKEN_ENCRYPTION_KEY` must equal staging's `TOKEN_ENCRYPTION_KEY`,
+`E2E_GOOGLE_CALENDAR_ID` defaults to `primary`, and the "Testing" OAuth
+publishing-status refresh-token-expiry caveat).
 
-- `bun run lint` — clean.
-- `bun run typecheck` — clean.
-- `bun run test` — all 77 suites / 968 tests pass (no regressions; the two
-  new test files the spec names for the Testing stage —
-  `tests/unit/app/api/service-weeks-member-view-route.test.ts` and
-  `tests/unit/app/member-week-view.test.tsx` — were intentionally not written
-  here, per the pipeline contract that Testing writes and owns test files).
+### `.pipeline/spec.md`
+Overwritten by the Planning stage for this run (was previously issue #65's
+spec still on disk, uncommitted before this run started); included in this
+commit since it's the git-tracked handoff artifact for this run.
 
-## What the Tester should focus on
+## Verification run (all passed)
+- `bun run typecheck`
+- `bun run lint`
+- `bun run test` (1040 tests, 81 suites — Jest ignores `tests/e2e/`)
+- `bun run check:workflows`
+- `bun run test:e2e` locally (no staging/Google secrets set): all 4 new
+  tests (calendar-sync ×1, setlist-publish ×2, setlist-duplicate-song ×1)
+  skip cleanly with no import/collect-time errors; `health.spec.ts` still
+  passes (1 passed, 10 skipped).
 
-- The 13 edge cases enumerated in `.pipeline/spec.md` under "Edge cases the
-  implementation MUST handle", especially:
-  - Published setlist with zero songs vs. no/draft setlist (must render two
-    distinct messages).
-  - Empty `event_attendees` for the week — handler must not issue an `.in()`
-    query with an empty array (verify via a `from` spy on `event_attendees`
-    not being called when `events` is empty).
-  - `getDownloadUrl` throwing (simulate R2 misconfiguration) → endpoint still
-    200 with `documents: []`.
-  - Guest role → 403.
-  - A member assigned to only some of the week's events — only those show in
-    the Events section, but `team` reflects the full attendee set across all
-    events.
-  - Event with `location: null` → detail panel renders with no Maps link.
-- The handler's per-table Supabase mock dispatch (many tables read across one
-  request) — verify the `makeChain`-style test double the spec calls for
-  handles `service_weeks`, `invitations`, `setlists`, `setlist_songs`,
-  `songs`, `events`, `event_attendees`, `users`, `member_profiles`,
-  `member_instruments`, `instruments`, `song_documents` all being queried
-  from the same `getSupabaseClient(jwt)` instance.
+## For the Testing stage to focus on
+- The spec explicitly assigns `tests/unit/e2e-support/google.test.ts`
+  (verifying `toGoogleEventId`/`encryptE2EToken` agree with their `lib/`
+  counterparts) to the Testing stage, not this one — it does not exist yet.
+- No product bugs were found while writing these tests; OPEN QUESTION 1 in
+  `.pipeline/spec.md` documents a pre-existing behavior/AC-wording mismatch
+  that this issue intentionally does not fix (out of scope).
+- `calendar-sync.spec.ts` cannot be exercised end-to-end without a human
+  provisioning the five Google secrets (§7.1) — verify it skips cleanly
+  rather than trying to make it pass.
