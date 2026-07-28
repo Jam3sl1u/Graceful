@@ -125,6 +125,7 @@ export async function getMemberWeekView(
   lookup?: UserLookup,
 ): Promise<Response>;
 ```
+`entry.notes === undefined` (field absent) → leave the column as-is; `null` → clear it; string → set it. Do not change any other reorder behavior (membership check, position rewrite, response).
 
 Handler logic (all queries via `getSupabaseClient(jwt)` = caller RLS):
 
@@ -184,9 +185,16 @@ Copy `app/api/service-weeks/[id]/setlist/route.ts` shape, GET only:
 import { NextRequest } from "next/server";
 import { getMemberWeekView } from "./handler";
 
-type Ctx = { params: Promise<{ id: string }> };
+## Frontend
 
-export async function GET(req: NextRequest, { params }: Ctx): Promise<Response> {
+### `app/(app)/setlists/[id]/page.tsx` (replace the stub)
+
+Server wrapper mirroring `app/(app)/week/[id]/page.tsx`:
+```tsx
+import SetlistBuilder from "./setlist-builder";
+export default async function SetlistBuilderPage({
+  params,
+}: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   return getMemberWeekView(req, id);
 }

@@ -1,6 +1,26 @@
 # Changes — Issue #65: Build Member Week View screen
 
-## Files created
+- `app/api/setlists/[id]/handler.ts`
+  - Added `getSetlistWithSongs(req, id, lookup?)`: `GET /api/setlists/:id`
+    handler. `requireAuth` + `requireRole(["admin", "set_leader"])`, loads the
+    setlist tenant-scoped (`church_group_id` match), 404s if missing/other
+    tenant, 500 on DB error, reuses the existing private `loadSongResponses`
+    helper for the ordered songs, and returns
+    `{ setlist: toSetlistResponse(data), songs }` for both draft and
+    published setlists (client needs status to render the locked state).
+  - `reorderSetlist`'s per-song update loop now conditionally includes
+    `notes` in the Supabase update payload only when `entry.notes !== undefined`
+    (i.e. the client actually sent it), so existing reorder callers that omit
+    notes do not wipe them. `null` clears notes, a string sets them.
+- `app/api/setlists/[id]/route.ts` — added `export async function GET` wired
+  to `getSetlistWithSongs`; `PUT` export unchanged.
+- `schemas/setlists.ts` — `reorderSetlistSchema`'s per-song object gained an
+  optional `notes: z.string().trim().max(1000).nullish()` field.
+  `addSetlistSongSchema` left unchanged (notes are only added via PUT after a
+  song is in the setlist).
+- `schemas/songs.ts` — added `export const SONG_KEY_OPTIONS = ASCII_SONG_KEYS;`
+  (the ordered 17-key ASCII list) for the frontend key `<select>`. Left
+  `VALID_SONG_KEYS` / `isValidSongKey` untouched.
 
 - `app/api/service-weeks/[id]/member-view/handler.ts` — new
   `getMemberWeekView(req, id, lookup?)` handler exporting
