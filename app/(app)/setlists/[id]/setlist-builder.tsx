@@ -34,6 +34,14 @@ type SetlistMeta = {
 
 type ViewState = "loading" | "ready" | "forbidden" | "not-found" | "error";
 
+// Shared by the quick-add-seeding effect and the render-time catalog filter
+// so the two never drift out of sync on what counts as "no match".
+function filterCatalog(catalog: CatalogSong[], term: string): CatalogSong[] {
+  return catalog.filter(
+    (c) => c.title.toLowerCase().includes(term) || (c.artist ?? "").toLowerCase().includes(term),
+  );
+}
+
 export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
   const [view, setView] = useState<ViewState>("loading");
   const [meta, setMeta] = useState<SetlistMeta | null>(null);
@@ -121,10 +129,7 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
 
   useEffect(() => {
     const term = searchTerm.trim().toLowerCase();
-    const hasMatch = catalog.some(
-      (c) => c.title.toLowerCase().includes(term) || (c.artist ?? "").toLowerCase().includes(term),
-    );
-    const showQuickAdd = term !== "" && !hasMatch;
+    const showQuickAdd = term !== "" && filterCatalog(catalog, term).length === 0;
 
     if (showQuickAdd) {
       if (!quickAddTitleDirty) {
@@ -238,6 +243,7 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
       setQuickAddTitle("");
       setQuickAddArtist("");
       setQuickAddKey("");
+      setQuickAddTitleDirty(false);
     } catch {
       setQuickAddError("Something went wrong creating that song.");
     }
@@ -380,9 +386,7 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
   if (!meta) return null;
 
   const term = searchTerm.trim().toLowerCase();
-  const filteredCatalog = catalog.filter(
-    (c) => c.title.toLowerCase().includes(term) || (c.artist ?? "").toLowerCase().includes(term),
-  );
+  const filteredCatalog = filterCatalog(catalog, term);
   const showQuickAdd = term !== "" && filteredCatalog.length === 0;
   const songIds = new Set(songs.map((s) => s.songId));
 

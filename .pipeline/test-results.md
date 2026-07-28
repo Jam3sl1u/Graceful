@@ -99,3 +99,16 @@ No implementation files were modified by this stage (the temporary
 regression-revert during verification step 4 was restored from a backup
 before running the final full suite; the working tree reflects only the
 Coding stage's corrected fix). Ready for Review.
+
+## Addendum — non-blocking cleanup round
+
+The SHIP review above also flagged two non-blocking items (stuck
+`quickAddTitleDirty` flag on a failed add-to-setlist; the catalog
+match predicate duplicated between the seeding effect and the render-time
+filter). Both are now fixed — see `.pipeline/changes.md` "Non-blocking
+cleanup (post-SHIP)". A new regression test, "quick-add flow: a failed
+add-to-setlist after a successful song creation still leaves the title
+resyncable (not stuck blank)", was added and mutation-verified (fails with
+exactly the predicted wrong value when the `setQuickAddTitleDirty(false)`
+fix is removed). Full suite: 79 suites / 1004 tests, all passing. Verdict
+unchanged: ALL TESTS PASSING.

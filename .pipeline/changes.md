@@ -92,6 +92,29 @@
   through continued typing, while still preserving a user's manual edit
   once they've made one.
 
+### Non-blocking cleanup (post-SHIP)
+
+The final review that SHIPped the corrected fix above also flagged two
+non-blocking items, both since addressed:
+
+- **Stuck dirty flag**: in `handleQuickAdd`, if `POST /api/songs` succeeds
+  but the follow-up `handleAdd` (add-to-setlist) call fails, `quickAddTitle`
+  was still unconditionally cleared to `""`, but `quickAddTitleDirty` was
+  left `true` — so if the search term still didn't match anything (e.g. the
+  created song's title diverged from the search term), the title field was
+  stuck blank with no way to re-sync short of the user retyping the search
+  box from scratch. Fixed by resetting `quickAddTitleDirty` to `false`
+  alongside the other field resets in `handleQuickAdd`, so the seeding
+  effect re-populates the title from the current search term on its next
+  run. Covered by a new test: "quick-add flow: a failed add-to-setlist
+  after a successful song creation still leaves the title resyncable (not
+  stuck blank)".
+- **Duplicated match predicate**: the "does this term match the catalog"
+  substring rule was independently written out twice — once in the seeding
+  `useEffect`, once in the render-time `filteredCatalog` computation —
+  risking drift between the two. Extracted into a single module-level
+  `filterCatalog(catalog, term)` helper used by both.
+
 ## Verification
 
 - `bun run lint` — clean.

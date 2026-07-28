@@ -2,138 +2,142 @@
 
 ## VERDICT: SHIP
 
-The prior blocker is genuinely fixed. The `wasQuickAddShownRef` latch is gone;
-`quickAddTitle` is now re-synced to `searchTerm` on **every** `searchTerm`
-change while the quick-add form is shown and the user has not edited the Title
-field themselves. I traced the state machine by hand (not from the reports) and
-could not construct an input sequence that reproduces the stale-prefix /
-junk-catalog-row behavior that caused the previous BLOCK. The new test is a
-real regression guard, and lint/typecheck/full suite are green when I run them
-myself.
+This round is a targeted final pass over the two non-blocking items the prior
+SHIP recorded (stuck `quickAddTitleDirty` flag; duplicated catalog-match
+predicate). Both are correctly fixed, the new regression test is a real guard
+(I mutation-tested it myself), and lint/typecheck/full suite are green when I
+run them. The previously-reviewed-and-SHIPped core of #64 is untouched by this
+diff. No new issues found; nothing left open.
 
-Two non-blocking notes are recorded below; neither justifies another round.
+## Scope of this diff (verified)
 
-## Why I believe the fix is correct (my own reasoning)
+`git status --short` / `git diff --stat`:
 
-`app/(app)/setlists/[id]/setlist-builder.tsx`:
+```
+ .pipeline/changes.md                        | 23 +++++++++++++++++
+ app/(app)/setlists/[id]/setlist-builder.tsx | 18 ++++++++------
+ tests/unit/app/setlist-builder.test.tsx     | 38 +++++++++++++++++++++++++++++
+```
 
-- **State (line 50):** `const [quickAddTitleDirty, setQuickAddTitleDirty] = useState(false);`
-- **Seeding effect (lines 122–136):** deps `[searchTerm, catalog, quickAddTitleDirty]`.
-  When `showQuickAdd` is true and `!quickAddTitleDirty` → `setQuickAddTitle(searchTerm)`.
-  When `showQuickAdd` is false → `setQuickAddTitleDirty(false)`.
-- **Title `onChange` (lines 463–466):** sets the value *and* `setQuickAddTitleDirty(true)`.
-  This is the only place the flag is set to `true`, so "dirty" strictly means
-  "the human typed in the Title box".
+Three files, +72/-7, working tree only (nothing staged, `git diff HEAD --stat`
+identical). The 4 duplicate `" 2"`-suffixed test files flagged in the previous
+round are gone from the working tree. No stray files, no unrelated source
+edits, no backend/CSS changes.
 
-Case analysis:
+## Fix 1 — stuck dirty flag (`handleQuickAdd`)
 
-1. **Incremental typing, no manual title edit.** Every keystroke changes
-   `searchTerm` → the effect re-runs → form still shown, flag still `false` →
-   title re-seeded to the *current* full search term. No latch, no freeze. This
-   is precisely the previously-broken path.
-2. **User edits the Title, then keeps typing in search.** The `onChange` sets
-   the flag before the next effect run, so the effect's `!quickAddTitleDirty`
-   guard short-circuits and the manual value survives. Verified by test.
-3. **Form goes hidden (search cleared, or search starts matching a catalog
-   row).** The `else` branch resets the flag, so the next time the form appears
-   it seeds fresh from the new search term. Correct: the form's identity is
-   "the thing shown for the current no-match search", so a manual edit should
-   not survive the form disappearing.
-4. **`handleQuickAdd` success interaction.** `handleQuickAdd` (lines 212–244)
-   appends the created song to `catalog`, `await handleAdd(song.id)`, then
-   resets `quickAddTitle`/artist/key to `""`. `handleAdd` on success calls
-   `setSearchTerm("")` (line 206) → the effect sees `showQuickAdd === false` →
-   flag resets to `false` and the form hides. So the reset of `quickAddTitle`
-   to `""` cannot be immediately clobbered by a re-seed, and the flag does not
-   leak into the next quick-add. (The previous review asked for an explicit
-   flag reset in `handleQuickAdd`; the `setSearchTerm("")` path makes it
-   redundant on the success path. See note 1 for the one path it does not
-   cover.)
-5. **Rapid/duplicate catalog updates.** `catalog` is a dep, so a new array
-   identity re-runs the effect; the effect is idempotent (`setQuickAddTitle`
-   to the same string and `setQuickAddTitleDirty(false)` when already `false`
-   both bail out via `Object.is`, so no render loop). If a catalog refresh
-   makes the term match, the form hides and the flag resets — correct.
-6. **No infinite loop / no cross-field interference.** The only state the
-   effect writes is `quickAddTitle` and `quickAddTitleDirty`, both convergent.
-   `quickAddArtist` / `quickAddKey` are untouched by the effect.
-7. **Data-corruption vector closed.** The Title submitted by `handleQuickAdd`
-   is now always exactly what the user sees in the field (either the live
-   search term or their own edit), so `POST /api/songs` can no longer write a
-   truncated-prefix junk row into the shared church-group catalog.
+`app/(app)/setlists/[id]/setlist-builder.tsx:246` adds
+`setQuickAddTitleDirty(false);` alongside the existing
+`setQuickAddTitle("") / setQuickAddArtist("") / setQuickAddKey("")` resets.
 
-## Test quality
+My own trace of the paths:
 
-`tests/unit/app/setlist-builder.test.tsx`:
+1. **Create OK + add OK (happy path).** `handleAdd` calls `setSearchTerm("")`
+   (line 211) → the seeding effect sees `showQuickAdd === false` and already
+   reset the flag via its `else` branch. The new line is redundant here and
+   changes nothing — confirmed by the pre-existing quick-add happy-path test
+   still passing.
+2. **Create OK + add FAILS (the reported bug).** `setSearchTerm("")` never
+   runs, so `searchTerm` still holds a term that (if the created title diverged
+   from it) matches nothing — including the newly appended catalog entry — so
+   `showQuickAdd` stays `true` and the effect's `else` branch never fires.
+   Pre-fix: `quickAddTitle === ""` with `quickAddTitleDirty === true` → the
+   `!quickAddTitleDirty` guard blocks re-seeding and the field is stuck blank.
+   Post-fix: the flag is cleared, the effect (deps include
+   `quickAddTitleDirty`) re-runs and re-seeds `quickAddTitle` from the current
+   `searchTerm`. Correct.
+3. **Create FAILS (`!res.ok` or throw).** The function returns early / lands in
+   `catch` *before* the resets, so the flag stays `true` and the user's typed
+   title survives for a retry. This is the right behavior and the fix
+   deliberately does not touch it — worth calling out because clearing the flag
+   there would have destroyed user input.
+4. **No new render-loop risk.** `setQuickAddTitleDirty(false)` when already
+   `false` bails out via `Object.is`; the effect remains convergent
+   (`quickAddTitle` settles at `searchTerm`, flag settles at `false`).
 
-- The new **"prefilled title tracks the search term through incremental
-  (letter-by-letter) typing"** test fires 18 sequential `fireEvent.change`
-  calls on the search box with progressively longer prefixes of
-  `"Xylophone Jam 2000"` and asserts `getByLabelText(/title/i)` equals the
-  prefix **after every step**, not only at the end. That is exactly the shape
-  the old ref-based code failed on (it would freeze at `"X"` and fail on
-  iteration 2), so it is a genuine guard, not a tautology. It is also not
-  trivially passing: `getByLabelText(/title/i)` throws if the quick-add form
-  is not rendered, so the test would fail loudly if the form stopped showing.
-- The fixture-choice comment is correct and load-bearing: none of the fixture
-  titles/artists (`Amazing Grace`/`Traditional`, `How Great Thou Art`,
-  `10,000 Reasons`/`Matt Redman`) contains an `x`, so every prefix is a real
-  no-match. A `"T…"` target would have matched on the first character and
-  masked the bug — the earlier round's blind spot.
-- The companion **"further edits … are not clobbered"** test drives the other
-  branch (manual edit, then continued search typing) and asserts both that the
-  form is still shown and the edited title survived. Together the two tests
-  pin both sides of the `quickAddTitleDirty` guard.
-- I did not re-run the Testing stage's mutation check (it would require editing
-  source, and this stage is read-only), but the claimed failure mode is exactly
-  what the ref-latch logic implies, and the test's per-step assertion makes the
-  check structurally sound.
+## Fix 2 — `filterCatalog` extraction
 
-## What I verified myself this run
+New module-level helper at
+`app/(app)/setlists/[id]/setlist-builder.tsx:39-44`, used by the seeding effect
+(line 132) and the render-time `filteredCatalog` (line 389).
 
-- `bun run lint` — 0 errors, 1 pre-existing warning in the generated artifact
-  `coverage/lcov-report/block-navigation.js` (unrelated to this change).
+- The predicate is character-for-character the same rule both call sites used
+  before (`title` OR `artist ?? ""`, `.toLowerCase().includes(term)`), so this
+  is a pure extraction with no behavior change.
+- The effect's `catalog.some(pred)` → `filterCatalog(...).length === 0` swap is
+  logically equivalent (`!some(p)` ≡ `filter(p).length === 0`). It trades
+  short-circuiting for an allocation; catalogs here are a single church group's
+  song list rendered in full on every keystroke anyway, so this is noise, not a
+  performance regression.
+- Both call sites pass an already `trim().toLowerCase()`-normalized `term`
+  (lines 131 and 388), so the helper's implicit "term must be pre-normalized"
+  contract holds today. Stylistic nit only, not a defect: normalizing inside
+  the helper would make it misuse-proof. Not worth a round.
+- Pure function, module-level, no closure over component state — no hook-order
+  or stale-capture concerns.
+
+## Test quality — I proved the new test is not tautological
+
+`tests/unit/app/setlist-builder.test.tsx:277-313`, "quick-add flow: a failed
+add-to-setlist after a successful song creation still leaves the title
+resyncable (not stuck blank)".
+
+The test mocks `POST /api/songs` → 201 and `POST /api/setlists/:id/songs` →
+409, types a search term (`"Divergent Search Term"`) that no fixture matches,
+deliberately diverges the Title to `"My Custom Title"` (setting the dirty flag
+via the field's own `onChange`), submits, waits for the inline 409 message,
+then asserts the Title field has re-populated to the current search term.
+The divergence matters: it guarantees the newly-appended catalog entry still
+does not match the search term, so the quick-add form stays mounted and the
+"stuck blank" state is actually reachable.
+
+Rather than trust that reasoning, I copied the tree to a scratch directory,
+deleted **only** the `setQuickAddTitleDirty(false);` line from `handleQuickAdd`,
+and reran the suite file there:
+
+```
+Tests: 1 failed, 21 passed, 22 total
+● quick-add flow: a failed add-to-setlist ... (not stuck blank)
+  Expected the element to have value: Divergent Search Term
+  Received: (empty)
+```
+
+Exactly the reported bug, and exactly one test fails — so the assertion is
+genuinely load-bearing and no other test was silently depending on the old
+behavior. The `filterCatalog` extraction is covered transitively by the
+existing search/quick-add-visibility tests (any drift in the predicate would
+change which rows render).
+
+## Verified myself this run
+
+- `bun run lint` — 0 errors. 1 warning, in the gitignored generated artifact
+  `coverage/lcov-report/block-navigation.js` (confirmed `.gitignore:13`);
+  unrelated to this diff and unchanged from prior rounds.
 - `bun run typecheck` — clean.
-- `bun run test` — **79 suites / 1003 tests, all passing.** Matches
-  `test-results.md`.
-- `git status --short` / `git diff --stat` — scope is exactly as expected:
-  4 staged deletions of byte-identical `" 2"`-suffixed duplicate test files
-  (I confirmed `tests/unit/app/week-view.test 2.tsx` is byte-identical to the
-  real file), `app/(app)/setlists/[id]/setlist-builder.tsx` (+20/-9, only the
-  dirty-flag change and the now-unused `useRef` import removal), the two added
-  tests in `tests/unit/app/setlist-builder.test.tsx`, and the three
-  `.pipeline/` docs. No stray files, no unrelated source edits.
+- `bun run test` (full suite) — **79 suites / 1004 tests, all passing**
+  (1003 + the one new test).
+- `git status --short`, `git diff`, `git diff HEAD --stat` — scope as above.
 
-## Non-blocking notes (do not require another pipeline round)
+## Notes for the human (non-blocking, no action required before merge)
 
-1. **Create-succeeds-but-add-fails leaves the flag stuck.** In
-   `handleQuickAdd`, if `POST /api/songs` succeeds but the follow-up
-   `handleAdd` fails (non-ok/throw), `setSearchTerm("")` never runs, so the
-   form stays visible with `quickAddTitle === ""` and
-   `quickAddTitleDirty === true` (if the user had edited the title) — meaning
-   it will not re-seed until the form hides. The `required` attribute prevents
-   submitting an empty title, so this is a cosmetic dead-end, not a data
-   problem. A one-line `setQuickAddTitleDirty(false)` next to the existing
-   resets in `handleQuickAdd` would close it.
-2. **Duplicated `showQuickAdd` predicate** (still open from the previous
-   review): computed once in the effect (line 124, `catalog.some(...)`) and
-   once in the render body (line 386, `filteredCatalog.length === 0`). They are
-   equivalent today and must not drift. Worth unifying opportunistically.
+1. `.pipeline/test-results.md` was not refreshed for this cleanup round — it
+   still describes the previous round (1003 tests) and does not mention the new
+   "not stuck blank" test. Documentation drift only; I ran the suite and the
+   mutation check myself this round, so verification coverage is not actually
+   missing.
+2. Pre-existing UX nit, unchanged by this diff and out of scope: on the
+   create-OK/add-409 path the right-hand setlist panel is not refreshed
+   (`handleAdd` returns early before `setSongs`), so a song that the server
+   says is already in the setlist may not be visible there until the next
+   reload. Worth a separate issue if it ever matters.
 
-## Process note (for the human)
+## Previously verified, re-confirmed as untouched by this round
 
-The 4 duplicate-file deletions, the source fix, the new tests, and the
-`.pipeline/` updates are all staged/working-tree only. They must be committed
-before the PR is finalized, or `git diff main...HEAD` will still show the 4
-junk duplicate test files as *added*.
-
-## Previously verified, re-confirmed as unchanged by this round
-
-Backend `GET /api/setlists/:id` (auth + role gate, tenant-scoped, 404 not 403
-for missing/other-tenant, `{ setlist, songs }` for draft and published), the
-`entry.notes !== undefined` guard in `reorderSetlist`, the `nullish()` notes
-field on `reorderSetlistSchema` only, `SONG_KEY_OPTIONS`, and the rest of the
+Backend `GET /api/setlists/:id` (auth + role gate, tenant-scoped, 404 not 403),
+the `entry.notes !== undefined` guard in `reorderSetlist`, the `nullish()` notes
+field on `reorderSetlistSchema`, `SONG_KEY_OPTIONS`, and the rest of the
 frontend (load/degrade behavior, duplicate-add 409, key-equals-default → null,
 notes persist-on-blur, full-set PUT with resync-on-failure, native HTML5 drag
-with no new dependency, zero-song Publish copy, locked state + Unlock). This
-round's diff touches none of it.
+with no new dependency, zero-song Publish copy, locked state + Unlock), plus
+the previously-SHIPped `quickAddTitleDirty` prefill fix itself. This diff
+changes none of it.

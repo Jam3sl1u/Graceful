@@ -274,6 +274,44 @@ describe("SetlistBuilder", () => {
     await waitFor(() => expect(screen.getByText("3 songs")).toBeInTheDocument());
   });
 
+  it("quick-add flow: a failed add-to-setlist after a successful song creation still leaves the title resyncable (not stuck blank)", async () => {
+    const newSong = { id: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", title: "My Custom Title", artist: null, defaultKey: null };
+    const fetchMock = jest.fn((url: string, init?: RequestInit) => {
+      if (url === `/api/songs` && init?.method === "POST") {
+        return Promise.resolve(jsonResponse(201, { data: { song: newSong } }));
+      }
+      if (url === `/api/setlists/${SETLIST_ID}/songs` && init?.method === "POST") {
+        return Promise.resolve(
+          jsonResponse(409, { error: "That song is already in the setlist.", code: "CONFLICT" }),
+        );
+      }
+      return mockFetchByUrl()(url);
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    render(<SetlistBuilder setlistId={SETLIST_ID} />);
+    await waitFor(() => expect(screen.getByText("Setlist Builder")).toBeInTheDocument());
+
+    const search = screen.getByPlaceholderText(/search songs/i);
+    fireEvent.change(search, { target: { value: "Divergent Search Term" } });
+    expect(screen.getByLabelText(/title/i)).toHaveValue("Divergent Search Term");
+
+    // Diverge the title from the search term (marks it dirty), then submit.
+    // The song gets created but the add-to-setlist call 409s — the title
+    // whose new catalog entry doesn't match the still-unchanged search term
+    // must not end up permanently stuck at "" once cleared.
+    fireEvent.change(screen.getByLabelText(/title/i), { target: { value: "My Custom Title" } });
+    fireEvent.click(screen.getByRole("button", { name: /add song/i }));
+
+    await waitFor(() => expect(screen.getByText("That song is already in the setlist.")).toBeInTheDocument());
+
+    // The search term is unchanged and still matches nothing (the newly
+    // created "My Custom Title" song doesn't match "Divergent Search Term"),
+    // so the quick-add form is still showing and should have re-seeded from
+    // the current search term rather than staying blank.
+    expect(screen.getByLabelText(/title/i)).toHaveValue("Divergent Search Term");
+  });
+
   it("key override: choosing a key different from default sends keyOverride; choosing the default sends null", async () => {
     const fetchMock = jest.fn((url: string, init?: RequestInit) => {
       if (url === `/api/setlists/${SETLIST_ID}` && init?.method === "PUT") {
