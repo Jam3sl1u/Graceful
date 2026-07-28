@@ -1,66 +1,143 @@
-# Review — Issue #63: iCal (.ics) export fallback
+# Review — Issue #64: Setlist Builder screen
 
-VERDICT: SHIP
+## VERDICT: SHIP
 
-## What I checked
-- Read spec.md, changes.md, test-results.md.
-- Read the actual diff (`git diff main...HEAD`) and every created file:
-  `lib/ical/generate.ts`, both `ics/handler.ts` + `route.ts` pairs, and both
-  test files (coder's + tester's supplements).
-- Re-ran independently: `bun run lint` (0 errors), `bun run typecheck`
-  (0 errors), `bun run test` (77 suites / 968 tests pass, 0 failures).
-- Scanned the diff for network/exfil patterns — none (no `fetch`, no beacon,
-  no dynamic `require`/`eval`); only a benign code comment matched.
+This round is a targeted final pass over the two non-blocking items the prior
+SHIP recorded (stuck `quickAddTitleDirty` flag; duplicated catalog-match
+predicate). Both are correctly fixed, the new regression test is a real guard
+(I mutation-tested it myself), and lint/typecheck/full suite are green when I
+run them. The previously-reviewed-and-SHIPped core of #64 is untouched by this
+diff. No new issues found; nothing left open.
 
-## Spec conformance (verified against the code, not just the summaries)
-- Generator emits the exact VCALENDAR/VEVENT structure, order, PRODID, CRLF
-  line endings + trailing CRLF as specced.
-- `formatIcsDate` uses the exact `toISOString()` UTC-basic transform → no
-  local-time drift (verified by the offset-normalization test).
-- `escapeIcsText` escapes backslash-first, then `;` `,` then CR/LF → `\n`, in
-  the required order.
-- `foldLine` folds at 75 octets (74 for continuation to account for the
-  leading space), backs off on UTF-8 continuation bytes so multibyte chars
-  aren't split. Escape-then-fold ordering round-trips (tester verified an
-  escape sequence straddling a fold boundary still unfolds losslessly).
-- `null`/empty/whitespace LOCATION/DESCRIPTION lines are omitted, not emitted
-  empty.
-- Both handlers mirror the existing auth/JWT/try-catch shape: `requireAuth`
-  (no role gate, correct per spec), explicit 401 on missing JWT, 500 on any
-  Supabase error, `ApiException` → `fail(...)` else 500.
-- Single-event handler checks `event_attendees` (the #60 attendee model, not
-  the invitation-scoped list) before fetching the event, and returns 404
-  without distinguishing "not yours" from "doesn't exist" — no info leak.
-- Full-export handler: optional `?serviceWeekId` validated as uuid (400 on
-  invalid), dedupes attendee event_ids, 404 on zero attendee rows AND 404 on
-  empty post-filter result (Decision 2 honored in both branches), orders by
-  start_time asc, filename `graceful-events.ics`.
-- No new dependency (`bun.lock` untouched), no UI (correct — member-week
-  screen is still a placeholder), no scope creep.
+## Scope of this diff (verified)
 
-## Tests — meaningful, not superficial
-- Route tests cover every named edge case: 401 (null Clerk id / null JWT,
-  asserting lookup + supabase client are NOT consulted early), 404 (not an
-  attendee / event missing / zero assigned / serviceWeekId matches none), 400
-  (invalid serviceWeekId), 500 (both query error paths), and 200 happy paths
-  asserting Content-Type, Content-Disposition filename, and VEVENT count.
-- Tester supplements add genuine coverage the coder's suite structurally
-  couldn't reach: multibyte UTF-8 fold safety, escape-then-fold ordering
-  end-to-end, the attendee-vs-invitation scoping distinction (asserts the
-  handler never queries an `invitations` table), and a real failure case —
-  a malformed `start_time` throws `RangeError` inside `generateIcs` and the
-  outer try/catch correctly converts it to a 500 rather than crashing.
+`git status --short` / `git diff --stat`:
 
-## Notes (non-blocking)
-- The two `*-tester-supplement.test.ts` files and the updated
-  `test-results.md` are present in the worktree but not yet committed (only
-  the implementation commit exists). Orchestration should commit them with
-  the rest before the PR; they pass as-is.
-- The handlers rely on RLS + `user_id`/attendee scoping for tenancy rather
-  than an explicit `.eq("church_group_id", ...)` like sibling handlers. This
-  is an explicit, defensible spec decision and is safe here: the full-export
-  events query only fetches ids drawn from the caller's own attendee rows,
-  and the single-event path gates on an attendee check first. Called out for
-  human awareness, not a blocker.
+```
+ .pipeline/changes.md                        | 23 +++++++++++++++++
+ app/(app)/setlists/[id]/setlist-builder.tsx | 18 ++++++++------
+ tests/unit/app/setlist-builder.test.tsx     | 38 +++++++++++++++++++++++++++++
+```
 
-Green tests here reflect genuinely correct behavior. Ship it.
+Three files, +72/-7, working tree only (nothing staged, `git diff HEAD --stat`
+identical). The 4 duplicate `" 2"`-suffixed test files flagged in the previous
+round are gone from the working tree. No stray files, no unrelated source
+edits, no backend/CSS changes.
+
+## Fix 1 — stuck dirty flag (`handleQuickAdd`)
+
+`app/(app)/setlists/[id]/setlist-builder.tsx:246` adds
+`setQuickAddTitleDirty(false);` alongside the existing
+`setQuickAddTitle("") / setQuickAddArtist("") / setQuickAddKey("")` resets.
+
+My own trace of the paths:
+
+1. **Create OK + add OK (happy path).** `handleAdd` calls `setSearchTerm("")`
+   (line 211) → the seeding effect sees `showQuickAdd === false` and already
+   reset the flag via its `else` branch. The new line is redundant here and
+   changes nothing — confirmed by the pre-existing quick-add happy-path test
+   still passing.
+2. **Create OK + add FAILS (the reported bug).** `setSearchTerm("")` never
+   runs, so `searchTerm` still holds a term that (if the created title diverged
+   from it) matches nothing — including the newly appended catalog entry — so
+   `showQuickAdd` stays `true` and the effect's `else` branch never fires.
+   Pre-fix: `quickAddTitle === ""` with `quickAddTitleDirty === true` → the
+   `!quickAddTitleDirty` guard blocks re-seeding and the field is stuck blank.
+   Post-fix: the flag is cleared, the effect (deps include
+   `quickAddTitleDirty`) re-runs and re-seeds `quickAddTitle` from the current
+   `searchTerm`. Correct.
+3. **Create FAILS (`!res.ok` or throw).** The function returns early / lands in
+   `catch` *before* the resets, so the flag stays `true` and the user's typed
+   title survives for a retry. This is the right behavior and the fix
+   deliberately does not touch it — worth calling out because clearing the flag
+   there would have destroyed user input.
+4. **No new render-loop risk.** `setQuickAddTitleDirty(false)` when already
+   `false` bails out via `Object.is`; the effect remains convergent
+   (`quickAddTitle` settles at `searchTerm`, flag settles at `false`).
+
+## Fix 2 — `filterCatalog` extraction
+
+New module-level helper at
+`app/(app)/setlists/[id]/setlist-builder.tsx:39-44`, used by the seeding effect
+(line 132) and the render-time `filteredCatalog` (line 389).
+
+- The predicate is character-for-character the same rule both call sites used
+  before (`title` OR `artist ?? ""`, `.toLowerCase().includes(term)`), so this
+  is a pure extraction with no behavior change.
+- The effect's `catalog.some(pred)` → `filterCatalog(...).length === 0` swap is
+  logically equivalent (`!some(p)` ≡ `filter(p).length === 0`). It trades
+  short-circuiting for an allocation; catalogs here are a single church group's
+  song list rendered in full on every keystroke anyway, so this is noise, not a
+  performance regression.
+- Both call sites pass an already `trim().toLowerCase()`-normalized `term`
+  (lines 131 and 388), so the helper's implicit "term must be pre-normalized"
+  contract holds today. Stylistic nit only, not a defect: normalizing inside
+  the helper would make it misuse-proof. Not worth a round.
+- Pure function, module-level, no closure over component state — no hook-order
+  or stale-capture concerns.
+
+## Test quality — I proved the new test is not tautological
+
+`tests/unit/app/setlist-builder.test.tsx:277-313`, "quick-add flow: a failed
+add-to-setlist after a successful song creation still leaves the title
+resyncable (not stuck blank)".
+
+The test mocks `POST /api/songs` → 201 and `POST /api/setlists/:id/songs` →
+409, types a search term (`"Divergent Search Term"`) that no fixture matches,
+deliberately diverges the Title to `"My Custom Title"` (setting the dirty flag
+via the field's own `onChange`), submits, waits for the inline 409 message,
+then asserts the Title field has re-populated to the current search term.
+The divergence matters: it guarantees the newly-appended catalog entry still
+does not match the search term, so the quick-add form stays mounted and the
+"stuck blank" state is actually reachable.
+
+Rather than trust that reasoning, I copied the tree to a scratch directory,
+deleted **only** the `setQuickAddTitleDirty(false);` line from `handleQuickAdd`,
+and reran the suite file there:
+
+```
+Tests: 1 failed, 21 passed, 22 total
+● quick-add flow: a failed add-to-setlist ... (not stuck blank)
+  Expected the element to have value: Divergent Search Term
+  Received: (empty)
+```
+
+Exactly the reported bug, and exactly one test fails — so the assertion is
+genuinely load-bearing and no other test was silently depending on the old
+behavior. The `filterCatalog` extraction is covered transitively by the
+existing search/quick-add-visibility tests (any drift in the predicate would
+change which rows render).
+
+## Verified myself this run
+
+- `bun run lint` — 0 errors. 1 warning, in the gitignored generated artifact
+  `coverage/lcov-report/block-navigation.js` (confirmed `.gitignore:13`);
+  unrelated to this diff and unchanged from prior rounds.
+- `bun run typecheck` — clean.
+- `bun run test` (full suite) — **79 suites / 1004 tests, all passing**
+  (1003 + the one new test).
+- `git status --short`, `git diff`, `git diff HEAD --stat` — scope as above.
+
+## Notes for the human (non-blocking, no action required before merge)
+
+1. `.pipeline/test-results.md` was not refreshed for this cleanup round — it
+   still describes the previous round (1003 tests) and does not mention the new
+   "not stuck blank" test. Documentation drift only; I ran the suite and the
+   mutation check myself this round, so verification coverage is not actually
+   missing.
+2. Pre-existing UX nit, unchanged by this diff and out of scope: on the
+   create-OK/add-409 path the right-hand setlist panel is not refreshed
+   (`handleAdd` returns early before `setSongs`), so a song that the server
+   says is already in the setlist may not be visible there until the next
+   reload. Worth a separate issue if it ever matters.
+
+## Previously verified, re-confirmed as untouched by this round
+
+Backend `GET /api/setlists/:id` (auth + role gate, tenant-scoped, 404 not 403),
+the `entry.notes !== undefined` guard in `reorderSetlist`, the `nullish()` notes
+field on `reorderSetlistSchema`, `SONG_KEY_OPTIONS`, and the rest of the
+frontend (load/degrade behavior, duplicate-add 409, key-equals-default → null,
+notes persist-on-blur, full-set PUT with resync-on-failure, native HTML5 drag
+with no new dependency, zero-song Publish copy, locked state + Unlock), plus
+the previously-SHIPped `quickAddTitleDirty` prefill fix itself. This diff
+changes none of it.

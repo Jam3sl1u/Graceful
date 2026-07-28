@@ -1,100 +1,114 @@
-# Test Results — Issue #63: iCal (.ics) export fallback
+# Test Results — Issue #64: Setlist Builder screen
 
-This overwrites the stale `test-results.md` for issue #62 that was still
-sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
-recent run).
+This overwrites the previous `test-results.md` (which incorrectly signed off
+on the ref-based `wasQuickAddShownRef` fix — that fix was subsequently found
+broken on critical re-review and BLOCKed; see `.pipeline/changes.md`
+"Follow-up fix (post-review)" for the full history). Per AGENTS.md,
+`.pipeline/` files reflect only the most recent run.
 
-## Verdict: ALL PASS
+## Verdict: ALL TESTS PASSING — corrected (`quickAddTitleDirty`-based) fix verified against the exact regression the reviewer found
 
-`bun run lint`, `bun run typecheck`, and `bun run test` were re-run
-independently (not trusted from `.pipeline/changes.md`):
+## What I did
 
-- `bun run lint` (eslint .) — 0 errors.
-- `bun run typecheck` (tsc --noEmit) — 0 errors.
-- `bun run test` (Jest, full suite including new tests below) — **77 suites /
-  968 tests passed**, 0 failures. Coder's baseline was 75 suites / 960 tests;
-  this stage added 2 suites / 8 tests, all passing, no other file touched.
+Independently re-verified the **corrected** fix (a `quickAddTitleDirty`
+boolean state, not the earlier `wasQuickAddShownRef` ref) rather than
+trusting `changes.md`'s claims:
 
-## What I independently verified (beyond re-running the coder's own suite)
+1. Read the current `app/(app)/setlists/[id]/setlist-builder.tsx` directly
+   (seeding `useEffect`, Title `onChange`, `handleQuickAdd`):
+   - `quickAddTitleDirty` is set `true` only inside the Title input's own
+     `onChange` handler.
+   - The seeding `useEffect` (deps `[searchTerm, catalog, quickAddTitleDirty]`)
+     re-runs on **every** `searchTerm` change while the quick-add form is
+     shown, and calls `setQuickAddTitle(searchTerm)` whenever
+     `!quickAddTitleDirty` — i.e. it is not gated by a latch that only fires
+     once. It resets `quickAddTitleDirty` to `false` when the form goes
+     hidden. This is architecturally different from the earlier broken
+     ref-based latch and does genuinely handle progressive/incremental
+     typing, not just single-shot paste.
 
-I read `lib/ical/generate.ts`, `app/api/events/[id]/ics/handler.ts`,
-`app/api/events/[id]/ics/route.ts`, `app/api/events/ics/handler.ts`,
-`app/api/events/ics/route.ts`, and both of the coder's own test files
-(`tests/unit/lib/ical/generate.test.ts`,
-`tests/unit/app/api/events-ics-route.test.ts`) against `.pipeline/spec.md`.
-The coder's own suite is thorough and all of it passes unmodified. I then
-added two new `*-tester-supplement.test.ts` files (matching this repo's
-existing convention for tester-added coverage, e.g.
-`events-id-attendees-route-tester-supplement.test.ts`) targeting the exact
-"What the Tester should focus on" list in `.pipeline/changes.md`, plus one
-case the coder's suite structurally could not reach.
+2. Checked the existing test file
+   (`tests/unit/app/setlist-builder.test.tsx`) and confirmed neither existing
+   test reproduced the real regression shape: both used single
+   `fireEvent.change` calls with the full final string (paste semantics), or
+   two discrete jumps with a manual title edit between them — never a
+   sequence of `fireEvent.change` calls simulating letter-by-letter typing
+   with no title interaction, which is exactly the shape that would have
+   caught the original broken ref-based fix.
 
-### `tests/unit/lib/ical/generate-tester-supplement.test.ts` (3 new tests)
-- **Multi-byte UTF-8 fold safety.** The coder's own `foldLine` tests only use
-  repeated ASCII (`"x"`/`"A"`), which can never exercise the "back off while
-  the next byte is a UTF-8 continuation byte" branch. I forced folds
-  mid-character using 4-byte emoji and 3-byte CJK text, and confirmed every
-  physical line is valid, round-trippable UTF-8 (no `U+FFFD` replacement
-  characters introduced) and that de-folding reconstructs the exact original
-  string. **Pass** — the byte-boundary backoff logic is correct.
-- **Escape-then-fold ordering.** Built a long description containing `,` `;`
-  `\` and embedded newlines, ran it through the real `generateIcs`, and
-  confirmed the folded+rejoined DESCRIPTION value equals `escapeIcsText`
-  applied once to the whole raw string — i.e. escaping happens on the full
-  value before folding, not per-chunk after folding (which would risk
-  double-escaping or corrupting an escape sequence at a chunk boundary).
-  **Pass.**
+3. Added a new test: **"search no match: prefilled title tracks the search
+   term through incremental (letter-by-letter) typing, not just a single
+   paste"**. It fires 19 sequential `fireEvent.change` calls on the search
+   input with progressively longer prefixes of `"Xylophone Jam 2000"` (one
+   character added each time, none matching the fixture catalog), asserting
+   the Title field's value equals the search term after **every single
+   step**, not just the end state. (Target string chosen so no catalog
+   title/artist contains "x" — a `"T..."` target's very first character
+   would substring-match "How Great Thou Art" and mask the bug by never
+   entering quick-add mode long enough to matter.)
 
-### `tests/unit/app/api/events-ics-route-tester-supplement.test.ts` (5 new tests)
-- **Attendee-scoping distinction** (changes.md focus item #1). For both
-  endpoints, built a Supabase mock where `event_attendees` returns "not
-  assigned"/"zero rows" while an `invitations` table (if ever queried) would
-  wrongly grant access. Asserted `supabase.from(...)` is **never** called
-  with `"invitations"` and that both endpoints still return 404. This
-  confirms — in the actual code, not just the coder's documentation claim —
-  that both handlers are genuinely scoped to the #60 attendee model and
-  cannot be satisfied by an invitation alone. **Pass.**
-- **End-to-end escaping** (focus item #3). Fed a DB row with `,` `;` `\` and
-  embedded `\n`/`\r\n` in `name`/`location`/`notes` through the real
-  `exportEventIcs` handler (not just the pure generator) and asserted the
-  escaped forms appear correctly in the response body. **Pass.**
-- **End-to-end long-notes folding** (focus item #4). Fed a >75-octet `notes`
-  value through the real handler, confirmed the DESCRIPTION line folds with
-  a continuation line, and that every physical line in the entire response
-  body respects the 75-octet limit. **Pass.**
-- **Genuine failure case beyond "Supabase returned an error object".** Fed a
-  malformed `start_time` (`"not-a-real-date"`) through the real handler.
-  `new Date(...).toISOString()` throws a `RangeError` inside `generateIcs`,
-  which is not a Supabase-error-shaped failure and is not exercised anywhere
-  in the coder's own suite (which only tests `{ error: {...} }` responses
-  from Supabase). Confirmed the handler's outer `try/catch` still turns this
-  into a well-formed `500 INTERNAL` response rather than an unhandled
-  exception or a corrupted 200 body. **Pass.**
+4. **Verified the test is a real regression guard, not a tautology**: I
+   temporarily reintroduced the old broken `wasQuickAddShownRef`-based
+   seeding logic in place of the current `quickAddTitleDirty` logic and
+   reran the test in isolation. It failed exactly as expected — the title
+   froze at `"X"` after the first keystroke (`Expected: "Xy"`, `Received:
+   "X"`) — confirming this test would have caught the original blocking
+   bug. I then restored the file to the corrected implementation from a
+   backup and diffed to confirm an exact, clean restore (no ref-based code
+   left behind).
 
-All 8 new tests pass against the existing implementation as-is — no code
-changes were needed or made.
+5. Ran `bun run lint`, `bun run typecheck`, and `bun run test` (full suite)
+   for real, from the repo root, against the restored corrected code.
 
-## Spec cross-check (no discrepancies found)
+6. Confirmed via `git status --short` that the working tree only shows the 4
+   expected staged deletions (duplicate " 2"-suffixed test files), the
+   `.pipeline/changes.md` edit, the `app/(app)/setlists/[id]/setlist-builder.tsx`
+   edit, `tests/unit/app/setlist-builder.test.tsx` (my new test), and
+   `.pipeline/review.md` (pre-existing modification from the prior BLOCK
+   verdict, not touched by me this run) — nothing unexpected.
 
-- CRLF everywhere + trailing CRLF: confirmed by the coder's own tests and
-  re-verified independently in the end-to-end folding supplement test
-  (byte-length check over every non-empty line of a real handler response).
-- 404 (never a 200-with-empty-calendar) on zero assigned events, and on
-  `serviceWeekId` matching none of the caller's events: present in the
-  coder's suite; re-read the handler logic directly and it matches spec
-  Decision 2 exactly (both the zero-attendee-rows short-circuit and the
-  post-filter empty-result check return the same 404).
-- No role gate on either endpoint: confirmed — neither handler calls
-  `requireRole`, matching the spec's "any authenticated member" scope.
-- No new dependency added: `bun.lock` is unmodified; `git status` shows only
-  the files listed in `changes.md` plus the two new test files added by this
-  stage.
-- No UI added or wired: confirmed no changes under `app/(app)/member-week/`
-  or any other app route.
+## Results
 
-## Files added by this stage (Testing)
+- `bun run lint` — clean. (One pre-existing, unrelated warning in a
+  generated coverage-report artifact, `coverage/lcov-report/block-navigation.js`;
+  not part of this change.)
+- `bun run typecheck` — clean, no errors.
+- `bun run test` (full suite) — **79 suites / 1003 tests, all passing.**
+- `tests/unit/app/setlist-builder.test.tsx` in isolation: **21/21 passing**,
+  including the new incremental-typing test and the pre-existing
+  "further edits ... not clobbered" test (which covers a different angle:
+  preserving a manual edit across continued search typing, not the
+  incremental-typing-without-manual-edit regression itself).
 
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-63/tests/unit/lib/ical/generate-tester-supplement.test.ts`
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-63/tests/unit/app/api/events-ics-route-tester-supplement.test.ts`
+## Is the incremental-typing scenario genuinely covered?
 
-No implementation files were modified. Ready for Review.
+Yes. Prior to this run, no test in the suite simulated sequential keystrokes
+without a manual title edit in between — the exact scenario the second
+review round identified as uncaught. The new test does, it passes against
+the current (`quickAddTitleDirty`) implementation, and it was confirmed to
+fail against the previously-BLOCKed ref-based implementation, so it is a
+genuine regression guard rather than incidental coverage.
+
+## Files touched by this stage (Testing)
+
+- `/Users/jamesliu/Documents/Graceful/tests/unit/app/setlist-builder.test.tsx`
+  — added one new test (incremental/letter-by-letter typing). No other test
+  files modified this run.
+
+No implementation files were modified by this stage (the temporary
+regression-revert during verification step 4 was restored from a backup
+before running the final full suite; the working tree reflects only the
+Coding stage's corrected fix). Ready for Review.
+
+## Addendum — non-blocking cleanup round
+
+The SHIP review above also flagged two non-blocking items (stuck
+`quickAddTitleDirty` flag on a failed add-to-setlist; the catalog
+match predicate duplicated between the seeding effect and the render-time
+filter). Both are now fixed — see `.pipeline/changes.md` "Non-blocking
+cleanup (post-SHIP)". A new regression test, "quick-add flow: a failed
+add-to-setlist after a successful song creation still leaves the title
+resyncable (not stuck blank)", was added and mutation-verified (fails with
+exactly the predicted wrong value when the `setQuickAddTitleDirty(false)`
+fix is removed). Full suite: 79 suites / 1004 tests, all passing. Verdict
+unchanged: ALL TESTS PASSING.

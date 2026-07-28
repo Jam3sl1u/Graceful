@@ -8,6 +8,7 @@ export const reorderSetlistSchema = z.object({
     z.object({
       songId: z.string().uuid(),
       keyOverride: z.string().trim().min(1).max(5).nullish(),
+      notes: z.string().trim().max(1000).nullish(),
     }),
   ),
 });
