@@ -65,6 +65,33 @@
   row styling, following `week-view.module.css`'s `.container` / `var(--color-*)`
   conventions. No global style changes.
 
+### Follow-up fix (post-review)
+
+- `app/(app)/setlists/[id]/setlist-builder.tsx` — the initial version left
+  `quickAddTitle` as an independent `useState("")`, so the quick-add form's
+  Title field rendered empty instead of prefilled with the search term
+  (spec requirement, flagged by Review as the sole blocker).
+
+  A first attempted fix (`wasQuickAddShownRef` + a `useEffect` that seeded
+  `quickAddTitle` only on the hidden→shown transition) was itself found
+  broken on re-review: the ref latched `true` after the *first* no-match
+  character, so continued typing in the search box never re-synced the
+  title — a user typing "Totally New Song" letter-by-letter ended up
+  submitting `title: "To"`, silently writing a junk row into the shared
+  song catalog (worse than the original bug, which at least blocked submit
+  via `required`).
+
+  Corrected fix: a `quickAddTitleDirty` boolean state, set `true` in the
+  Title field's own `onChange` (i.e. the user has independently edited it).
+  The seeding `useEffect` (keyed on `[searchTerm, catalog, quickAddTitleDirty]`)
+  now syncs `quickAddTitle` to `searchTerm` on every change to `searchTerm`
+  while the quick-add form is shown **and** the title hasn't been
+  independently edited, and resets `quickAddTitleDirty` back to `false`
+  whenever the form goes hidden (so the next time it reappears, it seeds
+  fresh from whatever the new search term is). This keeps the title synced
+  through continued typing, while still preserving a user's manual edit
+  once they've made one.
+
 ## Verification
 
 - `bun run lint` — clean.

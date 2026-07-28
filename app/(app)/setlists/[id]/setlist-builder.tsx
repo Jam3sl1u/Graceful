@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
+import { useEffect, useState, type DragEvent, type FormEvent } from "react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
@@ -47,7 +47,7 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
   const [quickAddArtist, setQuickAddArtist] = useState("");
   const [quickAddKey, setQuickAddKey] = useState("");
   const [quickAddError, setQuickAddError] = useState<string | null>(null);
-  const wasQuickAddShownRef = useRef(false);
+  const [quickAddTitleDirty, setQuickAddTitleDirty] = useState(false);
 
   const [persistError, setPersistError] = useState<string | null>(null);
   const [draggedSongId, setDraggedSongId] = useState<string | null>(null);
@@ -126,11 +126,14 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
     );
     const showQuickAdd = term !== "" && !hasMatch;
 
-    if (showQuickAdd && !wasQuickAddShownRef.current) {
-      setQuickAddTitle(searchTerm);
+    if (showQuickAdd) {
+      if (!quickAddTitleDirty) {
+        setQuickAddTitle(searchTerm);
+      }
+    } else {
+      setQuickAddTitleDirty(false);
     }
-    wasQuickAddShownRef.current = showQuickAdd;
-  }, [searchTerm, catalog]);
+  }, [searchTerm, catalog, quickAddTitleDirty]);
 
   const isLocked = meta?.status === "published";
   const catalogById = new Map(catalog.map((c) => [c.id, c]));
@@ -457,7 +460,10 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
                   required
                   value={quickAddTitle}
                   disabled={isLocked}
-                  onChange={(e) => setQuickAddTitle(e.target.value)}
+                  onChange={(e) => {
+                    setQuickAddTitle(e.target.value);
+                    setQuickAddTitleDirty(true);
+                  }}
                 />
               </label>
               <label>

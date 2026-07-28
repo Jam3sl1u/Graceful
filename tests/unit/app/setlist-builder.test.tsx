@@ -160,6 +160,50 @@ describe("SetlistBuilder", () => {
     expect(screen.getByLabelText(/title/i)).toHaveValue("Totally New Song");
   });
 
+  it("search no match: prefilled title tracks the search term through incremental (letter-by-letter) typing, not just a single paste", async () => {
+    render(<SetlistBuilder setlistId={SETLIST_ID} />);
+    await waitFor(() => expect(screen.getByText("Setlist Builder")).toBeInTheDocument());
+
+    const search = screen.getByPlaceholderText(/search songs/i);
+    // None of the fixture catalog's titles/artists contain "x", so every
+    // prefix of this target (starting from the very first character) is
+    // guaranteed to be a no-match and keep the quick-add form visible —
+    // unlike e.g. "T", whose 1-character prefix substring-matches "How
+    // Great Thou Art" and would suppress the form before typing even gets
+    // going.
+    const target = "Xylophone Jam 2000";
+
+    // Simulate typing one character at a time (each fireEvent.change here
+    // mirrors a single keystroke, unlike a single paste of the full string)
+    // without ever touching the Title field directly.
+    for (let i = 1; i <= target.length; i++) {
+      const partial = target.slice(0, i);
+      fireEvent.change(search, { target: { value: partial } });
+      expect(screen.getByLabelText(/title/i)).toHaveValue(partial);
+    }
+
+    expect(screen.getByLabelText(/title/i)).toHaveValue(target);
+  });
+
+  it("search no match: further edits to the prefilled title are not clobbered by continued typing in the search box", async () => {
+    render(<SetlistBuilder setlistId={SETLIST_ID} />);
+    await waitFor(() => expect(screen.getByText("Setlist Builder")).toBeInTheDocument());
+
+    const search = screen.getByPlaceholderText(/search songs/i);
+    fireEvent.change(search, { target: { value: "Totally New Song" } });
+    expect(screen.getByLabelText(/title/i)).toHaveValue("Totally New Song");
+
+    // user overrides the prefilled title by hand
+    fireEvent.change(screen.getByLabelText(/title/i), { target: { value: "My Custom Title" } });
+    expect(screen.getByLabelText(/title/i)).toHaveValue("My Custom Title");
+
+    // continuing to type in the search box (quick-add form stays visible,
+    // still no catalog match) must not overwrite the user's edited title
+    fireEvent.change(search, { target: { value: "Totally New Song 2" } });
+    expect(screen.getByText("Add a new song")).toBeInTheDocument();
+    expect(screen.getByLabelText(/title/i)).toHaveValue("My Custom Title");
+  });
+
   it("duplicate add: a 409 from POST /songs shows an inline message and does not mutate local state", async () => {
     const fetchMock = jest.fn((url: string, init?: RequestInit) => {
       if (url === `/api/setlists/${SETLIST_ID}/songs` && init?.method === "POST") {
