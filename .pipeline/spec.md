@@ -1,77 +1,189 @@
-# Spec — Issue #64: Build Setlist Builder screen
-
-Two-panel Set Leader screen at `/setlists/[id]` (`[id]` = **setlist id**): left =
-song search + quick-add; right = ordered setlist with per-song key/notes/drag/remove;
-bottom bar = song count + Publish (with confirmation). Wires to the already-built
-#55/#56/#57 endpoints, plus two small enabling backend changes noted below.
+# Spec — Issue #65: Build Member Week View screen
 
 ## OPEN QUESTIONS
 
-None blocking. Two deliberate, low-risk decisions are called out inline (a new
-read endpoint, and per-song notes persistence) — both are required to satisfy the
-acceptance criteria and are speced concretely below rather than left ambiguous.
+None blocking. One design decision is called out under **Decisions & assumptions**
+(how the confirmed team is sourced for a member) — it is resolved with an
+RLS-compatible approach and does not require a human to proceed. If a reviewer
+disagrees with that sourcing, it is a follow-up, not a blocker for this screen.
+
+## Goal
+
+Turn the stub at `app/(app)/member-week/[id]/page.tsx` ("coming soon") into the
+Member Week View: a mobile-first screen showing, for the signed-in member and a
+given service week, the header (date + their confirmation status), setlist,
+their assigned events (each tappable to a detail view with a Maps link), the
+confirmed team with instruments, and this week's song documents (chord charts /
+sheet music) opened via signed URL.
+
+PRD ref: Phase 1 PRD §13 Screen 3.
 
 ## Current state (verified)
 
-- `app/(app)/setlists/[id]/page.tsx` is a stub: `<h1>Setlist Builder — coming soon</h1>`.
-- Backend for editing already exists in `app/api/setlists/[id]/handler.ts`:
-  - `POST /api/setlists/:id/songs` (`addSetlistSong`) — adds one song, BR-07 dup → 409, returns `{ songs }` (201).
-  - `DELETE /api/setlists/:id/songs/:songId` (`removeSetlistSong`) — removes + recompacts positions, returns `{ songs }`.
-  - `PUT /api/setlists/:id` (`reorderSetlist`) — full reorder + key overrides, returns `{ songs }`. Body must contain **exactly** the setlist's current song set; position is derived from array index (1-based). Editing 409s if the setlist is published.
-  - `POST /api/setlists/:id/publish` (`publishSetlist`) — draft→published, BR-01 zero songs is valid.
-  - `POST /api/setlists/:id/unlock` (`unlockSetlist`) — published→draft.
-- `GET /api/songs?q=` (`listSongs`) returns the whole catalog (`{ songs: [{id,title,artist,defaultKey,bpm,tags,...}] }`), optional case-insensitive title/artist filter. `POST /api/songs` (`createSong`) creates a catalog song (201, `{ song }`).
-- **Gap 1:** there is NO endpoint that returns a setlist + its ordered songs by setlist id. `setlist_songs` are only ever returned as a side effect of add/remove/reorder. The builder needs an initial read → add `GET /api/setlists/:id` (below).
-- **Gap 2:** `setlist_songs.notes` is returned in responses but NO endpoint accepts writing it. `reorderSetlistSchema` and `addSetlistSongSchema` have no `notes`. The AC requires an editable per-song notes field → extend the PUT reorder path to persist notes (below).
-- `SetlistSongResponse` (from `app/api/setlists/[id]/handler.ts`) has NO `title`/`artist` — only `songId`, `position`, `keyOverride`, `defaultKey`, `effectiveKey`, `isOverridden`, `notes`. The builder must map title/artist by `songId` from the `/api/songs` catalog it already loads. Do NOT change `toSetlistSongResponse` / `SetlistSongResponse` shape — existing tests assert both directly.
-- Response envelope: success `{ data: ... }`, error `{ error, code }` (`lib/api/response.ts`). Client reads `body.data.*`.
-- No drag-and-drop library is installed. Use **native HTML5 DnD** (`draggable`, `onDragStart`/`onDragOver`/`onDrop`). Do NOT add any dependency.
-- UI kit: `components/ui/Button.tsx` (`variant="primary"|"secondary"`), `components/ui/Badge.tsx` (`tone`), `components/ui/Modal.tsx` (`{ open, onClose, children }`).
-- Valid key list lives in `schemas/songs.ts` as the ordered `ASCII_SONG_KEYS` (17 keys) — currently NOT exported.
+- `app/(app)/member-week/[id]/page.tsx` is a stub returning an `<h1>`.
+- There is **no** member-facing endpoint that returns setlist *songs*
+  (`GET /api/setlists/:id` is PUT-only; `.../songs` is POST-only). Members
+  therefore currently have no way to read songs + keys.
+- `GET /api/invitations?serviceWeekId=` is `set_leader`/`admin` only
+  (`app/api/invitations/handler.ts` `listInvitations`), so a member cannot read
+  the roster or others' confirmation via it.
+- RLS (`supabase/migrations/20260704000001_rls_policies.sql`) for a `member`:
+  - `service_weeks`, `events`, `event_attendees`, `songs`, `song_documents`,
+    `users`, `member_profiles`, `member_instruments`, `instruments` — **tenant
+    readable** (whole church group).
+  - `setlists` / `setlist_songs` — readable **only when the setlist is
+    `published`** (drafts filtered out for members).
+  - `invitations` — a member can read **only their own** rows
+    (`invitations_select_own`); cannot read other members' invitations.
+- `accept_invitation` RPC inserts one `event_attendees` row per existing week
+  event on accept (idempotent) — so `event_attendees` for a week's events is the
+  member-visible source of "who is serving this week".
 
-## Backend changes
+Because a member cannot read other members' `invitations` under RLS, the Team
+section and "is anyone else confirmed" cannot be derived from `invitations`. It
+is instead derived from `event_attendees` (which members *can* read). See
+Decisions.
 
-### 1. Add `GET /api/setlists/:id` → returns setlist + ordered songs
+## Approach
 
-`app/api/setlists/[id]/handler.ts` — add exported `getSetlistWithSongs(req, id, lookup?)`:
-- `requireAuth`; `requireRole(ctx, ["admin", "set_leader"])` (this is the Set Leader editing surface).
-- Get supabase JWT client (same `auth()`/`getToken({ template: "supabase" })` pattern as siblings).
-- Load setlist tenant-scoped: `.from("setlists").select("*").eq("id", id).eq("church_group_id", ctx.churchGroupId).maybeSingle()`. Missing → `fail("Setlist not found", ErrorCode.NOT_FOUND, 404)`. DB error → 500.
-- Reuse the existing private `loadSongResponses(supabase, id)` helper for the ordered songs; on error → 500.
-- Return `ok({ setlist: toSetlistResponse(data), songs })`. (Return for both draft and published — the client needs status to render the locked state.)
-- Wrap in the same `try/catch` mapping `ApiException` → `fail(err.message, err.code, err.status)`, else 500.
+Add **one** member-facing aggregate endpoint that returns the entire screen
+payload in a single call, then build the screen as a server wrapper + `"use
+client"` component (mirroring `app/(app)/week/[id]/page.tsx` +
+`week-view.tsx`). The endpoint does all reads through the caller's RLS-scoped
+Supabase client — **no new RPC, no RLS changes, no service-role usage**
+(service-role is banned in `app/`).
 
-`app/api/setlists/[id]/route.ts` — add:
+## Files to create / modify
+
+### 1. CREATE `app/api/service-weeks/[id]/member-view/handler.ts`
+
+Pattern to copy: `app/api/service-weeks/[id]/setlist/handler.ts` (auth + JWT +
+`getSupabaseClient` boilerplate) and `app/api/church-group/members/handler.ts`
+(directory / instrument assembly), plus `app/api/songs/[id]/documents/handler.ts`
+`toSongDocumentResponse` for signed-URL minting.
+
+Export the response type and the handler:
+
 ```ts
-export async function GET(req: NextRequest, { params }: Ctx): Promise<Response> {
-  const { id } = await params;
-  return getSetlistWithSongs(req, id);
-}
-```
-Keep the existing `PUT` export unchanged.
+import type { EventType, InvitationStatus, VocalCapability } from "@/types/domain";
 
-### 2. Persist per-song `notes` through the PUT reorder path
-
-`schemas/setlists.ts` — extend `reorderSetlistSchema`'s per-song object with an optional notes field:
-```ts
-notes: z.string().trim().max(1000).nullish(),
-```
-(Leave `addSetlistSongSchema` unchanged — notes are added via PUT after a song is in the setlist.)
-
-`app/api/setlists/[id]/handler.ts`, inside `reorderSetlist`'s per-song update loop — only touch `notes` when the client actually sent it, so existing reorder callers (that omit notes) do NOT wipe notes:
-```ts
-const update: Record<string, unknown> = {
-  position: i + 1,
-  key_override: entry.keyOverride ?? null,
+export type MemberWeekEvent = {
+  id: string;
+  type: EventType;
+  name: string;
+  location: string | null;
+  startTime: string;   // events.start_time
+  endTime: string;     // events.end_time
+  notes: string | null;
+  assigned: boolean;   // caller is in event_attendees for this event
 };
-if (entry.notes !== undefined) update.notes = entry.notes ?? null;
-// ...supabase.from("setlist_songs").update(update as unknown as ...Update)
+
+export type MemberWeekSong = {
+  songId: string;
+  title: string;
+  artist: string | null;
+  position: number;             // setlist_songs.position
+  effectiveKey: string | null;  // key_override ?? songs.default_key
+};
+
+export type MemberWeekTeamMember = {
+  userId: string;
+  name: string;
+  vocalCapability: VocalCapability;      // 'none' when no member_profile
+  instruments: { id: string; name: string }[];
+};
+
+export type MemberWeekDocumentGroup = {
+  songId: string;
+  songTitle: string;
+  files: {
+    id: string;
+    name: string;
+    fileType: string;
+    fileSizeBytes: number;
+    downloadUrl: string;   // presigned GET, 30-min expiry (lib/r2/client getDownloadUrl)
+  }[];
+};
+
+export type MemberWeekViewResponse = {
+  serviceWeek: {
+    id: string;
+    serviceDate: string;   // service_weeks.service_date (YYYY-MM-DD)
+    title: string | null;
+    isCancelled: boolean;
+  };
+  confirmationStatus: InvitationStatus | null; // caller's own invitation status for this week; null if none
+  setlist: { status: "published"; songs: MemberWeekSong[] } | null; // null = draft or no setlist
+  events: MemberWeekEvent[];   // ALL events of the week (assigned flag per event), ordered by startTime asc
+  team: MemberWeekTeamMember[];
+  documents: MemberWeekDocumentGroup[];
+};
+
+export async function getMemberWeekView(
+  req: NextRequest,
+  id: string,               // service_week_id
+  lookup?: UserLookup,
+): Promise<Response>;
 ```
 `entry.notes === undefined` (field absent) → leave the column as-is; `null` → clear it; string → set it. Do not change any other reorder behavior (membership check, position rewrite, response).
 
-### 3. Export the ordered key list for the dropdown
+Handler logic (all queries via `getSupabaseClient(jwt)` = caller RLS):
 
-`schemas/songs.ts` — add `export const SONG_KEY_OPTIONS = ASCII_SONG_KEYS;` (the ordered 17-key ASCII array). Do NOT change `VALID_SONG_KEYS` / `isValidSongKey`.
+1. `requireAuth(req, lookup)`, then `requireRole(ctx, ["admin", "set_leader", "member"])`
+   — guests are excluded (guest variant is #72, out of scope). Get the supabase
+   JWT exactly like the sibling handlers (401 if no JWT).
+2. Load the service week (`service_weeks` where `id` + `church_group_id`,
+   `maybeSingle`). If missing → `fail("Not found", ErrorCode.NOT_FOUND, 404)`.
+   Map to `{ id, serviceDate: row.service_date, title, isCancelled: row.is_cancelled }`.
+3. Caller's own invitation: `invitations` select `status, created_at` where
+   `service_week_id = id` and `user_id = ctx.userId`. If multiple rows, pick the
+   latest by `created_at` (re-invite safety — mirror `getCurrentInvitation` in
+   `week-view.tsx`). `confirmationStatus` = that status, else `null`.
+4. Setlist: `setlists` where `service_week_id = id` + `church_group_id`,
+   `maybeSingle`. RLS returns it only if `published` for members.
+   - If no row **or** `status !== "published"` → `setlist = null`.
+   - If `published` → read `setlist_songs` where `setlist_id` ordered by
+     `position asc`; collect distinct `song_id`s; read `songs` (`id, title,
+     artist, default_key`) for those ids; build `MemberWeekSong[]` with
+     `effectiveKey = key_override ?? default_key`. Zero songs → `songs: []`
+     (still `setlist: { status: "published", songs: [] }`, NOT null).
+5. Events: `events` where `service_week_id = id` + `church_group_id` ordered by
+   `start_time asc`.
+6. Attendees: `event_attendees` where `event_id in (weekEventIds)` selecting
+   `event_id, user_id`. Build:
+   - per-event `assigned = attendees.some(a => a.event_id === e.id && a.user_id === ctx.userId)`.
+   - `teamUserIds` = distinct `user_id` across those attendee rows.
+   Guard the `.in(...)` against an empty id list (skip the query, treat as `[]`)
+   to avoid a malformed query.
+7. Team directory (only if `teamUserIds` non-empty): mirror
+   `getChurchGroupMembers` assembly but scoped to `teamUserIds`:
+   `users` (`id, name`, `church_group_id = ctx.churchGroupId`, `anonymized_at is null`,
+   `id in teamUserIds`), `member_profiles` (`id, user_id, vocal_capability`),
+   `member_instruments` (`member_profile_id, instrument_id`), `instruments`
+   (`id, name`, group-scoped). Produce `MemberWeekTeamMember[]`. Sort by `name`
+   ascending for stable output. Do **not** include email/phone.
+8. Documents (only if the published setlist has songs): `song_documents` where
+   `song_id in (weekSongIds)` + `church_group_id`, selecting
+   `id, song_id, name, file_key, file_type, file_size_bytes`, ordered by
+   `created_at asc`. Mint `downloadUrl` per row via `getDownloadUrl(file_key)`
+   (import from `@/lib/r2/client`). Group by `song_id`, attaching `songTitle`
+   from step 4's song map; only include groups that have ≥1 file. **Best-effort**:
+   wrap the whole documents block in try/catch — on any R2/query error, set
+   `documents = []` and still return 200 (documents are one non-critical section;
+   an R2 outage must not 500 the whole screen).
+9. Return `ok<MemberWeekViewResponse>({ ... })`. Catch `ApiException` →
+   `fail(err.message, err.code, err.status)`, else 500 — same as siblings.
+
+Envelope: use `ok(...)` / `fail(...)` from `@/lib/api/response`; the success body
+is `{ data: MemberWeekViewResponse }`.
+
+### 2. CREATE `app/api/service-weeks/[id]/member-view/route.ts`
+
+Copy `app/api/service-weeks/[id]/setlist/route.ts` shape, GET only:
+
+```ts
+import { NextRequest } from "next/server";
+import { getMemberWeekView } from "./handler";
 
 ## Frontend
 
@@ -84,81 +196,154 @@ export default async function SetlistBuilderPage({
   params,
 }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  return <SetlistBuilder setlistId={id} />;
+  return getMemberWeekView(req, id);
 }
 ```
 
-### `app/(app)/setlists/[id]/setlist-builder.tsx` (new, `"use client"`)
+### 3. REWRITE `app/(app)/member-week/[id]/page.tsx`
 
-Follow `app/(app)/week/[id]/week-view.tsx` for structure: local minimal types, `ViewState` union, `useEffect` load with a `cancelled` guard, view-state early returns, CSS module.
+Copy `app/(app)/week/[id]/page.tsx` exactly (server wrapper awaiting `params`,
+rendering the client child):
 
-Signature: `export default function SetlistBuilder({ setlistId }: { setlistId: string })`.
+```tsx
+import MemberWeekView from "./member-week-view";
 
-Local types (subset of the envelopes above):
-```ts
-type CatalogSong = { id: string; title: string; artist: string | null; defaultKey: string | null };
-type SetlistSong = { songId: string; position: number; keyOverride: string | null; defaultKey: string | null; effectiveKey: string | null; notes: string | null };
-type SetlistMeta = { id: string; status: "draft" | "published" };
-type ViewState = "loading" | "ready" | "forbidden" | "not-found" | "error";
+export default async function MemberWeekViewPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  return <MemberWeekView serviceWeekId={id} />;
+}
 ```
 
-**Initial load** (`Promise.all`):
-- `GET /api/setlists/${setlistId}` → 403 → `forbidden`; 404 → `not-found`; other non-ok → `error`. On ok, set `songs = body.data.songs`, `meta = { id, status } = body.data.setlist`.
-- `GET /api/songs` → catalog for title/artist lookup + search. If it 403s treat as forbidden; other failure → degrade search to empty (non-critical), still render.
-- Build `catalogById: Map<songId, CatalogSong>` so the right panel can resolve title/artist (and defaultKey) per setlist song.
+### 4. CREATE `app/(app)/member-week/[id]/member-week-view.tsx`  (`"use client"`)
 
-**Left panel — search + quick-add:**
-- Text input filtering the catalog client-side (case-insensitive substring on title OR artist). (Server `?q=` is available but client-side filter over the already-loaded catalog is sufficient and simpler.)
-- Each result row: title, artist, defaultKey, and an "Add" button (disabled if the song's `id` is already in `songs`). Add → `POST /api/setlists/${setlistId}/songs` `{ songId }`; on 409 show inline "That song is already in the setlist."; on ok replace `songs` from `body.data.songs`.
-- Quick-add form shown when the search term is non-empty and no catalog row matches: title (prefilled with the search term, required), artist (optional), key `<select>` from `SONG_KEY_OPTIONS` plus a blank "— none —" option (optional). Submit → `POST /api/songs` `{ title, artist?, default_key? }`; on ok, add the returned `body.data.song` to the local catalog AND immediately `POST .../songs { songId }` to put it in the setlist, then refresh `songs` from that response. Surface a validation/failure message inline.
+Pattern to copy: `app/(app)/week/[id]/week-view.tsx` — same `ViewState`
+machine (`"loading" | "ready" | "forbidden" | "not-found" | "error"`), same
+`useEffect` + `cancelled` guard, same `formatServiceDate` / `getInitials`
+helpers, same envelope reads (`body.data.X`).
 
-**Right panel — the setlist (ordered):**
-- Empty state when `songs.length === 0`.
-- Each row (ordered by `position`): position number, title + artist (from `catalogById`), a key `<select>` (options = `SONG_KEY_OPTIONS`, plus a blank option meaning "no key"/null), a notes text input, a drag handle, and a Remove button.
-  - **Key select** value = `effectiveKey ?? ""`. On change: compute the song's `defaultKey`; if the chosen value equals `defaultKey` (or both empty) send `keyOverride: null` (using default), otherwise send the chosen key. Persist via the reorder PUT (below) with the updated per-song `keyOverride`.
-  - **Notes input** — persist on blur (not per keystroke) via the reorder PUT, sending that song's `notes`.
-  - **Remove** → `DELETE /api/setlists/${setlistId}/songs/${songId}`; on ok replace `songs` from `body.data.songs`.
-- **Drag reorder** (native HTML5): dragging a row and dropping onto another reorders the local array, then persist via the reorder PUT.
+Props: `{ serviceWeekId: string }`.
 
-**Persistence via PUT (single mechanism for reorder + key + notes):**
-`PUT /api/setlists/${setlistId}` body `{ songs: [{ songId, keyOverride, notes }, ...] }` in the desired display order — always send the **full current** song set (the endpoint requires exact membership match and derives position from array index). On ok, replace local `songs` from `body.data.songs` (authoritative positions/keys/notes). On non-ok show a non-blocking inline error and reload from `GET /api/setlists/:id` to resync.
+Single fetch: `GET /api/service-weeks/${serviceWeekId}/member-view`.
+- 404 → `not-found`; 403 → `forbidden`; other non-ok → `error`; on network
+  throw → `error`. On ok, store the `data` payload and set `ready`.
 
-**Bottom bar:**
-- Song count (e.g. `songs.length === 1 ? "1 song" : \`${songs.length} songs\``).
-- **Publish** button — NOT disabled at zero songs (BR-01). Clicking opens a confirmation step (use `components/ui/Modal.tsx`): confirm copy that, when `songs.length === 0`, explicitly notes the setlist will be published with no songs yet. Confirm → `POST /api/setlists/${setlistId}/publish`; on ok set `meta.status = "published"` and render the locked state; on 409 show "Setlist is already published."; other failure → inline error.
+Render (mobile-first, single column), sections in this order:
 
-**Published (locked) state:** when `meta.status === "published"`, disable all editing controls (add / key / notes / drag / remove / publish) and show a banner with an **Unlock to edit** button → `POST /api/setlists/${setlistId}/unlock`; on ok set `meta.status = "draft"` and re-enable editing. (All the editing endpoints already 409 on a published setlist; this just makes the UI coherent instead of letting the user hit dead 409s.)
+- **Header**: `formatServiceDate(serviceWeek.serviceDate)` and the title
+  (`serviceWeek.title ?? "Untitled service"`). Confirmation status shown with
+  `Badge` (`@/components/ui/Badge`): map `confirmationStatus` →
+  `accepted`→"Confirmed"/`success`; `pending`→"Pending"/`warning`;
+  `denied`→"Declined"/`neutral`; `withdrawn`/`expired`→"Not serving"/`neutral`;
+  `null`→"Not invited"/`neutral`. If `serviceWeek.isCancelled`, also render a
+  `Badge tone="danger"`>Cancelled (copy the cancelled treatment from
+  `week-view.tsx`).
+- **Setlist section** (`<h2>Setlist</h2>`):
+  - `setlist === null` → paragraph `Setlist not yet released`.
+  - published with `songs.length === 0` → `No songs added yet` (distinct from
+    the not-released message).
+  - published with songs → ordered list, each row `title` (+ `artist` if
+    present) and `effectiveKey` (show a "—" / "no key" when `effectiveKey`
+    is null).
+- **Events section** (`<h2>Events</h2>`): render events where `assigned === true`.
+  If none assigned → `You're not assigned to any events this week`. Each event is
+  a tappable button/row (`type="button"`) showing name + start time; clicking sets
+  a `selectedEventId` in state to open the detail view. Format times from the
+  ISO `startTime`/`endTime` with `toLocaleString` (date + time).
+  - **Event detail view**: an in-page panel/modal (no new route) rendered when
+    `selectedEventId` is set, showing name, type, start–end, notes, location, and
+    — only when `location` is non-empty — a **Maps link**:
+    `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(location)}`
+    rendered as an `<a target="_blank" rel="noopener noreferrer">Open in Maps</a>`.
+    Include a close control that clears `selectedEventId`.
+- **Team section** (`<h2>Team</h2>`): list `team` members; each shows
+  `getInitials(name)` avatar, `name`, and their instruments (join
+  `instruments.map(i => i.name)` with ", "; when empty show a muted "—"). If
+  `team.length === 0` → `No confirmed team yet`.
+- **Documents section** (`<h2>Documents</h2>`): for each group in `documents`,
+  a subheading `songTitle` and its `files` as `<a href={file.downloadUrl}
+  target="_blank" rel="noopener noreferrer">{file.name}</a>`. If
+  `documents.length === 0` → `No documents for this week's songs`.
+- **Floating chat button** (Phase 2 placeholder): a visually-present floating
+  button (fixed position, mobile-first) that is inert — render it but give it no
+  working `onClick` (omit the handler or a no-op). Add
+  `aria-label="Week chat (coming soon)"` and mark it `disabled` so it clearly
+  does nothing yet. Do NOT wire any chat behavior.
 
-**View-state renders** (copy the loading/forbidden/not-found/error blocks from `week-view.tsx`):
-- `forbidden`: "This screen is available to Set Leaders and Admins only."
-- `not-found`: "Setlist not found".
-- `error`: generic "Something went wrong".
+Loading / forbidden / not-found / error branches: copy the corresponding
+`<main>` blocks from `week-view.tsx` (adjust the forbidden copy to a member
+context, e.g. "You don't have access to this week.").
 
-### `app/(app)/setlists/[id]/setlist-builder.module.css` (new)
+### 5. CREATE `app/(app)/member-week/[id]/member-week-view.module.css`
 
-Desktop-first two-column layout (left search panel / right setlist), a sticky/fixed bottom bar, and row styling. Copy variable usage + container conventions from `app/(app)/week/[id]/week-view.module.css` (`.container` max-width, `var(--color-*)`). No global style changes.
+Mobile-first. Copy the container/card/header conventions from
+`app/(app)/week/[id]/week-view.module.css` (`.container`, `.header`, `.card`,
+`.date`, `.error`). Single-column layout (no sidebar). Add a `.chatButton`
+(fixed bottom-right floating) and `.detail`/`.detailOverlay` for the event
+detail panel. Use existing CSS variables (e.g. `var(--color-fg)`).
 
-## Edge cases the implementation must handle
+## Tests (for the Testing stage — named here for the coder's awareness)
 
-- **Zero songs:** right panel empty state; Publish still enabled; confirmation still shown with the "no songs yet" wording.
-- **Search no match:** show the quick-add form (title required; artist + key optional).
-- **Duplicate add:** POST songs → 409 → inline "already in the setlist"; do not mutate local state.
-- **Published setlist on load:** render locked/read-only with an Unlock affordance; editing controls disabled.
-- **Key = default:** selecting the option equal to the song's `defaultKey` clears the override (send `keyOverride: null`). Song with `defaultKey === null`: blank option = null.
-- **Notes:** empty notes → `null`; persist on blur only; never wipe another song's notes (PUT always sends every song's current notes).
-- **Reorder to same slot / no-op drag:** harmless; safe to skip the PUT or send it — either is fine.
-- **403 / 404 / 500** on initial load → `forbidden` / `not-found` / `error` views. Mutation failures → non-blocking inline error, and on PUT failure resync from GET.
-- **Backend:** `getSetlistWithSongs` must be tenant-scoped (404 for other-tenant/missing, never leak existence via 403). PUT reorder must NOT wipe `notes` when the client omits the field (`entry.notes === undefined` → leave column unchanged).
+- Handler: `tests/unit/app/api/service-weeks-member-view-route.test.ts`.
+  Mirror `tests/unit/app/api/song-documents-route.test.ts`:
+  `jest.mock` `@clerk/nextjs/server`, `@/lib/supabase/client`, `@/lib/r2/client`;
+  use the `makeChain` / `makeLookup` / `setUpAuth` helpers. `getSupabaseClient`
+  should return a `from(table)` dispatcher returning a per-table chain so the
+  many reads can be stubbed by table name.
+- Component: `tests/unit/app/member-week-view.test.tsx`. Mirror
+  `tests/unit/app/week-view.test.tsx` (`/** @jest-environment jsdom */`, mocked
+  `fetch` keyed by URL, `jsonResponse` helper).
 
-## Explicitly out of scope
+## Edge cases the implementation MUST handle
 
-- Spotify autocomplete / metadata enrichment (issue: nice-to-have, Phase-1 optional).
-- Wiring the "Edit setlist" button in `app/(app)/week/[id]/week-view.tsx` (it has a `TODO(#64)`) — the builder is reachable directly by setlist id; entry-point wiring is not in this issue's AC. Leave the TODO as-is.
-- Any change to `toSetlistSongResponse` / `SetlistSongResponse` shape, or to `addSetlistSongSchema`.
+1. Service week missing / other tenant → endpoint 404 → screen `not-found`.
+2. No setlist OR draft setlist → `setlist: null` → "Setlist not yet released".
+3. Published setlist with **zero** songs → `setlist: { status:"published",
+   songs: [] }` → "No songs added yet" (must NOT show the not-released message).
+4. `effectiveKey` is `key_override ?? default_key`; both may be null → render a
+   neutral placeholder, not "null".
+5. Week with no events → `events: []`; Events section empty state; `team` may
+   also be empty.
+6. Member assigned to some but not all events → only `assigned === true` events
+   show; the header/team still reflect the full week's attendees.
+7. Event with `location === null` (or empty) → detail view shows NO Maps link.
+8. Empty `event_attendees` id set → skip the `.in()` queries; do not issue a
+   query with an empty array.
+9. Documents: R2 not configured / `getDownloadUrl` throws → `documents: []`,
+   endpoint still 200 (best-effort; screen shows the empty state).
+10. Member has no invitation for the week → `confirmationStatus: null` →
+    "Not invited" badge; screen still renders (viewing is not gated on
+    confirmation).
+11. Cancelled week → header shows the Cancelled badge.
+12. Guest role calling the endpoint → 403 (requireRole excludes guest).
+13. Signed download URLs expire in 30 min — always freshly minted per request
+    (never cached); do not store `file_key` in the response.
 
-## Verify before finishing
+## Decisions & assumptions
 
-`bun run lint`, `bun run typecheck`, `bun run test` (Jest). Existing setlist route tests
-(`tests/unit/app/api/setlists-songs-route.test.ts`, `setlists-key-override.test.ts`,
-`setlists-publish-route.test.ts`) must still pass — the notes change is additive/guarded and
-`toSetlistSongResponse` is untouched.
+- **Confirmed team is sourced from `event_attendees`, not `invitations`.**
+  A `member` cannot read other members' `invitations` under RLS, but *can* read
+  `event_attendees` for the group's events. `accept_invitation` auto-inserts an
+  attendee row per week event on accept, so attendees of the week's events are
+  the member-visible confirmed serving roster. Known limitation: a member
+  confirmed for a week that has **no events yet** won't appear in `team` until
+  events exist / they're assigned. Acceptable for Phase 1 and avoids any
+  RLS/RPC change in a screen-scoped issue. (Strict accepted-invitation semantics
+  for a member would need a `SECURITY DEFINER` RPC — out of scope here.)
+- **One aggregate endpoint** rather than several member-facing GETs, to keep the
+  client to a single fetch and localize the read logic. It uses only the
+  caller's RLS-scoped client (no service-role, no new RPC, no RLS migration).
+- **Event detail is in-page** (selected-event panel/modal), not a separate
+  route — satisfies "tappable into a detail view with a Maps link" without new
+  routing surface.
+- **Scope guardrails**: do not add app nav/links to this screen (AppShell nav is
+  a separate TODO); do not change existing endpoints' RBAC; do not implement
+  chat; do not build a guest variant (#72).
+
+## Verification before finishing (Coding stage)
+
+Run `bun run lint`, `bun run typecheck`, and `bun run test`. All must pass.
+</content>

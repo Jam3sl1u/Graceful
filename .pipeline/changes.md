@@ -1,6 +1,4 @@
-# Changes — Issue #64: Setlist Builder screen
-
-## Backend
+# Changes — Issue #65: Build Member Week View screen
 
 - `app/api/setlists/[id]/handler.ts`
   - Added `getSetlistWithSongs(req, id, lookup?)`: `GET /api/setlists/:id`
@@ -24,126 +22,117 @@
   (the ordered 17-key ASCII list) for the frontend key `<select>`. Left
   `VALID_SONG_KEYS` / `isValidSongKey` untouched.
 
-## Frontend
+- `app/api/service-weeks/[id]/member-view/handler.ts` — new
+  `getMemberWeekView(req, id, lookup?)` handler exporting
+  `MemberWeekViewResponse` (and its constituent types `MemberWeekEvent`,
+  `MemberWeekSong`, `MemberWeekTeamMember`, `MemberWeekDocumentGroup`).
+  Aggregates, via the caller's RLS-scoped Supabase client only (no
+  service-role, no new RPC):
+  - `requireAuth` + `requireRole(["admin", "set_leader", "member"])` (guest
+    excluded — #72 is out of scope).
+  - Service week lookup by `id` + `church_group_id` → 404 if missing.
+  - Caller's own `invitations` row for the week, picking the latest by
+    `created_at` when multiple exist → `confirmationStatus` (null if none).
+  - `setlists` row for the week; only treated as present when
+    `status === "published"` (drafts filtered by RLS anyway for members, but
+    checked explicitly) → `setlist: null` otherwise. When published, reads
+    `setlist_songs` ordered by `position`, then `songs` for the distinct song
+    ids, building `effectiveKey = key_override ?? default_key`. Zero songs
+    still yields `{ status: "published", songs: [] }`, not `null`.
+  - `events` for the week ordered by `start_time asc`.
+  - `event_attendees` for the week's event ids (query skipped entirely when
+    there are no events, to avoid an empty `.in()`), used to compute each
+    event's `assigned` flag (caller present as an attendee) and the distinct
+    `teamUserIds`.
+  - Team directory scoped to `teamUserIds` only (mirrors
+    `getChurchGroupMembers`'s users/member_profiles/member_instruments/
+    instruments assembly), sorted by name; no email/phone included.
+  - Documents: only queried when there's a published setlist with songs;
+    `song_documents` rows grouped by `song_id` with freshly minted
+    `getDownloadUrl` per file (`@/lib/r2/client`, 30-min presigned GET); the
+    whole block is wrapped in try/catch so an R2/query failure degrades to
+    `documents: []` with a 200, not a 500.
+  - Returns `ok<MemberWeekViewResponse>(...)`; catches `ApiException` →
+    `fail(...)`, else 500 — same pattern as sibling handlers.
 
-- `app/(app)/setlists/[id]/page.tsx` — replaced the stub with a server
-  wrapper (mirrors `app/(app)/week/[id]/page.tsx`) that awaits `params` and
-  renders `<SetlistBuilder setlistId={id} />`.
-- `app/(app)/setlists/[id]/setlist-builder.tsx` (new, `"use client"`) — the
-  two-panel Setlist Builder screen:
-  - Loads `GET /api/setlists/:id` and `GET /api/songs` in parallel on mount
-    (`cancelled` guard). Setlist 403/404/other-failure → `forbidden` /
-    `not-found` / `error` views; catalog 403 → `forbidden`, other catalog
-    failure degrades to an empty catalog (search still renders, non-fatal).
-  - Left panel: client-side substring search (title/artist, case-insensitive)
-    over the loaded catalog, an Add button per result (disabled once already
-    in the setlist; 409 → inline "already in the setlist" message), and a
-    quick-add form (title required, artist + `SONG_KEY_OPTIONS` key select
-    optional) shown when the search term is non-empty and no catalog row
-    matches — submits `POST /api/songs` then immediately
-    `POST /api/setlists/:id/songs` to add it.
-  - Right panel: ordered rows (position, title/artist resolved via a
-    `catalogById` map, key `<select>` from `SONG_KEY_OPTIONS`, a notes text
-    input persisted on blur, a native HTML5 drag handle, and Remove). Key
-    changes, drag reorders, and notes-blur all persist through a single
-    `persistSongs` helper that PUTs the **full** current song set
-    (`{ songId, keyOverride, notes }[]`) to `PUT /api/setlists/:id` in
-    display order; on failure it shows an inline error and resyncs from
-    `GET /api/setlists/:id`.
-  - Bottom bar: song count + a Publish button (never disabled at zero songs)
-    that opens a `components/ui/Modal.tsx` confirmation (explicit "no songs
-    yet" copy when empty) before calling `POST /api/setlists/:id/publish`
-    (409 → "Setlist is already published.").
-  - Published/locked state: when `meta.status === "published"`, all editing
-    controls are disabled and a banner with an "Unlock to edit" button calls
-    `POST /api/setlists/:id/unlock`.
-  - No drag-and-drop dependency added — uses native `draggable` /
-    `onDragStart` / `onDragOver` / `onDrop` on the row `<li>` elements
-    (`DragEvent<HTMLLIElement>`).
-- `app/(app)/setlists/[id]/setlist-builder.module.css` (new) — desktop-first
-  two-column layout (search panel / setlist panel), a fixed bottom bar, and
-  row styling, following `week-view.module.css`'s `.container` / `var(--color-*)`
-  conventions. No global style changes.
+- `app/api/service-weeks/[id]/member-view/route.ts` — `GET` route wiring,
+  copied from the `setlist` route's shape (await `params`, delegate to the
+  handler).
 
-### Follow-up fix (post-review)
+- `app/(app)/member-week/[id]/member-week-view.tsx` (`"use client"`) — the
+  screen component. `ViewState` machine (`loading | ready | forbidden |
+  not-found | error`), single `useEffect` with a `cancelled` guard fetching
+  `GET /api/service-weeks/:id/member-view` once. Renders, in order:
+  - Header: title, `formatServiceDate`, confirmation `Badge` (mapped per
+    spec: accepted→Confirmed/success, pending→Pending/warning,
+    denied→Declined/neutral, withdrawn/expired→Not serving/neutral,
+    null→Not invited/neutral) plus a `Cancelled`/danger badge when
+    `isCancelled`.
+  - Setlist section: not-released vs. zero-songs vs. song list w/
+    title/artist/effectiveKey (`—` placeholder when null) — these are
+    distinct states per the spec's edge cases 2 and 3.
+  - Events section: only `assigned === true` events, each a `type="button"`
+    row opening an in-page detail panel (`selectedEventId` state, no new
+    route) showing name/type/start–end/notes, and a Maps link
+    (`https://www.google.com/maps/search/?api=1&query=...`) only when
+    `location` is non-empty.
+  - Team section: avatar (`getInitials`), name, instruments joined by ", "
+    (or "—" when empty); empty-team message when `team.length === 0`.
+  - Documents section: per-song-group heading + file links (`downloadUrl`,
+    opened in a new tab); empty-state message when none.
+  - A disabled, inert floating "chat" button (`aria-label="Week chat (coming
+    soon)"`, `disabled`, no `onClick`) as the Phase 2 placeholder.
+  - Loading/forbidden/not-found/error branches mirror `week-view.tsx`'s
+    `<main>` blocks (forbidden copy adjusted to a member context).
 
-- `app/(app)/setlists/[id]/setlist-builder.tsx` — the initial version left
-  `quickAddTitle` as an independent `useState("")`, so the quick-add form's
-  Title field rendered empty instead of prefilled with the search term
-  (spec requirement, flagged by Review as the sole blocker).
+- `app/(app)/member-week/[id]/member-week-view.module.css` — mobile-first,
+  single-column styles (container/header/card/date/error mirrored from
+  `week-view.module.css`'s conventions, using the existing `--color-fg`/
+  `--color-border`/`--color-bg` variables), plus new `.chatButton` (fixed
+  bottom-right) and `.detail`/`.detailOverlay` (bottom-sheet-style event
+  detail panel).
 
-  A first attempted fix (`wasQuickAddShownRef` + a `useEffect` that seeded
-  `quickAddTitle` only on the hidden→shown transition) was itself found
-  broken on re-review: the ref latched `true` after the *first* no-match
-  character, so continued typing in the search box never re-synced the
-  title — a user typing "Totally New Song" letter-by-letter ended up
-  submitting `title: "To"`, silently writing a junk row into the shared
-  song catalog (worse than the original bug, which at least blocked submit
-  via `required`).
+## Files modified
 
-  Corrected fix: a `quickAddTitleDirty` boolean state, set `true` in the
-  Title field's own `onChange` (i.e. the user has independently edited it).
-  The seeding `useEffect` (keyed on `[searchTerm, catalog, quickAddTitleDirty]`)
-  now syncs `quickAddTitle` to `searchTerm` on every change to `searchTerm`
-  while the quick-add form is shown **and** the title hasn't been
-  independently edited, and resets `quickAddTitleDirty` back to `false`
-  whenever the form goes hidden (so the next time it reappears, it seeds
-  fresh from whatever the new search term is). This keeps the title synced
-  through continued typing, while still preserving a user's manual edit
-  once they've made one.
+- `app/(app)/member-week/[id]/page.tsx` — replaced the "coming soon" stub
+  with a server wrapper that awaits `params` and renders
+  `<MemberWeekView serviceWeekId={id} />`, matching
+  `app/(app)/week/[id]/page.tsx`'s shape exactly.
 
-### Non-blocking cleanup (post-SHIP)
-
-The final review that SHIPped the corrected fix above also flagged two
-non-blocking items, both since addressed:
-
-- **Stuck dirty flag**: in `handleQuickAdd`, if `POST /api/songs` succeeds
-  but the follow-up `handleAdd` (add-to-setlist) call fails, `quickAddTitle`
-  was still unconditionally cleared to `""`, but `quickAddTitleDirty` was
-  left `true` — so if the search term still didn't match anything (e.g. the
-  created song's title diverged from the search term), the title field was
-  stuck blank with no way to re-sync short of the user retyping the search
-  box from scratch. Fixed by resetting `quickAddTitleDirty` to `false`
-  alongside the other field resets in `handleQuickAdd`, so the seeding
-  effect re-populates the title from the current search term on its next
-  run. Covered by a new test: "quick-add flow: a failed add-to-setlist
-  after a successful song creation still leaves the title resyncable (not
-  stuck blank)".
-- **Duplicated match predicate**: the "does this term match the catalog"
-  substring rule was independently written out twice — once in the seeding
-  `useEffect`, once in the render-time `filteredCatalog` computation —
-  risking drift between the two. Extracted into a single module-level
-  `filterCatalog(catalog, term)` helper used by both.
+- `.pipeline/spec.md` — this was already updated in the working tree (issue
+  #65's spec, produced by the Planning stage) before this Coding session
+  started; included in this commit as part of the normal pipeline handoff.
+  No further edits made to it by the Coding stage.
 
 ## Verification
 
 - `bun run lint` — clean.
-- `bun run typecheck` — clean (one fixup needed: the drag handlers are
-  attached to `<li>` rows, so the `DragEvent` generic had to be
-  `HTMLLIElement`, not `HTMLDivElement`).
-- `bun run test` — full suite: 77 suites / 968 tests, all passing, including
-  the three existing setlist route tests the spec calls out by name
-  (`setlists-songs-route.test.ts`, `setlists-key-override.test.ts`,
-  `setlists-publish-route.test.ts` — 74 tests, all green, run in isolation
-  too). No new tests were added in this stage (Coding implements only; the
-  Testing stage should cover the new `GET` endpoint, the notes-persistence
-  guard, and the new UI).
+- `bun run typecheck` — clean.
+- `bun run test` — all 77 suites / 968 tests pass (no regressions; the two
+  new test files the spec names for the Testing stage —
+  `tests/unit/app/api/service-weeks-member-view-route.test.ts` and
+  `tests/unit/app/member-week-view.test.tsx` — were intentionally not written
+  here, per the pipeline contract that Testing writes and owns test files).
 
 ## What the Tester should focus on
 
-- New `GET /api/setlists/:id`: tenant scoping (404 for other-tenant/missing,
-  not 403 — never leak existence), role gating (403 for non set_leader/admin),
-  and that it returns songs for **both** draft and published setlists.
-- The `notes` guard in `reorderSetlist`: a PUT that omits `notes` on an entry
-  must leave that song's existing `notes` column untouched; `notes: null`
-  clears it; a string sets it. Confirm the existing reorder/key-override
-  tests (which omit `notes`) still pass unmodified — they do (verified above).
-- Frontend: quick-add flow (create song → auto-add to setlist), duplicate-add
-  409 handling, key-override "equals default → null" logic (including a song
-  whose `defaultKey` is `null`), notes persist-on-blur (not per keystroke),
-  drag reorder, the zero-songs Publish confirmation copy, and the
-  published/locked state disabling all editing controls with a working
-  Unlock affordance.
-- Out of scope (left untouched, per spec): Spotify enrichment, the
-  `TODO(#64)` "Edit setlist" button wiring in `week-view.tsx`, and the shape
-  of `toSetlistSongResponse` / `SetlistSongResponse` / `addSetlistSongSchema`.
+- The 13 edge cases enumerated in `.pipeline/spec.md` under "Edge cases the
+  implementation MUST handle", especially:
+  - Published setlist with zero songs vs. no/draft setlist (must render two
+    distinct messages).
+  - Empty `event_attendees` for the week — handler must not issue an `.in()`
+    query with an empty array (verify via a `from` spy on `event_attendees`
+    not being called when `events` is empty).
+  - `getDownloadUrl` throwing (simulate R2 misconfiguration) → endpoint still
+    200 with `documents: []`.
+  - Guest role → 403.
+  - A member assigned to only some of the week's events — only those show in
+    the Events section, but `team` reflects the full attendee set across all
+    events.
+  - Event with `location: null` → detail panel renders with no Maps link.
+- The handler's per-table Supabase mock dispatch (many tables read across one
+  request) — verify the `makeChain`-style test double the spec calls for
+  handles `service_weeks`, `invitations`, `setlists`, `setlist_songs`,
+  `songs`, `events`, `event_attendees`, `users`, `member_profiles`,
+  `member_instruments`, `instruments`, `song_documents` all being queried
+  from the same `getSupabaseClient(jwt)` instance.
