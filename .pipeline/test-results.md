@@ -1,125 +1,137 @@
-# Test Results — Issue #65: Build Member Week View screen
+# Test Results — Issue #75: [Sprint 4] PWA manifest & install prompt
 
-This overwrites the stale `test-results.md` for issue #63 that was still
+This overwrites the stale `test-results.md` for issue #65 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
-## Verdict: ALL PASS
+## Verdict: PASS, with one flagged finding for Review
 
-## Summary
+All automated checks pass (lint/typecheck/test/build), independently re-run and matching
+the Coder's claims in `changes.md`. No failing test to stop the pipeline on. However,
+manual verification against a real running production build (not a physical device, so
+this **was** performable in this pipeline stage, contrary to the "manual verification"
+checklist's blanket assumption) surfaced a genuine discrepancy between the spec's stated
+intent and the actual rendered output — see "Finding" below. Recommend the Reviewer weigh
+this before shipping.
 
-All checks pass. Two new test files were written (as named in `.pipeline/spec.md`
-under "Tests for the Testing stage") and independently verify the coder's
-claims — the coder's `changes.md` explicitly deferred writing these to this
-stage, which matches the pipeline contract.
+## Re-run verification (independent)
 
-## Commands run
+- `bun run lint` — clean. Matches the Coder's claim.
+- `bun run typecheck` — clean. Matches the Coder's claim.
+- `bun run test` — **84 suites / 1068 tests passed**, exact match to the Coder's reported
+  numbers, 0 failures. Also re-ran the 3 new PWA suites in isolation:
+  `tests/unit/lib/pwa/install.test.ts`, `tests/unit/app/manifest.test.ts`,
+  `tests/unit/app/install-prompt.test.tsx` → 3 suites / 28 tests passed.
+- `bun run build` (with throwaway well-formed dummy Clerk keys, same approach the Coder
+  used — no local `.env` in this worktree, nothing committed) — succeeds. Route list
+  confirms `○ /apple-icon` and `○ /manifest.webmanifest` as static routes, matching the
+  Coder's claim.
+- Confirmed `.next/` build output is gitignored and `git status` is clean — no build
+  artifacts or stray files were left behind by this verification.
 
-- `bun run typecheck` — clean, no errors.
-- `bun run lint` — clean, no errors/warnings.
-- `bun run test` — **79 suites / 1004 tests pass**, 0 failures (77 suites /
-  968 tests pre-existing per the coder's baseline + 2 new suites / 36 new
-  tests added by this stage). No regressions in any pre-existing suite.
+## Manual/behavioral verification actually performed in this stage
 
-## New test files written
+Ran `bun run start` against the production build and hit it with `curl` (no physical
+device needed for this subset of the spec's "Manual verification" checklist):
 
-### `tests/unit/app/api/service-weeks-member-view-route.test.ts` (20 tests)
+- `GET /manifest.webmanifest` while signed out → **200**, body matches every field in the
+  spec's table exactly (name, short_name, description, id, start_url, scope, display,
+  background_color, theme_color, both icons with `sizes: "any"`).
+- `GET /apple-icon` while signed out → **200**. Confirms E9 / the middleware change works
+  end-to-end: `middleware.ts`'s `isPublicRoute` correctly exempts both new paths, and
+  `config.matcher`/`auth.protect()` are otherwise untouched (also diff-reviewed directly).
+- `/` page source (shares the root layout/metadata with `/dashboard`) contains
+  `<link rel="manifest" href="/manifest.webmanifest">`,
+  `<meta name="theme-color" content="#4f46e5">`,
+  `<meta name="application-name" content="Graceful">`,
+  `<meta name="apple-mobile-web-app-title" content="Graceful">`, and
+  `<meta name="apple-mobile-web-app-status-bar-style" content="default">`.
+- `public/icons/icon.svg` / `icon-maskable.svg` checked numerically against spec:
+  `icon.svg` has `rx="96"` rounding and `font-size="307"` (~60% of 512, matches spec);
+  `icon-maskable.svg` has no rounding and `font-size="205"` (~40% of 512, matches the
+  maskable safe-area requirement). `app/apple-icon.tsx` renders the same mark at 180x180
+  PNG, flex-centered, no rounding, no custom font — matches spec exactly (correctly not
+  imported from Jest per spec; verified only via `bun run build` + this curl check, as the
+  spec intended).
+- Could not directly hit `/dashboard` signed-out (Clerk's dev-browser rewrite returns 404
+  for unauthenticated requests to protected routes when using dummy keys with no real
+  Clerk dev-browser cookie — pre-existing Clerk/dummy-key interaction unrelated to this
+  change, not a regression). Used `/` instead, which shares the same root layout/metadata,
+  to check the meta tags.
 
-Mirrors `tests/unit/app/api/song-documents-route.test.ts` / the setlist route
-test's `makeChain`/`makeLookup`/`setUpAuth` helpers, with a per-table
-`from(table)` dispatcher covering all 12 tables the handler touches
-(`service_weeks`, `invitations`, `setlists`, `setlist_songs`, `songs`,
-`events`, `event_attendees`, `users`, `member_profiles`, `member_instruments`,
-`instruments`, `song_documents`).
+## Finding (flagged for Review — not a Jest failure, but a real behavioral gap)
 
-Covers:
-- Auth/authz: 401 (no Clerk user, no JWT), 403 for guest (and confirms
-  `getSupabaseClient` is never constructed for a rejected role), 200 for each
-  of admin/set_leader/member.
-- Happy path: full aggregate payload — `serviceWeek` summary, `confirmationStatus`,
-  `setlist.songs` with correct `effectiveKey` resolution and ordering, `events`
-  with per-event `assigned`, `team` sorted by name with correct
-  `vocalCapability`/`instruments` per member (including the "no profile" →
-  `vocalCapability: "none"`, `instruments: []` case), `documents` with a
-  freshly-minted `downloadUrl` and **no `file_key` anywhere in the response**
-  (spec edge case 13).
-- Edge case 1 (404 for missing/other-tenant week) + a 500 path when the
-  `service_weeks` query itself errors.
-- Edge case 2 (no setlist row → `null`; **draft** setlist row → `null`, as a
-  defense-in-depth check beyond RLS).
-- Edge case 3 (published setlist, zero songs → `{status:"published",songs:[]}`,
-  distinct from `null`).
-- Edge case 4 (`effectiveKey` null when both `key_override` and `default_key`
-  are null).
-- Edge case 5 / 8 (no events → `events: []`, `team: []`, and — verified via a
-  `from` spy — the handler never calls `.from("event_attendees")` or
-  `.from("users")` when there are no events, i.e. the empty-`.in()` guard is
-  real, not just claimed).
-- Edge case 6 (member assigned to only some events — per-event `assigned`
-  differs, but `team` still reflects the full attendee set across all events).
-- Edge case 9 (`getDownloadUrl` rejecting → `documents: []`, endpoint still
-  200) plus an additional case: documents query is skipped entirely (`from`
-  never called with `"song_documents"`) when the published setlist has zero
-  songs.
-- Edge case 10 (no invitation row → `confirmationStatus: null`, still 200).
-- Edge case 11 (cancelled week → `isCancelled: true` passed through).
-- Re-invite safety: multiple `invitations` rows for the caller → the one with
-  the latest `created_at` wins.
-- A general 500 path (events query error) to confirm the fail-fast pattern
-  holds beyond the week/setlist checks already covered by the sibling tests.
+**`app/layout.tsx`'s `appleWebApp: { capable: true, ... }` does not render the
+`<meta name="apple-mobile-web-app-capable" content="yes">` tag that the spec's own manual
+verification checklist and AC-bullet-3 rationale both explicitly call for.**
 
-### `tests/unit/app/member-week-view.test.tsx` (16 tests)
+Confirmed by inspecting the actual rendered `<head>` HTML from the production build (Next
+15.5.22, the version installed in this worktree per `node_modules/next/package.json`):
+only `<meta name="mobile-web-app-capable" content="yes">` (no `apple-` prefix) is emitted,
+alongside `apple-mobile-web-app-title` and `apple-mobile-web-app-status-bar-style`. There
+is no `apple-mobile-web-app-capable` tag anywhere in the response body.
 
-Mirrors `tests/unit/app/week-view.test.tsx` (jsdom, `fetch` mocked and keyed
-by URL).
+Root cause traced to `node_modules/next/dist/lib/metadata/generate/basic.js`
+(`AppleWebAppMeta`): in this installed Next version, `capable: true` is wired to emit only
+`name: 'mobile-web-app-capable'`, not the Apple-prefixed variant:
 
-Covers:
-- Loading state before the fetch resolves.
-- Happy path: header (title/date), confirmation badge, setlist list (scoped
-  via `within()` to disambiguate from the Documents section's same song
-  title), assigned-only events section (unassigned event correctly excluded),
-  team roster (incl. an instrument-less member rendering "—"), documents
-  section with a working download link, and the floating chat button present
-  but `disabled`.
-- Event detail panel: clicking an assigned event opens the panel with a Maps
-  link built from the event's location (percent-encoded), and the close
-  button clears it (edge case 7's positive case).
-- Edge case 7: an event with `location: null` opens a detail panel with **no**
-  Maps link.
-- Edge case 3 vs 2: zero-songs published setlist renders "No songs added yet"
-  and explicitly asserts the "not yet released" copy is absent (and vice
-  versa for a null setlist).
-- Empty-state messages for events, team, and documents sections.
-- Edge case 10: `confirmationStatus: null` renders the "Not invited" badge and
-  the rest of the screen still renders (not gated on confirmation).
-- Edge case 11: cancelled week renders the Cancelled badge.
-- View-state branches: 404 → not-found, 403 → forbidden, network throw →
-  error, unexpected 500 → error.
+```js
+function AppleWebAppMeta({ appleWebApp }) {
+    ...
+    capable ? (0, _meta.Meta)({
+        name: 'mobile-web-app-capable',
+        content: 'yes'
+    }) : null,
+```
 
-## Notes for the Reviewer
+Why this matters: `changes.md` states `appleWebApp` "is what gives iOS the full-screen,
+no-browser-chrome launch — AC bullet 3," and the spec's own manual checklist explicitly
+targets "iOS Safari (iOS 16+)". Historically, iOS Safari's standalone-mode detection has
+relied specifically on the `apple-` prefixed tag; the un-prefixed standards-track tag is a
+comparatively recent WebKit addition. If the iOS versions in the spec's own target range
+(16+) don't yet honor the un-prefixed tag, this implementation — despite following the
+spec's `appleWebApp` API shape exactly as written — may silently fail AC bullet 3's
+full-screen launch behavior on precisely the devices the manual checklist says to test.
 
-- No failures were found; nothing was patched around. The implementation
-  matches every edge case named in `.pipeline/spec.md`'s "Edge cases the
-  implementation MUST handle" list (1–11 directly tested here; 12 — guest
-  403 — is covered; 13 — no `file_key` leakage / fresh signed URL per request
-  — is asserted via `JSON.stringify` + a `getDownloadUrl` call-argument check).
-- One thing worth a second look in review, not a test failure: the spec's
-  Decisions section already flags that a member confirmed for a week with no
-  events yet won't show in `team` — this is by design (documented limitation),
-  and the "no events" test in this suite confirms that behavior is what's
-  actually implemented, not accidental.
-- Test-file-only fix made during this stage: the component test's fixture
-  data originally had an event named "Sunday Service" that collided with the
-  service week's title "Sunday Service", making some queries ambiguous
-  (`getByText`/`getByRole` matching two elements). Renamed the fixture event
-  to "Sunday Gathering" and scoped the setlist-song assertions with
-  `within()` to avoid a separate collision with an identically-titled
-  Documents heading. This was a test-fixture naming fix only — no production
-  code was touched.
+This is not the Coder deviating from the spec (the spec asked for the `appleWebApp.capable`
+field, which is the correct/only Next.js public API for this); it's a gap between what the
+installed framework version actually outputs and what the spec assumed it would output —
+worth a human decision (e.g. whether to add an explicit
+`other: { "apple-mobile-web-app-capable": "yes" }` override in `app/layout.tsx`) before
+this ships. No code was modified to work around this — flagging per the pipeline contract
+for Review/human judgment rather than patching around it myself.
 
-## Files added by this stage (Testing)
+## Everything else checked and consistent with spec/changes.md
 
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-65/tests/unit/app/api/service-weeks-member-view-route.test.ts`
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-65/tests/unit/app/member-week-view.test.tsx`
+- `lib/pwa/install.ts`: all four exports match the spec's declared signatures and edge-case
+  rules (E3, E5, E6) exactly; existing unit tests exercise iPhone Safari, iPadOS-13+
+  spoofed-Mac-with-touch, real desktop Mac, `CriOS`/`FxiOS` exclusion, Android Chrome, and
+  both storage-throw paths (E3) — re-run and confirmed passing; manually re-verified the
+  assertions are non-tautological by reading the implementation alongside each test.
+- `components/pwa/InstallPrompt.tsx`: E1 (null on mount before the effect fires), E2
+  (standalone → no listeners/render), E4 (sticky dismissal across unmount/remount), E7
+  (single-use `prompt()` guarded via clearing `deferred` before awaiting; a rejected
+  `prompt()` still finalizes without an unhandled rejection — confirmed via a
+  `jest.fn().mockRejectedValue` test), E8 (`appinstalled` hides + marks dismissed) are all
+  covered and passing.
+- `app/manifest.ts`: exact field match to the spec's table, plus the explicit
+  `start_url`-inside-`scope` installability check (E10) the spec names.
+- `middleware.ts`: diffed against the spec's file-10 instructions — only the two new
+  entries were added to `isPublicRoute`; `config.matcher` and the `auth.protect()` call are
+  byte-for-byte unchanged. Confirmed live via curl (both new paths return 200 while signed
+  out).
+- Out-of-scope guardrails respected: no service worker, no `next-pwa`/`workbox`, no new
+  dependency (`next/og` is bundled with Next 15, not added to `package.json` — confirmed).
+- The manual-verification checklist was correctly copied verbatim into `changes.md` and
+  left unchecked, as the spec required.
 
-No implementation files were modified. Ready for Review.
+## Files touched by this stage (Testing)
+
+None — no new test files were added. The Coder's existing test suite
+(`tests/unit/lib/pwa/install.test.ts`, `tests/unit/app/manifest.test.ts`,
+`tests/unit/app/install-prompt.test.tsx`) already covers the happy path, every named edge
+case, and at least one failure case (rejected `prompt()`) called for by the pipeline
+contract, and was independently re-run rather than trusted. This stage's contribution was
+re-running lint/typecheck/test/build and performing the additional live-server behavioral
+verification described above, which surfaced the finding above that unit tests alone could
+not catch.
