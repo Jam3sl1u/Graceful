@@ -1,138 +1,89 @@
-# Changes — Issue #65: Build Member Week View screen
+# Changes — Issue #70: Notification preferences API (BR-14 minimum-channel guard)
 
-- `app/api/setlists/[id]/handler.ts`
-  - Added `getSetlistWithSongs(req, id, lookup?)`: `GET /api/setlists/:id`
-    handler. `requireAuth` + `requireRole(["admin", "set_leader"])`, loads the
-    setlist tenant-scoped (`church_group_id` match), 404s if missing/other
-    tenant, 500 on DB error, reuses the existing private `loadSongResponses`
-    helper for the ordered songs, and returns
-    `{ setlist: toSetlistResponse(data), songs }` for both draft and
-    published setlists (client needs status to render the locked state).
-  - `reorderSetlist`'s per-song update loop now conditionally includes
-    `notes` in the Supabase update payload only when `entry.notes !== undefined`
-    (i.e. the client actually sent it), so existing reorder callers that omit
-    notes do not wipe them. `null` clears notes, a string sets them.
-- `app/api/setlists/[id]/route.ts` — added `export async function GET` wired
-  to `getSetlistWithSongs`; `PUT` export unchanged.
-- `schemas/setlists.ts` — `reorderSetlistSchema`'s per-song object gained an
-  optional `notes: z.string().trim().max(1000).nullish()` field.
-  `addSetlistSongSchema` left unchanged (notes are only added via PUT after a
-  song is in the setlist).
-- `schemas/songs.ts` — added `export const SONG_KEY_OPTIONS = ASCII_SONG_KEYS;`
-  (the ordered 17-key ASCII list) for the frontend key `<select>`. Left
-  `VALID_SONG_KEYS` / `isValidSongKey` untouched.
+## Summary
 
-- `app/api/service-weeks/[id]/member-view/handler.ts` — new
-  `getMemberWeekView(req, id, lookup?)` handler exporting
-  `MemberWeekViewResponse` (and its constituent types `MemberWeekEvent`,
-  `MemberWeekSong`, `MemberWeekTeamMember`, `MemberWeekDocumentGroup`).
-  Aggregates, via the caller's RLS-scoped Supabase client only (no
-  service-role, no new RPC):
-  - `requireAuth` + `requireRole(["admin", "set_leader", "member"])` (guest
-    excluded — #72 is out of scope).
-  - Service week lookup by `id` + `church_group_id` → 404 if missing.
-  - Caller's own `invitations` row for the week, picking the latest by
-    `created_at` when multiple exist → `confirmationStatus` (null if none).
-  - `setlists` row for the week; only treated as present when
-    `status === "published"` (drafts filtered by RLS anyway for members, but
-    checked explicitly) → `setlist: null` otherwise. When published, reads
-    `setlist_songs` ordered by `position`, then `songs` for the distinct song
-    ids, building `effectiveKey = key_override ?? default_key`. Zero songs
-    still yields `{ status: "published", songs: [] }`, not `null`.
-  - `events` for the week ordered by `start_time asc`.
-  - `event_attendees` for the week's event ids (query skipped entirely when
-    there are no events, to avoid an empty `.in()`), used to compute each
-    event's `assigned` flag (caller present as an attendee) and the distinct
-    `teamUserIds`.
-  - Team directory scoped to `teamUserIds` only (mirrors
-    `getChurchGroupMembers`'s users/member_profiles/member_instruments/
-    instruments assembly), sorted by name; no email/phone included.
-  - Documents: only queried when there's a published setlist with songs;
-    `song_documents` rows grouped by `song_id` with freshly minted
-    `getDownloadUrl` per file (`@/lib/r2/client`, 30-min presigned GET); the
-    whole block is wrapped in try/catch so an R2/query failure degrades to
-    `documents: []` with a 200, not a 500.
-  - Returns `ok<MemberWeekViewResponse>(...)`; catches `ApiException` →
-    `fail(...)`, else 500 — same pattern as sibling handlers.
+Replaced the 501 stub at `app/api/notifications/preferences/route.ts` with a real
+`GET`/`PUT` implementation, following `.pipeline/spec.md` exactly (pattern copied
+from `app/api/profile/handler.ts` / `route.ts`).
 
-- `app/api/service-weeks/[id]/member-view/route.ts` — `GET` route wiring,
-  copied from the `setlist` route's shape (await `params`, delegate to the
-  handler).
+## Files changed
 
-- `app/(app)/member-week/[id]/member-week-view.tsx` (`"use client"`) — the
-  screen component. `ViewState` machine (`loading | ready | forbidden |
-  not-found | error`), single `useEffect` with a `cancelled` guard fetching
-  `GET /api/service-weeks/:id/member-view` once. Renders, in order:
-  - Header: title, `formatServiceDate`, confirmation `Badge` (mapped per
-    spec: accepted→Confirmed/success, pending→Pending/warning,
-    denied→Declined/neutral, withdrawn/expired→Not serving/neutral,
-    null→Not invited/neutral) plus a `Cancelled`/danger badge when
-    `isCancelled`.
-  - Setlist section: not-released vs. zero-songs vs. song list w/
-    title/artist/effectiveKey (`—` placeholder when null) — these are
-    distinct states per the spec's edge cases 2 and 3.
-  - Events section: only `assigned === true` events, each a `type="button"`
-    row opening an in-page detail panel (`selectedEventId` state, no new
-    route) showing name/type/start–end/notes, and a Maps link
-    (`https://www.google.com/maps/search/?api=1&query=...`) only when
-    `location` is non-empty.
-  - Team section: avatar (`getInitials`), name, instruments joined by ", "
-    (or "—" when empty); empty-team message when `team.length === 0`.
-  - Documents section: per-song-group heading + file links (`downloadUrl`,
-    opened in a new tab); empty-state message when none.
-  - A disabled, inert floating "chat" button (`aria-label="Week chat (coming
-    soon)"`, `disabled`, no `onClick`) as the Phase 2 placeholder.
-  - Loading/forbidden/not-found/error branches mirror `week-view.tsx`'s
-    `<main>` blocks (forbidden copy adjusted to a member context).
+- **`lib/supabase/types.ts`** — added `NotificationPreferencesRow` type and
+  registered `notification_preferences` in `Database["public"]["Tables"]`,
+  immediately after the `notifications` entry. `chat_preference` is
+  deliberately omitted from the row shape (see inline comment): it's a Phase 2
+  chat concern, and `types/domain.ts`'s `ChatPref` union doesn't match the DB
+  enum, so it's out of scope for this API surface. No other table entries were
+  touched.
 
-- `app/(app)/member-week/[id]/member-week-view.module.css` — mobile-first,
-  single-column styles (container/header/card/date/error mirrored from
-  `week-view.module.css`'s conventions, using the existing `--color-fg`/
-  `--color-border`/`--color-bg` variables), plus new `.chatButton` (fixed
-  bottom-right) and `.detail`/`.detailOverlay` (bottom-sheet-style event
-  detail panel).
+- **`schemas/notifications.ts`** — left the existing placeholder
+  `notificationsSchema`/`NotificationsInput` untouched (owned by other Sprint 4
+  issues) and appended:
+  - `NOTIFICATION_PREFERENCE_DEFAULTS` (PRD §6.9.1 defaults)
+  - `MIN_REMINDER_HOURS_BEFORE` (1) / `MAX_REMINDER_HOURS_BEFORE` (168)
+  - `updateNotificationPreferencesSchema` (all fields optional — partial merge)
+    and its inferred `UpdateNotificationPreferencesInput` type.
 
-## Files modified
+- **`app/api/notifications/preferences/handler.ts`** (new) — exports
+  `getNotificationPreferences` and `updateNotificationPreferences`, both
+  `(req: NextRequest, lookup?: UserLookup) => Promise<Response>`, matching
+  `app/api/profile/handler.ts`'s auth → JWT → Supabase client → `ok`/`fail` →
+  `ApiException` catch shape. No role gate (PRD auth = Any).
+  - `GET`: selects the caller's row by `user_id`; returns PRD defaults (no
+    insert) when no row exists; maps snake_case → camelCase.
+  - `PUT`: validates body against `updateNotificationPreferencesSchema` (400 on
+    failure), reads the current row (or defaults if none), merges the parsed
+    partial body onto it, then runs the **BR-14 guard against the merged
+    state** — rejects with 422 `VALIDATION_FAILED` if all three invitation
+    channels (`invitation_sms`, `invitation_email`, `invitation_inapp`) would
+    end up disabled — before issuing any write. On success, upserts the full
+    merged row (`onConflict: "user_id"`, `chat_preference` never read/written)
+    and returns the updated preferences.
+  - `user_id` always comes from `ctx.userId` (never the request body), so a
+    body carrying another user's `userId` cannot retarget the write; unknown
+    keys are stripped by Zod's default strip behavior.
 
-- `app/(app)/member-week/[id]/page.tsx` — replaced the "coming soon" stub
-  with a server wrapper that awaits `params` and renders
-  `<MemberWeekView serviceWeekId={id} />`, matching
-  `app/(app)/week/[id]/page.tsx`'s shape exactly.
+- **`app/api/notifications/preferences/route.ts`** — replaced the
+  `notImplemented` stub with thin `GET`/`PUT` delegation to the new handler
+  (same shape as `app/api/profile/route.ts`).
 
-- `.pipeline/spec.md` — this was already updated in the working tree (issue
-  #65's spec, produced by the Planning stage) before this Coding session
-  started; included in this commit as part of the normal pipeline handoff.
-  No further edits made to it by the Coding stage.
+- **`tests/unit/app/api/notification-preferences-route.test.ts`** (new) — 22
+  tests mirroring `tests/unit/app/api/profile-route.test.ts`'s structure
+  (`jest.mock` for `@clerk/nextjs/server` and `@/lib/supabase/client`,
+  `makeReq`/`makeLookup`/`setUpAuth`/`makeSupabaseClient` helpers). The
+  Supabase fake supports an `upsertResult` fixture override so the post-upsert
+  `.select().maybeSingle()` can echo back a different row than the pre-write
+  select (needed for the "no row yet" PUT case) and an `onUpsert` capture
+  callback to assert both the written payload and that no upsert fires when a
+  request is rejected. Covers: GET with existing row / no row (defaults, no
+  upsert issued) / DB error; PUT happy path (captured merged snake_case
+  payload), empty-body no-op, insert-on-first-write, BR-14 direct violation
+  (no upsert issued), BR-14-via-merge violation, one-channel-remains-enabled
+  success, re-enabling a channel, malformed body (null/array/wrong types),
+  out-of-range `reminderHoursBefore` (0, 169, 1.5, string), unknown-key
+  stripping, missing JWT (401, no Supabase client built), and DB error (500).
 
 ## Verification
 
 - `bun run lint` — clean.
 - `bun run typecheck` — clean.
-- `bun run test` — all 77 suites / 968 tests pass (no regressions; the two
-  new test files the spec names for the Testing stage —
-  `tests/unit/app/api/service-weeks-member-view-route.test.ts` and
-  `tests/unit/app/member-week-view.test.tsx` — were intentionally not written
-  here, per the pipeline contract that Testing writes and owns test files).
+- `bun run test` — full suite: 82 suites / 1062 tests passed, including the 22
+  new tests in `notification-preferences-route.test.ts`.
 
-## What the Tester should focus on
+## Notes for the Tester
 
-- The 13 edge cases enumerated in `.pipeline/spec.md` under "Edge cases the
-  implementation MUST handle", especially:
-  - Published setlist with zero songs vs. no/draft setlist (must render two
-    distinct messages).
-  - Empty `event_attendees` for the week — handler must not issue an `.in()`
-    query with an empty array (verify via a `from` spy on `event_attendees`
-    not being called when `events` is empty).
-  - `getDownloadUrl` throwing (simulate R2 misconfiguration) → endpoint still
-    200 with `documents: []`.
-  - Guest role → 403.
-  - A member assigned to only some of the week's events — only those show in
-    the Events section, but `team` reflects the full attendee set across all
-    events.
-  - Event with `location: null` → detail panel renders with no Maps link.
-- The handler's per-table Supabase mock dispatch (many tables read across one
-  request) — verify the `makeChain`-style test double the spec calls for
-  handles `service_weeks`, `invitations`, `setlists`, `setlist_songs`,
-  `songs`, `events`, `event_attendees`, `users`, `member_profiles`,
-  `member_instruments`, `instruments`, `song_documents` all being queried
-  from the same `getSupabaseClient(jwt)` instance.
+- No migration or RLS changes were made or are needed — the
+  `notification_preferences` table and its RLS policies already existed with
+  the PRD-matching defaults (verified in the spec's "Current state" section).
+- `chat_preference` must never appear in a `select` or upsert payload for this
+  route — worth an explicit spot-check if you write any additional tests.
+- BR-14 is deliberately checked against the **merged** state, not the raw
+  request body, so the interesting edge case is a body that only sets one
+  field but disables the last remaining enabled invitation channel because the
+  other two are already `false` in the stored row.
+- `PUT` is a partial merge (not full replace) — this is the one intentional
+  divergence from `PUT /api/profile`, called out explicitly in spec Decisions.
+- `.pipeline/spec.md` was already updated in the working tree (issue #70's
+  spec, produced by the Planning stage) before this Coding session started;
+  included in this commit as part of the normal pipeline handoff. No further
+  edits made to it by the Coding stage.
