@@ -1,125 +1,99 @@
-# Test Results — Issue #65: Build Member Week View screen
+# Test Results — Issue #70: Notification preferences API (BR-14 minimum-channel guard)
 
-This overwrites the stale `test-results.md` for issue #63 that was still
+This overwrites the stale `test-results.md` for issue #65 that was still
 sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
 recent run).
 
 ## Verdict: ALL PASS
 
-## Summary
+## What was independently verified
 
-All checks pass. Two new test files were written (as named in `.pipeline/spec.md`
-under "Tests for the Testing stage") and independently verify the coder's
-claims — the coder's `changes.md` explicitly deferred writing these to this
-stage, which matches the pipeline contract.
+- `bun run lint` — clean, no warnings or errors.
+- `bun run typecheck` — clean (`tsc --noEmit`), no errors.
+- `bun run test` (full suite, before adding any tester tests) — 82 suites /
+  1062 tests passed, confirming the Coder's reported numbers in
+  `.pipeline/changes.md`.
+- Read `lib/supabase/types.ts`, `schemas/notifications.ts`,
+  `app/api/notifications/preferences/handler.ts`, and `route.ts` in full and
+  diffed them against every requirement in `.pipeline/spec.md` (column list,
+  defaults, BR-14 guard placement before the write, partial-merge semantics,
+  `chat_preference` exclusion, `user_id` always from `ctx.userId`, error
+  codes/status codes). All match the spec exactly.
 
-## Commands run
+## Additional tests written this stage
 
-- `bun run typecheck` — clean, no errors.
-- `bun run lint` — clean, no errors/warnings.
-- `bun run test` — **79 suites / 1004 tests pass**, 0 failures (77 suites /
-  968 tests pre-existing per the coder's baseline + 2 new suites / 36 new
-  tests added by this stage). No regressions in any pre-existing suite.
+Added `tests/unit/app/api/notification-preferences-route-tester-supplement.test.ts`
+(7 new tests) to independently probe gaps in the Coder's own
+`notification-preferences-route.test.ts` fixture, which couples the
+pre-write select and post-write upsert to the same `error`/`data` fields and
+so never actually isolates the upsert's own failure branch, never checks the
+`reminderHoursBefore` integer boundaries, never exercises `route.ts`'s `GET`/
+`PUT` exports directly (only the underlying `handler.ts` functions), and
+never explicitly asserts the SELECT column list excludes `chat_preference`.
 
-## New test files written
+Covered:
+1. **Upsert-specific 500** — pre-write select succeeds, but the upsert call
+   itself returns a Supabase error → 500 `INTERNAL` (previously only the
+   pre-write select's error path was isolated from the upsert's).
+2. **Upsert returns no error but no row** → 500 `INTERNAL` (the `!data`
+   half of the handler's `error || !data` check on the upsert result).
+3. **`reminderHoursBefore` boundary values** (`1` and `168`, both spec-valid
+   inclusive bounds) → 200, value round-trips unchanged.
+4. **Full unauthenticated PUT case** (Clerk `userId` null) → 401
+   `UNAUTHENTICATED`, `lookup` never consulted, `getSupabaseClient` never
+   called (the Coder's suite only had this variant for `GET`; `PUT` only had
+   the "JWT missing" variant, not the "no Clerk session at all" variant).
+5. **`route.ts` `GET` delegation**, driven through the actual exported
+   `GET`/`PUT` functions (not `handler.ts` directly) with a real
+   `requireAuth` → `users`-table lookup satisfied via a table-name-aware
+   Supabase fake, confirming the thin wrapper truly wires through to the
+   handler and returns its response untouched.
+6. **`route.ts` `PUT` delegation** with a malformed body → 400
+   `VALIDATION_FAILED`, same wiring check as above.
 
-### `tests/unit/app/api/service-weeks-member-view-route.test.ts` (20 tests)
+All 7 pass. Combined with the Coder's 22, the route now has 29 dedicated
+tests.
 
-Mirrors `tests/unit/app/api/song-documents-route.test.ts` / the setlist route
-test's `makeChain`/`makeLookup`/`setUpAuth` helpers, with a per-table
-`from(table)` dispatcher covering all 12 tables the handler touches
-(`service_weeks`, `invitations`, `setlists`, `setlist_songs`, `songs`,
-`events`, `event_attendees`, `users`, `member_profiles`, `member_instruments`,
-`instruments`, `song_documents`).
+## Full suite after additions
 
-Covers:
-- Auth/authz: 401 (no Clerk user, no JWT), 403 for guest (and confirms
-  `getSupabaseClient` is never constructed for a rejected role), 200 for each
-  of admin/set_leader/member.
-- Happy path: full aggregate payload — `serviceWeek` summary, `confirmationStatus`,
-  `setlist.songs` with correct `effectiveKey` resolution and ordering, `events`
-  with per-event `assigned`, `team` sorted by name with correct
-  `vocalCapability`/`instruments` per member (including the "no profile" →
-  `vocalCapability: "none"`, `instruments: []` case), `documents` with a
-  freshly-minted `downloadUrl` and **no `file_key` anywhere in the response**
-  (spec edge case 13).
-- Edge case 1 (404 for missing/other-tenant week) + a 500 path when the
-  `service_weeks` query itself errors.
-- Edge case 2 (no setlist row → `null`; **draft** setlist row → `null`, as a
-  defense-in-depth check beyond RLS).
-- Edge case 3 (published setlist, zero songs → `{status:"published",songs:[]}`,
-  distinct from `null`).
-- Edge case 4 (`effectiveKey` null when both `key_override` and `default_key`
-  are null).
-- Edge case 5 / 8 (no events → `events: []`, `team: []`, and — verified via a
-  `from` spy — the handler never calls `.from("event_attendees")` or
-  `.from("users")` when there are no events, i.e. the empty-`.in()` guard is
-  real, not just claimed).
-- Edge case 6 (member assigned to only some events — per-event `assigned`
-  differs, but `team` still reflects the full attendee set across all events).
-- Edge case 9 (`getDownloadUrl` rejecting → `documents: []`, endpoint still
-  200) plus an additional case: documents query is skipped entirely (`from`
-  never called with `"song_documents"`) when the published setlist has zero
-  songs.
-- Edge case 10 (no invitation row → `confirmationStatus: null`, still 200).
-- Edge case 11 (cancelled week → `isCancelled: true` passed through).
-- Re-invite safety: multiple `invitations` rows for the caller → the one with
-  the latest `created_at` wins.
-- A general 500 path (events query error) to confirm the fail-fast pattern
-  holds beyond the week/setlist checks already covered by the sibling tests.
+`bun run test` — **83 suites / 1069 tests passed**, 0 failures. No
+regressions in any pre-existing suite.
 
-### `tests/unit/app/member-week-view.test.tsx` (16 tests)
+## Spec edge cases: coverage confirmed
 
-Mirrors `tests/unit/app/week-view.test.tsx` (jsdom, `fetch` mocked and keyed
-by URL).
+All 15 edge cases enumerated in `.pipeline/spec.md` ("Edge cases the
+implementation MUST handle") are covered by the combined test files:
+no-row GET (defaults, no insert), no-row PUT (merge onto defaults + insert),
+BR-14 explicit / via-merge / not-violated / re-enable, empty-body no-op,
+malformed body (null, array, wrong types), out-of-range and boundary
+`reminderHoursBefore` (0, 169, 1.5, "24", 1, 168), unknown-key stripping,
+`chat_preference` never read/written, missing-JWT 401 (GET and PUT), fully
+unauthenticated 401 (GET and PUT), DB error on select and on upsert (500),
+and the `{ data: { preferences } }` / `{ error, code }` response envelopes.
 
-Covers:
-- Loading state before the fetch resolves.
-- Happy path: header (title/date), confirmation badge, setlist list (scoped
-  via `within()` to disambiguate from the Documents section's same song
-  title), assigned-only events section (unassigned event correctly excluded),
-  team roster (incl. an instrument-less member rendering "—"), documents
-  section with a working download link, and the floating chat button present
-  but `disabled`.
-- Event detail panel: clicking an assigned event opens the panel with a Maps
-  link built from the event's location (percent-encoded), and the close
-  button clears it (edge case 7's positive case).
-- Edge case 7: an event with `location: null` opens a detail panel with **no**
-  Maps link.
-- Edge case 3 vs 2: zero-songs published setlist renders "No songs added yet"
-  and explicitly asserts the "not yet released" copy is absent (and vice
-  versa for a null setlist).
-- Empty-state messages for events, team, and documents sections.
-- Edge case 10: `confirmationStatus: null` renders the "Not invited" badge and
-  the rest of the screen still renders (not gated on confirmation).
-- Edge case 11: cancelled week renders the Cancelled badge.
-- View-state branches: 404 → not-found, 403 → forbidden, network throw →
-  error, unexpected 500 → error.
+## Failure cases exercised
+
+- Malformed/invalid request bodies (null, array, wrong field types,
+  out-of-range and non-integer `reminderHoursBefore`) → 400.
+- BR-14 violation (direct and via-merge) → 422, confirmed no upsert issued.
+- Missing JWT and missing Clerk session → 401, confirmed no Supabase client
+  is even constructed.
+- DB error on the pre-write select, and on the upsert itself → 500, never
+  leaking the driver error message.
 
 ## Notes for the Reviewer
 
-- No failures were found; nothing was patched around. The implementation
-  matches every edge case named in `.pipeline/spec.md`'s "Edge cases the
-  implementation MUST handle" list (1–11 directly tested here; 12 — guest
-  403 — is covered; 13 — no `file_key` leakage / fresh signed URL per request
-  — is asserted via `JSON.stringify` + a `getDownloadUrl` call-argument check).
-- One thing worth a second look in review, not a test failure: the spec's
-  Decisions section already flags that a member confirmed for a week with no
-  events yet won't show in `team` — this is by design (documented limitation),
-  and the "no events" test in this suite confirms that behavior is what's
-  actually implemented, not accidental.
-- Test-file-only fix made during this stage: the component test's fixture
-  data originally had an event named "Sunday Service" that collided with the
-  service week's title "Sunday Service", making some queries ambiguous
-  (`getByText`/`getByRole` matching two elements). Renamed the fixture event
-  to "Sunday Gathering" and scoped the setlist-song assertions with
-  `within()` to avoid a separate collision with an identically-titled
-  Documents heading. This was a test-fixture naming fix only — no production
-  code was touched.
+- No implementation code in `app/`, `lib/`, or `schemas/` was modified by
+  this stage — only a new supplemental test file was added
+  (`tests/unit/app/api/notification-preferences-route-tester-supplement.test.ts`).
+- Confirmed by direct inspection (not just trusting `changes.md`) that
+  `chat_preference` never appears in the shared `COLUMNS` select string, the
+  upsert payload, or `NotificationPreferencesRow`/`NotificationPreferencesResponse`.
+- Confirmed no migration or RLS files were touched — matches what
+  `changes.md` claims.
 
 ## Files added by this stage (Testing)
 
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-65/tests/unit/app/api/service-weeks-member-view-route.test.ts`
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-65/tests/unit/app/member-week-view.test.tsx`
+- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-70/tests/unit/app/api/notification-preferences-route-tester-supplement.test.ts`
 
 No implementation files were modified. Ready for Review.
