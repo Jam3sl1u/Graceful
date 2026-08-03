@@ -1,138 +1,142 @@
-# Changes — Issue #65: Build Member Week View screen
+# Changes — Issue #75: [Sprint 4] PWA manifest & install prompt
 
-- `app/api/setlists/[id]/handler.ts`
-  - Added `getSetlistWithSongs(req, id, lookup?)`: `GET /api/setlists/:id`
-    handler. `requireAuth` + `requireRole(["admin", "set_leader"])`, loads the
-    setlist tenant-scoped (`church_group_id` match), 404s if missing/other
-    tenant, 500 on DB error, reuses the existing private `loadSongResponses`
-    helper for the ordered songs, and returns
-    `{ setlist: toSetlistResponse(data), songs }` for both draft and
-    published setlists (client needs status to render the locked state).
-  - `reorderSetlist`'s per-song update loop now conditionally includes
-    `notes` in the Supabase update payload only when `entry.notes !== undefined`
-    (i.e. the client actually sent it), so existing reorder callers that omit
-    notes do not wipe them. `null` clears notes, a string sets them.
-- `app/api/setlists/[id]/route.ts` — added `export async function GET` wired
-  to `getSetlistWithSongs`; `PUT` export unchanged.
-- `schemas/setlists.ts` — `reorderSetlistSchema`'s per-song object gained an
-  optional `notes: z.string().trim().max(1000).nullish()` field.
-  `addSetlistSongSchema` left unchanged (notes are only added via PUT after a
-  song is in the setlist).
-- `schemas/songs.ts` — added `export const SONG_KEY_OPTIONS = ASCII_SONG_KEYS;`
-  (the ordered 17-key ASCII list) for the frontend key `<select>`. Left
-  `VALID_SONG_KEYS` / `isValidSongKey` untouched.
+## Summary
 
-- `app/api/service-weeks/[id]/member-view/handler.ts` — new
-  `getMemberWeekView(req, id, lookup?)` handler exporting
-  `MemberWeekViewResponse` (and its constituent types `MemberWeekEvent`,
-  `MemberWeekSong`, `MemberWeekTeamMember`, `MemberWeekDocumentGroup`).
-  Aggregates, via the caller's RLS-scoped Supabase client only (no
-  service-role, no new RPC):
-  - `requireAuth` + `requireRole(["admin", "set_leader", "member"])` (guest
-    excluded — #72 is out of scope).
-  - Service week lookup by `id` + `church_group_id` → 404 if missing.
-  - Caller's own `invitations` row for the week, picking the latest by
-    `created_at` when multiple exist → `confirmationStatus` (null if none).
-  - `setlists` row for the week; only treated as present when
-    `status === "published"` (drafts filtered by RLS anyway for members, but
-    checked explicitly) → `setlist: null` otherwise. When published, reads
-    `setlist_songs` ordered by `position`, then `songs` for the distinct song
-    ids, building `effectiveKey = key_override ?? default_key`. Zero songs
-    still yields `{ status: "published", songs: [] }`, not `null`.
-  - `events` for the week ordered by `start_time asc`.
-  - `event_attendees` for the week's event ids (query skipped entirely when
-    there are no events, to avoid an empty `.in()`), used to compute each
-    event's `assigned` flag (caller present as an attendee) and the distinct
-    `teamUserIds`.
-  - Team directory scoped to `teamUserIds` only (mirrors
-    `getChurchGroupMembers`'s users/member_profiles/member_instruments/
-    instruments assembly), sorted by name; no email/phone included.
-  - Documents: only queried when there's a published setlist with songs;
-    `song_documents` rows grouped by `song_id` with freshly minted
-    `getDownloadUrl` per file (`@/lib/r2/client`, 30-min presigned GET); the
-    whole block is wrapped in try/catch so an R2/query failure degrades to
-    `documents: []` with a 200, not a 500.
-  - Returns `ok<MemberWeekViewResponse>(...)`; catches `ApiException` →
-    `fail(...)`, else 500 — same pattern as sibling handlers.
+Implements the install/launch experience described in `.pipeline/spec.md`: a
+Next.js web app manifest, home-screen icons (SVG for Android/Chrome, a
+generated PNG apple-touch-icon for iOS), viewport/appleWebApp metadata, and a
+client-side install-prompt banner (Android `beforeinstallprompt` + iOS
+"Add to Home Screen" instructions). No service worker, offline caching, or new
+dependency was added — out of scope per the spec.
 
-- `app/api/service-weeks/[id]/member-view/route.ts` — `GET` route wiring,
-  copied from the `setlist` route's shape (await `params`, delegate to the
-  handler).
+## Files created
 
-- `app/(app)/member-week/[id]/member-week-view.tsx` (`"use client"`) — the
-  screen component. `ViewState` machine (`loading | ready | forbidden |
-  not-found | error`), single `useEffect` with a `cancelled` guard fetching
-  `GET /api/service-weeks/:id/member-view` once. Renders, in order:
-  - Header: title, `formatServiceDate`, confirmation `Badge` (mapped per
-    spec: accepted→Confirmed/success, pending→Pending/warning,
-    denied→Declined/neutral, withdrawn/expired→Not serving/neutral,
-    null→Not invited/neutral) plus a `Cancelled`/danger badge when
-    `isCancelled`.
-  - Setlist section: not-released vs. zero-songs vs. song list w/
-    title/artist/effectiveKey (`—` placeholder when null) — these are
-    distinct states per the spec's edge cases 2 and 3.
-  - Events section: only `assigned === true` events, each a `type="button"`
-    row opening an in-page detail panel (`selectedEventId` state, no new
-    route) showing name/type/start–end/notes, and a Maps link
-    (`https://www.google.com/maps/search/?api=1&query=...`) only when
-    `location` is non-empty.
-  - Team section: avatar (`getInitials`), name, instruments joined by ", "
-    (or "—" when empty); empty-team message when `team.length === 0`.
-  - Documents section: per-song-group heading + file links (`downloadUrl`,
-    opened in a new tab); empty-state message when none.
-  - A disabled, inert floating "chat" button (`aria-label="Week chat (coming
-    soon)"`, `disabled`, no `onClick`) as the Phase 2 placeholder.
-  - Loading/forbidden/not-found/error branches mirror `week-view.tsx`'s
-    `<main>` blocks (forbidden copy adjusted to a member context).
-
-- `app/(app)/member-week/[id]/member-week-view.module.css` — mobile-first,
-  single-column styles (container/header/card/date/error mirrored from
-  `week-view.module.css`'s conventions, using the existing `--color-fg`/
-  `--color-border`/`--color-bg` variables), plus new `.chatButton` (fixed
-  bottom-right) and `.detail`/`.detailOverlay` (bottom-sheet-style event
-  detail panel).
+- `app/manifest.ts` — `MetadataRoute.Manifest` file convention (served at
+  `/manifest.webmanifest`, auto-linked by Next). Fields match the spec table
+  exactly: `name`/`short_name` "Graceful", `description` matching
+  `app/layout.tsx`, `id: "/"`, `start_url: "/dashboard"`, `scope: "/"`,
+  `display: "standalone"`, `background_color: "#ffffff"`,
+  `theme_color: "#4f46e5"`, and two SVG icons (`any` + `maskable` purpose).
+  `id` is typed by the installed Next version (`next/dist/lib/metadata/types/manifest-types.d.ts`),
+  so no cast/drop was needed.
+- `public/icons/icon.svg` — 512x512, `#4f46e5` background, 96 corner radius,
+  white "G" wordmark centered (~60% canvas height via font-size).
+- `public/icons/icon-maskable.svg` — same mark, full-bleed square (no corner
+  radius), "G" sized to the ~40%-height Android maskable safe area.
+- `app/apple-icon.tsx` — Next `apple-icon` convention using `ImageResponse`
+  from `next/og` (no new dependency), 180x180 PNG, white "G" flex-centered on
+  `#4f46e5`, no rounding (iOS applies its own mask).
+- `lib/pwa/install.ts` — pure, DOM-free helper module (doc-comment style
+  copied from `lib/invitations/state-machine.ts`): `INSTALL_DISMISSED_KEY`,
+  `BeforeInstallPromptEvent` type, `isRunningStandalone`,
+  `isIosInstallCapable` (iPhone/iPod/iPad UA or iPadOS-13+ spoofed
+  `Macintosh` + `maxTouchPoints > 1`; excludes `CriOS`/`FxiOS`/`EdgiOS`/`OPiOS`),
+  `isInstallPromptDismissed`/`markInstallPromptDismissed` (never throw; a
+  storage failure reads as "not dismissed").
+- `components/pwa/InstallPrompt.tsx` — client component, named export, reuses
+  `components/ui/Button`. Mount effect: standalone check → dismissed check →
+  register `beforeinstallprompt` (Android) and `appinstalled` listeners → iOS
+  capability check. Install handler clears the deferred event *before*
+  awaiting `prompt()`/`userChoice` (guards a double-click re-invoking a
+  single-use event) and always finalizes (hide + mark dismissed) even if
+  `prompt()` rejects. Dismiss handler marks dismissed and hides. All
+  `window`/`navigator`/`localStorage` access is confined to the effect and
+  handlers, never render, so SSR/first-render output is `null`.
+- `components/pwa/InstallPrompt.module.css` — fixed bottom banner,
+  `max-width: 480px`, `var(--color-border)`/`var(--color-bg)` tokens, 8px
+  radius (top corners), `padding-bottom: max(1rem, env(safe-area-inset-bottom))`,
+  dismiss button `min-height/min-width: 44px` (the `Install`/`Not now` buttons
+  already meet this via `components/ui/Button.module.css`).
+- `tests/unit/lib/pwa/install.test.ts` — unit tests for all four exports:
+  standalone detection (display-mode match, iOS `navigator.standalone`,
+  missing `matchMedia`), iOS capability rules (iPhone Safari, iPadOS-13+
+  spoofed Mac + touch points, real desktop Mac with 0 touch points, `CriOS`/
+  `FxiOS` exclusions, Android Chrome), and dismissal read/write including
+  thrown `getItem`/`setItem`.
+- `tests/unit/app/manifest.test.ts` — asserts every manifest field, plus an
+  explicit check that `start_url` stays inside `scope` (installability) and
+  both icons are present with `sizes: "any"`.
+- `tests/unit/app/install-prompt.test.tsx` — jsdom + `@testing-library/react`,
+  drives Android via a fake `beforeinstallprompt` event carrying
+  `prompt`/`userChoice`, and iOS via stubbed `navigator.userAgent`/
+  `maxTouchPoints`. Covers: hidden before any signal, hidden when already
+  dismissed, hidden when standalone (`matchMedia` stub), Android
+  install-and-hide, double-click guard (single `prompt()` call), rejected
+  `prompt()` still hides without throwing, dismiss is sticky across
+  unmount/remount, `appinstalled` hides + marks dismissed, iOS banner
+  copy/no-Install-button, iOS dismiss.
 
 ## Files modified
 
-- `app/(app)/member-week/[id]/page.tsx` — replaced the "coming soon" stub
-  with a server wrapper that awaits `params` and renders
-  `<MemberWeekView serviceWeekId={id} />`, matching
-  `app/(app)/week/[id]/page.tsx`'s shape exactly.
+- `app/layout.tsx` — added `applicationName`, `appleWebApp`, and `icons.icon`
+  to the existing `metadata` object (title/description unchanged, no
+  `metadata.manifest` added). Added a new `viewport` export (`themeColor`,
+  `width: "device-width"`, `initialScale: 1`, `viewportFit: "cover"`).
+- `app/(app)/layout.tsx` — renders `<InstallPrompt />` as a sibling after
+  `{children}` inside `<AppShell>`; the pre-existing Sprint-0 TODO comment is
+  left intact. Not mounted in `(marketing)`/`(auth)`/`(public)`.
+- `middleware.ts` — added `"/apple-icon(.*)"` and `"/manifest.webmanifest"` to
+  the `isPublicRoute` matcher array with a one-line comment (E9: `/apple-icon`
+  has no dot in its path, so it would otherwise hit `auth.protect()` and 302 an
+  unauthenticated request, breaking the iOS home-screen icon).
+  `config.matcher` and the `auth.protect()` call are untouched.
 
-- `.pipeline/spec.md` — this was already updated in the working tree (issue
-  #65's spec, produced by the Planning stage) before this Coding session
-  started; included in this commit as part of the normal pipeline handoff.
-  No further edits made to it by the Coding stage.
+## Notable implementation decision (not a deviation)
 
-## Verification
+`lib/pwa/install.ts`'s `isRunningStandalone` takes a `navigator?: { standalone?: boolean }`
+field (as specified), which TypeScript's "weak type" check rejects if you pass
+the real DOM `window` object directly (`Navigator` shares no property with
+`{ standalone?: boolean }` since that field is non-standard and absent from
+`lib.dom.d.ts`). `components/pwa/InstallPrompt.tsx` calls it with an object
+literal (`{ matchMedia: window.matchMedia?.bind(window), navigator:
+window.navigator as unknown as { standalone?: boolean } }`) instead of passing
+`window` directly — the cast is narrowly scoped to that one non-standard
+property, not a workaround for anything in our own code, and keeps
+`lib/pwa/install.ts` itself cast-free and independently testable with plain
+stubs.
+
+## Verification run
 
 - `bun run lint` — clean.
 - `bun run typecheck` — clean.
-- `bun run test` — all 77 suites / 968 tests pass (no regressions; the two
-  new test files the spec names for the Testing stage —
-  `tests/unit/app/api/service-weeks-member-view-route.test.ts` and
-  `tests/unit/app/member-week-view.test.tsx` — were intentionally not written
-  here, per the pipeline contract that Testing writes and owns test files).
+- `bun run test` — 84 suites / 1068 tests passed (includes the 3 new suites
+  above).
+- `bun run build` — succeeds; route list includes `○ /apple-icon` and
+  `○ /manifest.webmanifest` as static routes. Note: this repo's build always
+  requires *some* well-formed `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` /
+  `CLERK_SECRET_KEY` (Clerk validates the key format at build time) — this is
+  pre-existing and unrelated to this change; there is no local `.env` in this
+  worktree, so the build was run with throwaway well-formed dummy values
+  (`pk_test_...` base64 of `example.clerk.accounts.dev$`, `sk_test_dummy`)
+  purely to exercise the build. Nothing was committed with real or fake
+  secrets.
+
+## Manual verification (copied verbatim from spec.md — NOT performed by this pipeline stage)
+
+Not performable by any pipeline stage — requires physical devices per PRD §28.5.
+
+- [ ] Chrome Android: install banner appears, "Install" adds the icon, launched app shows
+      no browser chrome and lands on `/dashboard`.
+- [ ] iOS Safari (iOS 16+): instruction banner appears; Share → Add to Home Screen; the
+      icon is the "G" mark (not a page screenshot); launched app is full-screen.
+- [ ] Chrome desktop DevTools → Application → Manifest: no errors, both icons resolve,
+      "Installability: yes".
+- [ ] View source of `/dashboard` contains `<link rel="manifest" href="/manifest.webmanifest">`,
+      `<meta name="theme-color" content="#4f46e5">`, and
+      `<meta name="apple-mobile-web-app-capable" content="yes">`.
+- [ ] `/manifest.webmanifest` and `/apple-icon` both return 200 while signed out.
 
 ## What the Tester should focus on
 
-- The 13 edge cases enumerated in `.pipeline/spec.md` under "Edge cases the
-  implementation MUST handle", especially:
-  - Published setlist with zero songs vs. no/draft setlist (must render two
-    distinct messages).
-  - Empty `event_attendees` for the week — handler must not issue an `.in()`
-    query with an empty array (verify via a `from` spy on `event_attendees`
-    not being called when `events` is empty).
-  - `getDownloadUrl` throwing (simulate R2 misconfiguration) → endpoint still
-    200 with `documents: []`.
-  - Guest role → 403.
-  - A member assigned to only some of the week's events — only those show in
-    the Events section, but `team` reflects the full attendee set across all
-    events.
-  - Event with `location: null` → detail panel renders with no Maps link.
-- The handler's per-table Supabase mock dispatch (many tables read across one
-  request) — verify the `makeChain`-style test double the spec calls for
-  handles `service_weeks`, `invitations`, `setlists`, `setlist_songs`,
-  `songs`, `events`, `event_attendees`, `users`, `member_profiles`,
-  `member_instruments`, `instruments`, `song_documents` all being queried
-  from the same `getSupabaseClient(jwt)` instance.
+- `lib/pwa/install.ts` unit coverage (pure, `node` environment) — especially
+  the `CriOS`/`FxiOS`/`EdgiOS`/`OPiOS` exclusions and the iPadOS-13+
+  `Macintosh` + `maxTouchPoints` rule (E5/E6).
+- `InstallPrompt` E7 (single-use `prompt()`, rejected promise must not crash
+  or leave the banner stuck) and E3 (storage-throws paths) — these are
+  behavior correctness, not just "does it render".
+- `app/apple-icon.tsx` is intentionally **not** imported from any Jest test
+  (per spec — `next/og` is edge/wasm-only and `@swc/jest` can't load it); its
+  only verification is `bun run build` succeeding and emitting the
+  `○ /apple-icon` route.
+- Confirm `middleware.ts`'s `config.matcher` and `auth.protect()` logic were
+  left untouched — only the `isPublicRoute` array gained two entries.
