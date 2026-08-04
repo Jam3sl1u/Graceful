@@ -69,7 +69,7 @@ test.describe("setlist publish", () => {
 
       await adminPage.goto(`/setlists/${setlistId}`);
       await expect(adminPage.getByRole("heading", { name: "Setlist Builder" })).toBeVisible();
-      await expect(adminPage.getByText("Draft")).toBeVisible();
+      await expect(adminPage.getByText("Draft", { exact: true })).toBeVisible();
 
       await adminPage.getByPlaceholder("Search songs").fill(song.title);
       await adminPage.getByRole("button", { name: "Add", exact: true }).click();
@@ -132,8 +132,18 @@ test.describe("setlist publish", () => {
       await expect(memberPage.getByText(song.title)).toBeVisible();
       await expect(memberPage.getByText("Confirmed", { exact: true })).toBeVisible();
     } finally {
-      await adminContext?.close();
-      await memberContext?.close();
+      // Each step is individually failure-tolerant so one cleanup error
+      // doesn't mask the test result or skip the DB teardown below.
+      try {
+        await adminContext?.close();
+      } catch (err) {
+        console.error("setlist-publish cleanup: adminContext.close failed", err);
+      }
+      try {
+        await memberContext?.close();
+      } catch (err) {
+        console.error("setlist-publish cleanup: memberContext.close failed", err);
+      }
       await teardownFixtures(svc, {
         serviceWeekId,
         invitationIds: [confirmedInvitationId, pendingInvitationId],
@@ -221,8 +231,18 @@ test.describe("setlist publish", () => {
       await expect(memberPage.getByText("No songs added yet")).toBeVisible();
       await expect(memberPage.getByText("Setlist not yet released")).not.toBeVisible();
     } finally {
-      await adminContext?.close();
-      await memberContext?.close();
+      // Each step is individually failure-tolerant so one cleanup error
+      // doesn't mask the test result or skip the DB teardown below.
+      try {
+        await adminContext?.close();
+      } catch (err) {
+        console.error("setlist-publish cleanup: adminContext.close failed", err);
+      }
+      try {
+        await memberContext?.close();
+      } catch (err) {
+        console.error("setlist-publish cleanup: memberContext.close failed", err);
+      }
       await teardownFixtures(svc, {
         serviceWeekId,
         invitationId,

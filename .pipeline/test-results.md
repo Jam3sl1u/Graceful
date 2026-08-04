@@ -1,6 +1,32 @@
 # Test Results — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
 
-## Post-review fix pass (targeted, not a full pipeline rerun)
+## Independent second-pass review fix pass
+
+A second, independent reviewer pass over the whole branch (not just the
+first fix commit) found that the first fix pass's `try`/`finally` change
+introduced a regression: wrapping `.close()` calls as plain (unwrapped)
+statements inside `finally` meant a throwing `.close()` would skip
+`teardownFixtures` entirely — worse than the pre-fix behavior, where
+`teardownFixtures` was unconditionally reached. Fixed by wrapping each
+cleanup step (`adminContext.close()`, `memberContext.close()`,
+`leaderContext.close()`, and `setMemberRole(svc, "member")` in
+`setlist-duplicate-song.spec.ts`) in its own `try`/`catch` with
+`console.error`, matching `calendar-sync.spec.ts`'s existing pattern — one
+failing step no longer blocks the ones after it or the DB teardown.
+
+Also fixed: `setlist-publish.spec.ts:72`'s `getByText("Draft")` was the same
+bug class as the original BLOCK findings (non-exact match, at a point where
+the full staging catalog renders) — added `{ exact: true }`. And the "five
+secrets gate the skip" inaccuracy the first fix pass corrected in
+`documentation/staging-environment.md` was also present in
+`.github/workflows/ci.yml`'s comment and `calendar-sync.spec.ts`'s header
+comment — both corrected to "four".
+
+Re-ran `bun run lint`, `bun run typecheck`, `bun run test` (82 suites / 1051
+tests), and `bun run test:e2e` (1 passed / 10 skipped) after these fixes —
+all green, same shape as before.
+
+## Post-review fix pass (targeted, not a full pipeline rerun; first pass)
 
 The Review stage returned BLOCK on this run (see `.pipeline/review.md`):
 `getByText()`'s default case-insensitive substring matching caused three

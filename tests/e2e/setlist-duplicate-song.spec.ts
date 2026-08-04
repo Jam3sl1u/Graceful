@@ -72,8 +72,19 @@ test.describe("setlist duplicate song", () => {
       await expect(addedButton).toBeVisible();
       await expect(addedButton).toBeDisabled();
     } finally {
-      await setMemberRole(svc, "member");
-      await leaderContext?.close();
+      // Each step is individually failure-tolerant so one cleanup error
+      // doesn't mask the test result or skip a later cleanup step. Role
+      // restore stays first per the file-header invariant.
+      try {
+        await setMemberRole(svc, "member");
+      } catch (err) {
+        console.error("setlist-duplicate-song cleanup: setMemberRole restore failed", err);
+      }
+      try {
+        await leaderContext?.close();
+      } catch (err) {
+        console.error("setlist-duplicate-song cleanup: leaderContext.close failed", err);
+      }
       await teardownFixtures(svc, { serviceWeekId, songIds: [song.id] });
     }
   });

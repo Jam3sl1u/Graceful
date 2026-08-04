@@ -1,14 +1,69 @@
 # Review — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
 
-VERDICT: BLOCK (original run — see post-review fix pass below)
+VERDICT: SHIP (after two post-review fix passes below — see "Independent
+second-pass review" for the pass that confirmed this; original run below is
+historical)
 
-## Post-review fix pass (2026-08-04)
+## Independent second-pass review (2026-08-04)
+
+An independent reviewer agent re-audited the whole branch (not just the fix
+commit) with fresh eyes, specifically checking whether the first fix pass
+introduced any new bug and re-deriving the `getByText` fixes against the
+actual component source rather than trusting the commit message. Findings:
+
+- Confirmed both original BLOCKING items are genuinely fixed — re-derived
+  independently against `app/(app)/setlists/[id]/setlist-builder.tsx` and
+  `app/(app)/member-week/[id]/member-week-view.tsx`, each now resolves to
+  exactly one element.
+- Found a **real regression introduced by the first fix pass**: moving
+  `adminContext.close()`/`memberContext.close()`/`leaderContext.close()` into
+  `finally` made `teardownFixtures` (the DB cleanup) unreachable if the
+  `.close()` call itself threw, since nothing after a throw in the same
+  `finally` block runs — a change from the pre-fix behavior, where
+  `teardownFixtures` was the sole `finally` statement and always ran. Fixed
+  by wrapping each cleanup step in its own `try`/`catch` (mirroring
+  `calendar-sync.spec.ts`'s existing failure-tolerant pattern), so a failed
+  `.close()` (or, in `setlist-duplicate-song.spec.ts`, a failed role restore)
+  no longer blocks the steps after it.
+- Found a latent version of the *same* strict-mode bug class at
+  `setlist-publish.spec.ts:72` (`getByText("Draft")`, non-exact, at a point
+  where the full staging song catalog is rendered) — added `{ exact: true }`
+  for consistency/robustness.
+- Found the "five secrets gate the skip" inaccuracy (the same class just
+  fixed in `documentation/staging-environment.md`) also present in
+  `.github/workflows/ci.yml`'s e2e-job comment and
+  `tests/e2e/calendar-sync.spec.ts`'s header comment — both corrected to
+  "four" with `E2E_GOOGLE_CALENDAR_ID` called out as separate from the gate.
+- Swept every other `getByText`/`getByRole` call across the three new specs
+  against the actual rendered DOM — no further collisions found.
+- Checked the whole diff for the network-beaconing pattern from this repo's
+  prior rogue-commit incident — no unexpected hosts; `tests/e2e/support/google.ts`
+  only calls `oauth2.googleapis.com` and `www.googleapis.com`, no secrets are
+  logged, and scope is unchanged (`tests/`, `.github/workflows/ci.yml`,
+  `documentation/staging-environment.md`, `.pipeline/` only).
+- Independently re-ran `bun run lint`, `bun run typecheck`, and `bun run
+  test` — all green (82 suites / 1051 tests).
+
+All fixes from this pass were applied; re-verified again after applying them
+(`lint`, `typecheck`, `test`: 1051/1051, `test:e2e`: 1 passed / 10 skipped,
+same shape). Two informational (non-actionable) notes from this pass, kept
+here for a future reader's awareness rather than as blockers:
+- `setlist-publish.spec.ts` now keeps two browser contexts open
+  concurrently (admin stays open while the member context signs in) — an
+  unproven-but-plausible-safe pattern in this suite (contexts have isolated
+  cookie jars); no other spec does this yet.
+- `setlist-duplicate-song.spec.ts` is the first spec depending on DB-only
+  role elevation granting RLS write access; this only works today because
+  `auth_user_role()` falls back to the DB when the JWT has no `role` claim —
+  worth remembering if Clerk custom-claim sync (#5/#6) ever changes that.
+
+## Post-review fix pass (2026-08-04, first pass)
 
 Applied targeted fixes for MUST FIX items #1 and #2 below, plus NON-BLOCKING
 items #4 and #5 (item #3 was already resolved on the branch before this
 pass). This was a direct fix pass in response to this review's own findings,
-not a fresh independent run of the Review stage — a human or the Review
-stage should still re-verify before merge.
+not a fresh independent run of the Review stage — see "Independent
+second-pass review" above for the pass that actually re-verified it.
 
 - **#1/#2** (`getByText` strict-mode collisions): added `{ exact: true }` to
   `tests/e2e/setlist-publish.spec.ts:94`, `:189` (`"Published"`), and `:133`

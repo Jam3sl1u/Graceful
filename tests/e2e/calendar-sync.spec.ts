@@ -16,10 +16,11 @@ import {
 // Issue #66 AC #4: an event created by an admin lands on a connected
 // member's Google Calendar, and an update to it propagates. Runs for real
 // against Google, gated on both the base staging E2E secrets AND the extra
-// Google Calendar E2E secrets (documentation/staging-environment.md §7.1) —
-// until a human provisions those five secrets, this spec skips (mirroring
+// GOOGLE_SYNC_VARS secrets (documentation/staging-environment.md §7.1) —
+// until a human provisions those four secrets, this spec skips (mirroring
 // issue #52's precedent of the whole authenticated suite skipping until
-// staging Clerk/Supabase secrets existed).
+// staging Clerk/Supabase secrets existed). E2E_GOOGLE_CALENDAR_ID is not
+// part of this gate — it only sets which calendar the spec targets.
 const calendarSyncReady = e2eAuthEnabled && googleSyncEnabled;
 
 test.describe("google calendar event sync", () => {
