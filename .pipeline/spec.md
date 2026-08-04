@@ -1,349 +1,318 @@
-# Spec — Issue #65: Build Member Week View screen
+# Spec — Issue #68: [Sprint 4] Integrate Resend email dispatch + webhook verification
 
 ## OPEN QUESTIONS
 
-None blocking. One design decision is called out under **Decisions & assumptions**
-(how the confirmed team is sourced for a member) — it is resolved with an
-RLS-compatible approach and does not require a human to proceed. If a reviewer
-disagrees with that sourcing, it is a follow-up, not a blocker for this screen.
+None. Nothing here requires a human decision — proceed.
 
-## Goal
+Two scope decisions were made from the current repo state (documented, not blocking):
 
-Turn the stub at `app/(app)/member-week/[id]/page.tsx` ("coming soon") into the
-Member Week View: a mobile-first screen showing, for the signed-in member and a
-given service week, the header (date + their confirmation status), setlist,
-their assigned events (each tappable to a detail view with a Maps link), the
-confirmed team with instruments, and this week's song documents (chord charts /
-sheet music) opened via signed URL.
+1. **No delivery-event persistence.** There is no email/SMS delivery-log table in the
+   schema (`supabase/migrations/20260702000005_cluster_5_partial.sql` Cluster 5 has only
+   `availability`, `notification_preferences`, `notifications`). Adding a migration is out
+   of scope for this issue. "Processes Resend callbacks" is therefore implemented as
+   verify → parse → normalize to a delivery status → structured log → 200 ack. **Do not
+   add a migration or write to any table.**
+2. **`RESEND_FROM_EMAIL` is a new env var.** Resend's API requires a `from` value and no
+   existing var supplies one. Added as a placeholder to `.env.example` +
+   `documentation/staging-environment.md` only; no real value is committed.
 
-PRD ref: Phase 1 PRD §13 Screen 3.
+## Current state (verified, do not re-derive)
 
-## Current state (verified)
-
-- `app/(app)/member-week/[id]/page.tsx` is a stub returning an `<h1>`.
-- There is **no** member-facing endpoint that returns setlist *songs*
-  (`GET /api/setlists/:id` is PUT-only; `.../songs` is POST-only). Members
-  therefore currently have no way to read songs + keys.
-- `GET /api/invitations?serviceWeekId=` is `set_leader`/`admin` only
-  (`app/api/invitations/handler.ts` `listInvitations`), so a member cannot read
-  the roster or others' confirmation via it.
-- RLS (`supabase/migrations/20260704000001_rls_policies.sql`) for a `member`:
-  - `service_weeks`, `events`, `event_attendees`, `songs`, `song_documents`,
-    `users`, `member_profiles`, `member_instruments`, `instruments` — **tenant
-    readable** (whole church group).
-  - `setlists` / `setlist_songs` — readable **only when the setlist is
-    `published`** (drafts filtered out for members).
-  - `invitations` — a member can read **only their own** rows
-    (`invitations_select_own`); cannot read other members' invitations.
-- `accept_invitation` RPC inserts one `event_attendees` row per existing week
-  event on accept (idempotent) — so `event_attendees` for a week's events is the
-  member-visible source of "who is serving this week".
-
-Because a member cannot read other members' `invitations` under RLS, the Team
-section and "is anyone else confirmed" cannot be derived from `invitations`. It
-is instead derived from `event_attendees` (which members *can* read). See
-Decisions.
-
-## Approach
-
-Add **one** member-facing aggregate endpoint that returns the entire screen
-payload in a single call, then build the screen as a server wrapper + `"use
-client"` component (mirroring `app/(app)/week/[id]/page.tsx` +
-`week-view.tsx`). The endpoint does all reads through the caller's RLS-scoped
-Supabase client — **no new RPC, no RLS changes, no service-role usage**
-(service-role is banned in `app/`).
+- `lib/resend/client.ts` — stub, `sendEmail(_to, _template, _data): Promise<void>` throws.
+- `lib/api/webhook-verify.ts` — 4 stubs; only `verifyResendWebhook` is in scope.
+- `app/api/webhooks/resend/route.ts` — returns `notImplemented("POST /api/webhooks/resend")`.
+- `middleware.ts` already treats `/api/webhooks(.*)` as a public route — **no middleware change needed.**
+- `package.json` already depends on `resend@^4.8.0` and `svix@^1.99.1` (Resend signs webhooks
+  with Svix). **Do not add, remove, or upgrade any dependency; do not touch `bun.lock`.**
+- `.env.example` already has `RESEND_API_KEY` and `RESEND_WEBHOOK_SECRET`.
+- `node_modules/` is not present in this worktree — run `bun install` first.
+- No caller of `sendEmail` exists yet (#69 will be the caller), so its signature is free to change.
+- SMS (#67, `lib/pingram/client.ts`) is still a stub. **Do not touch it**, do not touch
+  `verifyClerkWebhook` / `verifyPingramWebhook` / `verifyModalWebhook`, and do not touch
+  `app/api/webhooks/{clerk,pingram,modal}/route.ts`.
 
 ## Files to create / modify
 
-### 1. CREATE `app/api/service-weeks/[id]/member-view/handler.ts`
+| Path | Action |
+| --- | --- |
+| `lib/resend/templates.ts` | CREATE |
+| `lib/resend/client.ts` | MODIFY (replace stub) |
+| `lib/api/webhook-verify.ts` | MODIFY (`verifyResendWebhook` only) |
+| `app/api/webhooks/resend/handler.ts` | CREATE |
+| `app/api/webhooks/resend/route.ts` | MODIFY (delegate to handler) |
+| `.env.example` | MODIFY (add `RESEND_FROM_EMAIL=`) |
+| `documentation/staging-environment.md` | MODIFY (add `RESEND_FROM_EMAIL` to the Resend env row) |
+| `tests/unit/lib/resend/templates.test.ts` | CREATE |
+| `tests/unit/lib/resend/client.test.ts` | CREATE |
+| `tests/unit/lib/api/webhook-verify-resend.test.ts` | CREATE |
+| `tests/unit/app/api/webhooks-resend-route.test.ts` | CREATE |
 
-Pattern to copy: `app/api/service-weeks/[id]/setlist/handler.ts` (auth + JWT +
-`getSupabaseClient` boilerplate) and `app/api/church-group/members/handler.ts`
-(directory / instrument assembly), plus `app/api/songs/[id]/documents/handler.ts`
-`toSongDocumentResponse` for signed-URL minting.
+---
 
-Export the response type and the handler:
+## 1. `lib/resend/templates.ts` (CREATE)
+
+Pure module — **no `import "server-only"`**, same rationale as `lib/scheduling/reminder.ts`
+(pure so it is unit-testable). Copy that file's header-comment style.
 
 ```ts
-import type { EventType, InvitationStatus, VocalCapability } from "@/types/domain";
+export type EmailTemplateKey =
+  | "set_invitation"
+  | "invitation_reminder_member"
+  | "invitation_reminder_admin"
+  | "invitation_denied"
+  | "scheduling_conflict"
+  | "setlist_released"
+  | "practice_reminder";
 
-export type MemberWeekEvent = {
-  id: string;
-  type: EventType;
-  name: string;
-  location: string | null;
-  startTime: string;   // events.start_time
-  endTime: string;     // events.end_time
-  notes: string | null;
-  assigned: boolean;   // caller is in event_attendees for this event
-};
+export const EMAIL_TEMPLATE_KEYS: readonly EmailTemplateKey[];
 
-export type MemberWeekSong = {
-  songId: string;
-  title: string;
-  artist: string | null;
-  position: number;             // setlist_songs.position
-  effectiveKey: string | null;  // key_override ?? songs.default_key
-};
-
-export type MemberWeekTeamMember = {
-  userId: string;
-  name: string;
-  vocalCapability: VocalCapability;      // 'none' when no member_profile
-  instruments: { id: string; name: string }[];
-};
-
-export type MemberWeekDocumentGroup = {
-  songId: string;
-  songTitle: string;
-  files: {
-    id: string;
-    name: string;
-    fileType: string;
-    fileSizeBytes: number;
-    downloadUrl: string;   // presigned GET, 30-min expiry (lib/r2/client getDownloadUrl)
-  }[];
-};
-
-export type MemberWeekViewResponse = {
-  serviceWeek: {
-    id: string;
-    serviceDate: string;   // service_weeks.service_date (YYYY-MM-DD)
-    title: string | null;
-    isCancelled: boolean;
+export type EmailTemplateDataMap = {
+  set_invitation: { date: string; adminName: string; link: string };
+  invitation_reminder_member: { date: string; link: string };
+  invitation_reminder_admin: { count: number; date: string; memberNames: string[]; link: string };
+  invitation_denied: { memberName: string; date: string; reason: string | null; link: string };
+  scheduling_conflict: { memberName: string; date: string; link: string };
+  setlist_released: { date: string; songCount: number; link: string };
+  practice_reminder: {
+    eventName: string;
+    hoursUntil: number;
+    dayDate: string;
+    time: string;
+    location: string;
+    link?: string;
   };
-  confirmationStatus: InvitationStatus | null; // caller's own invitation status for this week; null if none
-  setlist: { status: "published"; songs: MemberWeekSong[] } | null; // null = draft or no setlist
-  events: MemberWeekEvent[];   // ALL events of the week (assigned flag per event), ordered by startTime asc
-  team: MemberWeekTeamMember[];
-  documents: MemberWeekDocumentGroup[];
 };
 
-export async function getMemberWeekView(
-  req: NextRequest,
-  id: string,               // service_week_id
-  lookup?: UserLookup,
-): Promise<Response>;
+export type RenderedEmail = { subject: string; preview: string; html: string; text: string };
+
+export function renderEmailTemplate<K extends EmailTemplateKey>(
+  key: K,
+  data: EmailTemplateDataMap[K],
+): RenderedEmail;
 ```
-`entry.notes === undefined` (field absent) → leave the column as-is; `null` → clear it; string → set it. Do not change any other reorder behavior (membership check, position rewrite, response).
 
-Handler logic (all queries via `getSupabaseClient(jwt)` = caller RLS):
+### Copy (verbatim from PRD §30 "Notification Content Templates")
 
-1. `requireAuth(req, lookup)`, then `requireRole(ctx, ["admin", "set_leader", "member"])`
-   — guests are excluded (guest variant is #72, out of scope). Get the supabase
-   JWT exactly like the sibling handlers (401 if no JWT).
-2. Load the service week (`service_weeks` where `id` + `church_group_id`,
-   `maybeSingle`). If missing → `fail("Not found", ErrorCode.NOT_FOUND, 404)`.
-   Map to `{ id, serviceDate: row.service_date, title, isCancelled: row.is_cancelled }`.
-3. Caller's own invitation: `invitations` select `status, created_at` where
-   `service_week_id = id` and `user_id = ctx.userId`. If multiple rows, pick the
-   latest by `created_at` (re-invite safety — mirror `getCurrentInvitation` in
-   `week-view.tsx`). `confirmationStatus` = that status, else `null`.
-4. Setlist: `setlists` where `service_week_id = id` + `church_group_id`,
-   `maybeSingle`. RLS returns it only if `published` for members.
-   - If no row **or** `status !== "published"` → `setlist = null`.
-   - If `published` → read `setlist_songs` where `setlist_id` ordered by
-     `position asc`; collect distinct `song_id`s; read `songs` (`id, title,
-     artist, default_key`) for those ids; build `MemberWeekSong[]` with
-     `effectiveKey = key_override ?? default_key`. Zero songs → `songs: []`
-     (still `setlist: { status: "published", songs: [] }`, NOT null).
-5. Events: `events` where `service_week_id = id` + `church_group_id` ordered by
-   `start_time asc`.
-6. Attendees: `event_attendees` where `event_id in (weekEventIds)` selecting
-   `event_id, user_id`. Build:
-   - per-event `assigned = attendees.some(a => a.event_id === e.id && a.user_id === ctx.userId)`.
-   - `teamUserIds` = distinct `user_id` across those attendee rows.
-   Guard the `.in(...)` against an empty id list (skip the query, treat as `[]`)
-   to avoid a malformed query.
-7. Team directory (only if `teamUserIds` non-empty): mirror
-   `getChurchGroupMembers` assembly but scoped to `teamUserIds`:
-   `users` (`id, name`, `church_group_id = ctx.churchGroupId`, `anonymized_at is null`,
-   `id in teamUserIds`), `member_profiles` (`id, user_id, vocal_capability`),
-   `member_instruments` (`member_profile_id, instrument_id`), `instruments`
-   (`id, name`, group-scoped). Produce `MemberWeekTeamMember[]`. Sort by `name`
-   ascending for stable output. Do **not** include email/phone.
-8. Documents (only if the published setlist has songs): `song_documents` where
-   `song_id in (weekSongIds)` + `church_group_id`, selecting
-   `id, song_id, name, file_key, file_type, file_size_bytes`, ordered by
-   `created_at asc`. Mint `downloadUrl` per row via `getDownloadUrl(file_key)`
-   (import from `@/lib/r2/client`). Group by `song_id`, attaching `songTitle`
-   from step 4's song map; only include groups that have ≥1 file. **Best-effort**:
-   wrap the whole documents block in try/catch — on any R2/query error, set
-   `documents = []` and still return 200 (documents are one non-critical section;
-   an R2 outage must not 500 the whole screen).
-9. Return `ok<MemberWeekViewResponse>({ ... })`. Catch `ApiException` →
-   `fail(err.message, err.code, err.status)`, else 500 — same as siblings.
+These 7 keys are exactly the §30 rows that specify an email subject. The §30 rows without a
+`Subject:` (invitation accepted, new document, transcription complete) are in-app-only and
+are **not** in scope.
 
-Envelope: use `ok(...)` / `fail(...)` from `@/lib/api/response`; the success body
-is `{ data: MemberWeekViewResponse }`.
+Bracketed tokens below are substitution points, not literal text. Subjects are written in
+§30 as `Subject: <text>. Preview: <text>` — the period before `Preview:` is a table
+separator, so **subjects carry no trailing period**. Preview strings keep their punctuation
+exactly, including the em dash (U+2014) in `practice_reminder`.
 
-### 2. CREATE `app/api/service-weeks/[id]/member-view/route.ts`
+| key | subject | preview |
+| --- | --- | --- |
+| `set_invitation` | `You're invited to lead worship on {date}` | `{adminName} has selected you for {date}. Tap to accept or decline.` |
+| `invitation_reminder_member` | `Your invitation for {date} needs a response` | `You haven't responded yet. Please accept or decline.` |
+| `invitation_reminder_admin` | `{count} unanswered invitations for {date}` | `The following members haven't responded: {memberNames joined by ", "}` |
+| `invitation_denied` | `{memberName} declined for {date}` | `Reason: {reason}. Open Graceful to find a replacement.` |
+| `scheduling_conflict` | `Scheduling conflict for {date}` | `{memberName} changed their availability after confirming. Action may be needed.` |
+| `setlist_released` | `Setlist for {date} is ready` | `{songCount} songs planned. Open Graceful to see the full setlist and your chord charts.` |
+| `practice_reminder` | `Reminder: {eventName} in {hoursUntil} hours` | `{dayDate} at {time} — {location}. See you there.` |
 
-Copy `app/api/service-weeks/[id]/setlist/route.ts` shape, GET only:
+### Rendering rules
+
+- All `date` / `dayDate` / `time` fields are **already-formatted display strings** supplied
+  by the caller. This module must never parse or format a date — #69 owns that (see
+  `formatWeekLabel` in `lib/scheduling/reminder.ts`). Do not import from that file.
+- `html` is exactly (single line, no extra whitespace between tags):
+  `<!doctype html><html><body>` +
+  `<div style="display:none;max-height:0;overflow:hidden;">{preview}</div>` +
+  `<h1>{subject}</h1>` +
+  `<p>{preview}</p>` +
+  `<p><a href="{link}">Open Graceful</a></p>` (omit this element entirely when `link` is absent) +
+  `</body></html>`
+- `text` is `` `${subject}\n\n${preview}` ``, plus `` `\n\n${link}` `` when `link` is present.
+- **HTML escaping**: every interpolated value in `html` (subject, preview, and the `link`
+  in `href`) must be escaped for `&`, `<`, `>`, `"`, `'` via a module-local `escapeHtml`
+  helper. Member names, denial reasons and locations are user-supplied (PRD §25). `text`
+  is *not* escaped. `subject` and `preview` on the returned object are the **unescaped**
+  strings.
+- Do not add styling, images, or layout beyond the above — visual polish is explicitly out
+  of scope for this issue.
+
+### Edge cases
+
+- `renderEmailTemplate` called with a key not in `EMAIL_TEMPLATE_KEYS` (possible from an
+  untyped JS caller): throw `` new Error(`Unknown email template: ${key}`) ``.
+- `invitation_denied` with `reason === null` or a whitespace-only reason: drop the whole
+  `Reason: …. ` clause, so preview is exactly `Open Graceful to find a replacement.`
+- `invitation_reminder_admin` with an empty `memberNames` array: throw
+  `new Error("invitation_reminder_admin requires at least one member name")`.
+- `invitation_reminder_admin`: `count` is rendered as given by the caller; do not derive it
+  from `memberNames.length`.
+- `practice_reminder` with `link` absent/undefined: no `<a>` element in `html`, no trailing
+  URL line in `text`.
+
+---
+
+## 2. `lib/resend/client.ts` (MODIFY — replace the stub entirely)
+
+Keep `import "server-only";`. Follow the lazy-singleton + env-guard pattern of
+`lib/r2/client.ts` exactly (module-scope `let client`, private `getClient()` that validates
+env before constructing).
+
+```ts
+export type SendEmailResult = { id: string };
+
+export async function sendEmail<K extends EmailTemplateKey>(
+  to: string,
+  template: K,
+  data: EmailTemplateDataMap[K],
+): Promise<SendEmailResult>;
+
+export type EmailDeliveryStatus =
+  | "sent" | "delivered" | "delayed" | "bounced" | "complained" | "opened" | "clicked";
+
+// Pure mapper — exported for the webhook handler and for tests.
+export function mapResendEventToStatus(eventType: string): EmailDeliveryStatus | null;
+```
+
+Behavior:
+
+- `getClient()` reads `RESEND_API_KEY` and `RESEND_FROM_EMAIL`. If either is missing or an
+  empty string, throw
+  `new Error("Resend is not configured — missing required environment variable(s)")`
+  (mirrors `lib/r2/client.ts`'s message shape). The `Resend` client is constructed once and
+  reused.
+- `sendEmail` throws `new Error("sendEmail requires a recipient address")` when `to` is
+  empty or whitespace-only, before touching env or the SDK.
+- Render with `renderEmailTemplate(template, data)`, then call
+  `resend.emails.send({ from: process.env.RESEND_FROM_EMAIL, to, subject, html, text })`.
+  `RESEND_FROM_EMAIL` is passed through verbatim (it may be either `a@b.com` or
+  `Graceful <a@b.com>`); do not parse or reformat it.
+- resend v4 returns `{ data, error }`. If `error` is non-null **or** `data` is null, throw
+  `` new Error(`Resend email dispatch failed: ${error?.message ?? "unknown error"}`) ``.
+  Otherwise return `{ id: data.id }`.
+- Never log the recipient address, subject, or body (PRD §25.6).
+- `mapResendEventToStatus`: `email.sent`→`sent`, `email.delivered`→`delivered`,
+  `email.delivery_delayed`→`delayed`, `email.bounced`→`bounced`,
+  `email.complained`→`complained`, `email.opened`→`opened`, `email.clicked`→`clicked`;
+  anything else → `null`.
+
+---
+
+## 3. `lib/api/webhook-verify.ts` (MODIFY — `verifyResendWebhook` only)
+
+Keep the file's existing header comment and the other three stubs byte-identical. Replace
+the `TODO(Sprint 4 #59)` comment above `verifyResendWebhook` with a real comment. Signature
+stays `(rawBody: string, headers: Headers): Promise<boolean>`.
+
+Implementation:
+
+- Read `RESEND_WEBHOOK_SECRET`; if missing or empty, **throw**
+  `new Error("Resend webhook is not configured — RESEND_WEBHOOK_SECRET must be set")`
+  (the file's contract is "boolean (or throw) out"; a config error is not a bad signature).
+- Read `svix-id`, `svix-timestamp`, `svix-signature` from `headers`. If any is missing/empty,
+  **return `false`** (do not throw).
+- `new Webhook(secret).verify(rawBody, { "svix-id": …, "svix-timestamp": …, "svix-signature": … })`
+  from `svix`. Return `true` on success; return `false` when `verify` throws (bad signature,
+  stale timestamp, tampered body). A throw from the `Webhook` **constructor** (malformed
+  secret) is a config error and must propagate.
+
+---
+
+## 4. `app/api/webhooks/resend/handler.ts` (CREATE)
+
+Follows the repo's route/handler split (see `app/api/events/[id]/ics/route.ts` +
+`app/api/events/[id]/ics/handler.ts`) so the logic is unit-testable and `route.ts` exports
+only `POST`.
+
+```ts
+export async function handleResendWebhook(req: NextRequest): Promise<Response>;
+```
+
+Order of operations — this order is load-bearing:
+
+1. `const rawBody = await req.text();` — the raw bytes are what the signature covers.
+   **Never call `req.json()` before verification.**
+2. `verifyResendWebhook(rawBody, req.headers)` inside try/catch:
+   - throws → `fail("Internal error", ErrorCode.INTERNAL, 500)`
+   - `false` → `fail("Invalid webhook signature", ErrorCode.UNAUTHENTICATED, 401)`
+     and no further processing
+3. `JSON.parse(rawBody)`. If it throws, or the payload is not an object, or `type` is not a
+   non-empty string, or `data.email_id` is not a non-empty string →
+   `fail("Invalid webhook payload", ErrorCode.VALIDATION_FAILED, 400)`.
+4. `const status = mapResendEventToStatus(type) ?? "ignored";`
+5. `console.info("resend webhook", { type, emailId, status });` — event type, `email_id` and
+   status only. Never log recipient addresses or the payload.
+6. `return ok({ received: true, emailId, status });` (200)
+
+Use `ok` / `fail` from `@/lib/api/response` and `ErrorCode` from `@/lib/api/errors`, same as
+`app/api/cron/invitation-reminders/route.ts`.
+
+### Edge cases
+
+- Unknown/future Resend event type → **200** with `status: "ignored"`, never 4xx (a 4xx
+  triggers provider retry storms).
+- Missing svix headers → 401, not 500.
+- Duplicate deliveries of the same event → same 200 response; the handler has no side
+  effects beyond logging, so it is naturally idempotent.
+- The response body must never echo the payload or a recipient address.
+
+## 5. `app/api/webhooks/resend/route.ts` (MODIFY)
+
+Reduce to a delegation shim; drop the `notImplemented` import.
 
 ```ts
 import { NextRequest } from "next/server";
-import { getMemberWeekView } from "./handler";
+import { handleResendWebhook } from "./handler";
 
-## Frontend
-
-### `app/(app)/setlists/[id]/page.tsx` (replace the stub)
-
-Server wrapper mirroring `app/(app)/week/[id]/page.tsx`:
-```tsx
-import SetlistBuilder from "./setlist-builder";
-export default async function SetlistBuilderPage({
-  params,
-}: { params: Promise<{ id: string }> }) {
-  const { id } = await params;
-  return getMemberWeekView(req, id);
+export async function POST(req: NextRequest): Promise<Response> {
+  return handleResendWebhook(req);
 }
 ```
 
-### 3. REWRITE `app/(app)/member-week/[id]/page.tsx`
+Export nothing else from this file.
 
-Copy `app/(app)/week/[id]/page.tsx` exactly (server wrapper awaiting `params`,
-rendering the client child):
+---
 
-```tsx
-import MemberWeekView from "./member-week-view";
+## 6. `.env.example` (MODIFY)
 
-export default async function MemberWeekViewPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = await params;
-  return <MemberWeekView serviceWeekId={id} />;
-}
+Under the existing `# Resend (Email)` block, after `RESEND_WEBHOOK_SECRET=`, add:
+
+```
+RESEND_FROM_EMAIL=
 ```
 
-### 4. CREATE `app/(app)/member-week/[id]/member-week-view.tsx`  (`"use client"`)
+Placeholder only — no value, per the file's header comment.
 
-Pattern to copy: `app/(app)/week/[id]/week-view.tsx` — same `ViewState`
-machine (`"loading" | "ready" | "forbidden" | "not-found" | "error"`), same
-`useEffect` + `cancelled` guard, same `formatServiceDate` / `getInitials`
-helpers, same envelope reads (`body.data.X`).
+## 7. `documentation/staging-environment.md` (MODIFY)
 
-Props: `{ serviceWeekId: string }`.
+In the env-var table (the `| Resend | ...` row, ~line 61), add `RESEND_FROM_EMAIL` to the
+variable list for that row. Change nothing else in that file.
 
-Single fetch: `GET /api/service-weeks/${serviceWeekId}/member-view`.
-- 404 → `not-found`; 403 → `forbidden`; other non-ok → `error`; on network
-  throw → `error`. On ok, store the `data` payload and set `ready`.
+---
 
-Render (mobile-first, single column), sections in this order:
+## Tests to write
 
-- **Header**: `formatServiceDate(serviceWeek.serviceDate)` and the title
-  (`serviceWeek.title ?? "Untitled service"`). Confirmation status shown with
-  `Badge` (`@/components/ui/Badge`): map `confirmationStatus` →
-  `accepted`→"Confirmed"/`success`; `pending`→"Pending"/`warning`;
-  `denied`→"Declined"/`neutral`; `withdrawn`/`expired`→"Not serving"/`neutral`;
-  `null`→"Not invited"/`neutral`. If `serviceWeek.isCancelled`, also render a
-  `Badge tone="danger"`>Cancelled (copy the cancelled treatment from
-  `week-view.tsx`).
-- **Setlist section** (`<h2>Setlist</h2>`):
-  - `setlist === null` → paragraph `Setlist not yet released`.
-  - published with `songs.length === 0` → `No songs added yet` (distinct from
-    the not-released message).
-  - published with songs → ordered list, each row `title` (+ `artist` if
-    present) and `effectiveKey` (show a "—" / "no key" when `effectiveKey`
-    is null).
-- **Events section** (`<h2>Events</h2>`): render events where `assigned === true`.
-  If none assigned → `You're not assigned to any events this week`. Each event is
-  a tappable button/row (`type="button"`) showing name + start time; clicking sets
-  a `selectedEventId` in state to open the detail view. Format times from the
-  ISO `startTime`/`endTime` with `toLocaleString` (date + time).
-  - **Event detail view**: an in-page panel/modal (no new route) rendered when
-    `selectedEventId` is set, showing name, type, start–end, notes, location, and
-    — only when `location` is non-empty — a **Maps link**:
-    `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(location)}`
-    rendered as an `<a target="_blank" rel="noopener noreferrer">Open in Maps</a>`.
-    Include a close control that clears `selectedEventId`.
-- **Team section** (`<h2>Team</h2>`): list `team` members; each shows
-  `getInitials(name)` avatar, `name`, and their instruments (join
-  `instruments.map(i => i.name)` with ", "; when empty show a muted "—"). If
-  `team.length === 0` → `No confirmed team yet`.
-- **Documents section** (`<h2>Documents</h2>`): for each group in `documents`,
-  a subheading `songTitle` and its `files` as `<a href={file.downloadUrl}
-  target="_blank" rel="noopener noreferrer">{file.name}</a>`. If
-  `documents.length === 0` → `No documents for this week's songs`.
-- **Floating chat button** (Phase 2 placeholder): a visually-present floating
-  button (fixed position, mobile-first) that is inert — render it but give it no
-  working `onClick` (omit the handler or a no-op). Add
-  `aria-label="Week chat (coming soon)"` and mark it `disabled` so it clearly
-  does nothing yet. Do NOT wire any chat behavior.
+Mirror `tests/unit/lib/r2/client.test.ts` for env-var/singleton testing (`clearEnv` /
+`setValidEnv` helpers + `jest.isolateModulesAsync` re-import) and
+`tests/unit/app/api/cron-invitation-reminders-route.test.ts` for route mocking + the fake
+`NextRequest` object. Mock `resend` and `svix` with `jest.mock` — **no network calls.**
 
-Loading / forbidden / not-found / error branches: copy the corresponding
-`<main>` blocks from `week-view.tsx` (adjust the forbidden copy to a member
-context, e.g. "You don't have access to this week.").
+- `tests/unit/lib/resend/templates.test.ts`: all 7 keys produce the exact PRD subject +
+  preview; preheader div present; HTML escaping of a name containing `<script>` and `&`;
+  `text` unescaped; `invitation_denied` with `reason: null` and with `"   "`;
+  `invitation_reminder_admin` with an empty `memberNames` throws; `practice_reminder`
+  without `link` omits the `<a>` and the URL line; unknown key throws.
+- `tests/unit/lib/resend/client.test.ts`: happy path returns `{ id }` and passes
+  `from`/`to`/`subject`/`html`/`text`; missing `RESEND_API_KEY` throws without calling the
+  SDK; missing `RESEND_FROM_EMAIL` throws without calling the SDK; empty-string env var
+  throws; empty `to` throws; `{ error }` response throws; client constructed once across
+  two sends; `mapResendEventToStatus` for each known type and for an unknown type.
+- `tests/unit/lib/api/webhook-verify-resend.test.ts`: valid signature → `true`; svix
+  `verify` throwing → `false`; each missing svix header → `false`; missing/empty
+  `RESEND_WEBHOOK_SECRET` → rejects.
+- `tests/unit/app/api/webhooks-resend-route.test.ts`: valid signed `email.delivered` → 200
+  with `{ received: true, emailId, status: "delivered" }`; bad signature → 401 +
+  `UNAUTHENTICATED` and `JSON.parse` never reached; verify-throws → 500 + `INTERNAL`;
+  malformed JSON body → 400 + `VALIDATION_FAILED`; missing `data.email_id` → 400; unknown
+  event type → 200 with `status: "ignored"`; `req.text()` is used (not `req.json()`).
 
-### 5. CREATE `app/(app)/member-week/[id]/member-week-view.module.css`
+## Verification
 
-Mobile-first. Copy the container/card/header conventions from
-`app/(app)/week/[id]/week-view.module.css` (`.container`, `.header`, `.card`,
-`.date`, `.error`). Single-column layout (no sidebar). Add a `.chatButton`
-(fixed bottom-right floating) and `.detail`/`.detailOverlay` for the event
-detail panel. Use existing CSS variables (e.g. `var(--color-fg)`).
-
-## Tests (for the Testing stage — named here for the coder's awareness)
-
-- Handler: `tests/unit/app/api/service-weeks-member-view-route.test.ts`.
-  Mirror `tests/unit/app/api/song-documents-route.test.ts`:
-  `jest.mock` `@clerk/nextjs/server`, `@/lib/supabase/client`, `@/lib/r2/client`;
-  use the `makeChain` / `makeLookup` / `setUpAuth` helpers. `getSupabaseClient`
-  should return a `from(table)` dispatcher returning a per-table chain so the
-  many reads can be stubbed by table name.
-- Component: `tests/unit/app/member-week-view.test.tsx`. Mirror
-  `tests/unit/app/week-view.test.tsx` (`/** @jest-environment jsdom */`, mocked
-  `fetch` keyed by URL, `jsonResponse` helper).
-
-## Edge cases the implementation MUST handle
-
-1. Service week missing / other tenant → endpoint 404 → screen `not-found`.
-2. No setlist OR draft setlist → `setlist: null` → "Setlist not yet released".
-3. Published setlist with **zero** songs → `setlist: { status:"published",
-   songs: [] }` → "No songs added yet" (must NOT show the not-released message).
-4. `effectiveKey` is `key_override ?? default_key`; both may be null → render a
-   neutral placeholder, not "null".
-5. Week with no events → `events: []`; Events section empty state; `team` may
-   also be empty.
-6. Member assigned to some but not all events → only `assigned === true` events
-   show; the header/team still reflect the full week's attendees.
-7. Event with `location === null` (or empty) → detail view shows NO Maps link.
-8. Empty `event_attendees` id set → skip the `.in()` queries; do not issue a
-   query with an empty array.
-9. Documents: R2 not configured / `getDownloadUrl` throws → `documents: []`,
-   endpoint still 200 (best-effort; screen shows the empty state).
-10. Member has no invitation for the week → `confirmationStatus: null` →
-    "Not invited" badge; screen still renders (viewing is not gated on
-    confirmation).
-11. Cancelled week → header shows the Cancelled badge.
-12. Guest role calling the endpoint → 403 (requireRole excludes guest).
-13. Signed download URLs expire in 30 min — always freshly minted per request
-    (never cached); do not store `file_key` in the response.
-
-## Decisions & assumptions
-
-- **Confirmed team is sourced from `event_attendees`, not `invitations`.**
-  A `member` cannot read other members' `invitations` under RLS, but *can* read
-  `event_attendees` for the group's events. `accept_invitation` auto-inserts an
-  attendee row per week event on accept, so attendees of the week's events are
-  the member-visible confirmed serving roster. Known limitation: a member
-  confirmed for a week that has **no events yet** won't appear in `team` until
-  events exist / they're assigned. Acceptable for Phase 1 and avoids any
-  RLS/RPC change in a screen-scoped issue. (Strict accepted-invitation semantics
-  for a member would need a `SECURITY DEFINER` RPC — out of scope here.)
-- **One aggregate endpoint** rather than several member-facing GETs, to keep the
-  client to a single fetch and localize the read logic. It uses only the
-  caller's RLS-scoped client (no service-role, no new RPC, no RLS migration).
-- **Event detail is in-page** (selected-event panel/modal), not a separate
-  route — satisfies "tappable into a detail view with a Maps link" without new
-  routing surface.
-- **Scope guardrails**: do not add app nav/links to this screen (AppShell nav is
-  a separate TODO); do not change existing endpoints' RBAC; do not implement
-  chat; do not build a guest variant (#72).
-
-## Verification before finishing (Coding stage)
-
-Run `bun run lint`, `bun run typecheck`, and `bun run test`. All must pass.
-</content>
+Run from the repo root, in order: `bun install`, `bun run lint`, `bun run typecheck`,
+`bun run test`. Bun only — never npm/npx/yarn/pnpm.

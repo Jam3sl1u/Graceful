@@ -58,7 +58,7 @@ production) versus which may be shared across environments.
 | Supabase | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Distinct — staging Supabase project (see §5) |
 | Clerk | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET` | Distinct — Clerk test instance/test mode keys (see §4) |
 | Pingram | `PINGRAM_API_KEY`, `PINGRAM_WEBHOOK_SECRET` | Distinct — Pingram test environment keys (see §4) |
-| Resend | `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET` | Distinct — Resend test/sandbox key (see §4) |
+| Resend | `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET`, `RESEND_FROM_EMAIL` | Distinct — Resend test/sandbox key (see §4) |
 | Google Calendar | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY` | Distinct — `GOOGLE_REDIRECT_URI` must point at the staging host; use a dedicated OAuth client and encryption key for staging |
 | Cloudflare R2 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT` | Distinct — separate staging R2 bucket and credentials (PRD §25.7) |
 | Upstash Redis | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Distinct — dedicated staging Redis instance |

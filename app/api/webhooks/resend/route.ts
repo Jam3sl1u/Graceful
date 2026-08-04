@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { handleResendWebhook } from "./handler";
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/webhooks/resend");
+export async function POST(req: NextRequest): Promise<Response> {
+  return handleResendWebhook(req);
 }

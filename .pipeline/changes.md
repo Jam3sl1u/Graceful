@@ -1,138 +1,147 @@
-# Changes — Issue #65: Build Member Week View screen
+# Changes — Issue #68: Integrate Resend email dispatch + webhook verification
 
-- `app/api/setlists/[id]/handler.ts`
-  - Added `getSetlistWithSongs(req, id, lookup?)`: `GET /api/setlists/:id`
-    handler. `requireAuth` + `requireRole(["admin", "set_leader"])`, loads the
-    setlist tenant-scoped (`church_group_id` match), 404s if missing/other
-    tenant, 500 on DB error, reuses the existing private `loadSongResponses`
-    helper for the ordered songs, and returns
-    `{ setlist: toSetlistResponse(data), songs }` for both draft and
-    published setlists (client needs status to render the locked state).
-  - `reorderSetlist`'s per-song update loop now conditionally includes
-    `notes` in the Supabase update payload only when `entry.notes !== undefined`
-    (i.e. the client actually sent it), so existing reorder callers that omit
-    notes do not wipe them. `null` clears notes, a string sets them.
-- `app/api/setlists/[id]/route.ts` — added `export async function GET` wired
-  to `getSetlistWithSongs`; `PUT` export unchanged.
-- `schemas/setlists.ts` — `reorderSetlistSchema`'s per-song object gained an
-  optional `notes: z.string().trim().max(1000).nullish()` field.
-  `addSetlistSongSchema` left unchanged (notes are only added via PUT after a
-  song is in the setlist).
-- `schemas/songs.ts` — added `export const SONG_KEY_OPTIONS = ASCII_SONG_KEYS;`
-  (the ordered 17-key ASCII list) for the frontend key `<select>`. Left
-  `VALID_SONG_KEYS` / `isValidSongKey` untouched.
+## Summary
 
-- `app/api/service-weeks/[id]/member-view/handler.ts` — new
-  `getMemberWeekView(req, id, lookup?)` handler exporting
-  `MemberWeekViewResponse` (and its constituent types `MemberWeekEvent`,
-  `MemberWeekSong`, `MemberWeekTeamMember`, `MemberWeekDocumentGroup`).
-  Aggregates, via the caller's RLS-scoped Supabase client only (no
-  service-role, no new RPC):
-  - `requireAuth` + `requireRole(["admin", "set_leader", "member"])` (guest
-    excluded — #72 is out of scope).
-  - Service week lookup by `id` + `church_group_id` → 404 if missing.
-  - Caller's own `invitations` row for the week, picking the latest by
-    `created_at` when multiple exist → `confirmationStatus` (null if none).
-  - `setlists` row for the week; only treated as present when
-    `status === "published"` (drafts filtered by RLS anyway for members, but
-    checked explicitly) → `setlist: null` otherwise. When published, reads
-    `setlist_songs` ordered by `position`, then `songs` for the distinct song
-    ids, building `effectiveKey = key_override ?? default_key`. Zero songs
-    still yields `{ status: "published", songs: [] }`, not `null`.
-  - `events` for the week ordered by `start_time asc`.
-  - `event_attendees` for the week's event ids (query skipped entirely when
-    there are no events, to avoid an empty `.in()`), used to compute each
-    event's `assigned` flag (caller present as an attendee) and the distinct
-    `teamUserIds`.
-  - Team directory scoped to `teamUserIds` only (mirrors
-    `getChurchGroupMembers`'s users/member_profiles/member_instruments/
-    instruments assembly), sorted by name; no email/phone included.
-  - Documents: only queried when there's a published setlist with songs;
-    `song_documents` rows grouped by `song_id` with freshly minted
-    `getDownloadUrl` per file (`@/lib/r2/client`, 30-min presigned GET); the
-    whole block is wrapped in try/catch so an R2/query failure degrades to
-    `documents: []` with a 200, not a 500.
-  - Returns `ok<MemberWeekViewResponse>(...)`; catches `ApiException` →
-    `fail(...)`, else 500 — same pattern as sibling handlers.
+Implemented outbound email dispatch via Resend and inbound Resend webhook
+verification/handling, replacing the three stubs the spec named. No delivery
+events are persisted to the database (no schema for it yet — logged instead,
+per the spec's documented scope decision). No new dependencies were added;
+`resend` and `svix` were already in `package.json`.
 
-- `app/api/service-weeks/[id]/member-view/route.ts` — `GET` route wiring,
-  copied from the `setlist` route's shape (await `params`, delegate to the
-  handler).
+## Files changed
 
-- `app/(app)/member-week/[id]/member-week-view.tsx` (`"use client"`) — the
-  screen component. `ViewState` machine (`loading | ready | forbidden |
-  not-found | error`), single `useEffect` with a `cancelled` guard fetching
-  `GET /api/service-weeks/:id/member-view` once. Renders, in order:
-  - Header: title, `formatServiceDate`, confirmation `Badge` (mapped per
-    spec: accepted→Confirmed/success, pending→Pending/warning,
-    denied→Declined/neutral, withdrawn/expired→Not serving/neutral,
-    null→Not invited/neutral) plus a `Cancelled`/danger badge when
-    `isCancelled`.
-  - Setlist section: not-released vs. zero-songs vs. song list w/
-    title/artist/effectiveKey (`—` placeholder when null) — these are
-    distinct states per the spec's edge cases 2 and 3.
-  - Events section: only `assigned === true` events, each a `type="button"`
-    row opening an in-page detail panel (`selectedEventId` state, no new
-    route) showing name/type/start–end/notes, and a Maps link
-    (`https://www.google.com/maps/search/?api=1&query=...`) only when
-    `location` is non-empty.
-  - Team section: avatar (`getInitials`), name, instruments joined by ", "
-    (or "—" when empty); empty-team message when `team.length === 0`.
-  - Documents section: per-song-group heading + file links (`downloadUrl`,
-    opened in a new tab); empty-state message when none.
-  - A disabled, inert floating "chat" button (`aria-label="Week chat (coming
-    soon)"`, `disabled`, no `onClick`) as the Phase 2 placeholder.
-  - Loading/forbidden/not-found/error branches mirror `week-view.tsx`'s
-    `<main>` blocks (forbidden copy adjusted to a member context).
+- **`lib/resend/templates.ts`** (new) — Pure, unit-testable module rendering
+  the 7 PRD §30 email templates (`set_invitation`,
+  `invitation_reminder_member`, `invitation_reminder_admin`,
+  `invitation_denied`, `scheduling_conflict`, `setlist_released`,
+  `practice_reminder`) to `{ subject, preview, html, text }`. HTML-escapes all
+  interpolated values via a local `escapeHtml` helper (subject/preview/link);
+  `text` is left unescaped. Edge cases implemented: unknown key throws,
+  `invitation_reminder_admin` throws on empty `memberNames`, `count` is never
+  derived from `memberNames.length`, `invitation_denied` drops the "Reason:"
+  clause when `reason` is `null` or whitespace-only, `practice_reminder`
+  omits the `<a>` element/trailing URL line when `link` is absent. No
+  `import "server-only"` (mirrors `lib/scheduling/reminder.ts` so it's
+  unit-testable) and never imports `formatWeekLabel` or otherwise
+  parses/formats dates itself.
 
-- `app/(app)/member-week/[id]/member-week-view.module.css` — mobile-first,
-  single-column styles (container/header/card/date/error mirrored from
-  `week-view.module.css`'s conventions, using the existing `--color-fg`/
-  `--color-border`/`--color-bg` variables), plus new `.chatButton` (fixed
-  bottom-right) and `.detail`/`.detailOverlay` (bottom-sheet-style event
-  detail panel).
+- **`lib/resend/client.ts`** (rewritten from stub) — Lazy-singleton Resend
+  client following `lib/r2/client.ts`'s `getClient()` pattern:
+  `RESEND_API_KEY` + `RESEND_FROM_EMAIL` are validated on first use (throws
+  `"Resend is not configured — missing required environment variable(s)"` if
+  either is missing/empty), and the `Resend` instance is built once and
+  reused. `sendEmail<K>(to, template, data)` throws on an empty/whitespace
+  `to` before touching env or the SDK, renders via `renderEmailTemplate`,
+  calls `resend.emails.send({ from, to, subject, html, text })` (passing
+  `RESEND_FROM_EMAIL` through verbatim, unparsed), and throws
+  `` `Resend email dispatch failed: ${message}` `` when the SDK returns an
+  `error` or a null `data`; otherwise returns `{ id }`. Never logs recipient,
+  subject, or body. Also exports the pure `mapResendEventToStatus(eventType)`
+  mapper (`email.sent`→`sent`, `email.delivered`→`delivered`,
+  `email.delivery_delayed`→`delayed`, `email.bounced`→`bounced`,
+  `email.complained`→`complained`, `email.opened`→`opened`,
+  `email.clicked`→`clicked`, anything else → `null`), used by the webhook
+  handler and covered directly by tests.
 
-## Files modified
+- **`lib/api/webhook-verify.ts`** (modified — `verifyResendWebhook` only) —
+  Implemented using `svix`'s `Webhook` class + `RESEND_WEBHOOK_SECRET`. Throws
+  a config error if the secret is missing/empty (config errors propagate per
+  the file's existing contract); returns `false` (does not throw) if any of
+  `svix-id` / `svix-timestamp` / `svix-signature` headers are missing/empty;
+  returns `true`/`false` based on whether `webhook.verify(...)` succeeds or
+  throws. The other three stubs (`verifyClerkWebhook`, `verifyPingramWebhook`,
+  `verifyModalWebhook`) and the file's header comment are untouched, byte-
+  identical apart from replacing the `TODO(Sprint 4 #59)` comment above
+  `verifyResendWebhook` with a real one.
 
-- `app/(app)/member-week/[id]/page.tsx` — replaced the "coming soon" stub
-  with a server wrapper that awaits `params` and renders
-  `<MemberWeekView serviceWeekId={id} />`, matching
-  `app/(app)/week/[id]/page.tsx`'s shape exactly.
+- **`app/api/webhooks/resend/handler.ts`** (new) — `handleResendWebhook(req)`
+  implements the load-bearing order from the spec: `req.text()` first (never
+  `req.json()` before verification) → `verifyResendWebhook` in a try/catch
+  (throw → 500 `INTERNAL`, `false` → 401 `UNAUTHENTICATED`) → `JSON.parse` the
+  raw body and validate it's an object with a non-empty string `type` and a
+  non-empty string `data.email_id` (any failure → 400 `VALIDATION_FAILED`) →
+  `mapResendEventToStatus(type) ?? "ignored"` → `console.info("resend
+  webhook", { type, emailId, status })` (never logs the payload or a
+  recipient) → `ok({ received: true, emailId, status })` (200, even for
+  unknown/future event types, so Resend doesn't retry-storm on 4xx).
 
-- `.pipeline/spec.md` — this was already updated in the working tree (issue
-  #65's spec, produced by the Planning stage) before this Coding session
-  started; included in this commit as part of the normal pipeline handoff.
-  No further edits made to it by the Coding stage.
+- **`app/api/webhooks/resend/route.ts`** (modified) — Reduced to a pure
+  delegation shim exporting only `POST`, which calls
+  `handleResendWebhook(req)`. Dropped the `notImplemented` import/stub.
 
-## Verification
+- **`.env.example`** (modified) — Added `RESEND_FROM_EMAIL=` (placeholder,
+  no value) under the existing `# Resend (Email)` block, after
+  `RESEND_WEBHOOK_SECRET=`.
 
-- `bun run lint` — clean.
-- `bun run typecheck` — clean.
-- `bun run test` — all 77 suites / 968 tests pass (no regressions; the two
-  new test files the spec names for the Testing stage —
-  `tests/unit/app/api/service-weeks-member-view-route.test.ts` and
-  `tests/unit/app/member-week-view.test.tsx` — were intentionally not written
-  here, per the pipeline contract that Testing writes and owns test files).
+- **`documentation/staging-environment.md`** (modified) — Added
+  `RESEND_FROM_EMAIL` to the Resend row's variable list in the env-var table.
+  Nothing else in the file changed.
+
+- **`tests/unit/lib/resend/templates.test.ts`** (new) — All 7 template keys'
+  exact subject/preview copy; full HTML structure assertions for
+  `set_invitation` (with link) and `practice_reminder` (without link); HTML
+  escaping of a name containing `<script>` and `&` (asserts `text`/`subject`
+  stay unescaped); `invitation_denied` with `reason: null` and `"   "`;
+  `invitation_reminder_admin` empty-`memberNames` throw and "count from
+  caller, not derived" case; unknown-key throw; `EMAIL_TEMPLATE_KEYS`
+  contents.
+
+- **`tests/unit/lib/resend/client.test.ts`** (new) — Mirrors
+  `tests/unit/lib/r2/client.test.ts`'s `clearEnv`/`setValidEnv` +
+  `jest.isolateModulesAsync` re-import pattern, mocking the `resend` package.
+  Covers: happy path (`{id}` + exact `from`/`to`/`subject`/`html`/`text`
+  passthrough), missing/empty `RESEND_API_KEY` and `RESEND_FROM_EMAIL` throw
+  without invoking the SDK, empty/whitespace `to` throws first, `{error}`
+  response throws with the SDK's message, null `data`/`error` throws a
+  generic message, singleton construction (`Resend` ctor called once across
+  two `sendEmail` calls), and `mapResendEventToStatus` for every known type
+  plus an unknown one.
+
+- **`tests/unit/lib/api/webhook-verify-resend.test.ts`** (new) — Mocks
+  `svix`'s `Webhook`. Covers: valid signature → `true`; `verify()` throwing →
+  `false`; each of the three svix headers missing → `false` without calling
+  `verify()`; missing/empty `RESEND_WEBHOOK_SECRET` → rejects without
+  constructing `Webhook`.
+
+- **`tests/unit/app/api/webhooks-resend-route.test.ts`** (new) — Mocks
+  `@/lib/api/webhook-verify` and `@/lib/resend/client`, exercises `POST` from
+  `route.ts` end to end (through the handler). Covers: valid signed
+  `email.delivered` → 200 with `{received, emailId, status}`; bad signature →
+  401 `UNAUTHENTICATED` and `req.json` never called; `verifyResendWebhook`
+  throwing → 500 `INTERNAL`; malformed JSON → 400 `VALIDATION_FAILED`;
+  missing `data.email_id` → 400; missing `type` → 400; unknown event type →
+  200 with `status: "ignored"`; asserts `req.text()` is used, not
+  `req.json()`.
+
+## Not touched (out of scope, per spec)
+
+- No migration added; no writes to any table — delivery events are only
+  logged.
+- `lib/pingram/client.ts` (SMS, #67) untouched.
+- `verifyClerkWebhook`, `verifyPingramWebhook`, `verifyModalWebhook`
+  untouched (still stubs).
+- `app/api/webhooks/{clerk,pingram,modal}/route.ts` untouched.
+- `middleware.ts` untouched (already treats `/api/webhooks(.*)` as public).
+- No dependency changes; `bun.lock` untouched.
+
+## Verification run
+
+From the repo root, in order: `bun install`, `bun run lint`, `bun run
+typecheck`, `bun run test`. All green:
+- `eslint .` — no errors.
+- `tsc --noEmit` — no errors.
+- `jest` — 85 suites / 1086 tests passed (including the 4 new suites: 46
+  tests across templates, client, webhook-verify-resend, and the route).
 
 ## What the Tester should focus on
 
-- The 13 edge cases enumerated in `.pipeline/spec.md` under "Edge cases the
-  implementation MUST handle", especially:
-  - Published setlist with zero songs vs. no/draft setlist (must render two
-    distinct messages).
-  - Empty `event_attendees` for the week — handler must not issue an `.in()`
-    query with an empty array (verify via a `from` spy on `event_attendees`
-    not being called when `events` is empty).
-  - `getDownloadUrl` throwing (simulate R2 misconfiguration) → endpoint still
-    200 with `documents: []`.
-  - Guest role → 403.
-  - A member assigned to only some of the week's events — only those show in
-    the Events section, but `team` reflects the full attendee set across all
-    events.
-  - Event with `location: null` → detail panel renders with no Maps link.
-- The handler's per-table Supabase mock dispatch (many tables read across one
-  request) — verify the `makeChain`-style test double the spec calls for
-  handles `service_weeks`, `invitations`, `setlists`, `setlist_songs`,
-  `songs`, `events`, `event_attendees`, `users`, `member_profiles`,
-  `member_instruments`, `instruments`, `song_documents` all being queried
-  from the same `getSupabaseClient(jwt)` instance.
+- The load-bearing order in `handleResendWebhook` (`req.text()` before any
+  verification/parsing; verification before `JSON.parse`).
+- HTML-escaping correctness in `templates.ts`, especially that `subject`/
+  `preview`/`text` on the returned object stay **unescaped** while the `html`
+  string is escaped (this is easy to get backwards).
+- That an unknown/future Resend event type always yields 200 (never 4xx).
+- That `sendEmail`/`getClient` never log recipient, subject, or body
+  anywhere (including on error paths).
+- The `.env.example` / `documentation/staging-environment.md` edits are
+  additive-only — no other lines in either file should have changed.
