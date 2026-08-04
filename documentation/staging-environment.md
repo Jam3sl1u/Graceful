@@ -165,7 +165,7 @@ cover:
 | `E2E_GOOGLE_CLIENT_ID` | optional — `calendar-sync.spec.ts` skips when absent — OAuth client id used to redeem the test refresh token |
 | `E2E_GOOGLE_CLIENT_SECRET` | optional — `calendar-sync.spec.ts` skips when absent — OAuth client secret paired with the id above |
 | `E2E_GOOGLE_REFRESH_TOKEN` | optional — `calendar-sync.spec.ts` skips when absent — refresh token for the dedicated Google test account |
-| `E2E_GOOGLE_CALENDAR_ID` | optional — `calendar-sync.spec.ts` skips when absent — defaults to `primary` when unset |
+| `E2E_GOOGLE_CALENDAR_ID` | optional — not part of the skip gate (see `GOOGLE_SYNC_VARS` in `tests/e2e/support/google.ts`) — defaults to `primary` when unset |
 
 **Note (issue #52 OQ2/OQ3):** `GET /api/notifications` is an unimplemented
 501 stub (`app/api/notifications/route.ts`) as of this issue, so admin
@@ -183,10 +183,13 @@ seven above — they gate on `e2eAuthEnabled` only.
 
 `calendar-sync.spec.ts` exercises the real Google Calendar sync flow
 (`lib/google-calendar/sync.ts`, `app/api/events/**`) against an actual
-Google Calendar, not a mock. It gates on `e2eAuthEnabled` **and** the five
-`E2E_GOOGLE_*` / `E2E_TOKEN_ENCRYPTION_KEY` secrets above (`googleSyncEnabled`
-in `tests/e2e/support/google.ts`) and skips cleanly when any are absent —
-until a human completes the one-time setup below, it will not run in CI.
+Google Calendar, not a mock. It gates on `e2eAuthEnabled` **and** the four
+`GOOGLE_SYNC_VARS` secrets above (`E2E_TOKEN_ENCRYPTION_KEY`,
+`E2E_GOOGLE_CLIENT_ID`, `E2E_GOOGLE_CLIENT_SECRET`, `E2E_GOOGLE_REFRESH_TOKEN`
+— see `tests/e2e/support/google.ts`) and skips cleanly when any of those four
+are absent — until a human completes the one-time setup below, it will not
+run in CI. `E2E_GOOGLE_CALENDAR_ID` is separate: it's not part of the skip
+gate, it only controls which calendar the spec targets (see below).
 
 Human setup steps:
 

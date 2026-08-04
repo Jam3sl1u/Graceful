@@ -1,8 +1,38 @@
 # Review — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
 
-VERDICT: BLOCK
+VERDICT: BLOCK (original run — see post-review fix pass below)
 
-## Why
+## Post-review fix pass (2026-08-04)
+
+Applied targeted fixes for MUST FIX items #1 and #2 below, plus NON-BLOCKING
+items #4 and #5 (item #3 was already resolved on the branch before this
+pass). This was a direct fix pass in response to this review's own findings,
+not a fresh independent run of the Review stage — a human or the Review
+stage should still re-verify before merge.
+
+- **#1/#2** (`getByText` strict-mode collisions): added `{ exact: true }` to
+  `tests/e2e/setlist-publish.spec.ts:94`, `:189` (`"Published"`), and `:133`
+  (`"Confirmed"`) — the same option already used for every `getByRole(...,
+  { name, exact: true })` call in these specs.
+- **#4** (`try`/`finally` scope): hoisted `adminContext`/`memberContext`
+  (`setlist-publish.spec.ts`, both tests) and `leaderContext`
+  (`setlist-duplicate-song.spec.ts`) to `let` declarations above `try`, and
+  moved their `.close()` calls into the existing `finally` blocks, matching
+  `calendar-sync.spec.ts`'s established pattern. In
+  `setlist-duplicate-song.spec.ts`, `.close()` was placed *after* the
+  `setMemberRole(svc, "member")` restore, preserving the file's documented
+  "restore role as the first `finally` statement" invariant (safe only
+  because the suite is serialized, per the top-of-file comment).
+- **#5** (doc mislabel): reworded `documentation/staging-environment.md` §7's
+  `E2E_GOOGLE_CALENDAR_ID` row and the §7.1 intro paragraph — it is not part
+  of `GOOGLE_SYNC_VARS`/the skip gate, it only sets the default calendar id.
+
+Re-verified after the fixes: `bun run lint`, `bun run typecheck`, `bun run
+test` (82 suites / 1051 tests, unchanged), and `bun run test:e2e` (1 passed /
+10 skipped, same shape as the original run, no new failures). See
+`.pipeline/test-results.md`'s "Post-review fix pass" section for details.
+
+## Why (original BLOCK verdict)
 
 The deliverable of this issue *is* the tests. Two of the four new specs
 (`tests/e2e/setlist-publish.spec.ts`, both tests) contain assertions that are

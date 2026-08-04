@@ -29,10 +29,11 @@ test.describe("setlist duplicate song", () => {
     const serviceWeekId = await seedServiceWeek(svc, FIXTURE.churchGroupId, serviceDate);
     const song = await seedSong(svc, FIXTURE.churchGroupId);
 
+    let leaderContext: Awaited<ReturnType<typeof browser.newContext>> | undefined;
     try {
       await setMemberRole(svc, "set_leader");
 
-      const leaderContext = await browser.newContext();
+      leaderContext = await browser.newContext();
       const leaderPage = await leaderContext.newPage();
       await leaderPage.goto("/");
       await signInAs(leaderPage, "member");
@@ -70,10 +71,9 @@ test.describe("setlist duplicate song", () => {
       const addedButton = leaderPage.getByRole("button", { name: "Added", exact: true });
       await expect(addedButton).toBeVisible();
       await expect(addedButton).toBeDisabled();
-
-      await leaderContext.close();
     } finally {
       await setMemberRole(svc, "member");
+      await leaderContext?.close();
       await teardownFixtures(svc, { serviceWeekId, songIds: [song.id] });
     }
   });

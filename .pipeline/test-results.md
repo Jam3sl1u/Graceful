@@ -1,6 +1,38 @@
 # Test Results — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
 
-## Summary: ALL PASS
+## Post-review fix pass (targeted, not a full pipeline rerun)
+
+The Review stage returned BLOCK on this run (see `.pipeline/review.md`):
+`getByText()`'s default case-insensitive substring matching caused three
+assertions to collide with a second element containing the same text —
+`tests/e2e/setlist-publish.spec.ts:94`/`:189` (`"Published"` also matches the
+locked-setlist banner) and `:133` (`"Confirmed"` also matches the member-view
+team list's `"No confirmed team yet"` empty state). Fixed by adding
+`{ exact: true }` to all three, the same option already used throughout these
+specs for `getByRole(..., { name, exact: true })`.
+
+While in these files, also fixed the two non-blocking findings from the same
+review: `setlist-publish.spec.ts` (both tests) and
+`setlist-duplicate-song.spec.ts` were closing their browser context(s) inside
+`try` instead of `finally`, contrary to `.pipeline/spec.md` edge case 5 —
+hoisted the context variable(s) to `let` above `try` and moved `.close()`
+into `finally`, matching `calendar-sync.spec.ts`'s existing pattern (in
+`setlist-duplicate-song.spec.ts`, `.close()` was placed *after* the
+`setMemberRole(svc, "member")` restore, preserving the documented "restore
+role as the first `finally` statement" invariant). Also fixed
+`documentation/staging-environment.md` §7/§7.1, which mislabeled
+`E2E_GOOGLE_CALENDAR_ID` as part of the skip gate — it's deliberately not in
+`GOOGLE_SYNC_VARS`, it only sets the default calendar id.
+
+Re-ran the full verification suite after these fixes (see below) — all still
+green, same "1 passed / 10 skipped" E2E shape as the original run (no staging
+secrets locally, so the fixed assertions themselves are still unexercised
+here; see "Not independently exercised" below, which still applies to the
+underlying assertions this pass didn't add new coverage for). Item 3 from the
+review (`tests/unit/e2e-support/google.test.ts` untracked at review time) was
+already resolved on the branch before this pass — no action needed.
+
+## Summary: ALL PASS (original Testing-stage run, prior to the above fixes)
 
 Independently re-ran every verification the Coding stage claimed, and added
 the Jest unit coverage the spec explicitly assigned to the Testing stage
@@ -69,6 +101,12 @@ All run fresh in this worktree (`/Users/jamesliu/Documents/Graceful/.claude/work
 Confirmed no `env` vars for staging/Google were present in this shell
 (`env | grep -iE "STAGING|E2E_|CLERK"` returned nothing), so the skip behavior
 above is a genuine "secrets absent" run, not an accidental pass.
+
+**Post-review fix pass re-verification:** after the `{ exact: true }` and
+`try`/`finally` fixes described above, re-ran `bun run lint`, `bun run
+typecheck`, `bun run test` (82 suites / 1051 tests, unchanged), and `bun run
+test:e2e` (still 1 passed / 10 skipped, same shape, no new failures or
+collect-time errors) — all green.
 
 ## Manual code review (spot-checked against spec.md, not just trusted changes.md)
 

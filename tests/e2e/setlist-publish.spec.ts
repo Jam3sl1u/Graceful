@@ -53,8 +53,10 @@ test.describe("setlist publish", () => {
     });
 
     let setlistId: string | undefined;
+    let adminContext: Awaited<ReturnType<typeof browser.newContext>> | undefined;
+    let memberContext: Awaited<ReturnType<typeof browser.newContext>> | undefined;
     try {
-      const adminContext = await browser.newContext();
+      adminContext = await browser.newContext();
       const adminPage = await adminContext.newPage();
       await adminPage.goto("/");
       await signInAs(adminPage, "admin");
@@ -91,9 +93,7 @@ test.describe("setlist publish", () => {
       await expect(
         adminPage.getByText("This setlist is published and locked for editing."),
       ).toBeVisible();
-      await expect(adminPage.getByText("Published")).toBeVisible();
-
-      await adminContext.close();
+      await expect(adminPage.getByText("Published", { exact: true })).toBeVisible();
 
       const { data: setlistRow } = await svc
         .from("setlists")
@@ -124,15 +124,16 @@ test.describe("setlist publish", () => {
         .eq("link_entity_id", setlistId);
       expect(pendingNotifications).toHaveLength(0);
 
-      const memberContext = await browser.newContext();
+      memberContext = await browser.newContext();
       const memberPage = await memberContext.newPage();
       await memberPage.goto("/");
       await signInAs(memberPage, "member");
       await memberPage.goto(`/member-week/${serviceWeekId}`);
       await expect(memberPage.getByText(song.title)).toBeVisible();
-      await expect(memberPage.getByText("Confirmed")).toBeVisible();
-      await memberContext.close();
+      await expect(memberPage.getByText("Confirmed", { exact: true })).toBeVisible();
     } finally {
+      await adminContext?.close();
+      await memberContext?.close();
       await teardownFixtures(svc, {
         serviceWeekId,
         invitationIds: [confirmedInvitationId, pendingInvitationId],
@@ -158,8 +159,10 @@ test.describe("setlist publish", () => {
     });
 
     let setlistId: string | undefined;
+    let adminContext: Awaited<ReturnType<typeof browser.newContext>> | undefined;
+    let memberContext: Awaited<ReturnType<typeof browser.newContext>> | undefined;
     try {
-      const adminContext = await browser.newContext();
+      adminContext = await browser.newContext();
       const adminPage = await adminContext.newPage();
       await adminPage.goto("/");
       await signInAs(adminPage, "admin");
@@ -186,9 +189,7 @@ test.describe("setlist publish", () => {
         adminPage.getByRole("button", { name: "Publish", exact: true }),
       ).toHaveCount(2);
       await adminPage.getByRole("button", { name: "Publish", exact: true }).last().click();
-      await expect(adminPage.getByText("Published")).toBeVisible();
-
-      await adminContext.close();
+      await expect(adminPage.getByText("Published", { exact: true })).toBeVisible();
 
       const { data: setlistRow } = await svc
         .from("setlists")
@@ -212,15 +213,16 @@ test.describe("setlist publish", () => {
         "The setlist has been published — songs are still being added.",
       );
 
-      const memberContext = await browser.newContext();
+      memberContext = await browser.newContext();
       const memberPage = await memberContext.newPage();
       await memberPage.goto("/");
       await signInAs(memberPage, "member");
       await memberPage.goto(`/member-week/${serviceWeekId}`);
       await expect(memberPage.getByText("No songs added yet")).toBeVisible();
       await expect(memberPage.getByText("Setlist not yet released")).not.toBeVisible();
-      await memberContext.close();
     } finally {
+      await adminContext?.close();
+      await memberContext?.close();
       await teardownFixtures(svc, {
         serviceWeekId,
         invitationId,
