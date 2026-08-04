@@ -45,18 +45,23 @@ export async function GET(req: NextRequest): Promise<Response> {
     }
 
     try {
-      await sendSms(
-        reminder.phone,
-        buildMemberReminderSms(
+      const result = await sendSms({
+        to: reminder.phone,
+        body: buildMemberReminderSms(
           reminder.member_name,
           formatWeekLabel(reminder.week_title, reminder.service_date),
         ),
-      );
-      smsSent += 1;
+        smsOptedIn: reminder.sms_opted_in === true,
+      });
+      if (result.status === "sent") {
+        smsSent += 1;
+      } else {
+        smsSkipped += 1;
+      }
     } catch (err) {
-      // sendSms is currently a stub that always throws (Sprint 4 #58) — a
-      // failed/unimplemented dispatch must not fail the whole job (each
-      // invitation was already stamped + listed to admins by the RPC).
+      // A dispatch failure (Pingram outage, bad config, invalid body, etc.)
+      // must not fail the whole job (each invitation was already stamped +
+      // listed to admins by the RPC).
       smsFailed += 1;
       console.error("invitation-reminders: sendSms failed", err);
     }

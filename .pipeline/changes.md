@@ -1,138 +1,169 @@
-# Changes — Issue #65: Build Member Week View screen
+# Changes — Issue #67: Integrate Pingram SMS dispatch + webhook verification
 
-- `app/api/setlists/[id]/handler.ts`
-  - Added `getSetlistWithSongs(req, id, lookup?)`: `GET /api/setlists/:id`
-    handler. `requireAuth` + `requireRole(["admin", "set_leader"])`, loads the
-    setlist tenant-scoped (`church_group_id` match), 404s if missing/other
-    tenant, 500 on DB error, reuses the existing private `loadSongResponses`
-    helper for the ordered songs, and returns
-    `{ setlist: toSetlistResponse(data), songs }` for both draft and
-    published setlists (client needs status to render the locked state).
-  - `reorderSetlist`'s per-song update loop now conditionally includes
-    `notes` in the Supabase update payload only when `entry.notes !== undefined`
-    (i.e. the client actually sent it), so existing reorder callers that omit
-    notes do not wipe them. `null` clears notes, a string sets them.
-- `app/api/setlists/[id]/route.ts` — added `export async function GET` wired
-  to `getSetlistWithSongs`; `PUT` export unchanged.
-- `schemas/setlists.ts` — `reorderSetlistSchema`'s per-song object gained an
-  optional `notes: z.string().trim().max(1000).nullish()` field.
-  `addSetlistSongSchema` left unchanged (notes are only added via PUT after a
-  song is in the setlist).
-- `schemas/songs.ts` — added `export const SONG_KEY_OPTIONS = ASCII_SONG_KEYS;`
-  (the ordered 17-key ASCII list) for the frontend key `<select>`. Left
-  `VALID_SONG_KEYS` / `isValidSongKey` untouched.
+## Human resolution applied
 
-- `app/api/service-weeks/[id]/member-view/handler.ts` — new
-  `getMemberWeekView(req, id, lookup?)` handler exporting
-  `MemberWeekViewResponse` (and its constituent types `MemberWeekEvent`,
-  `MemberWeekSong`, `MemberWeekTeamMember`, `MemberWeekDocumentGroup`).
-  Aggregates, via the caller's RLS-scoped Supabase client only (no
-  service-role, no new RPC):
-  - `requireAuth` + `requireRole(["admin", "set_leader", "member"])` (guest
-    excluded — #72 is out of scope).
-  - Service week lookup by `id` + `church_group_id` → 404 if missing.
-  - Caller's own `invitations` row for the week, picking the latest by
-    `created_at` when multiple exist → `confirmationStatus` (null if none).
-  - `setlists` row for the week; only treated as present when
-    `status === "published"` (drafts filtered by RLS anyway for members, but
-    checked explicitly) → `setlist: null` otherwise. When published, reads
-    `setlist_songs` ordered by `position`, then `songs` for the distinct song
-    ids, building `effectiveKey = key_override ?? default_key`. Zero songs
-    still yields `{ status: "published", songs: [] }`, not `null`.
-  - `events` for the week ordered by `start_time asc`.
-  - `event_attendees` for the week's event ids (query skipped entirely when
-    there are no events, to avoid an empty `.in()`), used to compute each
-    event's `assigned` flag (caller present as an attendee) and the distinct
-    `teamUserIds`.
-  - Team directory scoped to `teamUserIds` only (mirrors
-    `getChurchGroupMembers`'s users/member_profiles/member_instruments/
-    instruments assembly), sorted by name; no email/phone included.
-  - Documents: only queried when there's a published setlist with songs;
-    `song_documents` rows grouped by `song_id` with freshly minted
-    `getDownloadUrl` per file (`@/lib/r2/client`, 30-min presigned GET); the
-    whole block is wrapped in try/catch so an R2/query failure degrades to
-    `documents: []` with a 200, not a 500.
-  - Returns `ok<MemberWeekViewResponse>(...)`; catches `ApiException` →
-    `fail(...)`, else 500 — same pattern as sibling handlers.
+The planner flagged a blocking OPEN QUESTION (no confirmed Pingram API
+contract in the repo — send endpoint/auth, webhook signature scheme,
+delivery-status payload shape). A human resolved it: **use the provisional
+defaults in `.pipeline/spec.md` §7 as-is**, understood to be unverified
+guesses at Pingram's real API that may need correction once confirmed against
+Pingram's actual docs/dashboard. All vendor-contract constants below are
+implemented exactly as specified in §7 and are collected in one clearly
+commented block per file so a corrected contract is a one-place edit.
 
-- `app/api/service-weeks/[id]/member-view/route.ts` — `GET` route wiring,
-  copied from the `setlist` route's shape (await `params`, delegate to the
-  handler).
+## Files changed
 
-- `app/(app)/member-week/[id]/member-week-view.tsx` (`"use client"`) — the
-  screen component. `ViewState` machine (`loading | ready | forbidden |
-  not-found | error`), single `useEffect` with a `cancelled` guard fetching
-  `GET /api/service-weeks/:id/member-view` once. Renders, in order:
-  - Header: title, `formatServiceDate`, confirmation `Badge` (mapped per
-    spec: accepted→Confirmed/success, pending→Pending/warning,
-    denied→Declined/neutral, withdrawn/expired→Not serving/neutral,
-    null→Not invited/neutral) plus a `Cancelled`/danger badge when
-    `isCancelled`.
-  - Setlist section: not-released vs. zero-songs vs. song list w/
-    title/artist/effectiveKey (`—` placeholder when null) — these are
-    distinct states per the spec's edge cases 2 and 3.
-  - Events section: only `assigned === true` events, each a `type="button"`
-    row opening an in-page detail panel (`selectedEventId` state, no new
-    route) showing name/type/start–end/notes, and a Maps link
-    (`https://www.google.com/maps/search/?api=1&query=...`) only when
-    `location` is non-empty.
-  - Team section: avatar (`getInitials`), name, instruments joined by ", "
-    (or "—" when empty); empty-team message when `team.length === 0`.
-  - Documents section: per-song-group heading + file links (`downloadUrl`,
-    opened in a new tab); empty-state message when none.
-  - A disabled, inert floating "chat" button (`aria-label="Week chat (coming
-    soon)"`, `disabled`, no `onClick`) as the Phase 2 placeholder.
-  - Loading/forbidden/not-found/error branches mirror `week-view.tsx`'s
-    `<main>` blocks (forbidden copy adjusted to a member context).
+- **`lib/pingram/client.ts`** (replaced stub) — real `sendSms` implementation.
+  - `SmsNotConfiguredError`, `SmsValidationError`, `SmsDispatchError` (with
+    `status?`) error classes.
+  - `toE164(raw)` — US-only phone normalization (strips separators; accepts
+    already-E.164, bare 10-digit, or 11-digit-leading-1; else `null`).
+  - `sendSms({ to, body, smsOptedIn })` — options-object signature (breaking
+    change from the old 2-arg positional stub). Order of operations is
+    load-bearing: opt-in check → phone presence → phone format → body
+    non-empty → body ≤160 chars → `PINGRAM_API_KEY` configured → `fetch` the
+    send endpoint. No network call on any skip/validation/config failure.
+  - Provisional vendor constants (§7): `POST
+    ${PINGRAM_API_BASE_URL ?? "https://api.pingram.io/v1"}/messages`,
+    `Authorization: Bearer ${PINGRAM_API_KEY}`, body `{ to, text, from? }`
+    (`from` only when `PINGRAM_SENDER` is set/non-empty), response message id
+    from `id` falling back to `message_id`, then `null`. 10s timeout via
+    `AbortSignal.timeout`. Never logs the API key, full recipient number, or
+    message body.
 
-- `app/(app)/member-week/[id]/member-week-view.module.css` — mobile-first,
-  single-column styles (container/header/card/date/error mirrored from
-  `week-view.module.css`'s conventions, using the existing `--color-fg`/
-  `--color-border`/`--color-bg` variables), plus new `.chatButton` (fixed
-  bottom-right) and `.detail`/`.detailOverlay` (bottom-sheet-style event
-  detail panel).
+- **`lib/api/webhook-verify.ts`** (modified — `verifyPingramWebhook` only;
+  the other three stubs are untouched) — real HMAC-SHA256 verification using
+  `createHmac` + `timingSafeEqual` from `crypto`.
+  - Missing/empty `PINGRAM_WEBHOOK_SECRET` → throws (500 config fault, not a
+    401).
+  - Missing signature/timestamp header, non-integer timestamp, timestamp
+    outside ±300s of now, or signature mismatch → returns `false` (never
+    throws for bad input).
+  - Buffers of unequal length are rejected by a length check *before*
+    `timingSafeEqual` is called, so mismatched-length signatures return
+    `false` instead of throwing.
+  - Provisional vendor constants (§7): header `x-pingram-signature` (optional
+    `sha256=` prefix), `x-pingram-timestamp` (unix seconds), signed payload
+    `` `${timestamp}.${rawBody}` ``, HMAC-SHA256 lowercase hex, ±300s replay
+    window.
 
-## Files modified
+- **`app/api/webhooks/pingram/route.ts`** (replaced stub) — real `POST`
+  handler. Reads raw text before any JSON parsing (signature is over raw
+  bytes) → `verifyPingramWebhook` in try/catch (throw → 500 `INTERNAL`) →
+  falsy result → 401 `UNAUTHENTICATED` (this gate runs before any
+  parsing/processing) → `JSON.parse` in try/catch (throw → 400
+  `VALIDATION_FAILED`) → `pingramWebhookSchema.safeParse` (failure → 400
+  `VALIDATION_FAILED`) → maps raw status to canonical status via
+  `toDeliveryStatus`, logs one structured `console.info` line (never logs raw
+  body or full recipient), returns `ok({ received: true, messageId, status
+  })`. Exports only `POST`. No Clerk auth, no Supabase client (middleware
+  already makes `/api/webhooks(.*)` public).
 
-- `app/(app)/member-week/[id]/page.tsx` — replaced the "coming soon" stub
-  with a server wrapper that awaits `params` and renders
-  `<MemberWeekView serviceWeekId={id} />`, matching
-  `app/(app)/week/[id]/page.tsx`'s shape exactly.
+- **`schemas/pingram.ts`** (new) — `pingramWebhookSchema` (Zod v3, strips
+  unknown keys), `PingramWebhookPayload` type, `PingramDeliveryStatus` union,
+  and `toDeliveryStatus(raw)` which maps unrecognized provider status strings
+  to `"unknown"` (so the route still 200s and Pingram doesn't retry forever).
 
-- `.pipeline/spec.md` — this was already updated in the working tree (issue
-  #65's spec, produced by the Planning stage) before this Coding session
-  started; included in this commit as part of the normal pipeline handoff.
-  No further edits made to it by the Coding stage.
+- **`lib/notifications/sms-templates.ts`** (new, no `import "server-only"` —
+  pure/unit-testable like `lib/scheduling/reminder.ts`) — `SMS_MAX_LENGTH =
+  160` plus seven builders transcribed verbatim from PRD §30:
+  `setInvitationSms`, `memberReminderSms`, `adminReminderSms`,
+  `invitationDeniedSms`, `schedulingConflictSms`, `setlistPublishedSms`,
+  `practiceReminderSms`. Free-text inputs are truncated (with a trailing
+  `...`) before substitution — `memberName`/`roleNote`/`eventName`/`location`
+  at 40 chars, `reason` at 60 — and every builder's result passes through a
+  final hard clamp to `SMS_MAX_LENGTH` (links are always last in the
+  template, so a pathological clamp degrades the link, not the meaning).
+  Optional fields (`roleNote`, `reason`, `location`) are omitted cleanly (no
+  double spaces / dangling separators) when null. **Not yet wired to any
+  caller** — per spec decision, rewiring live triggers to these templates is
+  issue #69; they're covered by their own unit tests only.
+
+- **`app/api/cron/invitation-reminders/route.ts`** (only the `sendSms` call
+  site changed, per spec §6) — switched to the new options-object call
+  (`{ to, body, smsOptedIn }`); counts `result.status === "sent"` as
+  `smsSent` and `"skipped"` as `smsSkipped`; the existing try/catch →
+  `smsFailed` and the pre-loop phone/opt-in guard are unchanged. Updated the
+  stale "sendSms is a stub" comment.
+
+- **`tests/unit/app/api/cron-invitation-reminders-route.test.ts`** — updated
+  the happy-path assertion (line ~106-116) from the old positional-args
+  `mockSendSms` call/`undefined` resolution to the new options-object call
+  and `{ status: "sent", messageId: "m1" }` resolution, per spec §7. No other
+  test in this file changed.
+
+- **`.env.example`** — added `PINGRAM_API_BASE_URL` (optional override) and
+  `PINGRAM_SENDER` (sender number/ID, included in the send payload only when
+  set) to the Pingram block.
+
+- **`documentation/staging-environment.md`** — added the two new env vars to
+  the Pingram row of the §3 variable table, marked distinct/optional
+  consistent with the Q1 answer. No other edit to this doc.
+
+- **`.pipeline/spec.md`** — this was already updated in the working tree
+  (issue #67's spec, produced by the Planning stage) before this Coding
+  session started; included in this commit as part of the normal pipeline
+  handoff. No further edits made to it by the Coding stage.
+
+## Tests added
+
+- **`tests/unit/lib/pingram/client.test.ts`** — mocks `global.fetch`; covers
+  `toE164` normalization/rejection cases and every `sendSms` edge case from
+  the spec (opt-in precedence over missing phone, no-phone, invalid-phone,
+  empty/161-char body, 160-char-exactly allowed, missing/empty API key,
+  default vs. overridden base URL, conditional `from` field, 4xx/5xx/network
+  failures, non-JSON/id-less 2xx body, `message_id` fallback) — asserting no
+  network call happens on every skip/validation/config path.
+- **`tests/unit/lib/api/webhook-verify.test.ts`** — uses real `crypto` HMAC
+  to build valid signatures; covers missing/empty secret (throws), valid
+  signature with/without `sha256=` prefix, missing signature/timestamp
+  header, wrong signature, same-length-but-different-bytes signature,
+  different-length signature (must not throw), non-numeric timestamp,
+  timestamp outside the replay window (past and future), and a mutated body
+  after signing. Only `verifyPingramWebhook` is asserted; the other three
+  stubs are untouched.
+- **`tests/unit/app/api/webhooks-pingram-route.test.ts`** — mocks
+  `@/lib/api/webhook-verify`; asserts the 500 config-throw path, that a
+  rejected signature returns 401 `UNAUTHENTICATED` *before* JSON parsing
+  (proved via a malformed-JSON body that only 400s once the signature is
+  valid), the 400 malformed-JSON and 400 schema-validation paths, a 200 with
+  `status: "unknown"` for an unrecognized provider status, extra unknown
+  fields being ignored, and the happy path (200 + structured `console.info`
+  log line).
+- **`tests/unit/lib/notifications/sms-templates.test.ts`** — exact-copy
+  assertions per PRD §30 for all seven builders (including the literal `"1
+  invitation(s)"` copy for `count: 1`), optional-field omission with no
+  double spaces/dangling separators, truncation-with-`...` at each field's
+  limit, and the ≤160 `SMS_MAX_LENGTH` property under maximum-length inputs.
 
 ## Verification
 
 - `bun run lint` — clean.
 - `bun run typecheck` — clean.
-- `bun run test` — all 77 suites / 968 tests pass (no regressions; the two
-  new test files the spec names for the Testing stage —
-  `tests/unit/app/api/service-weeks-member-view-route.test.ts` and
-  `tests/unit/app/member-week-view.test.tsx` — were intentionally not written
-  here, per the pipeline contract that Testing writes and owns test files).
+- `bun run test` — 85 suites / 1110 tests passed (includes the 4 new test
+  files and the 1 updated cron test).
+- No new dependency added; no DB migration added (per spec decisions 1-2).
 
 ## What the Tester should focus on
 
-- The 13 edge cases enumerated in `.pipeline/spec.md` under "Edge cases the
-  implementation MUST handle", especially:
-  - Published setlist with zero songs vs. no/draft setlist (must render two
-    distinct messages).
-  - Empty `event_attendees` for the week — handler must not issue an `.in()`
-    query with an empty array (verify via a `from` spy on `event_attendees`
-    not being called when `events` is empty).
-  - `getDownloadUrl` throwing (simulate R2 misconfiguration) → endpoint still
-    200 with `documents: []`.
-  - Guest role → 403.
-  - A member assigned to only some of the week's events — only those show in
-    the Events section, but `team` reflects the full attendee set across all
-    events.
-  - Event with `location: null` → detail panel renders with no Maps link.
-- The handler's per-table Supabase mock dispatch (many tables read across one
-  request) — verify the `makeChain`-style test double the spec calls for
-  handles `service_weeks`, `invitations`, `setlists`, `setlist_songs`,
-  `songs`, `events`, `event_attendees`, `users`, `member_profiles`,
-  `member_instruments`, `instruments`, `song_documents` all being queried
-  from the same `getSupabaseClient(jwt)` instance.
+1. **The provisional vendor contract is a guess, not a fact.** Every assumed
+   header/field/URL name is confined to the two commented blocks in
+   `lib/pingram/client.ts` and `lib/api/webhook-verify.ts` — verify tests
+   exercise the *documented* contract (as coded) rather than accidentally
+   asserting some other shape.
+2. **Signature-gate ordering in the webhook route** — confirm a falsy/absent
+   signature never reaches `JSON.parse` (401 path), and that a thrown
+   verifier error (missing secret) is a 500, not a 401 or silent pass.
+3. **`timingSafeEqual` length handling** — a signature of a different length
+   than expected must return `false`, never throw (would otherwise be an
+   unhandled 500 on attacker-controlled input).
+4. **`sendSms` opt-in precedence** — `smsOptedIn: false` short-circuits
+   before the phone is even inspected, and no scenario reaches `fetch` except
+   the fully-valid path.
+5. **The cron route's counters** — `smsSent` vs `smsSkipped` now come from
+   `sendSms`'s returned `status`, not from a boolean return; confirm the
+   updated test still matches the route's actual counting logic.
+6. **`lib/notifications/sms-templates.ts` is intentionally unwired** — no
+   caller change outside the cron route's existing `buildMemberReminderSms`
+   call (that one is untouched, per spec decision 3). Don't flag the new
+   templates as dead code; wiring them is issue #69.
