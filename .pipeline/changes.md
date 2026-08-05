@@ -1,122 +1,103 @@
-# Changes — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
+# Changes — Issue #74: Admin Global Dashboard screen
 
-Implemented exactly per `.pipeline/spec.md`. Tests only — no `app/`, `lib/`,
-`schemas/`, `components/`, or `supabase/migrations/` changes.
+## Summary
+
+Implemented the read-only Admin Global Dashboard (PRD wireframe screen 8,
+`/dashboard`): one new aggregate read endpoint
+(`GET /api/service-weeks/overview`) plus the client screen that consumes it.
+No changes to existing endpoints, handlers, RLS/migrations, or
+`app/(app)/week/**`, per the spec's scope guard.
 
 ## Files changed
 
-### `tests/e2e/support/fixtures.ts` (modified)
-- Added `seedSong(svc, churchGroupId, opts?)` — inserts one `songs` row with a
-  unique default title (`E2E Song ${randomSuffix}`), returns `{ id, title }`.
-- Added `seedSyntheticUser(svc, churchGroupId, opts?)` — inserts a `users` row
-  with no real Clerk identity (`clerk_id: e2e_synthetic_<uuid-no-dashes>`),
-  used only as a notification recipient / invitation target; documented that
-  it must never be signed in via `signInAs`.
-- Extended `TeardownIds` with `invitationIds`, `songIds`,
-  `googleTokenUserIds`, `userIds`.
-- Extended `teardownFixtures` to delete, in FK-safe order (children first):
-  each id in `invitationIds` (alongside the existing single `invitationId`),
-  then `songs` (`in songIds`), `google_calendar_tokens` (`in
-  googleTokenUserIds`), and finally `users` (`in userIds`) — commented that
-  `userIds` must only ever contain ids from `seedSyntheticUser`, never the
-  stable `FIXTURE.adminUserId`/`FIXTURE.memberUserId`.
+- **`schemas/service-weeks.ts`** (modified, append-only) — added
+  `serviceWeekStatusFilters` / `ServiceWeekStatusFilter` and
+  `serviceWeeksOverviewQuerySchema` (optional `startDate`/`endDate`, `status`
+  defaulting to `"all"`), with a `.superRefine` rejecting invalid calendar
+  dates and `startDate > endDate`. `createServiceWeekSchema` /
+  `updateServiceWeekSchema` untouched.
 
-### `tests/e2e/support/google.ts` (new)
-Google-side helpers for the calendar sync spec. Does not import from `lib/`
-or `app/` (those start with `import "server-only"`, which throws under the
-plain-Node Playwright runner) — `toGoogleEventId` and the AES-256-GCM
-`encryptE2EToken` are hand-duplicated from `lib/google-calendar/sync.ts` and
-`lib/google-calendar/token-crypto.ts` respectively, each commented with its
-source of truth. Also exports `GOOGLE_SYNC_VARS`/`googleSyncEnabled` (checked
-via `checkEnv`, deliberately not added to `env.ts`'s `REQUIRED_VARS`),
-`e2eCalendarId`, `seedGoogleCalendarToken` (upserts a
-`google_calendar_tokens` row with `token_expiry` in the past so the app
-always takes the refresh-token path), `getGoogleAccessToken` (test-side
-refresh-token exchange), `getGoogleCalendarEvent`, and
-`deleteGoogleCalendarEvent` (never throws — cleanup-only).
+- **`app/api/service-weeks/overview/handler.ts`** (new) — `getServiceWeeksOverview`.
+  Gate: `requireAuth` + `requireRole(["admin", "set_leader"])`. Query flow:
+  1. `service_weeks` filtered by group + optional date bounds + status, ordered
+     by `service_date` desc (same ordering as `listServiceWeeks`).
+  2. Short-circuits with `{ serviceWeeks: [] }` when there are zero weeks
+     (skips the three follow-up queries).
+  3. `setlists` → map of week id → status.
+  4. `invitations` (explicit columns only — `id, service_week_id, user_id,
+     status, created_at`; never `select("*")`, so `response_token` /
+     `denial_reason` never leak) → reduced to the latest row per
+     `(service_week_id, user_id)` by `created_at` (mirrors
+     `getCurrentInvitation` in `week-view.tsx`). `rosterSize` counts members
+     whose latest status is not `withdrawn`; `confirmedCount` counts those
+     whose latest status is `accepted`.
+  5. `conflicts` (`resolved_at IS NULL`) mapped to a week via the invitation
+     rows from step 4; a conflict whose invitation isn't in that map (i.e.
+     belongs to a filtered-out week) is silently ignored — no crash.
+  6. Aggregates and returns `serviceWeeks` in the step-1 order.
+  All reads go through the caller's RLS-scoped client — no service-role
+  client, no RPC, no migration.
 
-### `tests/e2e/setlist-publish.spec.ts` (new, AC #1/#2)
-- Test A: admin builds a setlist in `/setlists/[id]` (search → Add → 1 song →
-  Publish → confirm-modal Publish), asserts `setlists.status === "published"`
-  and `published_at` truthy, asserts the confirmed member (`accepted`
-  invitation) gets exactly one `setlist_released` notification with
-  `body === null`, asserts a synthetic **pending**-invitation member gets
-  **zero** notifications, then confirms the member sees the song + `Confirmed`
-  badge on `/member-week/[id]`.
-- Test B: same flow with zero songs — asserts the zero-song copy in both the
-  publish confirm modal and the resulting notification `body` (exact string,
-  em dash included), and that the member view shows `No songs added yet`
-  (not `Setlist not yet released`).
-- Both resolve the "two buttons named Publish" ambiguity (bottom bar + modal,
-  `Modal` has no `role="dialog"`) by asserting `toHaveCount(2)` then clicking
-  `.last()`, per spec edge case 3.
-- Header comment documents OPEN QUESTION 1's resolution (published setlists
-  are tenant-readable per RLS; the actual confirmed/pending distinction is in
-  notification recipients, not read access).
+- **`app/api/service-weeks/overview/route.ts`** (new) — thin `GET` wrapper,
+  same shape as `app/api/availability/team/route.ts`.
 
-### `tests/e2e/setlist-duplicate-song.spec.ts` (new, AC #3)
-One test, driven by the member fixture temporarily elevated to `set_leader`
-(restored in `finally`, first statement, mirroring
-`conflict-detection.spec.ts`'s self-exclusion test). Adds a song via
-`POST /api/setlists/:id/songs` (201), repeats the same request (409,
-`error: "That song is already in the setlist.", code: "CONFLICT"`), asserts
-exactly one `setlist_songs` row persisted, then confirms the builder UI shows
-the catalog row's button as `Added` and disabled.
+- **`app/(app)/dashboard/admin-dashboard.tsx`** (new, client component) —
+  `AdminDashboard`. State machine (`loading` / `ready` / `forbidden` /
+  `error`) copied from `conflicts-list.tsx`, plus `startDate`/`endDate`/
+  `status`/`filterError` state. `useEffect` keyed on the three filters, with
+  the `cancelled` guard so a stale response can't overwrite a newer one.
+  Fetches `/api/service-weeks/overview` with `status` always set and
+  `startDate`/`endDate` appended only when non-empty. `403` → forbidden;
+  `400` → stays `ready` with `weeks: []` and an inline `role="alert"` message
+  (filters remain usable); other failures → `error`. Renders `From`/`To`/
+  `Status` filter controls, and per-week cards linking to `/week/{id}` with
+  the publish badge (`Published` / `Draft` / `No setlist`), a `Cancelled`
+  badge when applicable, the roster fill line (`No one invited yet` when
+  `rosterSize === 0`, else `"N of M confirmed"`), and an open-conflict badge
+  (singular/plural) when `openConflictCount > 0`.
 
-### `tests/e2e/calendar-sync.spec.ts` (new, AC #4)
-Gated on `e2eAuthEnabled && googleSyncEnabled` (`calendarSyncReady`) — skips
-without both the base E2E secrets and the five new Google secrets. Seeds an
-accepted invitation + a Google Calendar token for the member, creates an
-event as admin, assigns the member as attendee (the create-propagation
-trigger — a brand-new event has no attendees, so creation alone syncs
-nothing), polls the real Google Calendar API (`expect.poll`, 30s timeout)
-until the event appears with the right `summary`/`location`/`start.dateTime`,
-then `PUT`s an update and polls again until the summary/start reflect the
-change (proving update propagation, not just create). `finally` is fully
-failure-tolerant: best-effort `DELETE /api/events/:id` (app-side unsync),
-then a direct Google delete as a belt-and-braces cleanup, then context close,
-then `teardownFixtures`.
+- **`app/(app)/dashboard/admin-dashboard.module.css`** (new) — based on
+  `conflicts-list.module.css` (`.container` widened to `860px`), plus
+  `.filters` / `.filterField` / `.cardMeta`.
 
-### `.github/workflows/ci.yml` (modified)
-Appended the five new `E2E_GOOGLE_*`/`E2E_TOKEN_ENCRYPTION_KEY` secrets to
-the `e2e` job's `env:` block (the `check-secrets` gate on `STAGING_APP_URL`
-is unchanged — `calendar-sync.spec.ts` self-gates on top of that via
-`googleSyncEnabled`). Updated the job's leading comment to mention the
-setlist publish and Google Calendar sync coverage (issue #66).
+- **`app/(app)/dashboard/page.tsx`** (modified) — replaced the 4-line
+  placeholder with the server component wrapper rendering `AdminDashboard`,
+  mirroring `app/(app)/conflicts/page.tsx`.
 
-### `documentation/staging-environment.md` (modified)
-Added the five new secrets to §7's table (each marked "optional —
-`calendar-sync.spec.ts` skips when absent"), a note that the setlist specs
-need no secrets beyond the existing seven, and a new **§7.1 Google Calendar
-E2E (issue #66)** subsection with the human setup steps (dedicated Google
-test account + same OAuth client as staging, one-time consent flow for
-`calendar.events` scope with `access_type=offline`/`prompt=consent`,
-`E2E_TOKEN_ENCRYPTION_KEY` must equal staging's `TOKEN_ENCRYPTION_KEY`,
-`E2E_GOOGLE_CALENDAR_ID` defaults to `primary`, and the "Testing" OAuth
-publishing-status refresh-token-expiry caveat).
+- **`tests/unit/app/api/service-weeks-overview-route.test.ts`** (new) — 401
+  (no Clerk user, lookup never consulted), 403 for `member`/`guest`, 401
+  (missing JWT), 400 (invalid date, `startDate > endDate`, unknown `status`),
+  zero-weeks short-circuit (asserts the three follow-up tables are never
+  queried), happy-path aggregation (asserts fill rate, latest-invitation-wins
+  for a re-invited member, a `withdrawn` invitation excluded from both
+  numerator and denominator, `setlistStatus: null` for a week with no setlist
+  row, and an orphaned conflict ignored without crashing), `status=active` /
+  `status=cancelled` filter wiring, inclusive `gte`/`lte` date-bound wiring,
+  and 500 on both a `service_weeks` and a `conflicts` query error. Uses the
+  chainable `makeChain` mock pattern from
+  `service-weeks-member-view-route.test.ts`.
 
-### `.pipeline/spec.md`
-Overwritten by the Planning stage for this run (was previously issue #65's
-spec still on disk, uncommitted before this run started); included in this
-commit since it's the git-tracked handoff artifact for this run.
+- **`tests/unit/app/admin-dashboard.test.tsx`** (new, jsdom) — loading state,
+  happy path (fill rate `"5 of 7 confirmed"`, `Published`/`Draft`/`No setlist`
+  badges, `Cancelled` badge, singular/plural open-conflict badges,
+  `"No one invited yet"`, `"Untitled service"` title fallback, card `href`),
+  empty-list message, Status-select change re-fetching with
+  `status=cancelled` in the URL, the 403 forbidden branch, the network-error
+  branch, and the 400 branch (inline alert text, filter controls still
+  rendered, list falls back to the empty-list message).
 
-## Verification run (all passed)
-- `bun run typecheck`
-- `bun run lint`
-- `bun run test` (1040 tests, 81 suites — Jest ignores `tests/e2e/`)
-- `bun run check:workflows`
-- `bun run test:e2e` locally (no staging/Google secrets set): all 4 new
-  tests (calendar-sync ×1, setlist-publish ×2, setlist-duplicate-song ×1)
-  skip cleanly with no import/collect-time errors; `health.spec.ts` still
-  passes (1 passed, 10 skipped).
+## Notes for the Tester
 
-## For the Testing stage to focus on
-- The spec explicitly assigns `tests/unit/e2e-support/google.test.ts`
-  (verifying `toGoogleEventId`/`encryptE2EToken` agree with their `lib/`
-  counterparts) to the Testing stage, not this one — it does not exist yet.
-- No product bugs were found while writing these tests; OPEN QUESTION 1 in
-  `.pipeline/spec.md` documents a pre-existing behavior/AC-wording mismatch
-  that this issue intentionally does not fix (out of scope).
-- `calendar-sync.spec.ts` cannot be exercised end-to-end without a human
-  provisioning the five Google secrets (§7.1) — verify it skips cleanly
-  rather than trying to make it pass.
+- A pre-existing, unrelated environment quirk: `components/ui/Badge.tsx`
+  renders `class="undefined undefined"` under the current Jest CSS-module
+  mock in this jsdom test environment (verified via a standalone repro
+  render of `<Badge>` outside this screen's code) — text content and
+  `toBeInTheDocument()` assertions are unaffected and were used throughout;
+  this is not something introduced by this change and is out of scope for
+  issue #74.
+- The Status `<select>`'s `"Cancelled"` option text collides with the
+  `Cancelled` badge's text in `getByText` queries — the test disambiguates
+  with `within(card)`.
+- Verification run: `bun run lint`, `bun run typecheck`, and `bun run test`
+  (84 suites / 1072 tests) all pass, including the 21 new tests across the
+  two new test files.
