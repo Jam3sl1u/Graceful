@@ -553,6 +553,20 @@ export type Database = {
         Args: { p_user_id: string };
         Returns: boolean;
       };
+      provision_guest_user: {
+        Args: { p_email: string; p_name: string };
+        Returns: UsersRow;
+      };
+      claim_guest_invitation: {
+        Args: { p_response_token: string; p_name: string | null };
+        Returns: {
+          user_id: string;
+          church_group_id: string;
+          invitation_id: string;
+          service_week_id: string;
+          already_claimed: boolean;
+        };
+      };
     };
     Enums: {
       user_role: UserRole;

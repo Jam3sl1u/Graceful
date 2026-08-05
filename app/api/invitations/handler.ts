@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { auth, currentUser } from "@clerk/nextjs/server";
 import { requireAuth, requireRole, type UserLookup } from "@/lib/api/auth";
 import { ok, fail } from "@/lib/api/response";
 import { ApiException, ErrorCode } from "@/lib/api/errors";
@@ -13,6 +13,8 @@ import {
   acceptInvitationSchema,
   respondTokenParamSchema,
   listInvitationsQuerySchema,
+  createGuestInvitationSchema,
+  claimGuestInvitationSchema,
 } from "@/schemas/invitations";
 import type { EventType, InvitationStatus } from "@/types/domain";
 import { canTransition, applyTransition, canInvite, MAX_DENIALS_PER_WEEK } from "@/lib/invitations/state-machine";
@@ -264,6 +266,318 @@ export async function createInvitation(req: NextRequest, lookup?: UserLookup): P
     return ok({ invitation: toInvitationResponse(invitation) }, 201);
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
+// NEXT_PUBLIC_APP_URL is optional at runtime; fall back to a site-relative URL
+// rather than throwing, so an unconfigured preview env still returns a usable link.
+function appUrl(path: string): string {
+  const base = (process.env.NEXT_PUBLIC_APP_URL ?? "").replace(/\/+$/, "");
+  return `${base}${path}`;
+}
+
+export type GuestInvitationResponse = {
+  invitation: InvitationResponse;
+  isNewUser: boolean;
+  guestUserId: string;
+  email: string;
+  inviteUrl: string; // `${base}/invite/${response_token}`
+  accountSetupUrl: string | null; // `${base}/guest/${response_token}`, null when isNewUser === false
+};
+
+// POST /api/invitations/guest (#72) — set_leader/admin only. Invites a guest
+// by email: if that email already belongs to a (non-anonymized) user in this
+// group, the invitation is created against that existing user_id with their
+// role left untouched (PRD Flow 6 step 2a — no silent privilege change).
+// Otherwise a placeholder `users` row is provisioned via the
+// provision_guest_user SECURITY DEFINER RPC (users has no authenticated
+// INSERT policy) and the invitation points at that new guest.
+export async function createGuestInvitation(
+  req: NextRequest,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+    requireRole(ctx, ["admin", "set_leader"]);
+
+    const body = await req.json().catch(() => null);
+    const parsedResult = createGuestInvitationSchema.safeParse(body);
+    if (!parsedResult.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+    const parsed = parsedResult.data;
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data: week, error: weekError } = await supabase
+      .from("service_weeks")
+      .select("*")
+      .eq("id", parsed.serviceWeekId)
+      .eq("church_group_id", ctx.churchGroupId)
+      .maybeSingle();
+
+    if (weekError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    // Missing and wrong-group are indistinguishable by construction (RLS +
+    // the explicit church_group_id filter) — always 404, never 403 (mirrors
+    // createInvitation).
+    if (!week) {
+      return fail("Service week not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    // Existing-user lookup: group-scoped by construction, so an email
+    // belonging to a user in a *different* group is invisible here and
+    // falls through to the new-user branch below (provision_guest_user's
+    // global EMAIL_TAKEN check then 409s without leaking who owns it).
+    const { data: existingUsers, error: existingUserError } = await supabase
+      .from("users")
+      .select("id")
+      .eq("church_group_id", ctx.churchGroupId)
+      .eq("email", parsed.email)
+      .is("anonymized_at", null)
+      .limit(1);
+
+    if (existingUserError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    const isNewUser = (existingUsers ?? []).length === 0;
+    let guestUserId: string;
+
+    if (!isNewUser) {
+      guestUserId = existingUsers![0]!.id;
+
+      // BR-08 (PRD §8): a member who has denied MAX_DENIALS_PER_WEEK
+      // invitations for this service week cannot be re-invited for it.
+      const { data: deniedForWeek, error: deniedError } = await supabase
+        .from("invitations")
+        .select("id")
+        .eq("user_id", guestUserId)
+        .eq("service_week_id", parsed.serviceWeekId)
+        .eq("status", "denied");
+      if (deniedError) return fail("Internal error", ErrorCode.INTERNAL, 500);
+      if (!canInvite((deniedForWeek ?? []).length)) {
+        return fail(
+          `Member has denied ${MAX_DENIALS_PER_WEEK} invitations for this week and cannot be re-invited (BR-08)`,
+          ErrorCode.CONFLICT,
+          409,
+        );
+      }
+
+      // BR-05 double-booking check: does this user already have an accepted
+      // invitation for another service week on the same calendar date in
+      // this group?
+      const { data: acceptedInvitations, error: acceptedError } = await supabase
+        .from("invitations")
+        .select("service_week_id")
+        .eq("user_id", guestUserId)
+        .eq("status", "accepted")
+        .eq("church_group_id", ctx.churchGroupId);
+
+      if (acceptedError) {
+        return fail("Internal error", ErrorCode.INTERNAL, 500);
+      }
+
+      const acceptedWeekIds = [
+        ...new Set((acceptedInvitations ?? []).map((i) => i.service_week_id)),
+      ];
+
+      let hasConflict = false;
+      if (acceptedWeekIds.length > 0) {
+        const { data: collidingWeeks, error: collidingError } = await supabase
+          .from("service_weeks")
+          .select("id")
+          .in("id", acceptedWeekIds)
+          .eq("service_date", week.service_date)
+          .neq("id", parsed.serviceWeekId);
+
+        if (collidingError) {
+          return fail("Internal error", ErrorCode.INTERNAL, 500);
+        }
+
+        hasConflict = (collidingWeeks ?? []).length > 0;
+      }
+
+      if (hasConflict && parsed.acknowledgeConflict !== true) {
+        return fail(
+          "Member already confirmed for another week on this date",
+          ErrorCode.CONFLICT,
+          409,
+        );
+      }
+    } else {
+      // New-user branch: a fresh placeholder row has no prior invitations by
+      // construction, so BR-08/BR-05 do not apply — skip straight to
+      // provisioning.
+      const guestName = (parsed.name ?? parsed.email.split("@")[0] ?? "").slice(0, 100);
+      const { data: guestUser, error: provisionError } = await supabase.rpc(
+        "provision_guest_user",
+        { p_email: parsed.email, p_name: guestName },
+      );
+
+      if (provisionError) {
+        const message = provisionError.message ?? "";
+        if (message.includes("FORBIDDEN")) {
+          return fail("Forbidden", ErrorCode.FORBIDDEN, 403);
+        }
+        if (message.includes("UNAUTHENTICATED")) {
+          return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+        }
+        if (message.includes("EMAIL_TAKEN")) {
+          return fail("A user with this email already exists", ErrorCode.CONFLICT, 409);
+        }
+        return fail("Internal error", ErrorCode.INTERNAL, 500);
+      }
+
+      guestUserId = guestUser.id;
+    }
+
+    const token = generateResponseToken();
+    const deadlineIso = new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString();
+
+    const invitationInsertPayload = {
+      church_group_id: ctx.churchGroupId,
+      service_week_id: parsed.serviceWeekId,
+      user_id: guestUserId,
+      role_note: parsed.roleNote ?? null,
+      response_token: token,
+      response_deadline: deadlineIso,
+      invited_by: ctx.userId,
+    } as unknown as Database["public"]["Tables"]["invitations"]["Insert"];
+
+    const { data: invitation, error: invitationError } = await supabase
+      .from("invitations")
+      .insert(invitationInsertPayload)
+      .select("*")
+      .maybeSingle();
+
+    if (invitationError || !invitation) {
+      // A failed invite must not leave an orphan placeholder account behind:
+      // best-effort delete (users_delete_leader_admin permits this caller to
+      // remove it); the outcome is ignored either way, the 500 below is
+      // returned regardless.
+      if (isNewUser) {
+        await supabase.from("users").delete().eq("id", guestUserId);
+      }
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    await writeAuditLog(supabase, {
+      action: "invitation.sent",
+      entityType: "invitation",
+      entityId: invitation.id,
+      metadata: {
+        service_week_id: parsed.serviceWeekId,
+        user_id: guestUserId,
+        guest: true,
+        is_new_user: isNewUser,
+      },
+    });
+
+    // TODO(#68): dispatch the guest invitation email with accountSetupUrl.
+
+    return ok<GuestInvitationResponse>(
+      {
+        invitation: toInvitationResponse(invitation),
+        isNewUser,
+        guestUserId,
+        email: parsed.email,
+        inviteUrl: appUrl(`/invite/${invitation.response_token}`),
+        accountSetupUrl: isNewUser ? appUrl(`/guest/${invitation.response_token}`) : null,
+      },
+      201,
+    );
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
+// Derives a display name the same way deriveMemberName does in
+// app/api/church-group/join/route.ts, except the fallback is null instead of
+// "Member": claim_guest_invitation keeps the placeholder's existing name
+// when p_name is NULL, so there is no NOT NULL column to satisfy here.
+function deriveGuestName(user: Awaited<ReturnType<typeof currentUser>> | null): string | null {
+  const candidates = [
+    user?.fullName,
+    [user?.firstName, user?.lastName].filter(Boolean).join(" ").trim(),
+    user?.username,
+    user?.primaryEmailAddress?.emailAddress?.split("@")[0],
+  ];
+
+  const name = candidates.find((candidate) => candidate && candidate.trim().length > 0);
+  return name ? name.trim().slice(0, 100) : null;
+}
+
+// POST /api/invitations/guest/claim (#72) — deliberately does NOT call
+// requireAuth: the claimer has no real `users` row yet (only the
+// pending_guest_ placeholder), so requireAuth would always 401. Mirrors the
+// auth preamble of app/api/church-group/join/route.ts.
+export async function claimGuestInvitation(req: NextRequest): Promise<Response> {
+  try {
+    const { userId: clerkId, getToken } = await auth();
+    if (!clerkId) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+
+    const body = await req.json().catch(() => null);
+    const parsedResult = claimGuestInvitationSchema.safeParse(body);
+    if (!parsedResult.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+    const { responseToken } = parsedResult.data;
+
+    const user = await currentUser();
+    const guestName = deriveGuestName(user);
+
+    const supabase = getSupabaseClient(jwt);
+    const { data, error } = await supabase.rpc("claim_guest_invitation", {
+      p_response_token: responseToken,
+      p_name: guestName,
+    });
+
+    if (error) {
+      const message = error.message ?? "";
+      if (message.includes("UNAUTHENTICATED")) {
+        return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+      }
+      if (message.includes("NOT_FOUND")) {
+        return fail("Not found", ErrorCode.NOT_FOUND, 404);
+      }
+      if (message.includes("ALREADY_CLAIMED")) {
+        return fail("Invitation already claimed", ErrorCode.CONFLICT, 409);
+      }
+      if (message.includes("NOT_CLAIMABLE")) {
+        return fail("Invitation is not claimable", ErrorCode.CONFLICT, 409);
+      }
+      if (message.includes("USER_ALREADY_IN_GROUP")) {
+        return fail("You already belong to a church group", ErrorCode.CONFLICT, 409);
+      }
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    return ok(
+      {
+        guest: { userId: data.user_id, churchGroupId: data.church_group_id },
+        invitationId: data.invitation_id,
+        serviceWeekId: data.service_week_id,
+        alreadyClaimed: data.already_claimed,
+      },
+      201,
+    );
+  } catch {
     return fail("Internal error", ErrorCode.INTERNAL, 500);
   }
 }

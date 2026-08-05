@@ -57,6 +57,7 @@ function makeChain(result: QueryResult) {
     in: jest.fn(() => chain),
     is: jest.fn(() => chain),
     order: jest.fn(() => chain),
+    limit: jest.fn(() => chain),
     select: jest.fn(() => chain),
     maybeSingle: jest.fn(() => Promise.resolve(result)),
     then: (resolve: (value: QueryResult) => unknown, reject?: (reason: unknown) => unknown) =>
@@ -113,8 +114,8 @@ const attendeeRows = [
 ];
 
 const userRows = [
-  { id: USER_ID, name: "Zoe Caller" },
-  { id: OTHER_USER_ID, name: "Amy Other" },
+  { id: USER_ID, name: "Zoe Caller", role: "member" },
+  { id: OTHER_USER_ID, name: "Amy Other", role: "member" },
 ];
 
 const memberProfileRows = [{ id: "profile-2", user_id: OTHER_USER_ID, vocal_capability: "lead" }];
@@ -199,17 +200,6 @@ describe("GET /api/service-weeks/:id/member-view", () => {
 
     const res = await getMemberWeekView(fakeReq, WEEK_ID, makeLookup("member"));
     expect(res.status).toBe(401);
-    expect(mockGetSupabaseClient).not.toHaveBeenCalled();
-  });
-
-  it("returns 403 FORBIDDEN for a guest (supabase never constructed)", async () => {
-    setUpAuth();
-    mockGetSupabaseClient.mockReturnValue(makeSupabaseClient());
-
-    const res = await getMemberWeekView(fakeReq, WEEK_ID, makeLookup("guest"));
-    expect(res.status).toBe(403);
-    const body = await res.json();
-    expect(body.code).toBe("FORBIDDEN");
     expect(mockGetSupabaseClient).not.toHaveBeenCalled();
   });
 
@@ -468,5 +458,95 @@ describe("GET /api/service-weeks/:id/member-view", () => {
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.code).toBe("INTERNAL");
+  });
+
+  // #72: guest role variant.
+  describe("guest role", () => {
+    it("guest with an accepted invitation for this week gets 200", async () => {
+      setUpAuth();
+      mockGetSupabaseClient.mockReturnValue(
+        makeSupabaseClient({
+          invitations: {
+            data: [{ status: "accepted", created_at: "2026-07-10T00:00:00Z" }],
+            error: null,
+          },
+        }),
+      );
+
+      const res = await getMemberWeekView(fakeReq, WEEK_ID, makeLookup("guest"));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.confirmationStatus).toBe("accepted");
+    });
+
+    it("guest with only a denied invitation for this week gets 404 (not 403)", async () => {
+      setUpAuth();
+      // This mock ignores query args (it can't distinguish guestHasWeekAccess's
+      // `.in("status", GUEST_ACCESS_STATUSES)` filter from any other select on
+      // this table), so the fixture models the already-filtered result a real
+      // denied-only invitation would produce: zero rows. The access check runs
+      // and short-circuits before the (never-reached) confirmationStatus query
+      // against this same table would matter.
+      mockGetSupabaseClient.mockReturnValue(
+        makeSupabaseClient({
+          invitations: { data: [], error: null },
+        }),
+      );
+
+      const res = await getMemberWeekView(fakeReq, WEEK_ID, makeLookup("guest"));
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.code).toBe("NOT_FOUND");
+    });
+
+    it("guest with no invitation for this week gets 404", async () => {
+      setUpAuth();
+      mockGetSupabaseClient.mockReturnValue(
+        makeSupabaseClient({ invitations: { data: [], error: null } }),
+      );
+
+      const res = await getMemberWeekView(fakeReq, WEEK_ID, makeLookup("guest"));
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.code).toBe("NOT_FOUND");
+    });
+
+    it("returns 500 INTERNAL when the guest access-check query errors", async () => {
+      setUpAuth();
+      mockGetSupabaseClient.mockReturnValue(
+        makeSupabaseClient({
+          invitations: { data: null, error: { message: "connection refused" } },
+        }),
+      );
+
+      const res = await getMemberWeekView(fakeReq, WEEK_ID, makeLookup("guest"));
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.code).toBe("INTERNAL");
+    });
+
+    it("a guest-role user in the attendee set is filtered out of team", async () => {
+      setUpAuth();
+      mockGetSupabaseClient.mockReturnValue(
+        makeSupabaseClient({
+          invitations: {
+            data: [{ status: "accepted", created_at: "2026-07-10T00:00:00Z" }],
+            error: null,
+          },
+          users: {
+            data: [
+              { id: USER_ID, name: "Zoe Caller", role: "member" },
+              { id: OTHER_USER_ID, name: "Amy Other", role: "guest" },
+            ],
+            error: null,
+          },
+        }),
+      );
+
+      const res = await getMemberWeekView(fakeReq, WEEK_ID, makeLookup("member"));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.team.map((m: { userId: string }) => m.userId)).toEqual([USER_ID]);
+    });
   });
 });

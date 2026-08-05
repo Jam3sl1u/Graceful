@@ -5,6 +5,7 @@ import { ok, fail } from "@/lib/api/response";
 import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import { getDownloadUrl } from "@/lib/r2/client";
+import { guestHasWeekAccess } from "@/lib/invitations/guest-access";
 import type { EventType, InvitationStatus, VocalCapability } from "@/types/domain";
 
 export type MemberWeekEvent = {
@@ -60,9 +61,11 @@ export type MemberWeekViewResponse = {
 };
 
 // GET /api/service-weeks/:id/member-view — a single aggregate read for the
-// Member Week View screen (#65). Admin/set_leader/member only (guest variant
-// is #72, out of scope). All reads go through the caller's RLS-scoped
-// Supabase client — no service-role usage, no new RPC.
+// Member Week View screen (#65). Admin/set_leader/member/guest (#72). Guests
+// must have a live (pending/accepted) invitation for this week, else 404 —
+// same anti-enumeration rule as the sibling handlers (never 403). All reads
+// go through the caller's RLS-scoped Supabase client — no service-role
+// usage, no new RPC.
 export async function getMemberWeekView(
   req: NextRequest,
   id: string,
@@ -70,7 +73,7 @@ export async function getMemberWeekView(
 ): Promise<Response> {
   try {
     const ctx = await requireAuth(req, lookup);
-    requireRole(ctx, ["admin", "set_leader", "member"]);
+    requireRole(ctx, ["admin", "set_leader", "member", "guest"]);
 
     const { getToken } = await auth();
     const jwt = await getToken({ template: "supabase" });
@@ -92,6 +95,12 @@ export async function getMemberWeekView(
     }
     if (!weekRow) {
       return fail("Not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    if (ctx.role === "guest") {
+      const access = await guestHasWeekAccess(supabase, id, ctx.userId);
+      if (access.dbError) return fail("Internal error", ErrorCode.INTERNAL, 500);
+      if (!access.allowed) return fail("Not found", ErrorCode.NOT_FOUND, 404);
     }
 
     const serviceWeek = {
@@ -229,7 +238,7 @@ export async function getMemberWeekView(
       const [usersRes, profilesRes, miRes, instrRes] = await Promise.all([
         supabase
           .from("users")
-          .select("id, name")
+          .select("id, name, role")
           .eq("church_group_id", ctx.churchGroupId)
           .is("anonymized_at", null)
           .in("id", teamUserIds),
@@ -268,6 +277,10 @@ export async function getMemberWeekView(
       }
 
       team = (usersRes.data ?? [])
+        // Defense in depth (#72): a user demoted to guest after already
+        // accruing event_attendees rows must never render as a
+        // music-roster slot — guests never occupy one.
+        .filter((user) => user.role !== "guest")
         .map((user) => {
           const profile = profileByUserId.get(user.id);
           return {
