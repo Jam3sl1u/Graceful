@@ -1,232 +1,161 @@
-# Review — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
+# Review — Issue #72: Guest invitation flow (existing vs. new user)
 
-VERDICT: SHIP (after two post-review fix passes below — see "Independent
-second-pass review" for the pass that confirmed this; original run below is
-historical)
+VERDICT: NEEDS WORK
 
-## Independent second-pass review (2026-08-04)
+Scope of this review: `.pipeline/spec.md`, `.pipeline/changes.md`,
+`.pipeline/test-results.md`, `git diff main...HEAD` read in full, plus my own
+runs of `bun run lint`, `bun run typecheck`, `bun run test`
+(87 suites / 1091 tests, all green) and `bun run check:service-role` (OK).
 
-An independent reviewer agent re-audited the whole branch (not just the fix
-commit) with fresh eyes, specifically checking whether the first fix pass
-introduced any new bug and re-deriving the `getByText` fixes against the
-actual component source rather than trusting the commit message. Findings:
+The design is sound and the implementation tracks the spec closely. Two
+things must change before a human sees this as done; two more are judgment
+calls a human should make explicitly.
 
-- Confirmed both original BLOCKING items are genuinely fixed — re-derived
-  independently against `app/(app)/setlists/[id]/setlist-builder.tsx` and
-  `app/(app)/member-week/[id]/member-week-view.tsx`, each now resolves to
-  exactly one element.
-- Found a **real regression introduced by the first fix pass**: moving
-  `adminContext.close()`/`memberContext.close()`/`leaderContext.close()` into
-  `finally` made `teardownFixtures` (the DB cleanup) unreachable if the
-  `.close()` call itself threw, since nothing after a throw in the same
-  `finally` block runs — a change from the pre-fix behavior, where
-  `teardownFixtures` was the sole `finally` statement and always ran. Fixed
-  by wrapping each cleanup step in its own `try`/`catch` (mirroring
-  `calendar-sync.spec.ts`'s existing failure-tolerant pattern), so a failed
-  `.close()` (or, in `setlist-duplicate-song.spec.ts`, a failed role restore)
-  no longer blocks the steps after it.
-- Found a latent version of the *same* strict-mode bug class at
-  `setlist-publish.spec.ts:72` (`getByText("Draft")`, non-exact, at a point
-  where the full staging song catalog is rendered) — added `{ exact: true }`
-  for consistency/robustness.
-- Found the "five secrets gate the skip" inaccuracy (the same class just
-  fixed in `documentation/staging-environment.md`) also present in
-  `.github/workflows/ci.yml`'s e2e-job comment and
-  `tests/e2e/calendar-sync.spec.ts`'s header comment — both corrected to
-  "four" with `E2E_GOOGLE_CALENDAR_ID` called out as separate from the gate.
-- Swept every other `getByText`/`getByRole` call across the three new specs
-  against the actual rendered DOM — no further collisions found.
-- Checked the whole diff for the network-beaconing pattern from this repo's
-  prior rogue-commit incident — no unexpected hosts; `tests/e2e/support/google.ts`
-  only calls `oauth2.googleapis.com` and `www.googleapis.com`, no secrets are
-  logged, and scope is unchanged (`tests/`, `.github/workflows/ci.yml`,
-  `documentation/staging-environment.md`, `.pipeline/` only).
-- Independently re-ran `bun run lint`, `bun run typecheck`, and `bun run
-  test` — all green (82 suites / 1051 tests).
+---
 
-All fixes from this pass were applied; re-verified again after applying them
-(`lint`, `typecheck`, `test`: 1051/1051, `test:e2e`: 1 passed / 10 skipped,
-same shape). Two informational (non-actionable) notes from this pass, kept
-here for a future reader's awareness rather than as blockers:
-- `setlist-publish.spec.ts` now keeps two browser contexts open
-  concurrently (admin stays open while the member context signs in) — an
-  unproven-but-plausible-safe pattern in this suite (contexts have isolated
-  cookie jars); no other spec does this yet.
-- `setlist-duplicate-song.spec.ts` is the first spec depending on DB-only
-  role elevation granting RLS write access; this only works today because
-  `auth_user_role()` falls back to the DB when the JWT has no `role` claim —
-  worth remembering if Clerk custom-claim sync (#5/#6) ever changes that.
+## MUST FIX
 
-## Post-review fix pass (2026-08-04, first pass)
+### 1. Existing-user email lookup is case-sensitive; the RPC guarding it is not
+`app/api/invitations/handler.ts:337-345`
 
-Applied targeted fixes for MUST FIX items #1 and #2 below, plus NON-BLOCKING
-items #4 and #5 (item #3 was already resolved on the branch before this
-pass). This was a direct fix pass in response to this review's own findings,
-not a fresh independent run of the Review stage — see "Independent
-second-pass review" above for the pass that actually re-verified it.
-
-- **#1/#2** (`getByText` strict-mode collisions): added `{ exact: true }` to
-  `tests/e2e/setlist-publish.spec.ts:94`, `:189` (`"Published"`), and `:133`
-  (`"Confirmed"`) — the same option already used for every `getByRole(...,
-  { name, exact: true })` call in these specs.
-- **#4** (`try`/`finally` scope): hoisted `adminContext`/`memberContext`
-  (`setlist-publish.spec.ts`, both tests) and `leaderContext`
-  (`setlist-duplicate-song.spec.ts`) to `let` declarations above `try`, and
-  moved their `.close()` calls into the existing `finally` blocks, matching
-  `calendar-sync.spec.ts`'s established pattern. In
-  `setlist-duplicate-song.spec.ts`, `.close()` was placed *after* the
-  `setMemberRole(svc, "member")` restore, preserving the file's documented
-  "restore role as the first `finally` statement" invariant (safe only
-  because the suite is serialized, per the top-of-file comment).
-- **#5** (doc mislabel): reworded `documentation/staging-environment.md` §7's
-  `E2E_GOOGLE_CALENDAR_ID` row and the §7.1 intro paragraph — it is not part
-  of `GOOGLE_SYNC_VARS`/the skip gate, it only sets the default calendar id.
-
-Re-verified after the fixes: `bun run lint`, `bun run typecheck`, `bun run
-test` (82 suites / 1051 tests, unchanged), and `bun run test:e2e` (1 passed /
-10 skipped, same shape as the original run, no new failures). See
-`.pipeline/test-results.md`'s "Post-review fix pass" section for details.
-
-## Why (original BLOCK verdict)
-
-The deliverable of this issue *is* the tests. Two of the four new specs
-(`tests/e2e/setlist-publish.spec.ts`, both tests) contain assertions that are
-**guaranteed to fail** the moment a human provisions the staging secrets — they
-are Playwright strict-mode violations, not flakiness. Everything green so far
-(lint / typecheck / 1051 Jest tests / "10 skipped, 1 passed" E2E run) only
-proves the specs *skip* cleanly; nothing in the pipeline exercised a single
-assertion inside them. This is exactly the "green tests are not correct
-behavior" case.
-
-I independently re-ran, in this worktree (`node_modules` was missing, so I ran
-`bun install --frozen-lockfile` first):
-
-| Check | Result |
-|---|---|
-| `bun run typecheck` | PASS |
-| `bun run lint` | PASS |
-| `bun run test` | PASS — 82 suites / 1051 tests |
-| `bun run test:e2e` (no secrets) | 1 passed, 10 skipped — new specs skip cleanly, no collect-time errors |
-
-and I empirically reproduced both failures below with a real Chromium +
-Playwright `expect` against the exact DOM the components render.
-
-## MUST FIX (blocking)
-
-### 1. `getByText("Published")` resolves to 2 elements — both tests fail
-`tests/e2e/setlist-publish.spec.ts:94` and `tests/e2e/setlist-publish.spec.ts:189`
-
-`getByText(string)` defaults to `exact: false`, which is **case-insensitive
-substring** matching (`playwright-core` builds `internal:text="Published"i`).
-In the published state `app/(app)/setlists/[id]/setlist-builder.tsx` renders
-both:
-
-- the badge `<Badge>Published</Badge>` (line 398), and
-- the locked banner `<p>This setlist is published and locked for editing.</p>`
-  (line 404) — which contains "published".
-
-Reproduced verbatim:
-
-```
-Error: strict mode violation: getByText('Published') resolved to 2 elements:
-    1) <span>Published</span> aka getByText('Published', { exact: true })
-    2) <p>This setlist is published and locked for editing.</p>
+```ts
+.from("users").select("id")
+  .eq("church_group_id", ctx.churchGroupId)
+  .eq("email", parsed.email)      // parsed.email is lowercased by the schema
+  .is("anonymized_at", null)
 ```
 
-Fix: `getByText("Published", { exact: true })` (or scope to the header/badge).
-Note test A asserts the locked-banner sentence on line 92, so both elements are
-provably on the page at that point; test B renders the same banner after
-publishing.
+`users.email` is never normalized on write: `join_church_group`
+(`supabase/migrations/20260706000002_church_group_join_rpc.sql:68-69`)
+inserts Clerk's `primaryEmailAddress.emailAddress` verbatim, and there is no
+lowercase constraint, trigger, or citext on the column. Meanwhile
+`provision_guest_user` guards with `lower(email) = lower(p_email)`
+(`supabase/migrations/20260805000001_guest_invitation_flow.sql`, step 3) — so
+the handler and the migration it was written alongside disagree about
+case-sensitivity.
 
-### 2. `getByText("Confirmed")` resolves to 2 elements — test A fails
-`tests/e2e/setlist-publish.spec.ts:133`
+Consequence: for any existing user whose stored email contains an uppercase
+character, the group-scoped lookup misses, the code takes the **new-user**
+branch, `provision_guest_user` raises `EMAIL_TAKEN`, and the admin gets a
+permanent 409 with no way to invite that person as a guest. That silently
+defeats spec edge case 1 and AC bullet 2 ("Existing-user path: invitation
+created directly with the known user_id"). It fails closed (no data
+corruption, no leak), which is why it is NEEDS WORK and not BLOCK.
 
-`app/(app)/member-week/[id]/member-week-view.tsx` renders the `Confirmed`
-badge (line 100 via `confirmationBadge`) **and**, when the team list is empty,
-`<p>No confirmed team yet</p>` (line 262). The team list is derived from
-`event_attendees` (`app/api/service-weeks/[id]/member-view/handler.ts:224`),
-and this test creates no events — so the team is *always* empty here and the
-"No confirmed team yet" paragraph is *always* present. Case-insensitive
-substring matching makes `getByText("Confirmed")` match both.
+Fix, in `createGuestInvitation`: make the lookup case-insensitive without
+reintroducing LIKE semantics — note that a bare `.ilike("email", parsed.email)`
+is *not* a safe drop-in, because `_` and `%` are legal in the local part of an
+address and would become wildcards matching a different user's row. Either
+escape `%`/`_` before `.ilike`, or normalize `users.email` to lowercase at
+write time (`join_church_group` + a one-off data migration) and keep `.eq`.
+This is the only `eq("email", …)` in the codebase, so whichever rule is chosen
+becomes the precedent — state it in a comment.
 
-Fix: `getByText("Confirmed", { exact: true })` (whole-string, case-sensitive —
-"No confirmed team yet" then no longer matches).
+Add a test with a mixed-case stored email (e.g. row `Guest@Example.com`,
+request `guest@example.com`) asserting `isNewUser === false` and that
+`provision_guest_user` is never called.
 
-While fixing 1 and 2, sweep the rest of the new specs for the same class of
-bug. I checked the others: `"Draft"`, `"1 song"`, `"0 songs"`, the two modal
-sentences, `"No songs added yet"`, `"Setlist not yet released"` and the
-`getByRole(... exact: true)` locators are all unambiguous on the pages as
-rendered today, but adding `exact: true` to the short, badge-like strings is
-the cheap way to keep them that way.
+### 2. The Tester stage's two supplemental suites are not committed
+`git status` shows them untracked, so they are absent from
+`git diff main...HEAD` and would not reach the PR:
 
-### 3. The Testing stage's own new test file is not committed
-`tests/unit/e2e-support/google.test.ts` is **untracked** (`git status` shows
-`?? tests/unit/e2e-support/google.test.ts`), and `.pipeline/test-results.md` is
-modified but uncommitted. That file is a real deliverable (the spec explicitly
-assigned it to the Testing stage, and it is the only thing preventing silent
-drift between `tests/e2e/support/google.ts` and `lib/google-calendar/`). It
-must be committed before the PR, or the drift guard ships as nothing.
+- `tests/unit/app/api/events-route-guest-scoping-tester-supplement.test.ts`
+- `tests/unit/app/api/invitations-guest-route-tester-supplement.test.ts`
 
-## SHOULD FIX (non-blocking)
+These are the *only* tests in the change that assert on actual query
+arguments (every other fixture is a pass-through mock that returns the same
+canned data regardless of what was filtered), so losing them removes the
+regression protection the Testing stage specifically added. Commit both,
+along with the modified `.pipeline/test-results.md`.
 
-4. **Browser contexts are closed inside `try`, not `finally`** —
-   `tests/e2e/setlist-publish.spec.ts` (lines 96, 134, 191, 222) and
-   `tests/e2e/setlist-duplicate-song.spec.ts:74`. Spec edge case 5 explicitly
-   requires the `context.close()` calls to be in `finally`; as written, any
-   failing assertion (including the two above) leaks the context for the rest
-   of the worker. `calendar-sync.spec.ts` does this correctly — copy that
-   shape.
+---
 
-5. **`documentation/staging-environment.md` §7 table mislabels
-   `E2E_GOOGLE_CALENDAR_ID`** as "optional — `calendar-sync.spec.ts` skips when
-   absent". It is *not* in `GOOGLE_SYNC_VARS`; the spec does not skip when it is
-   absent, it defaults to `primary` (the same row then says so, contradicting
-   itself). Drop the "skips when absent" clause on that one row.
+## HUMAN DECISION REQUIRED (do not silently ship)
 
-## What is good (verified, not taken on trust)
+### 3. AC bullet 4's "NO instrument/key UI" is not honoured
+Guests are now admitted to `GET /api/service-weeks/:id/member-view`
+(`app/api/service-weeks/[id]/member-view/handler.ts:76`), which returns
+`setlist.songs[].effectiveKey` and `team[].vocalCapability` /
+`team[].instruments`, and `app/(app)/member-week/[id]/member-week-view.tsx:228,272`
+renders both. The issue's AC says guests get "NO music roster slot, NO
+instrument/key UI"; the roster-slot half is correctly implemented (the
+`event_attendees` branch in `accept_invitation` plus the `role !== "guest"`
+filter on `team`), the instrument/key half is not.
 
-- Scope is respected: the feature commit touches only `tests/`,
-  `.github/workflows/ci.yml`, `documentation/staging-environment.md` and
-  `.pipeline/`. No `app/`, `lib/`, `schemas/`, `components/`, or
-  `supabase/migrations/` changes — confirmed against `git show --stat 9cb333b`.
-  (The larger `main...HEAD` diff is the already-merged #64/#65 work, not this
-  issue.)
-- Gating is correct: `REQUIRED_VARS` untouched; `googleSyncEnabled` via
-  `checkEnv(GOOGLE_SYNC_VARS)`; both `test.skip(...)` calls are the first
-  statement in their `describe`; verified all four new tests skip with no
-  import-time errors.
-- Fixture helpers match the DB: `songs` (`created_by` FK, `default_key
-  varchar(5)`), `users` (`clerk_id varchar(50)` — the 46-char synthetic id
-  fits; `anonymized_at` exists via `20260710000001_member_removal_rpc.sql`),
-  `google_calendar_tokens` (`is_valid` added by
-  `20260716000001_google_calendar_sync.sql`). Teardown order is FK-safe and the
-  `userIds` branch is correctly fenced with a comment.
-- `tests/e2e/support/google.ts` duplicates match their sources byte-for-byte
-  (`encryptToken` format `iv:authTag:ciphertext`, 12-byte IV, 32-byte key;
-  `toGoogleEventId`), imports nothing from `lib/`/`app/`, and never logs a
-  token or secret. The tester's `google.test.ts` machine-verifies both against
-  the real `lib/` implementations — genuinely meaningful coverage, not
-  superficial.
-- API contract assertions are right: `POST /api/service-weeks/:id/setlist`
-  asserted via `res.ok()` (200-or-201 get-or-create), `POST
-  /api/setlists/:id/songs` 201 then 409 `{ error, code: "CONFLICT" }` matching
-  `app/api/setlists/[id]/handler.ts:344/362` and `lib/api/response.ts`,
-  `POST /api/events` 201 / `POST /api/events/:id/attendees` 201, `PUT
-  /api/events/:id` accepts the partial body (`updateEventSchema` is all-optional).
-- `calendar-sync.spec.ts` is well constructed: attendee-POST as the real
-  create-propagation trigger, BR-10-safe timestamps, `expect.poll` (never
-  `waitForTimeout`) for both create and update, `summary`/`location`/
-  `start.dateTime` assertions that match `upsertCalendarEvent`'s payload
-  (`lib/google-calendar/sync.ts:81`), and a fully failure-tolerant `finally`
-  with both app-side DELETE and a direct Google delete.
-- The OPEN QUESTION 1 resolution (assert notification recipients, not read
-  visibility) is correctly reasoned and correctly documented in the spec header
-  comment; it does not paper over the AC/behavior mismatch.
+`.pipeline/spec.md` "Explicitly out of scope" deliberately deferred this, and
+the issue's own Out of Scope section ("guest-specific UI polish beyond reusing
+#49/#65's existing screens with scoped data") can be read either way. Cheapest
+honest fix is ~5 lines in the member-view handler: when `ctx.role === "guest"`,
+null out `effectiveKey` and emit `team` entries without
+`instruments`/`vocalCapability`. Otherwise get explicit sign-off that this AC
+bullet ships unmet and record it on the issue.
 
-## Re-review scope
+### 4. A newly invited guest does not appear in the new "Guests" section
+`app/(app)/week/[id]/week-view.tsx` — `handleInviteGuest` pushes the new
+invitation into `invitations`, but `guestEntries` is derived from
+`members.filter((m) => m.role === "guest")` and `members` is only loaded once
+on mount. So after a successful new-user guest invite the section still reads
+"No guests invited for this week yet" until a manual reload; the only visible
+feedback is the `accountSetupUrl` blob. Either refetch
+`/api/church-group/members` on success or append a local directory entry from
+the response (`guestUserId` + `email`).
 
-Fix items 1–3 (and ideally 4–5), re-run `bun run lint`, `bun run typecheck`,
-`bun run test`, `bun run test:e2e`, and re-submit. Note that items 1 and 2
-still cannot be proven green without staging secrets — the reviewer's
-reproduction above is the evidence, so the fix should be locator-level and
-obviously correct by inspection.
+---
+
+## Verified correct (I checked these myself, not just the summaries)
+
+- **`accept_invitation` supersede is faithful.** I extracted both function
+  bodies and diffed them: the only changes are the `v_invitee_role`
+  declaration and the guest branch around the `event_attendees` insert.
+  Status flip, expiry ordering, notification fan-out, and the audit insert are
+  untouched. No other migration defines `accept_invitation`, and
+  `20260805000001` sorts last, so nothing is silently reverted.
+- **Concurrency in `claim_guest_invitation`.** `SELECT … FOR UPDATE` on the
+  placeholder row before the `pending_guest_` / role checks correctly
+  serializes two racing claims — the loser gets `ALREADY_CLAIMED`, not a
+  double-claim. `email` is never overwritten, so the global unique index can't
+  be tripped. Step order matches the spec's numbered list exactly.
+- **`middleware.ts`.** `"/guest(.*)"` is anchored at the path start, so it does
+  not match `/api/invitations/guest` or `/api/invitations/guest/claim`; both
+  stay protected. Confirmed against `createRouteMatcher` semantics and the
+  neighbouring `/join(.*)` entry.
+- **Anti-enumeration.** All four guest branches return 404, never 403, and the
+  service-week lookup keeps the "missing and wrong-group are
+  indistinguishable" invariant.
+- **The latent `.maybeSingle()` bug is genuinely fixed.** `guestHasWeekAccess`
+  awaits an array query with `.limit(1)`, so a re-invited guest with two
+  invitation rows for one week no longer 500s. Covered by a real test.
+- **`app/api/events/handler.ts`.** The `.in("status", GUEST_ACCESS_STATUSES)`
+  filter is applied only for `ctx.role === "guest"`; member/set_leader scoping
+  is unchanged, and the tester supplement asserts both directions on the actual
+  call arguments.
+- **No service-role usage anywhere in the new code** (`check:service-role` OK);
+  both new RPCs are `SECURITY DEFINER` with `SET search_path = ''`, fully
+  schema-qualified, with the caller-role check (not RLS) as the documented
+  enforcement point, matching `remove_church_group_member`'s pattern.
+- **`clerk_id` construction** is 46 chars (`pending_guest_` + 32 hex), inside
+  `varchar(50)`, and the `md5(random()||clock_timestamp())`-over-`gen_random_uuid()`
+  rationale is correct for `search_path = ''`.
+- **Removal interaction.** `remove_church_group_member` sets `email = NULL`
+  (line 136), so re-inviting a removed member's address provisions cleanly —
+  spec edge case 3 holds.
+
+## Non-blocking notes for the record
+
+- The cross-group path returns 409 "A user with this email already exists",
+  which is an existence oracle for any address registered anywhere in
+  Graceful. `.pipeline/spec.md` edge case 2 accepts this tradeoff explicitly;
+  flagging so it is a decision, not an accident.
+- Two admins inviting the same brand-new email concurrently: both pass
+  `provision_guest_user`'s `EXISTS` check, the loser hits the unique index and
+  surfaces a generic error → 500 instead of 409. Mapping SQLSTATE `23505` to
+  `EMAIL_TAKEN` would close it.
+- `claim_guest_invitation` does not check `response_deadline`. A `pending`
+  invitation past its deadline is still claimable; the account is created, then
+  `accept_invitation` raises `EXPIRED` — but `pending` is in
+  `GUEST_ACCESS_STATUSES`, so that guest still has read access to the week.
+  Consistent with how members behave today; worth a follow-up issue rather than
+  a change here.
+- The migration is not exercised by CI (no local Postgres in the harness), so
+  all SQL confidence above comes from reading and diffing, not execution. Worth
+  one manual `supabase db push` against a scratch project before merge.
