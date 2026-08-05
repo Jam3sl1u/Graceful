@@ -1,122 +1,128 @@
-# Changes — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
+# Changes — Issue #76: Rate limiting on auth, SMS, and write endpoints
 
-Implemented exactly per `.pipeline/spec.md`. Tests only — no `app/`, `lib/`,
-`schemas/`, `components/`, or `supabase/migrations/` changes.
+## Files created
 
-## Files changed
+- **`lib/api/rate-limit.ts`** — the limiter, all pure/testable logic:
+  - `RATE_LIMIT_POLICIES` (webhook 600/min, read 240/min, write 60/min, auth
+    10/min, sms 5/min).
+  - `resolveTier(pathname, method)` — classifies any `/api/*` request into
+    `webhook | sms | auth | write | read | null` per the exact precedence
+    order in the spec (health/page exemptions first, then webhooks, then the
+    named SMS-triggering routes, then the named auth-brute-force routes,
+    then non-GET/HEAD/OPTIONS → write, else read). Normalizes trailing
+    slashes and method casing before matching.
+  - `getRequestIdentifier(req, clerkUserId)` — `user:<id>` for signed-in
+    callers, else `ip:<first x-forwarded-for hop>`, else `ip:<x-real-ip>`,
+    else the shared `ip:unknown` bucket (documented trade-off).
+  - `checkRateLimit(key, policy, now?)` — fixed-window counter against a
+    module-level `Map`. Denied requests still increment the counter but
+    never move `windowStartMs` forward (so a blocked caller's own window
+    isn't extended). Store is pruned once it exceeds 10,000 entries (sweep
+    stale entries using the largest configured `windowMs`, then
+    `store.clear()` if still oversized).
+  - `checkRequestRateLimit(req, clerkUserId, now?)` — the middleware entry
+    point; returns `null` for exempt requests, otherwise resolves tier +
+    policy, builds the `${tier}:${identifier}` key, and returns a full
+    `RateLimitDecision`.
+  - `rateLimitResponse(decision)` — builds the `429` with `{ error, code:
+    "RATE_LIMITED" }` body and a single `Retry-After` header.
+  - `resetRateLimitStore()` — test-only store reset.
 
-### `tests/e2e/support/fixtures.ts` (modified)
-- Added `seedSong(svc, churchGroupId, opts?)` — inserts one `songs` row with a
-  unique default title (`E2E Song ${randomSuffix}`), returns `{ id, title }`.
-- Added `seedSyntheticUser(svc, churchGroupId, opts?)` — inserts a `users` row
-  with no real Clerk identity (`clerk_id: e2e_synthetic_<uuid-no-dashes>`),
-  used only as a notification recipient / invitation target; documented that
-  it must never be signed in via `signInAs`.
-- Extended `TeardownIds` with `invitationIds`, `songIds`,
-  `googleTokenUserIds`, `userIds`.
-- Extended `teardownFixtures` to delete, in FK-safe order (children first):
-  each id in `invitationIds` (alongside the existing single `invitationId`),
-  then `songs` (`in songIds`), `google_calendar_tokens` (`in
-  googleTokenUserIds`), and finally `users` (`in userIds`) — commented that
-  `userIds` must only ever contain ids from `seedSyntheticUser`, never the
-  stable `FIXTURE.adminUserId`/`FIXTURE.memberUserId`.
+  **Server-only branch taken**: the spec's primary path (importing
+  `{ ErrorCode }` from `@/lib/api/errors`, which itself is `server-only`
+  tagged) was verified via `bun run build`. The build **compiled
+  successfully** (middleware bundling completed with no `server-only`
+  error) before failing later, during static page generation, on a
+  pre-existing/unrelated issue (see "Build" below). So the primary path was
+  kept — no fallback `const RATE_LIMIT_CODE` literal was needed. A comment
+  at the top of the file documents the deviation from the `lib/**`
+  `server-only` convention as the spec requires.
 
-### `tests/e2e/support/google.ts` (new)
-Google-side helpers for the calendar sync spec. Does not import from `lib/`
-or `app/` (those start with `import "server-only"`, which throws under the
-plain-Node Playwright runner) — `toGoogleEventId` and the AES-256-GCM
-`encryptE2EToken` are hand-duplicated from `lib/google-calendar/sync.ts` and
-`lib/google-calendar/token-crypto.ts` respectively, each commented with its
-source of truth. Also exports `GOOGLE_SYNC_VARS`/`googleSyncEnabled` (checked
-via `checkEnv`, deliberately not added to `env.ts`'s `REQUIRED_VARS`),
-`e2eCalendarId`, `seedGoogleCalendarToken` (upserts a
-`google_calendar_tokens` row with `token_expiry` in the past so the app
-always takes the refresh-token path), `getGoogleAccessToken` (test-side
-refresh-token exchange), `getGoogleCalendarEvent`, and
-`deleteGoogleCalendarEvent` (never throws — cleanup-only).
+- **`tests/unit/lib/api/rate-limit.test.ts`** — unit tests covering:
+  happy path (remaining counts down to 0), limit firing on request N+1,
+  the 429 shape (`status`, integer `Retry-After`, JSON envelope), window
+  rollover, "denied requests do not extend the window" (asserts
+  `resetAtMs` is unchanged across repeated denials and the caller is
+  allowed again exactly at the original `resetAtMs`), tier isolation
+  (`sms` exhaustion doesn't touch `read`) and identity isolation (two
+  different identities don't share a bucket), the full `resolveTier` table
+  from the spec (including trailing slash, lowercase method, and the
+  `GET /api/invitations` → `read` vs `POST /api/invitations` → `sms`
+  distinction), `getRequestIdentifier` for all four cases (`user:`,
+  first-hop XFF, `x-real-ip` fallback, `ip:unknown`), and the
+  `sms < auth < write < read` policy-ordering invariant.
 
-### `tests/e2e/setlist-publish.spec.ts` (new, AC #1/#2)
-- Test A: admin builds a setlist in `/setlists/[id]` (search → Add → 1 song →
-  Publish → confirm-modal Publish), asserts `setlists.status === "published"`
-  and `published_at` truthy, asserts the confirmed member (`accepted`
-  invitation) gets exactly one `setlist_released` notification with
-  `body === null`, asserts a synthetic **pending**-invitation member gets
-  **zero** notifications, then confirms the member sees the song + `Confirmed`
-  badge on `/member-week/[id]`.
-- Test B: same flow with zero songs — asserts the zero-song copy in both the
-  publish confirm modal and the resulting notification `body` (exact string,
-  em dash included), and that the member view shows `No songs added yet`
-  (not `Setlist not yet released`).
-- Both resolve the "two buttons named Publish" ambiguity (bottom bar + modal,
-  `Modal` has no `role="dialog"`) by asserting `toHaveCount(2)` then clicking
-  `.last()`, per spec edge case 3.
-- Header comment documents OPEN QUESTION 1's resolution (published setlists
-  are tenant-readable per RLS; the actual confirmed/pending distinction is in
-  notification recipients, not read access).
+- **`tests/unit/middleware.test.ts`** — proves the 429 fires through the
+  real `middleware.ts` with Clerk mocked as an identity function
+  (`clerkMiddleware: (handler) => handler`, `createRouteMatcher: () => ()
+  => true`). Covers: requests within the `sms` limit to
+  `POST /api/invitations` are not `429`; the first request past the `sms`
+  limit is `429` with a parsable integer `Retry-After` and
+  `code: "RATE_LIMITED"`; `GET /api/health` never `429`s regardless of call
+  count. `resetRateLimitStore()` runs in `beforeEach` so tests don't leak
+  counters into each other.
 
-### `tests/e2e/setlist-duplicate-song.spec.ts` (new, AC #3)
-One test, driven by the member fixture temporarily elevated to `set_leader`
-(restored in `finally`, first statement, mirroring
-`conflict-detection.spec.ts`'s self-exclusion test). Adds a song via
-`POST /api/setlists/:id/songs` (201), repeats the same request (409,
-`error: "That song is already in the setlist.", code: "CONFLICT"`), asserts
-exactly one `setlist_songs` row persisted, then confirms the builder UI shows
-the catalog row's button as `Added` and disabled.
+## Files modified
 
-### `tests/e2e/calendar-sync.spec.ts` (new, AC #4)
-Gated on `e2eAuthEnabled && googleSyncEnabled` (`calendarSyncReady`) — skips
-without both the base E2E secrets and the five new Google secrets. Seeds an
-accepted invitation + a Google Calendar token for the member, creates an
-event as admin, assigns the member as attendee (the create-propagation
-trigger — a brand-new event has no attendees, so creation alone syncs
-nothing), polls the real Google Calendar API (`expect.poll`, 30s timeout)
-until the event appears with the right `summary`/`location`/`start.dateTime`,
-then `PUT`s an update and polls again until the summary/start reflect the
-change (proving update propagation, not just create). `finally` is fully
-failure-tolerant: best-effort `DELETE /api/events/:id` (app-side unsync),
-then a direct Google delete as a belt-and-braces cleanup, then context close,
-then `teardownFixtures`.
+- **`middleware.ts`** — `isPublicRoute` and `config.matcher` are untouched
+  (matcher already covers `/(api|trpc)(.*)`). Inside the `clerkMiddleware`
+  callback, before the existing `auth.protect()` call: resolves
+  `clerkUserId` from `await auth()` (catching and falling back to `null`/IP
+  bucketing if it throws on a malformed/expired session), calls
+  `checkRequestRateLimit(req, clerkUserId)`, and returns
+  `rateLimitResponse(decision)` immediately if the decision is non-null and
+  denied — before the `isPublicRoute` check, so unauthenticated floods
+  (including the public invitation-token endpoints) are rejected cheaply
+  pre-auth.
 
-### `.github/workflows/ci.yml` (modified)
-Appended the five new `E2E_GOOGLE_*`/`E2E_TOKEN_ENCRYPTION_KEY` secrets to
-the `e2e` job's `env:` block (the `check-secrets` gate on `STAGING_APP_URL`
-is unchanged — `calendar-sync.spec.ts` self-gates on top of that via
-`googleSyncEnabled`). Updated the job's leading comment to mention the
-setlist publish and Google Calendar sync coverage (issue #66).
+Nothing under `app/`, `schemas/`, or `supabase/` was touched. No new
+dependencies or env vars were added; `package.json` and `.env.example` are
+unchanged. `.pipeline/spec.md` was already updated by the Planning stage
+before this run started (not touched further here).
 
-### `documentation/staging-environment.md` (modified)
-Added the five new secrets to §7's table (each marked "optional —
-`calendar-sync.spec.ts` skips when absent"), a note that the setlist specs
-need no secrets beyond the existing seven, and a new **§7.1 Google Calendar
-E2E (issue #66)** subsection with the human setup steps (dedicated Google
-test account + same OAuth client as staging, one-time consent flow for
-`calendar.events` scope with `access_type=offline`/`prompt=consent`,
-`E2E_TOKEN_ENCRYPTION_KEY` must equal staging's `TOKEN_ENCRYPTION_KEY`,
-`E2E_GOOGLE_CALENDAR_ID` defaults to `primary`, and the "Testing" OAuth
-publishing-status refresh-token-expiry caveat).
+## Known limitation (carried from spec's OPEN QUESTIONS, non-blocking)
 
-### `.pipeline/spec.md`
-Overwritten by the Planning stage for this run (was previously issue #65's
-spec still on disk, uncommitted before this run started); included in this
-commit since it's the git-tracked handoff artifact for this run.
+Rate limiting is in-memory (module-level `Map`), not Redis-backed. On
+serverless/multi-instance deployments each instance holds its own counters,
+so the effective limit is per-instance, not global. The concrete limits
+(webhook 600, read 240, write 60, auth 10, sms 5, all per 60s) are a first
+pass meant to be tuned by a human later.
 
-## Verification run (all passed)
-- `bun run typecheck`
-- `bun run lint`
-- `bun run test` (1040 tests, 81 suites — Jest ignores `tests/e2e/`)
-- `bun run check:workflows`
-- `bun run test:e2e` locally (no staging/Google secrets set): all 4 new
-  tests (calendar-sync ×1, setlist-publish ×2, setlist-duplicate-song ×1)
-  skip cleanly with no import/collect-time errors; `health.spec.ts` still
-  passes (1 passed, 10 skipped).
+## Verification
 
-## For the Testing stage to focus on
-- The spec explicitly assigns `tests/unit/e2e-support/google.test.ts`
-  (verifying `toGoogleEventId`/`encryptE2EToken` agree with their `lib/`
-  counterparts) to the Testing stage, not this one — it does not exist yet.
-- No product bugs were found while writing these tests; OPEN QUESTION 1 in
-  `.pipeline/spec.md` documents a pre-existing behavior/AC-wording mismatch
-  that this issue intentionally does not fix (out of scope).
-- `calendar-sync.spec.ts` cannot be exercised end-to-end without a human
-  provisioning the five Google secrets (§7.1) — verify it skips cleanly
-  rather than trying to make it pass.
+- `bun run typecheck` — **pass**, no errors.
+- `bun run lint` — **pass**, no errors (initial `@typescript-eslint/no-explicit-any`
+  failures in `middleware.test.ts` were fixed by giving the mocked handler an
+  explicit type instead of casting through `any`).
+- `bun run test` — **pass**, 84 suites / 1084 tests total, including the 2
+  new test files added here.
+- `bun run build` — compiles successfully (Next reports "Compiled
+  successfully"), confirming `middleware.ts`'s new import of
+  `lib/api/rate-limit.ts` (and its transitive import of
+  `lib/api/errors.ts`, which is `server-only` tagged) bundles fine for the
+  Edge runtime with **no `server-only` error**. The build then fails later,
+  during static page generation of `/conflicts` (and other app pages), with
+  `Error: @clerk/clerk-react: Missing publishableKey` — this is a
+  pre-existing environment issue (no Clerk env vars are configured in this
+  sandbox), **not** caused by this change. Confirmed by stashing this
+  branch's diff and re-running `bun run build` against the unmodified
+  baseline: it fails at the exact same static-generation step with the
+  same missing-publishableKey error (on `/_not-found` instead of
+  `/conflicts` — which page prerenders first varies, but the root cause is
+  identical). No fallback branch (local `RATE_LIMITED_CODE` constant) was
+  needed.
+
+## What the Tester should focus on
+
+- The `resolveTier` precedence order, especially that `GET /api/invitations`
+  resolves to `read` (not `sms`) while `POST /api/invitations` resolves to
+  `sms` — method matters, not just path.
+- The "denied requests do not extend the window" behavior — this is the
+  subtlest part of the fixed-window implementation and is easy to get wrong
+  in a way that either bans callers forever or lets them reset their own
+  window by continuing to hammer it.
+- That the store-pruning threshold (10,000 keys) and `ip:unknown` shared
+  bucket are deliberate, documented trade-offs, not bugs.
+- `middleware.ts`'s Clerk `auth()` failure fallback (`try/catch` around
+  `await auth()`) — verify it degrades to IP bucketing rather than
+  throwing/500ing.

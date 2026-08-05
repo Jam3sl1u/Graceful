@@ -1,4 +1,5 @@
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
+import { checkRequestRateLimit, rateLimitResponse } from "@/lib/api/rate-limit";
 
 // Request-level auth is enforced here; role-level checks (requireRole) still
 // land in #6.
@@ -16,6 +17,18 @@ export const isPublicRoute = createRouteMatcher([
 ]);
 
 export default clerkMiddleware(async (auth, req) => {
+  let clerkUserId: string | null = null;
+  try {
+    clerkUserId = (await auth()).userId;
+  } catch {
+    clerkUserId = null; // malformed/expired session -> fall back to IP bucketing
+  }
+
+  const decision = checkRequestRateLimit(req, clerkUserId);
+  if (decision && !decision.allowed) {
+    return rateLimitResponse(decision);
+  }
+
   if (!isPublicRoute(req)) {
     await auth.protect();
   }
