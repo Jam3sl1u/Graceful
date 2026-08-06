@@ -1,122 +1,159 @@
-# Changes — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
+# Changes — Issue #78: [Sprint 4] Run infrastructure security pass (HTTPS, CSP, secret scan)
 
-Implemented exactly per `.pipeline/spec.md`. Tests only — no `app/`, `lib/`,
-`schemas/`, `components/`, or `supabase/migrations/` changes.
+Implements `.pipeline/spec.md` in full. No OPEN QUESTIONS blocked the pipeline
+(both items in the spec's OPEN QUESTIONS section are post-merge human-action
+checklist items, recorded in the new documentation file per the spec).
 
 ## Files changed
 
-### `tests/e2e/support/fixtures.ts` (modified)
-- Added `seedSong(svc, churchGroupId, opts?)` — inserts one `songs` row with a
-  unique default title (`E2E Song ${randomSuffix}`), returns `{ id, title }`.
-- Added `seedSyntheticUser(svc, churchGroupId, opts?)` — inserts a `users` row
-  with no real Clerk identity (`clerk_id: e2e_synthetic_<uuid-no-dashes>`),
-  used only as a notification recipient / invitation target; documented that
-  it must never be signed in via `signInAs`.
-- Extended `TeardownIds` with `invitationIds`, `songIds`,
-  `googleTokenUserIds`, `userIds`.
-- Extended `teardownFixtures` to delete, in FK-safe order (children first):
-  each id in `invitationIds` (alongside the existing single `invitationId`),
-  then `songs` (`in songIds`), `google_calendar_tokens` (`in
-  googleTokenUserIds`), and finally `users` (`in userIds`) — commented that
-  `userIds` must only ever contain ids from `seedSyntheticUser`, never the
-  stable `FIXTURE.adminUserId`/`FIXTURE.memberUserId`.
+- **`lib/security/csp.ts`** (new) — pure, dependency-free, edge-safe module:
+  - `clerkFrontendApiOrigin(publishableKey)` — derives `https://<host>` from a
+    `pk_test_`/`pk_live_` Clerk key by base64-decoding the payload up to the
+    first `$`; returns `null` for any invalid/undefined/garbage input.
+  - `generateNonce()` — 16 random bytes via `crypto.getRandomValues`,
+    base64-encoded via `btoa`.
+  - `buildContentSecurityPolicy({ nonce, clerkOrigin, isDev })` — builds the
+    single-line CSP header value per the directive table in the spec
+    (`script-src`/`connect-src` include the Clerk origin only when non-null;
+    `'unsafe-eval'`/`ws:` only when `isDev`; `upgrade-insecure-requests`
+    omitted when `isDev`).
 
-### `tests/e2e/support/google.ts` (new)
-Google-side helpers for the calendar sync spec. Does not import from `lib/`
-or `app/` (those start with `import "server-only"`, which throws under the
-plain-Node Playwright runner) — `toGoogleEventId` and the AES-256-GCM
-`encryptE2EToken` are hand-duplicated from `lib/google-calendar/sync.ts` and
-`lib/google-calendar/token-crypto.ts` respectively, each commented with its
-source of truth. Also exports `GOOGLE_SYNC_VARS`/`googleSyncEnabled` (checked
-via `checkEnv`, deliberately not added to `env.ts`'s `REQUIRED_VARS`),
-`e2eCalendarId`, `seedGoogleCalendarToken` (upserts a
-`google_calendar_tokens` row with `token_expiry` in the past so the app
-always takes the refresh-token path), `getGoogleAccessToken` (test-side
-refresh-token exchange), `getGoogleCalendarEvent`, and
-`deleteGoogleCalendarEvent` (never throws — cleanup-only).
+- **`middleware.ts`** (modified) — `isPublicRoute`, the `clerkMiddleware`
+  wrapper, the auth behavior, and the exported `config` matcher are
+  unchanged. Added: generate a nonce + CSP per request, stamp the CSP onto
+  the *request* headers before `NextResponse.next()` (so Next.js can sign its
+  own streaming inline scripts with the nonce), then set the same CSP on the
+  *response* headers. Comment explains the redirect-short-circuit edge case
+  (an `auth.protect()` redirect carries no CSP header — acceptable, empty
+  body). No `x-nonce` header added (no app code reads it — would be unused
+  scope creep).
 
-### `tests/e2e/setlist-publish.spec.ts` (new, AC #1/#2)
-- Test A: admin builds a setlist in `/setlists/[id]` (search → Add → 1 song →
-  Publish → confirm-modal Publish), asserts `setlists.status === "published"`
-  and `published_at` truthy, asserts the confirmed member (`accepted`
-  invitation) gets exactly one `setlist_released` notification with
-  `body === null`, asserts a synthetic **pending**-invitation member gets
-  **zero** notifications, then confirms the member sees the song + `Confirmed`
-  badge on `/member-week/[id]`.
-- Test B: same flow with zero songs — asserts the zero-song copy in both the
-  publish confirm modal and the resulting notification `body` (exact string,
-  em dash included), and that the member view shows `No songs added yet`
-  (not `Setlist not yet released`).
-- Both resolve the "two buttons named Publish" ambiguity (bottom bar + modal,
-  `Modal` has no `role="dialog"`) by asserting `toHaveCount(2)` then clicking
-  `.last()`, per spec edge case 3.
-- Header comment documents OPEN QUESTION 1's resolution (published setlists
-  are tenant-readable per RLS; the actual confirmed/pending distinction is in
-  notification recipients, not read access).
+- **`next.config.ts`** (modified) — added `async headers()` returning one
+  entry: `source: "/:path*"` with
+  `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`.
+  `reactStrictMode`, `outputFileTracingRoot`, `eslint.dirs` untouched. CSP is
+  deliberately NOT here (must be per-request/nonce-based, middleware-only).
 
-### `tests/e2e/setlist-duplicate-song.spec.ts` (new, AC #3)
-One test, driven by the member fixture temporarily elevated to `set_leader`
-(restored in `finally`, first statement, mirroring
-`conflict-detection.spec.ts`'s self-exclusion test). Adds a song via
-`POST /api/setlists/:id/songs` (201), repeats the same request (409,
-`error: "That song is already in the setlist.", code: "CONFLICT"`), asserts
-exactly one `setlist_songs` row persisted, then confirms the builder UI shows
-the catalog row's button as `Added` and disabled.
+- **`scripts/check-git-secrets.mjs`** (new) — git-history secret scanner,
+  following `check-service-role.mjs`'s exit-code convention and
+  `check-workflows.mjs`'s `execFileSync` usage (node builtins only, no `bun
+  install` needed):
+  1. Fails if not inside a git work tree.
+  2. Fails (with an explanatory message) if the repo is a shallow clone —
+     `git rev-parse --is-shallow-repository`.
+  3. Added-line scan over `git log --all --full-history -p -U0` output,
+     matching `PATTERNS` (Clerk secret keys, Resend API keys, Google OAuth
+     client secrets, AWS/R2 access key IDs, PEM private key blocks, JWTs, and
+     assigned secret env vars from the 20 secret-bearing names in
+     `.env.example`).
+  4. Committed-`.env*`-file scan via `git log --diff-filter=A --name-only`,
+     flagging any added `.env`/`.env.*` path except `.env.example`.
+  5. Findings print to stderr as `<sha> <path> - <patternName>:
+     <redacted>` and exit 1; a clean scan prints `OK: ...` and exits 0.
+     Redaction is always `<first 4 chars>…(len=<n>)` — the matched secret
+     itself is never printed.
+  - Two allowlists, each entry carrying a `reason`: `VALUE_ALLOWLIST`
+    (matched-text regexes) and `PATH_ALLOWLIST` (the script's own path, plus
+    any path containing `check-git-secrets` for that script's own test
+    fixtures — nothing broader; `.pipeline/**` and `documentation/**` stay in
+    scope).
+  - **Deliberate deviation from the `check-service-role.mjs` `REPO_ROOT`
+    pattern:** this script does NOT hardcode `cwd` to its own location.
+    Instead it lets `git` auto-discover the repository from the process's
+    actual working directory. This is what makes the "exits 1 against a
+    scratch git repo with a fake key" test case in the spec's verification
+    section actually work — hardcoding `cwd` to this repo's root would make
+    the script always scan *this* repo regardless of where/against what it's
+    invoked, which would make that test case impossible to satisfy without
+    copying the script into the scratch repo first.
+  - Added `"check:git-secrets": "node scripts/check-git-secrets.mjs"` to
+    `package.json` scripts.
 
-### `tests/e2e/calendar-sync.spec.ts` (new, AC #4)
-Gated on `e2eAuthEnabled && googleSyncEnabled` (`calendarSyncReady`) — skips
-without both the base E2E secrets and the five new Google secrets. Seeds an
-accepted invitation + a Google Calendar token for the member, creates an
-event as admin, assigns the member as attendee (the create-propagation
-trigger — a brand-new event has no attendees, so creation alone syncs
-nothing), polls the real Google Calendar API (`expect.poll`, 30s timeout)
-until the event appears with the right `summary`/`location`/`start.dateTime`,
-then `PUT`s an update and polls again until the summary/start reflect the
-change (proving update propagation, not just create). `finally` is fully
-failure-tolerant: best-effort `DELETE /api/events/:id` (app-side unsync),
-then a direct Google delete as a belt-and-braces cleanup, then context close,
-then `teardownFixtures`.
+- **`.github/workflows/ci.yml`** (modified) — added a new top-level
+  `git-secret-scan` job (checkout with `fetch-depth: 0`, `setup-bun`, `bun
+  run check:git-secrets`, no `bun install` step). Every existing job,
+  including `check-secrets` (Actions-secret availability — unrelated,
+  untouched), is unchanged.
 
-### `.github/workflows/ci.yml` (modified)
-Appended the five new `E2E_GOOGLE_*`/`E2E_TOKEN_ENCRYPTION_KEY` secrets to
-the `e2e` job's `env:` block (the `check-secrets` gate on `STAGING_APP_URL`
-is unchanged — `calendar-sync.spec.ts` self-gates on top of that via
-`googleSyncEnabled`). Updated the job's leading comment to mention the
-setlist publish and Google Calendar sync coverage (issue #66).
+- **`.github/dependabot.yml`** (new) — weekly `bun` (root manifest) and
+  `github-actions` update checks, each capped at 5 open PRs. Header comment
+  notes this repo uses Bun exclusively per `AGENTS.md`.
 
-### `documentation/staging-environment.md` (modified)
-Added the five new secrets to §7's table (each marked "optional —
-`calendar-sync.spec.ts` skips when absent"), a note that the setlist specs
-need no secrets beyond the existing seven, and a new **§7.1 Google Calendar
-E2E (issue #66)** subsection with the human setup steps (dedicated Google
-test account + same OAuth client as staging, one-time consent flow for
-`calendar.events` scope with `access_type=offline`/`prompt=consent`,
-`E2E_TOKEN_ENCRYPTION_KEY` must equal staging's `TOKEN_ENCRYPTION_KEY`,
-`E2E_GOOGLE_CALENDAR_ID` defaults to `primary`, and the "Testing" OAuth
-publishing-status refresh-token-expiry caveat).
+- **`documentation/infrastructure-security.md`** (new) — follows
+  `documentation/staging-environment.md`'s house style. Sections: purpose &
+  scope (cross-references #76/#77/#79 as out of scope), HTTPS enforcement
+  (+ operator checklist), CSP (full directive table, nonce rationale, dev-only
+  relaxations, pre-launch checklist), git-history secret scan (how to run,
+  allowlist policy, **the actual scan run recorded**: date 2026-08-06, commit
+  `43050470ea60ca3637c4abaf02a843aa2321e728` — repo HEAD immediately prior to
+  this issue's own commit — result `OK: no secrets found in git history.`),
+  and Dependabot (+ post-merge verification checklist item).
 
-### `.pipeline/spec.md`
-Overwritten by the Planning stage for this run (was previously issue #65's
-spec still on disk, uncommitted before this run started); included in this
-commit since it's the git-tracked handoff artifact for this run.
+- **`README.md`** (modified) — added the `check:git-secrets` bullet to the
+  Scripts list and a line under "Environments" linking to the new doc.
+  Nothing else changed.
 
-## Verification run (all passed)
-- `bun run typecheck`
-- `bun run lint`
-- `bun run test` (1040 tests, 81 suites — Jest ignores `tests/e2e/`)
-- `bun run check:workflows`
-- `bun run test:e2e` locally (no staging/Google secrets set): all 4 new
-  tests (calendar-sync ×1, setlist-publish ×2, setlist-duplicate-song ×1)
-  skip cleanly with no import/collect-time errors; `health.spec.ts` still
-  passes (1 passed, 10 skipped).
+- **`tests/unit/lib/security/csp.test.ts`** (new) — coder-authored unit
+  tests for all three exported functions, covering every "Behaviors the
+  tester should be able to verify" bullet in the spec: valid/invalid
+  `pk_test_`/`pk_live_` keys, nonce uniqueness/byte-length, `isDev: false`
+  vs `isDev: true` directive differences, `clerkOrigin: null` well-formedness,
+  and directive ordering/no-trailing-semicolon.
 
-## For the Testing stage to focus on
-- The spec explicitly assigns `tests/unit/e2e-support/google.test.ts`
-  (verifying `toGoogleEventId`/`encryptE2EToken` agree with their `lib/`
-  counterparts) to the Testing stage, not this one — it does not exist yet.
-- No product bugs were found while writing these tests; OPEN QUESTION 1 in
-  `.pipeline/spec.md` documents a pre-existing behavior/AC-wording mismatch
-  that this issue intentionally does not fix (out of scope).
-- `calendar-sync.spec.ts` cannot be exercised end-to-end without a human
-  provisioning the five Google secrets (§7.1) — verify it skips cleanly
-  rather than trying to make it pass.
+- **`.pipeline/spec.md`** (staged) — this is the planning stage's own output
+  for this pipeline run (was already present, uncommitted, in the working
+  tree when this coding stage started); staged here so it lands in the same
+  commit as the implementation it specifies, rather than being lost. The
+  previously-committed `.pipeline/spec.md` on this branch was stale content
+  left over from issue #66.
+
+## Verification performed (all passed)
+
+- `bun run check:git-secrets` — exits 0 against this repo's real history.
+  Two `VALUE_ALLOWLIST` entries were added beyond the spec's minimum seed set
+  to suppress two categories of obvious false positive found on the first
+  run, both from this repo's own Jest test fixtures (not real secrets):
+  - `/"test-[a-z0-9-]+"/i` — reason: "Jest test-double value for a secret env
+    var (e.g. CRON_SECRET/PINGRAM_API_KEY fixtures like
+    `"test-cron-secret"`), not a real credential." Matched
+    `tests/unit/app/api/cron-invitation-reminders-route*.test.ts`,
+    `tests/unit/e2e-support/env.test.ts` (all `"test-cron-secret"`) and a
+    prior version of `tests/unit/lib/pingram/client.test.ts`
+    (`"test-api-key"`).
+  - `/"client-(id|secret)(-\d+)?"/i` — reason: "Jest test-double value for
+    GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET fixtures (e.g.
+    `"client-secret-456"`), not a real credential." Matched
+    `tests/unit/lib/google-calendar/{oauth,sync,sync-tester-supplement}.test.ts`.
+  Both were manually confirmed by reading the actual fixture source (`git
+  show <sha>:<path>`) before allowlisting — neither is a real credential.
+  Also independently exercised: exits 1 (redacted output, not the secret)
+  against a scratch repo with a fake `sk_live_...` key committed; exits 1
+  against a scratch repo with a committed `.env` file; exits 1 (with the
+  shallow-clone message) against a `--depth 1` clone.
+- `bun run typecheck`, `bun run lint`, `bun run test` (1064 tests, 83 suites,
+  including the 13 new CSP tests), `bun run format:check` — all pass.
+- `bun run build` — succeeds when Clerk env vars are present (confirms the
+  `next.config.ts` `headers()` shape is valid). Note: `bun run build` fails
+  in this sandbox both before and after this change (`Missing publishableKey`
+  on `/documents` prerender) because no `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
+  is set in this environment — verified pre-existing via `git stash` (fails
+  identically on unmodified `origin/main`). Re-ran with a synthetic
+  `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`/`CLERK_SECRET_KEY` set and the build
+  succeeded end-to-end, producing all 37 routes plus a compiled Middleware
+  bundle.
+
+## What the tester should focus on
+
+- The CSP directive string itself (order, exact tokens, no double spaces,
+  dev vs. prod differences) — `tests/unit/lib/security/csp.test.ts` covers
+  this but an independent read of `lib/security/csp.ts` against the spec's
+  directive table is worthwhile.
+- `middleware.ts`'s request-header nonce plumbing — this can't be unit
+  tested in isolation the way `csp.ts` can; worth a manual/integration check
+  that a real request gets a `content-security-policy` response header.
+- `scripts/check-git-secrets.mjs`'s shallow-clone detection and the
+  cwd-discovery behavior (no hardcoded `REPO_ROOT`) — independently verify
+  the three scratch-repo scenarios named in the spec's verification section
+  (fake key present, shallow clone, committed `.env` file).
+- The two `VALUE_ALLOWLIST` additions above — confirm independently that the
+  matched fixture values really are fake/test-only, not real credentials.
