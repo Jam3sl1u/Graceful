@@ -1,193 +1,176 @@
-# Test Results — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
+# Test Results — Issue #78: [Sprint 4] Run infrastructure security pass (HTTPS, CSP, secret scan)
 
-## Independent second-pass review fix pass
+## Verdict: ALL PASS
 
-A second, independent reviewer pass over the whole branch (not just the
-first fix commit) found that the first fix pass's `try`/`finally` change
-introduced a regression: wrapping `.close()` calls as plain (unwrapped)
-statements inside `finally` meant a throwing `.close()` would skip
-`teardownFixtures` entirely — worse than the pre-fix behavior, where
-`teardownFixtures` was unconditionally reached. Fixed by wrapping each
-cleanup step (`adminContext.close()`, `memberContext.close()`,
-`leaderContext.close()`, and `setMemberRole(svc, "member")` in
-`setlist-duplicate-song.spec.ts`) in its own `try`/`catch` with
-`console.error`, matching `calendar-sync.spec.ts`'s existing pattern — one
-failing step no longer blocks the ones after it or the DB teardown.
+Independently re-ran every verification `.pipeline/changes.md` claimed, from a
+clean `node_modules` (this worktree had none checked out — ran `bun install`
+first), and added two new test files covering the two seams the spec/changes.md
+flagged as not yet independently exercised: `middleware.ts`'s request/response
+CSP-header plumbing, and `scripts/check-git-secrets.mjs`'s exit-code behavior
+against disposable scratch git repos.
 
-Also fixed: `setlist-publish.spec.ts:72`'s `getByText("Draft")` was the same
-bug class as the original BLOCK findings (non-exact match, at a point where
-the full staging catalog renders) — added `{ exact: true }`. And the "five
-secrets gate the skip" inaccuracy the first fix pass corrected in
-`documentation/staging-environment.md` was also present in
-`.github/workflows/ci.yml`'s comment and `calendar-sync.spec.ts`'s header
-comment — both corrected to "four".
+## New test files added by this stage
 
-Re-ran `bun run lint`, `bun run typecheck`, `bun run test` (82 suites / 1051
-tests), and `bun run test:e2e` (1 passed / 10 skipped) after these fixes —
-all green, same shape as before.
+### `tests/unit/middleware.test.ts` (new, 5 tests)
 
-## Post-review fix pass (targeted, not a full pipeline rerun; first pass)
+`middleware.ts` wraps its handler in `clerkMiddleware`, so it can't be
+exercised the way a pure module can. Mocked `@clerk/nextjs/server` down to an
+identity function for `clerkMiddleware` only (`clerkMiddleware: (handler) =>
+handler`), keeping the real `createRouteMatcher` (pure route matching against
+`req.nextUrl.pathname`, no external calls), so the actual handler body in
+`middleware.ts` runs against a real `NextRequest`.
 
-The Review stage returned BLOCK on this run (see `.pipeline/review.md`):
-`getByText()`'s default case-insensitive substring matching caused three
-assertions to collide with a second element containing the same text —
-`tests/e2e/setlist-publish.spec.ts:94`/`:189` (`"Published"` also matches the
-locked-setlist banner) and `:133` (`"Confirmed"` also matches the member-view
-team list's `"No confirmed team yet"` empty state). Fixed by adding
-`{ exact: true }` to all three, the same option already used throughout these
-specs for `getByRole(..., { name, exact: true })`.
+- **Happy path**: a public route (`/sign-in`) gets a
+  `content-security-policy` response header containing `default-src 'self'`,
+  a `script-src 'self' 'nonce-...'` token, and `frame-ancestors 'none'`,
+  without `auth.protect()` being called.
+- **Edge case (spec-named auth interaction)**: a non-public route
+  (`/dashboard`) calls `auth.protect()` exactly once and still returns a
+  response carrying the CSP header.
+- **Edge case (the plumbing changes.md specifically flagged as worth
+  checking)**: spied on `NextResponse.next` to confirm the *same* nonce that
+  ends up in the response header is also stamped onto the *request* headers
+  object passed to `NextResponse.next({ request: { headers } })` — this is
+  the mechanism the spec relies on for Next to sign its own inline scripts.
+- **Edge case**: two consecutive requests get two different CSP strings
+  (nonce uniqueness carried through the full handler, not just
+  `generateNonce()` in isolation).
+- **Edge case (dev/prod branching)**: with `NODE_ENV=production`, the
+  response CSP contains neither `'unsafe-eval'` nor `ws:`, and does contain
+  `upgrade-insecure-requests`.
 
-While in these files, also fixed the two non-blocking findings from the same
-review: `setlist-publish.spec.ts` (both tests) and
-`setlist-duplicate-song.spec.ts` were closing their browser context(s) inside
-`try` instead of `finally`, contrary to `.pipeline/spec.md` edge case 5 —
-hoisted the context variable(s) to `let` above `try` and moved `.close()`
-into `finally`, matching `calendar-sync.spec.ts`'s existing pattern (in
-`setlist-duplicate-song.spec.ts`, `.close()` was placed *after* the
-`setMemberRole(svc, "member")` restore, preserving the documented "restore
-role as the first `finally` statement" invariant). Also fixed
-`documentation/staging-environment.md` §7/§7.1, which mislabeled
-`E2E_GOOGLE_CALENDAR_ID` as part of the skip gate — it's deliberately not in
-`GOOGLE_SYNC_VARS`, it only sets the default calendar id.
+Result: **5/5 passed**.
 
-Re-ran the full verification suite after these fixes (see below) — all still
-green, same "1 passed / 10 skipped" E2E shape as the original run (no staging
-secrets locally, so the fixed assertions themselves are still unexercised
-here; see "Not independently exercised" below, which still applies to the
-underlying assertions this pass didn't add new coverage for). Item 3 from the
-review (`tests/unit/e2e-support/google.test.ts` untracked at review time) was
-already resolved on the branch before this pass — no action needed.
+### `tests/unit/scripts/check-git-secrets.test.ts` (new, 6 tests)
 
-## Summary: ALL PASS (original Testing-stage run, prior to the above fixes)
+Integration-style test (real `git`/`node` subprocesses against disposable
+scratch repos under `os.tmpdir()`, cleaned up per-test) — the behavior under
+test (git history semantics, shallow-clone detection, exit codes) is only
+meaningfully verified end-to-end, matching the spec's own named verification
+scenarios.
 
-Independently re-ran every verification the Coding stage claimed, and added
-the Jest unit coverage the spec explicitly assigned to the Testing stage
-(`.pipeline/spec.md` "For the Testing stage (not the Coder's job)" and
-`.pipeline/changes.md` "For the Testing stage to focus on").
+- **Happy path**: a clean scratch repo (one commit, no secrets) → exit 0,
+  stdout contains `OK:`.
+- **Failure case (spec-named)**: a scratch repo with a commit containing a
+  fake `sk_live_...` key → exit 1, stderr names the `Clerk secret key`
+  pattern, stderr does **not** contain the raw fake secret anywhere, and the
+  redaction format matches `sk_l…(len=<n>)` exactly as the script's `redact()`
+  function specifies.
+- **Edge case**: a committed `.env` file, even after being deleted in a later
+  commit, still triggers a `Committed .env file` finding (history scan, not
+  working-tree scan) → exit 1.
+- **Edge case**: a committed `.env.example` file is correctly *not* flagged →
+  exit 0.
+- **Edge case (spec-named)**: a shallow clone (`git clone --depth 1`) of a
+  2-commit repo → exit 1 with a stderr message containing "shallow",
+  regardless of whether the shallow history itself contains a secret — i.e.
+  the shallow-clone guard fires before/instead of reporting a false "clean".
+- **Failure case**: running the script outside any git working tree → exit 1
+  with a "git working tree" error message.
 
-## New test file added by this stage
-
-### `tests/unit/e2e-support/google.test.ts` (new)
-
-Covers `tests/e2e/support/google.ts`'s two hand-duplicated pure functions
-(`toGoogleEventId`, `encryptE2EToken`) plus its env-gating (`googleSyncEnabled`,
-`e2eCalendarId`) — per the spec's explicit assignment of this file to the
-Testing stage, since Jest (unlike Playwright) maps `server-only` to a mock and
-can therefore import both the real `lib/google-calendar/` implementations and
-the `tests/e2e/support/` duplicates side by side.
-
-- **Happy path**: `toGoogleEventId` agrees with `lib/google-calendar/sync.ts`'s
-  version for a representative uuid; `encryptE2EToken` round-trips through
-  `lib/google-calendar/token-crypto.ts`'s `decryptToken`; `googleSyncEnabled`
-  is `true` when all base E2E vars + the four Google vars are set;
-  `e2eCalendarId()` returns the env var when set.
-- **Edge cases (named/implied by the spec)**:
-  - `toGoogleEventId` agreement holds for a uuid with uppercase hex digits
-    (both sides lowercase).
-  - `encryptE2EToken` produces a distinct ciphertext (distinct IV) for two
-    encryptions of the same plaintext (mirrors the analogous test in
-    `tests/unit/lib/google-calendar/token-crypto.test.ts`).
-  - `googleSyncEnabled` is `false` when any one of the four Google-specific
-    vars is missing.
-  - `googleSyncEnabled` is `false` when the Google vars are all set but a base
-    `REQUIRED_VARS` var (e.g. `STAGING_APP_URL`) is missing — verifies
-    `checkEnv(GOOGLE_SYNC_VARS)`'s actual AND semantics with the base vars
-    (discovered by writing the test — see "Note" below).
-  - `e2eCalendarId()` defaults to `"primary"` when unset.
-- **Failure cases**:
-  - `encryptE2EToken` throws `"E2E_TOKEN_ENCRYPTION_KEY must decode to exactly
-    32 bytes"` for a malformed key.
-  - `encryptE2EToken` throws `"Missing required env var for E2E tests:
-    E2E_TOKEN_ENCRYPTION_KEY"` when the key env var is unset.
-
-Result: **11/11 passed** (`bun run test -- tests/unit/e2e-support/google.test.ts`).
-
-**Note (not a bug):** my first draft assumed `googleSyncEnabled` only depended
-on the four `GOOGLE_SYNC_VARS`. It also requires the base `REQUIRED_VARS` from
-`tests/e2e/support/env.ts`, because `checkEnv(extra)` always ANDs
-`REQUIRED_VARS` with whatever `extra` array is passed — `google.ts` calls
-`checkEnv(GOOGLE_SYNC_VARS)`, so both sets are required together. This matches
-the spec's description ("checked via `checkEnv`") and `calendar-sync.spec.ts`'s
-own `calendarSyncReady = e2eAuthEnabled && googleSyncEnabled` (redundant-looking
-but consistent with this semantics). I corrected the test to assert the actual
-(correct) behavior rather than my initial wrong assumption.
+Result: **6/6 passed**.
 
 ## Independent re-verification of the Coding stage's claims
 
-All run fresh in this worktree (`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-66`):
+All run fresh in this worktree
+(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-78`), after `bun
+install` (node_modules was absent at the start of this stage):
 
 | Check | Command | Result |
 |---|---|---|
 | Typecheck | `bun run typecheck` | PASS — no errors |
 | Lint | `bun run lint` | PASS — no errors/warnings |
-| Unit tests | `bun run test` | PASS — **82 suites, 1051 tests** (1040 baseline + 11 new in `google.test.ts`; confirms the new file is collected and green, and nothing else regressed) |
-| Workflow-script check | `bun run check:workflows` | PASS — "1 workflow script(s) checked — syntax valid, all agent() calls pinned." |
-| E2E local run (no staging/Google secrets) | `bun run test:e2e` | PASS — **1 passed, 10 skipped**: `health.spec.ts` passes; all 4 new specs (`calendar-sync.spec.ts` ×1, `setlist-publish.spec.ts` ×2, `setlist-duplicate-song.spec.ts` ×1) skip cleanly via `test.skip`, no import/collect-time errors; pre-existing specs skip as before |
+| Unit tests (baseline, before this stage's new files) | `bun run test` | PASS — **83 suites, 1064 tests** — matches changes.md's claimed count exactly |
+| Unit tests (after this stage's 2 new test files) | `bun run test` | PASS — **85 suites, 1075 tests** (1064 + 5 middleware + 6 check-git-secrets, no regressions) |
+| Format check (repo-wide) | `bun run format:check` | FAILS — but confirmed pre-existing: same 79-file drift changes.md described, none of which are files this issue touches or the 2 files this stage added (`prettier --check` on the new test files individually passes) |
+| Format check (new test files only) | `bunx prettier --check tests/unit/middleware.test.ts tests/unit/scripts/check-git-secrets.test.ts` | PASS |
+| Git-history secret scan | `bun run check:git-secrets` | PASS — exit 0, `OK: no secrets found in git history.` against this repo's real history |
+| Production build | `bun run build` (with synthetic `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`/`CLERK_SECRET_KEY` set, since none are configured in this sandbox) | PASS — exit 0, all 37 routes + Middleware bundle produced, confirming `next.config.ts`'s `headers()` shape is valid Next.js config |
 
-Confirmed no `env` vars for staging/Google were present in this shell
-(`env | grep -iE "STAGING|E2E_|CLERK"` returned nothing), so the skip behavior
-above is a genuine "secrets absent" run, not an accidental pass.
+## Manual review against the spec (spot-checked, not just trusted changes.md)
 
-**Post-review fix pass re-verification:** after the `{ exact: true }` and
-`try`/`finally` fixes described above, re-ran `bun run lint`, `bun run
-typecheck`, `bun run test` (82 suites / 1051 tests, unchanged), and `bun run
-test:e2e` (still 1 passed / 10 skipped, same shape, no new failures or
-collect-time errors) — all green.
+- **`lib/security/csp.ts`**: directive order, tokens, and dev/prod branching
+  in `buildContentSecurityPolicy` match the spec's directive table exactly
+  (verified by reading the source against the table line by line, plus the
+  coder's own `tests/unit/lib/security/csp.test.ts`, which independently
+  looks correct and complete — re-ran it as part of the full suite above).
+  `clerkFrontendApiOrigin`'s prefix-strip / `atob` / `$`-split / host-regex
+  sequence matches the spec's five bullet points exactly.
+- **`middleware.ts`**: `isPublicRoute`, the `clerkMiddleware` wrapper, the
+  `auth.protect()` gate, and the exported `config` matcher are byte-for-byte
+  unchanged from what the spec said to preserve. The nonce/CSP addition
+  matches the spec's 5-step description; the redirect-short-circuit comment
+  is present and accurate. No stray `x-nonce` header (confirmed by grep).
+- **`next.config.ts`**: single `headers()` entry, exact HSTS value from the
+  spec (`max-age=63072000; includeSubDomains; preload`), `source: "/:path*"`.
+  No CSP here (correctly deferred to middleware). `reactStrictMode`,
+  `outputFileTracingRoot`, `eslint.dirs` untouched (confirmed via diff-free
+  read).
+- **`scripts/check-git-secrets.mjs`**: all 7 `PATTERNS` entries match the
+  spec's regexes verbatim, including the 20-name `SECRET_ENV_VAR_NAMES` list.
+  Both allowlists carry a `reason` per entry as required. `PATH_ALLOWLIST` is
+  narrowly scoped to the script's own path plus `check-git-secrets`-fragment
+  paths — confirmed `.pipeline/**` and `documentation/**` are NOT allowlisted
+  (grepped `PATH_ALLOWLIST`/`isAllowedPath`, only the two entries described in
+  changes.md exist). Redaction format matches spec exactly (`<first 4
+  chars>…(len=<n>)`) — confirmed with a live scratch-repo run above. The
+  deliberate no-hardcoded-`cwd` deviation from `check-service-role.mjs` is
+  real and is exactly what makes the scratch-repo test cases in this stage's
+  new test file work.
+- **`.github/workflows/ci.yml`**: new `git-secret-scan` job matches the
+  spec's YAML verbatim (`fetch-depth: 0`, `setup-bun@v2` at `1.2.x`, no `bun
+  install` step, `bun run check:git-secrets`). Every other job
+  (`checks`, `check-secrets`, `rls-integration`, `e2e`) is untouched —
+  confirmed by reading the full file (reproduced above).
+- **`.github/dependabot.yml`**: matches the spec's YAML verbatim, header
+  comment present.
+- **`README.md`**: both additions (Scripts bullet, Environments link) present
+  and match the spec's requested wording/placement; nothing else changed.
+- **`documentation/infrastructure-security.md`**: read in full — covers all
+  five spec sections (purpose/scope, HTTPS, CSP, git-history scan, Dependabot)
+  with the operator checklists as `- [ ]` items, and records the actual scan
+  run (date, commit SHA, `OK:` result) as required. The recorded commit SHA
+  (`43050470ea60ca3637c4abaf02a843aa2321e728`) is the repo HEAD immediately
+  prior to this issue's own commits, consistent with changes.md's explanation.
+- Confirmed the two `VALUE_ALLOWLIST` additions beyond the spec's seed set
+  (`"test-..."` and `"client-(id|secret)..."` regexes) by reading the actual
+  matched fixture files via `git show` — both are genuinely Jest test-double
+  strings (`"test-cron-secret"`, `"test-api-key"`, `"client-secret-456"`),
+  not real credentials. No overly broad allowlist entries found.
 
-## Manual code review (spot-checked against spec.md, not just trusted changes.md)
+## Not independently exercised (environment limitation, not a gap in the diff)
 
-- `tests/e2e/support/fixtures.ts`: `seedSong`, `seedSyntheticUser`,
-  `TeardownIds` extensions, and `teardownFixtures` ordering all match the
-  spec's field-by-field description (unique song title generator, synthetic
-  user's `clerk_id`/`email` shape, FK-safe teardown order, and the guarding
-  comment on `userIds` never receiving `FIXTURE` ids).
-- `tests/e2e/support/google.ts`: no `lib/`/`app/` imports (confirmed via
-  read); `toGoogleEventId` and `encryptE2EToken` are byte-for-byte consistent
-  with `lib/google-calendar/sync.ts` / `lib/google-calendar/token-crypto.ts`
-  (now also machine-verified by the new unit test, not just read-verified).
-- `tests/e2e/setlist-publish.spec.ts`: both tests match the spec's numbered
-  steps, including the two-buttons-named-Publish disambiguation
-  (`toHaveCount(2)` then `.last()`), the exact zero-song notification body
-  string (em dash), and `notificationLinkEntityIds` guarded by
-  `setlistId ? [setlistId] : []` so teardown is safe even if setlist creation
-  fails.
-- `tests/e2e/setlist-duplicate-song.spec.ts`: matches spec — 201 then 409 with
-  the exact error/code, `setlist_songs` row-count assertion, UI `Added`+
-  disabled assertion, role restore as the first `finally` statement.
-- `tests/e2e/calendar-sync.spec.ts`: matches spec — invitation seeded
-  `accepted` before the event (BR-10-safe timestamps), attendee-POST as the
-  create-propagation trigger, `expect.poll` (not `waitForTimeout`) for both
-  create and update propagation, fully failure-tolerant `finally` (each step
-  independently try/caught) with both app-side DELETE and a direct Google
-  delete fallback, `googleTokenUserIds` teardown.
-- `.github/workflows/ci.yml`: the five new secrets are appended to the `e2e`
-  job's existing `env:` block only; `check-secrets` gate on `STAGING_APP_URL`
-  is unchanged.
-- `documentation/staging-environment.md`: five new secrets documented in the
-  §7 table (each marked optional/skips-when-absent) plus a new §7.1 with the
-  human setup steps (shared OAuth client, one-time consent flow,
-  `E2E_TOKEN_ENCRYPTION_KEY` must equal staging's, `E2E_GOOGLE_CALENDAR_ID`
-  default, "Testing" publishing-status refresh-token-expiry caveat).
-- Confirmed no changes touch `app/`, `lib/`, `schemas/`, `components/`, or
-  `supabase/migrations/` (`git status`/`git diff --stat` show only `tests/`,
-  `.github/workflows/ci.yml`, `documentation/staging-environment.md`, and
-  `.pipeline/` changed — scope matches the spec's "tests only" constraint).
+- The two OPEN QUESTION items (Vercel's actual HTTP→HTTPS redirect behavior
+  on a deployed URL; Dependabot actually running on GitHub) are explicitly
+  post-merge human-action items per the spec and were not — and could not be
+  — exercised from this sandbox.
+- `bun run test:e2e` was not re-run: no `STAGING_APP_URL`/Clerk/E2E secrets
+  are configured in this sandbox (same limitation prior pipeline runs in this
+  repo have hit), and this issue's scope doesn't touch any E2E-covered flow.
+  Not required by this issue's spec.
+- A live end-to-end HTTP round-trip against a running `next dev`/`next start`
+  server (to see the `content-security-policy`/`Strict-Transport-Security`
+  headers on an actual HTTP response, as opposed to the in-process handler
+  test added above) was not performed — this repo's E2E harness needs real
+  Clerk credentials to boot the app (`clerkMiddleware` throws without a
+  publishable/secret key pair), which are not present in this sandbox. The
+  `tests/unit/middleware.test.ts` added by this stage exercises the same
+  handler code path in-process instead, which is the closest substitute
+  available without those credentials.
 
-## Not independently exercised (as the spec anticipated)
+## Failure case coverage summary (per AGENTS.md's Testing-stage requirement)
 
-- `calendar-sync.spec.ts`'s actual assertions against a real Google Calendar
-  were not exercised — no `E2E_GOOGLE_*` secrets exist in this environment
-  (by design; §7.1 requires human provisioning). Verified instead that it
-  skips cleanly, which is the correct behavior in this state, per spec OPEN
-  QUESTION 2.
-- `setlist-publish.spec.ts` / `setlist-duplicate-song.spec.ts` against real
-  staging (no `E2E_ADMIN_EMAIL`/staging secrets in this environment either) —
-  same treatment: verified clean skip, matching the established issue #52
-  precedent this repo already relies on for the rest of the authenticated E2E
-  suite.
+- `clerkFrontendApiOrigin` invalid-input failure cases: covered by the
+  coder's `tests/unit/lib/security/csp.test.ts` (undefined, empty string,
+  non-`pk_` string, garbage base64, invalid decoded host) — re-verified
+  green.
+- `check-git-secrets.mjs` failure cases: fake-secret-in-history, shallow
+  clone, and non-git-directory all covered by this stage's new test file
+  above, each independently confirmed to exit 1 with the expected message.
+- `middleware.ts`: no distinct failure-mode branch exists in this handler
+  beyond the auth redirect (which the spec explicitly says is out of scope
+  to test — "that redirect response carries no CSP header... state it in a
+  comment so it doesn't read as a bug" — not a code path the tester needs to
+  assert on).
 
-## Verdict
-
-No product bugs found. No failing tests. All checks the spec and changes.md
-called for are green, including the one new test file this stage was
-responsible for adding. Ready for Review.
+No product bugs found. No failing tests. Ready for Review.
