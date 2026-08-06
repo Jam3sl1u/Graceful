@@ -6,8 +6,14 @@ import { z } from "zod";
 export const createServiceWeekSchema = z.object({
   serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD"),
   title: z.string().trim().min(1).max(100),
-  sermonTopic: z.string().trim().min(1),
-  sermonScripture: z.string().trim().min(1),
+  // service_weeks.sermon_topic is a `text` column (no DB-level cap), so this
+  // is an app-layer limit. 200 matches the repo's "short titled text"
+  // convention (songs.title, song_documents.name).
+  sermonTopic: z.string().trim().min(1).max(200),
+  // service_weeks.sermon_scripture is a `text` column (no DB-level cap), so
+  // this is an app-layer limit. 200 matches the repo's "short titled text"
+  // convention (songs.title, song_documents.name).
+  sermonScripture: z.string().trim().min(1).max(200),
   speakerName: z.string().trim().min(1).max(100),
 });
 
@@ -22,8 +28,14 @@ export const updateServiceWeekSchema = z
       .regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD")
       .optional(),
     title: z.string().trim().min(1).max(100).optional(),
-    sermonTopic: z.string().trim().min(1).optional(),
-    sermonScripture: z.string().trim().min(1).optional(),
+    // service_weeks.sermon_topic is a `text` column (no DB-level cap), so
+    // this is an app-layer limit. 200 matches the repo's "short titled text"
+    // convention (songs.title, song_documents.name).
+    sermonTopic: z.string().trim().min(1).max(200).optional(),
+    // service_weeks.sermon_scripture is a `text` column (no DB-level cap), so
+    // this is an app-layer limit. 200 matches the repo's "short titled text"
+    // convention (songs.title, song_documents.name).
+    sermonScripture: z.string().trim().min(1).max(200).optional(),
     speakerName: z.string().trim().min(1).max(100).optional(),
   })
   .refine((v) => Object.keys(v).length > 0, "at least one field required");

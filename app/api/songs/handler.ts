@@ -6,6 +6,7 @@ import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import { createSongSchema, songSearchQuerySchema, isValidSongKey } from "@/schemas/songs";
+import { escapePostgrestFilterValue } from "@/lib/api/postgrest";
 
 export type SongResponse = {
   id: string;
@@ -69,7 +70,8 @@ export async function listSongs(req: NextRequest, lookup?: UserLookup): Promise<
       .eq("church_group_id", ctx.churchGroupId);
 
     if (q) {
-      query = query.or(`title.ilike.%${q}%,artist.ilike.%${q}%`);
+      const escaped = escapePostgrestFilterValue(q);
+      query = query.or(`title.ilike."%${escaped}%",artist.ilike."%${escaped}%"`);
     }
 
     const { data, error } = await query.order("title", { ascending: true });

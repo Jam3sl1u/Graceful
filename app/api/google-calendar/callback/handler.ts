@@ -7,6 +7,7 @@ import type { Database } from "@/lib/supabase/types";
 import { exchangeCode } from "@/lib/google-calendar/oauth";
 import { encryptToken } from "@/lib/google-calendar/token-crypto";
 import { syncAllEventsForUser } from "@/lib/google-calendar/sync";
+import { googleCalendarCallbackQuerySchema } from "@/schemas/google-calendar";
 
 const STATE_COOKIE = "gcal_oauth_state";
 const CONNECTED_PATH = "/profile?calendar=connected";
@@ -33,10 +34,13 @@ export async function callback(req: NextRequest, lookup?: UserLookup): Promise<R
   try {
     const ctx = await requireAuth(req, lookup);
 
-    const searchParams = req.nextUrl.searchParams;
-    const error = searchParams.get("error");
-    const code = searchParams.get("code");
-    const state = searchParams.get("state");
+    const parsedQuery = googleCalendarCallbackQuerySchema.safeParse(
+      Object.fromEntries(req.nextUrl.searchParams),
+    );
+    if (!parsedQuery.success) {
+      return redirectError();
+    }
+    const { error, code, state } = parsedQuery.data;
 
     // User denied consent (or Google reported some other error) — nothing
     // to store.

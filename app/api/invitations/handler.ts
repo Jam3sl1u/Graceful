@@ -13,6 +13,7 @@ import {
   acceptInvitationSchema,
   respondTokenParamSchema,
   listInvitationsQuerySchema,
+  invitationIdParamSchema,
 } from "@/schemas/invitations";
 import type { EventType, InvitationStatus } from "@/types/domain";
 import { canTransition, applyTransition, canInvite, MAX_DENIALS_PER_WEEK } from "@/lib/invitations/state-machine";
@@ -282,6 +283,11 @@ export async function denyInvitation(
   lookup?: UserLookup,
 ): Promise<Response> {
   try {
+    const parsedId = invitationIdParamSchema.safeParse(id);
+    if (!parsedId.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+
     const body = await req.json().catch(() => null);
     const parsedResult = denyInvitationSchema.safeParse(body ?? {});
     if (!parsedResult.success) {
@@ -423,6 +429,11 @@ export async function withdrawInvitation(
   try {
     const ctx = await requireAuth(req, lookup);
     requireRole(ctx, ["admin", "set_leader"]);
+
+    const parsedId = invitationIdParamSchema.safeParse(id);
+    if (!parsedId.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
 
     const { getToken } = await auth();
     const jwt = await getToken({ template: "supabase" });
