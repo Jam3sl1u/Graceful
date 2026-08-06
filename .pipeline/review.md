@@ -1,232 +1,141 @@
-# Review — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
+# Review — Issue #77: [Sprint 4] Audit input validation (Zod) across all Phase 1 routes
 
-VERDICT: SHIP (after two post-review fix passes below — see "Independent
-second-pass review" for the pass that confirmed this; original run below is
-historical)
+VERDICT: SHIP
 
-## Independent second-pass review (2026-08-04)
+Reviewed: `.pipeline/spec.md`, `.pipeline/changes.md`, `.pipeline/test-results.md`,
+`git diff main...HEAD`, the six untracked new test files, and the surrounding
+source I needed to check the claims independently.
 
-An independent reviewer agent re-audited the whole branch (not just the fix
-commit) with fresh eyes, specifically checking whether the first fix pass
-introduced any new bug and re-deriving the `getByText` fixes against the
-actual component source rather than trusting the commit message. Findings:
-
-- Confirmed both original BLOCKING items are genuinely fixed — re-derived
-  independently against `app/(app)/setlists/[id]/setlist-builder.tsx` and
-  `app/(app)/member-week/[id]/member-week-view.tsx`, each now resolves to
-  exactly one element.
-- Found a **real regression introduced by the first fix pass**: moving
-  `adminContext.close()`/`memberContext.close()`/`leaderContext.close()` into
-  `finally` made `teardownFixtures` (the DB cleanup) unreachable if the
-  `.close()` call itself threw, since nothing after a throw in the same
-  `finally` block runs — a change from the pre-fix behavior, where
-  `teardownFixtures` was the sole `finally` statement and always ran. Fixed
-  by wrapping each cleanup step in its own `try`/`catch` (mirroring
-  `calendar-sync.spec.ts`'s existing failure-tolerant pattern), so a failed
-  `.close()` (or, in `setlist-duplicate-song.spec.ts`, a failed role restore)
-  no longer blocks the steps after it.
-- Found a latent version of the *same* strict-mode bug class at
-  `setlist-publish.spec.ts:72` (`getByText("Draft")`, non-exact, at a point
-  where the full staging song catalog is rendered) — added `{ exact: true }`
-  for consistency/robustness.
-- Found the "five secrets gate the skip" inaccuracy (the same class just
-  fixed in `documentation/staging-environment.md`) also present in
-  `.github/workflows/ci.yml`'s e2e-job comment and
-  `tests/e2e/calendar-sync.spec.ts`'s header comment — both corrected to
-  "four" with `E2E_GOOGLE_CALENDAR_ID` called out as separate from the gate.
-- Swept every other `getByText`/`getByRole` call across the three new specs
-  against the actual rendered DOM — no further collisions found.
-- Checked the whole diff for the network-beaconing pattern from this repo's
-  prior rogue-commit incident — no unexpected hosts; `tests/e2e/support/google.ts`
-  only calls `oauth2.googleapis.com` and `www.googleapis.com`, no secrets are
-  logged, and scope is unchanged (`tests/`, `.github/workflows/ci.yml`,
-  `documentation/staging-environment.md`, `.pipeline/` only).
-- Independently re-ran `bun run lint`, `bun run typecheck`, and `bun run
-  test` — all green (82 suites / 1051 tests).
-
-All fixes from this pass were applied; re-verified again after applying them
-(`lint`, `typecheck`, `test`: 1051/1051, `test:e2e`: 1 passed / 10 skipped,
-same shape). Two informational (non-actionable) notes from this pass, kept
-here for a future reader's awareness rather than as blockers:
-- `setlist-publish.spec.ts` now keeps two browser contexts open
-  concurrently (admin stays open while the member context signs in) — an
-  unproven-but-plausible-safe pattern in this suite (contexts have isolated
-  cookie jars); no other spec does this yet.
-- `setlist-duplicate-song.spec.ts` is the first spec depending on DB-only
-  role elevation granting RLS write access; this only works today because
-  `auth_user_role()` falls back to the DB when the JWT has no `role` claim —
-  worth remembering if Clerk custom-claim sync (#5/#6) ever changes that.
-
-## Post-review fix pass (2026-08-04, first pass)
-
-Applied targeted fixes for MUST FIX items #1 and #2 below, plus NON-BLOCKING
-items #4 and #5 (item #3 was already resolved on the branch before this
-pass). This was a direct fix pass in response to this review's own findings,
-not a fresh independent run of the Review stage — see "Independent
-second-pass review" above for the pass that actually re-verified it.
-
-- **#1/#2** (`getByText` strict-mode collisions): added `{ exact: true }` to
-  `tests/e2e/setlist-publish.spec.ts:94`, `:189` (`"Published"`), and `:133`
-  (`"Confirmed"`) — the same option already used for every `getByRole(...,
-  { name, exact: true })` call in these specs.
-- **#4** (`try`/`finally` scope): hoisted `adminContext`/`memberContext`
-  (`setlist-publish.spec.ts`, both tests) and `leaderContext`
-  (`setlist-duplicate-song.spec.ts`) to `let` declarations above `try`, and
-  moved their `.close()` calls into the existing `finally` blocks, matching
-  `calendar-sync.spec.ts`'s established pattern. In
-  `setlist-duplicate-song.spec.ts`, `.close()` was placed *after* the
-  `setMemberRole(svc, "member")` restore, preserving the file's documented
-  "restore role as the first `finally` statement" invariant (safe only
-  because the suite is serialized, per the top-of-file comment).
-- **#5** (doc mislabel): reworded `documentation/staging-environment.md` §7's
-  `E2E_GOOGLE_CALENDAR_ID` row and the §7.1 intro paragraph — it is not part
-  of `GOOGLE_SYNC_VARS`/the skip gate, it only sets the default calendar id.
-
-Re-verified after the fixes: `bun run lint`, `bun run typecheck`, `bun run
-test` (82 suites / 1051 tests, unchanged), and `bun run test:e2e` (1 passed /
-10 skipped, same shape as the original run, no new failures). See
-`.pipeline/test-results.md`'s "Post-review fix pass" section for details.
-
-## Why (original BLOCK verdict)
-
-The deliverable of this issue *is* the tests. Two of the four new specs
-(`tests/e2e/setlist-publish.spec.ts`, both tests) contain assertions that are
-**guaranteed to fail** the moment a human provisions the staging secrets — they
-are Playwright strict-mode violations, not flakiness. Everything green so far
-(lint / typecheck / 1051 Jest tests / "10 skipped, 1 passed" E2E run) only
-proves the specs *skip* cleanly; nothing in the pipeline exercised a single
-assertion inside them. This is exactly the "green tests are not correct
-behavior" case.
-
-I independently re-ran, in this worktree (`node_modules` was missing, so I ran
-`bun install --frozen-lockfile` first):
-
-| Check | Result |
-|---|---|
-| `bun run typecheck` | PASS |
-| `bun run lint` | PASS |
-| `bun run test` | PASS — 82 suites / 1051 tests |
-| `bun run test:e2e` (no secrets) | 1 passed, 10 skipped — new specs skip cleanly, no collect-time errors |
-
-and I empirically reproduced both failures below with a real Chromium +
-Playwright `expect` against the exact DOM the components render.
-
-## MUST FIX (blocking)
-
-### 1. `getByText("Published")` resolves to 2 elements — both tests fail
-`tests/e2e/setlist-publish.spec.ts:94` and `tests/e2e/setlist-publish.spec.ts:189`
-
-`getByText(string)` defaults to `exact: false`, which is **case-insensitive
-substring** matching (`playwright-core` builds `internal:text="Published"i`).
-In the published state `app/(app)/setlists/[id]/setlist-builder.tsx` renders
-both:
-
-- the badge `<Badge>Published</Badge>` (line 398), and
-- the locked banner `<p>This setlist is published and locked for editing.</p>`
-  (line 404) — which contains "published".
-
-Reproduced verbatim:
+## Independently re-run verification
 
 ```
-Error: strict mode violation: getByText('Published') resolved to 2 elements:
-    1) <span>Published</span> aka getByText('Published', { exact: true })
-    2) <p>This setlist is published and locked for editing.</p>
+bun run lint       # clean
+bun run typecheck  # clean
+bun run test       # 88 suites / 1099 tests, all passing
 ```
 
-Fix: `getByText("Published", { exact: true })` (or scope to the header/badge).
-Note test A asserts the locked-banner sentence on line 92, so both elements are
-provably on the page at that point; test B renders the same banner after
-publishing.
+1099 − 1051 = 48 new cases, which matches the per-file count I did by hand
+(8 + 8 + 12 + 7 + 7 + 6). The Testing stage's numbers are honest.
 
-### 2. `getByText("Confirmed")` resolves to 2 elements — test A fails
-`tests/e2e/setlist-publish.spec.ts:133`
+## Does the code match the spec?
 
-`app/(app)/member-week/[id]/member-week-view.tsx` renders the `Confirmed`
-badge (line 100 via `confirmationBadge`) **and**, when the team list is empty,
-`<p>No confirmed team yet</p>` (line 262). The team list is derived from
-`event_attendees` (`app/api/service-weeks/[id]/member-view/handler.ts:224`),
-and this test creates no events — so the team is *always* empty here and the
-"No confirmed team yet" paragraph is *always* present. Case-insensitive
-substring matching makes `getByText("Confirmed")` match both.
+Yes, exactly, and nothing beyond it. `git diff main...HEAD --stat` touches only
+the nine files the spec's "Files touched" list names, plus the two `.pipeline/`
+artifacts. I checked each of the four changes against the spec text:
 
-Fix: `getByText("Confirmed", { exact: true })` (whole-string, case-sensitive —
-"No confirmed team yet" then no longer matches).
+- **Change 1 (PostgREST injection)** — `lib/api/postgrest.ts` is pure, has no
+  `server-only` import, and escapes `\` *before* `"`, which is the ordering that
+  actually matters (quote-first would turn a trailing `\"` into `\\"`, leaking an
+  unescaped quote). `listSongs` wraps both `ilike` terms in double quotes and
+  passes the escaped value. I grepped `app/**` and `lib/**` for `.or(`,
+  `.filter(`, `.ilike(`, `.like(`, `textSearch`, and backtick-templates passed to
+  `select/eq/in/match/order` — the fixed line in `app/api/songs/handler.ts:74` is
+  the only interpolation site in either tree. AC 3 holds.
+- **Change 2 (unbounded strings)** — the three caps are in place with the
+  rationale comments; no pre-existing limit was altered. I re-ran the audit
+  myself: `grep 'z\.string()' schemas/*.ts` minus `.max()`/`uuid`/`datetime`/
+  `regex`/`email`/`url` leaves only `schemas/availability.ts` `date`/`startDate`/
+  `endDate`, and those are constrained to 10 chars in practice by
+  `isValidDateString`'s `^\d{4}-\d{2}-\d{2}$` in the `superRefine`. So the
+  "everything else is bounded" claim holds for string fields.
+- **Change 3 (OAuth callback query schema)** — `safeParse` +
+  `Object.fromEntries(searchParams)`, failure returns `redirectError()`, never
+  `fail(...)`. I traced the whole function: the `null` → `undefined` change for
+  absent params is harmless (`if (error)` and `if (!code || !state)` behave
+  identically), and `?code=` empty-string still lands on the same redirect (now
+  via `min(1)` instead of the falsy guard). The `state` cap of 512 is safe —
+  `connect/handler.ts` mints `randomBytes(32).toString("base64url")`, i.e. 43
+  chars. Nothing anywhere still imports the deleted `googleCalendarSchema` /
+  `GoogleCalendarInput` (grepped repo-wide).
+- **Change 4 (invitation `:id`)** — `denyInvitation` validates first inside the
+  `try`, which does cover both the token and in-app branches;
+  `withdrawInvitation` validates after `requireAuth`/`requireRole`, so 401/403
+  still precede 400.
+- **Change 5 (audit record)** — I machine-diffed the inventory table against
+  `find app/api -name route.ts`: **57 files listed, 57 files on disk, exact
+  match, no omissions**. The `notImplemented` claim checks out (10 stub files:
+  5 notifications, 4 webhooks, `GET /api/church-group`). The RPC list matches
+  `grep -o 'rpc("[a-z_]*"'` exactly — same 12, no more, no fewer. The coder also
+  corrected the spec's own "58 files" estimate to the real 57 and said so.
 
-While fixing 1 and 2, sweep the rest of the new specs for the same class of
-bug. I checked the others: `"Draft"`, `"1 song"`, `"0 songs"`, the two modal
-sentences, `"No songs added yet"`, `"Setlist not yet released"` and the
-`getByRole(... exact: true)` locators are all unambiguous on the pages as
-rendered today, but adding `exact: true` to the short, badge-like strings is
-the cheap way to keep them that way.
+## Are the tests meaningful?
 
-### 3. The Testing stage's own new test file is not committed
-`tests/unit/e2e-support/google.test.ts` is **untracked** (`git status` shows
-`?? tests/unit/e2e-support/google.test.ts`), and `.pipeline/test-results.md` is
-modified but uncommitted. That file is a real deliverable (the spec explicitly
-assigned it to the Testing stage, and it is the only thing preventing silent
-drift between `tests/e2e/support/google.ts` and `lib/google-calendar/`). It
-must be committed before the PR, or the drift guard ships as nothing.
+Mostly yes, and several are genuinely adversarial rather than decorative:
 
-## SHOULD FIX (non-blocking)
+- `tests/unit/lib/api/postgrest.test.ts` includes the backslash-before-quote
+  ordering case, which is the one case a naive implementation gets wrong. That
+  test would fail if someone "simplified" the two `.replace()` calls into the
+  wrong order.
+- `songs-search-injection-tester-supplement.test.ts` doesn't just assert a
+  string equality — it regex-parses the emitted filter, asserts exactly two
+  `ilike` clauses, and asserts that reversing the escaping recovers `q` byte for
+  byte. That is a real breakout test.
+- `service-weeks`/`events` schema tests cover both sides of the boundary (200/201,
+  2000/2001) plus a 2MB payload, and confirm `min(1)`/`nullish()`/`optional()`
+  were not disturbed.
+- `google-calendar-callback-validation-*` proves `exchangeCode` is never reached
+  and that the response is a redirect with no JSON content-type.
+- `invitations-id-param-validation-*` asserts the 401 → 403 → 400 ordering on
+  withdraw and that no Supabase client / RPC is constructed on the 400 path.
 
-4. **Browser contexts are closed inside `try`, not `finally`** —
-   `tests/e2e/setlist-publish.spec.ts` (lines 96, 134, 191, 222) and
-   `tests/e2e/setlist-duplicate-song.spec.ts:74`. Spec edge case 5 explicitly
-   requires the `context.close()` calls to be in `finally`; as written, any
-   failing assertion (including the two above) leaks the context for the rest
-   of the worker. `calendar-sync.spec.ts` does this correctly — copy that
-   shape.
+One weak test, not worth blocking on: "redirects to error when error exceeds 200
+chars" passes identically before and after the change (any truthy `error` already
+short-circuited to `redirectError()`), so it does not discriminate the fix. The
+oversized-`state` test *does* discriminate, because the cookie is set to the same
+513-char value, so pre-fix it would have proceeded to `exchangeCode`.
 
-5. **`documentation/staging-environment.md` §7 table mislabels
-   `E2E_GOOGLE_CALENDAR_ID`** as "optional — `calendar-sync.spec.ts` skips when
-   absent". It is *not* in `GOOGLE_SYNC_VARS`; the spec does not skip when it is
-   absent, it defaults to `primary` (the same row then says so, contradicting
-   itself). Drop the "skips when absent" clause on that one row.
+## Findings
 
-## What is good (verified, not taken on trust)
+### Must do before merge (process, not code)
 
-- Scope is respected: the feature commit touches only `tests/`,
-  `.github/workflows/ci.yml`, `documentation/staging-environment.md` and
-  `.pipeline/`. No `app/`, `lib/`, `schemas/`, `components/`, or
-  `supabase/migrations/` changes — confirmed against `git show --stat 9cb333b`.
-  (The larger `main...HEAD` diff is the already-merged #64/#65 work, not this
-  issue.)
-- Gating is correct: `REQUIRED_VARS` untouched; `googleSyncEnabled` via
-  `checkEnv(GOOGLE_SYNC_VARS)`; both `test.skip(...)` calls are the first
-  statement in their `describe`; verified all four new tests skip with no
-  import-time errors.
-- Fixture helpers match the DB: `songs` (`created_by` FK, `default_key
-  varchar(5)`), `users` (`clerk_id varchar(50)` — the 46-char synthetic id
-  fits; `anonymized_at` exists via `20260710000001_member_removal_rpc.sql`),
-  `google_calendar_tokens` (`is_valid` added by
-  `20260716000001_google_calendar_sync.sql`). Teardown order is FK-safe and the
-  `userIds` branch is correctly fenced with a comment.
-- `tests/e2e/support/google.ts` duplicates match their sources byte-for-byte
-  (`encryptToken` format `iv:authTag:ciphertext`, 12-byte IV, 32-byte key;
-  `toGoogleEventId`), imports nothing from `lib/`/`app/`, and never logs a
-  token or secret. The tester's `google.test.ts` machine-verifies both against
-  the real `lib/` implementations — genuinely meaningful coverage, not
-  superficial.
-- API contract assertions are right: `POST /api/service-weeks/:id/setlist`
-  asserted via `res.ok()` (200-or-201 get-or-create), `POST
-  /api/setlists/:id/songs` 201 then 409 `{ error, code: "CONFLICT" }` matching
-  `app/api/setlists/[id]/handler.ts:344/362` and `lib/api/response.ts`,
-  `POST /api/events` 201 / `POST /api/events/:id/attendees` 201, `PUT
-  /api/events/:id` accepts the partial body (`updateEventSchema` is all-optional).
-- `calendar-sync.spec.ts` is well constructed: attendee-POST as the real
-  create-propagation trigger, BR-10-safe timestamps, `expect.poll` (never
-  `waitForTimeout`) for both create and update, `summary`/`location`/
-  `start.dateTime` assertions that match `upsertCalendarEvent`'s payload
-  (`lib/google-calendar/sync.ts:81`), and a fully failure-tolerant `finally`
-  with both app-side DELETE and a direct Google delete.
-- The OPEN QUESTION 1 resolution (assert notification recipients, not read
-  visibility) is correctly reasoned and correctly documented in the spec header
-  comment; it does not paper over the AC/behavior mismatch.
+1. **The six new test files are untracked.** `git status` shows
+   `tests/unit/lib/api/postgrest.test.ts`,
+   `tests/unit/schemas/service-weeks.test.ts`,
+   `tests/unit/schemas/events-notes-max-tester-supplement.test.ts`,
+   `tests/unit/app/api/songs-search-injection-tester-supplement.test.ts`,
+   `tests/unit/app/api/google-calendar-callback-validation-tester-supplement.test.ts`,
+   `tests/unit/app/api/invitations-id-param-validation-tester-supplement.test.ts`
+   as `??`, and `.pipeline/test-results.md` as modified. The only commit on this
+   branch (`7f22d48`) contains **none** of the Testing stage's tests. Commit them
+   before opening/updating the PR or the entire test deliverable is lost.
 
-## Re-review scope
+### Non-blocking, worth a human's eyes
 
-Fix items 1–3 (and ideally 4–5), re-run `bun run lint`, `bun run typecheck`,
-`bun run test`, `bun run test:e2e`, and re-submit. Note that items 1 and 2
-still cannot be proven green without staging secrets — the reviewer's
-reproduction above is the evidence, so the fix should be locator-level and
-obviously correct by inspection.
+2. **The PostgREST quoting fix is verified only against mocks.** Every test
+   asserts on the *string handed to a jest mock* `.or()`; nothing in this repo
+   exercises `title.ilike."%…%"` against a live PostgREST. The syntax is correct
+   per PostgREST's reserved-character rules (double-quoted values, `\"` and `\\`
+   escapes inside them, `%`/`*` wildcard handling unaffected by quoting), and
+   `tests/integration/rls/` has no song-search coverage to extend cheaply. Still:
+   if this form were rejected, `GET /api/songs?q=…` would 500 in production and
+   the green unit suite would not notice. Suggest one manual `curl` against a dev
+   Supabase before merge, or a follow-up integration test.
+3. **`denyInvitation` now returns 400 before 401/403 on the in-app branch.** The
+   spec mandated this ordering (it is the only way to cover the tokenless branch
+   with one check), but it inverts the "auth before validate" convention the same
+   spec lists in its own patterns table and that `withdrawInvitation` follows. No
+   information is disclosed — the id is entirely caller-supplied — so this is a
+   consistency nit, not a security issue. Flagging it so it is a conscious choice.
+4. **`Object.fromEntries(searchParams)` takes the last duplicate; `.get()` took
+   the first.** A `?code=a&code=b` now resolves to `b` instead of `a`. Both are
+   schema-bounded and Google does not send duplicates, so impact is nil, but it is
+   a real (undocumented) behavior delta introduced by this diff.
+5. **Audit gap the record does not mention: unbounded array cardinality.**
+   `reorderSetlistSchema.songs` is `z.array(...)` with no `.max()`, unlike
+   `setAvailabilitySchema.entries` (`.min(1).max(400)`), which sets the repo
+   precedent. Practical impact is limited — `PUT /api/setlists/:id` rejects any
+   body whose song set does not exactly match the stored setlist, so an oversized
+   array 400s before the per-row update loop — but a validation *audit* should say
+   so rather than be silent. Suggest adding a line to the audit record or filing a
+   follow-up alongside the already-documented blanket-`:id` gap.
+6. **`.max(200)` on `sermonTopic`/`sermonScripture` is a tightening on live data.**
+   Nothing in `app/`/`components/` renders these fields yet (grepped), so there is
+   no client/server `maxLength` mismatch, but any pre-existing row over 200 chars
+   would now fail a PUT. Low risk for a Sprint-4 app; noted for completeness.
+
+## Bottom line
+
+The diff is small, correct, matches the spec line for line, and the audit record
+is the rare kind that survives being machine-checked against the repo. Items 3–6
+are observations for a human, not defects. Item 1 is the only thing that has to
+happen before this ships.
