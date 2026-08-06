@@ -131,7 +131,17 @@ checklist items, recorded in the new documentation file per the spec).
   against a scratch repo with a committed `.env` file; exits 1 (with the
   shallow-clone message) against a `--depth 1` clone.
 - `bun run typecheck`, `bun run lint`, `bun run test` (1064 tests, 83 suites,
-  including the 13 new CSP tests), `bun run format:check` — all pass.
+  including the 13 new CSP tests) — all pass.
+- `bun run format:check` — **fails repo-wide, but pre-existing and out of
+  scope for this issue**: 79 files fail Prettier on this branch, none of
+  them touched by this change (confirmed by running `prettier --check` on
+  only the 10 files this issue adds/modifies — all pass — and by
+  `git stash`-ing this issue's diff and re-running `format:check` against
+  unmodified `origin/main`, which fails on 80 pre-existing files, i.e. the
+  same drift minus the one file — `README.md` — this issue happens to touch
+  and which was reformatted as a side effect of editing it). Not fixed here
+  per AGENTS.md's no-scope-creep rule; every file this issue actually
+  changed is individually Prettier-clean.
 - `bun run build` — succeeds when Clerk env vars are present (confirms the
   `next.config.ts` `headers()` shape is valid). Note: `bun run build` fails
   in this sandbox both before and after this change (`Missing publishableKey`
