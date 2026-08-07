@@ -63,7 +63,16 @@ from `app/api/profile/handler.ts` / `route.ts`).
   out-of-range `reminderHoursBefore` (0, 169, 1.5, string), unknown-key
   stripping, missing JWT (401, no Supabase client built), and DB error (500).
 
-## Verification
+### `documentation/staging-environment.md` (modified)
+Added the five new secrets to §7's table (each marked "optional —
+`calendar-sync.spec.ts` skips when absent"), a note that the setlist specs
+need no secrets beyond the existing seven, and a new **§7.1 Google Calendar
+E2E (issue #66)** subsection with the human setup steps (dedicated Google
+test account + same OAuth client as staging, one-time consent flow for
+`calendar.events` scope with `access_type=offline`/`prompt=consent`,
+`E2E_TOKEN_ENCRYPTION_KEY` must equal staging's `TOKEN_ENCRYPTION_KEY`,
+`E2E_GOOGLE_CALENDAR_ID` defaults to `primary`, and the "Testing" OAuth
+publishing-status refresh-token-expiry caveat).
 
 - `bun run lint` — clean.
 - `bun run typecheck` — clean.
