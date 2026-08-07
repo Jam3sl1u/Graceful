@@ -7,7 +7,15 @@ export const metadata: Metadata = {
   description: "Scheduling, setlist, and music coordination for worship teams.",
   applicationName: "Graceful",
   appleWebApp: { capable: true, title: "Graceful", statusBarStyle: "default" },
-  icons: { icon: [{ url: "/icons/icon.svg", type: "image/svg+xml" }] },
+  icons: {
+    icon: [{ url: "/icons/icon.svg", type: "image/svg+xml" }],
+    // Explicit metadata.icons suppresses Next's automatic file-convention
+    // merge of app/apple-icon.tsx, so it must be linked here manually.
+    apple: [{ url: "/apple-icon", sizes: "180x180", type: "image/png" }],
+  },
+  // appleWebApp.capable only emits name="mobile-web-app-capable" in this
+  // Next version; iOS Safari also needs the apple-prefixed tag.
+  other: { "apple-mobile-web-app-capable": "yes" },
 };
 
 export const viewport: Viewport = {

@@ -19,7 +19,6 @@ export default function AppleIcon() {
           background: "#4f46e5",
           color: "#ffffff",
           fontSize: 108,
-          fontWeight: 700,
         }}
       >
         G
