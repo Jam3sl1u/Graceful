@@ -1,10 +1,10 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { getNotificationPreferences, updateNotificationPreferences } from "./handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/notifications/preferences");
+export async function GET(req: NextRequest): Promise<Response> {
+  return getNotificationPreferences(req);
 }
 
-export async function PUT(_req: NextRequest) {
-  return notImplemented("PUT /api/notifications/preferences");
+export async function PUT(req: NextRequest): Promise<Response> {
+  return updateNotificationPreferences(req);
 }

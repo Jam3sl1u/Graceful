@@ -209,6 +209,25 @@ type NotificationsRow = {
   created_at: string;
 };
 
+// Added for #70 (notification preferences API).
+// chat_preference is deliberately omitted: it is a Phase 2 chat concern and the
+// `ChatPref` union in types/domain.ts does not match the DB enum
+// chat_pref ('all','mentions'). Omitting it from the Insert payload means the
+// column keeps its value on update and its DB default on insert.
+type NotificationPreferencesRow = {
+  id: string;
+  user_id: string;
+  invitation_sms: boolean;
+  invitation_email: boolean;
+  invitation_inapp: boolean;
+  reminder_sms: boolean;
+  reminder_email: boolean;
+  reminder_hours_before: number;
+  setlist_sms: boolean;
+  setlist_email: boolean;
+  gcal_sync_enabled: boolean;
+};
+
 // Added for #61 (Google Calendar OAuth connect/disconnect).
 // is_valid added for #62 (event sync): flips to false when a refresh is
 // revoked/expired (invalid_grant), reset to true on reconnect.
@@ -421,6 +440,12 @@ export type Database = {
         Update: Partial<NotificationsRow>;
         Relationships: [];
       };
+      notification_preferences: {
+        Row: NotificationPreferencesRow;
+        Insert: Omit<NotificationPreferencesRow, "id"> & { id?: string };
+        Update: Partial<NotificationPreferencesRow>;
+        Relationships: [];
+      };
       google_calendar_tokens: {
         Row: GoogleCalendarTokensRow;
         Insert: Omit<GoogleCalendarTokensRow, "id" | "created_at" | "updated_at" | "is_valid"> & {
@@ -552,6 +577,20 @@ export type Database = {
       flag_calendar_token_invalid: {
         Args: { p_user_id: string };
         Returns: boolean;
+      };
+      provision_guest_user: {
+        Args: { p_email: string; p_name: string };
+        Returns: UsersRow;
+      };
+      claim_guest_invitation: {
+        Args: { p_response_token: string; p_name: string | null };
+        Returns: {
+          user_id: string;
+          church_group_id: string;
+          invitation_id: string;
+          service_week_id: string;
+          already_claimed: boolean;
+        };
       };
     };
     Enums: {

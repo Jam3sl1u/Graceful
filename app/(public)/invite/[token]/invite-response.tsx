@@ -85,6 +85,7 @@ export default function InviteResponse({ token }: { token: string }) {
     null,
   );
   const [invitation, setInvitation] = useState<Lookup | null>(null);
+  const [serviceWeekId, setServiceWeekId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showDeclineForm, setShowDeclineForm] = useState(false);
@@ -114,6 +115,7 @@ export default function InviteResponse({ token }: { token: string }) {
         }
 
         const data: Lookup = body.data;
+        setServiceWeekId(data.serviceWeek.id);
         if (isUnavailableReason(data.status)) {
           setUnavailableReason(data.status);
           setView("unavailable");
@@ -228,6 +230,10 @@ export default function InviteResponse({ token }: { token: string }) {
     }
   }
 
+  // /dashboard is admin/set_leader-only; most invitees are members, so send
+  // them to their own week view instead once we know which week that is.
+  const appLink = serviceWeekId ? `/member-week/${serviceWeekId}` : "/dashboard";
+
   if (view === "loading") {
     return (
       <main className={styles.container}>
@@ -254,7 +260,7 @@ export default function InviteResponse({ token }: { token: string }) {
           ✓
         </p>
         <h1>{view === "accepted-success" ? "You're on the schedule" : "Response recorded"}</h1>
-        <a className={styles.appLink} href="/dashboard">
+        <a className={styles.appLink} href={appLink}>
           Go to the app
         </a>
       </main>

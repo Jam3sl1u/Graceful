@@ -9,6 +9,7 @@ export const isPublicRoute = createRouteMatcher([
   "/sign-up(.*)",
   "/join(.*)",
   "/invite(.*)",
+  "/guest(.*)",
   "/api/health",
   "/api/webhooks(.*)",
   "/api/invitations/(.*)/accept",
