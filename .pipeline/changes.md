@@ -8,7 +8,7 @@ Implemented the read-only Admin Global Dashboard (PRD wireframe screen 8,
 No changes to existing endpoints, handlers, RLS/migrations, or
 `app/(app)/week/**`, per the spec's scope guard.
 
-## Files changed
+## New files
 
 - **`schemas/service-weeks.ts`** (modified, append-only) — added
   `serviceWeekStatusFilters` / `ServiceWeekStatusFilter` and

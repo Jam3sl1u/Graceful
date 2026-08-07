@@ -20,6 +20,7 @@ type ServiceWeekSummary = {
 type DirectoryMember = {
   id: string;
   name: string;
+  role: string;
 };
 
 type WeekInvitation = {
@@ -142,6 +143,28 @@ function getRosterStatus(
   return { label: "Open", tone: "neutral", showInvite: true };
 }
 
+// Status label for a guest's invitation card (#72) — simpler than
+// getRosterStatus (no conflict/showInvite concerns, just "what state is
+// this guest's invitation in").
+function getGuestStatusLabel(
+  status: InvitationStatus,
+): { label: string; tone: "neutral" | "success" | "warning" | "danger" } {
+  switch (status) {
+    case "accepted":
+      return { label: "Confirmed", tone: "success" };
+    case "pending":
+      return { label: "Pending", tone: "warning" };
+    case "denied":
+      return { label: "Declined", tone: "neutral" };
+    case "withdrawn":
+      return { label: "Withdrawn", tone: "neutral" };
+    case "expired":
+      return { label: "Expired", tone: "neutral" };
+    default:
+      return { label: status, tone: "neutral" };
+  }
+}
+
 // Finds the prev/next neighbor week ids from the full list (ordered by
 // serviceDate desc, matching GET /api/service-weeks). Index 0 is the
 // newest/furthest-future week, so the neighbor before it (idx - 1) is the
@@ -172,6 +195,11 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [invitingMemberId, setInvitingMemberId] = useState<string | null>(null);
   const [inviteError, setInviteError] = useState<string | null>(null);
+  const [guestEmail, setGuestEmail] = useState("");
+  const [guestRoleNote, setGuestRoleNote] = useState("");
+  const [invitingGuest, setInvitingGuest] = useState(false);
+  const [guestInviteError, setGuestInviteError] = useState<string | null>(null);
+  const [guestAccountSetupUrl, setGuestAccountSetupUrl] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -320,6 +348,75 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
     }
   }
 
+  // Invites a guest (4th role, #72) by email — the account-creation link (for
+  // a brand-new guest) is only surfaced here until #68 sends it by email.
+  async function handleInviteGuest(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (invitingGuest) return;
+    setInvitingGuest(true);
+    setGuestInviteError(null);
+    setGuestAccountSetupUrl(null);
+
+    try {
+      const trimmedNote = guestRoleNote.trim();
+      const res = await fetch("/api/invitations/guest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          serviceWeekId,
+          email: guestEmail,
+          roleNote: trimmedNote.length > 0 ? trimmedNote : undefined,
+        }),
+      });
+
+      const body = await res.json();
+
+      if (!res.ok) {
+        setGuestInviteError(body?.error ?? "Something went wrong inviting the guest. Please try again.");
+        return;
+      }
+
+      const created = body.data.invitation;
+      setInvitations((prev) => [
+        ...prev,
+        {
+          id: created.id,
+          serviceWeekId: created.serviceWeekId,
+          userId: created.userId,
+          roleNote: created.roleNote,
+          status: created.status,
+          responseDeadline: created.responseDeadline,
+          createdAt: created.createdAt,
+        },
+      ]);
+
+      if (body.data.isNewUser === true) {
+        setGuestAccountSetupUrl(body.data.accountSetupUrl);
+      }
+
+      // Refresh the directory so the new guest appears in the Guests
+      // section immediately, instead of only after a manual reload.
+      try {
+        const membersRes = await fetch(`/api/church-group/members`);
+        if (membersRes.ok) {
+          const membersBody = await membersRes.json();
+          setMembers(membersBody.data.members);
+        }
+      } catch {
+        // Non-critical: the accountSetupUrl feedback above already confirms
+        // the invite succeeded; the directory just won't refresh until the
+        // next load.
+      }
+
+      setGuestEmail("");
+      setGuestRoleNote("");
+    } catch {
+      setGuestInviteError("Something went wrong inviting the guest. Please try again.");
+    } finally {
+      setInvitingGuest(false);
+    }
+  }
+
   if (view === "loading") {
     return (
       <main className={styles.container}>
@@ -360,6 +457,16 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
   const conflictInvitationIds = new Set(conflicts.map((c) => c.invitationId));
   const availabilityWindow = getAvailabilityWindow(week.serviceDate);
   const memberNameById = new Map(members.map((m) => [m.id, m.name]));
+  // Guests never occupy a music-roster slot (#72) — split the directory so
+  // the roster grid only ever shows non-guest members.
+  const rosterMembers = members.filter((m) => m.role !== "guest");
+  const guestEntries = members
+    .filter((m) => m.role === "guest")
+    .map((member) => ({ member, invitation: getCurrentInvitation(member.id, invitations) }))
+    .filter(
+      (entry): entry is { member: DirectoryMember; invitation: WeekInvitation } =>
+        entry.invitation !== undefined,
+    );
 
   return (
     <main className={styles.container}>
@@ -405,11 +512,11 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
                 {inviteError}
               </p>
             ) : null}
-            {members.length === 0 ? (
+            {rosterMembers.length === 0 ? (
               <p>No members yet</p>
             ) : (
               <div className={styles.rosterGrid}>
-                {members.map((member) => {
+                {rosterMembers.map((member) => {
                   const status = getRosterStatus(member.id, invitations, conflictInvitationIds);
                   return (
                     <div key={member.id} className={styles.rosterSlot}>
@@ -434,6 +541,66 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
                 })}
               </div>
             )}
+          </section>
+
+          <section className={styles.card}>
+            <h2>Guests</h2>
+            {guestInviteError ? (
+              <p role="alert" className={styles.error}>
+                {guestInviteError}
+              </p>
+            ) : null}
+            {guestEntries.length === 0 ? (
+              <p>No guests invited for this week yet</p>
+            ) : (
+              <div className={styles.rosterGrid}>
+                {guestEntries.map(({ member: guest, invitation }) => {
+                  const guestStatus = getGuestStatusLabel(invitation.status);
+                  return (
+                    <div key={guest.id} className={styles.rosterSlot}>
+                      <span className={styles.avatar} aria-hidden="true">
+                        {getInitials(guest.name)}
+                      </span>
+                      <span className={styles.memberName}>{guest.name}</span>
+                      <Badge tone={guestStatus.tone}>{guestStatus.label}</Badge>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <form className={styles.guestForm} onSubmit={handleInviteGuest}>
+              <h3>Invite a guest</h3>
+              <div className={styles.guestFormRow}>
+                <input
+                  type="email"
+                  required
+                  placeholder="Guest email"
+                  value={guestEmail}
+                  onChange={(e) => setGuestEmail(e.target.value)}
+                  aria-label="Guest email"
+                />
+                <input
+                  type="text"
+                  placeholder="Role note (optional)"
+                  value={guestRoleNote}
+                  onChange={(e) => setGuestRoleNote(e.target.value)}
+                  aria-label="Role note"
+                />
+                <Button variant="secondary" type="submit" disabled={invitingGuest}>
+                  {invitingGuest ? "Inviting…" : "Invite guest"}
+                </Button>
+              </div>
+            </form>
+
+            {guestAccountSetupUrl ? (
+              <p>
+                This guest needs this link to create their account (until email delivery is
+                available, #68):
+                <br />
+                <span className={styles.guestSetupUrl}>{guestAccountSetupUrl}</span>
+              </p>
+            ) : null}
           </section>
 
           <section className={styles.card}>

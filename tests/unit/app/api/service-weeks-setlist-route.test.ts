@@ -84,7 +84,7 @@ const DEFAULT_FIXTURES: Record<string, TableFixture> = {
     select: { data: publishedSetlistRow, error: null },
   },
   invitations: {
-    select: { data: { id: "invitation-1" }, error: null },
+    select: { data: [{ id: "invitation-1" }], error: null },
   },
   service_weeks: {
     select: { data: weekRow, error: null },
@@ -93,10 +93,13 @@ const DEFAULT_FIXTURES: Record<string, TableFixture> = {
 
 // Generic chainable mock covering:
 //   .select(...).eq(...).eq(...).maybeSingle()
+//   .select(...).eq(...).eq(...).in(...).limit(1)  (guestHasWeekAccess, #72; awaited directly)
 //   .insert(...).select(...).maybeSingle()
 function makeChain(result: QueryResult) {
   const chain: Record<string, unknown> & PromiseLike<QueryResult> = {
     eq: jest.fn(() => chain),
+    in: jest.fn(() => chain),
+    limit: jest.fn(() => chain),
     select: jest.fn(() => chain),
     maybeSingle: jest.fn(() => Promise.resolve(result)),
     then: (resolve: (value: QueryResult) => unknown, reject?: (reason: unknown) => unknown) =>
