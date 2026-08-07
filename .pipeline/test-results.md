@@ -1,123 +1,125 @@
-# Test Results — Issue #72: Guest invitation flow (existing vs. new user)
+# Test Results — Issue #74: Admin Global Dashboard screen
 
 ## Verdict: PASS
 
-All verification commands pass, both as originally claimed by the Coding
-stage and after re-running them independently, plus after adding two new
-supplemental test files (below) that close gaps left by the coder's own
-mocks.
+All checks pass. The coder's claims in `.pipeline/changes.md` were independently
+verified rather than trusted: every changed/new file was read against
+`.pipeline/spec.md`, the full verification suite was re-run from scratch, and
+11 new independent tests were added covering spec-named edge cases and failure
+paths not exercised by the coder's own test files.
 
-```
-bun run lint             -> clean (0 errors, 0 warnings)
-bun run typecheck         -> clean
-bun run test              -> 87 suites, 1091 tests, all passing
-bun run check:service-role -> OK: no service-role key references outside comments
-```
+## Commands re-run independently
 
-(1084 tests / 85 suites were the coder's; +7 tests / +2 suites are new,
-added below.)
+- `bun run lint` — clean (no errors/warnings).
+- `bun run typecheck` (`tsc --noEmit`) — clean.
+- `bun run test` (full Jest suite) — **86 suites / 1083 tests, all passing**
+  (84 suites / 1072 tests from the coder's changes, plus 2 new tester-supplement
+  files / 11 tests added in this stage — see below).
 
-## What I independently verified
+## Code review against spec.md
 
-- **Migration SQL** (`supabase/migrations/20260805000001_guest_invitation_flow.sql`,
-  not run by CI): read in full and diffed `accept_invitation`'s body against
-  the prior `20260712000001` version — confirmed it is byte-for-byte
-  identical except the added guest branch (declares `v_invitee_role`, looks
-  up the invitee's role, and skips the `event_attendees` insert /
-  `GET DIAGNOSTICS` when `role = 'guest'`, else the original insert runs
-  unchanged). Confirmed `claim_guest_invitation`'s step order exactly matches
-  the spec's numbered list: auth -> resolve by token -> lock row -> idempotent
-  re-claim -> anonymized check -> already-claimed check (`pending_guest_`
-  prefix / role) -> claimability check (`pending`/`accepted`) ->
-  already-in-group check -> update (never touches `email`) -> direct
-  `audit_logs` insert -> return. Confirmed `provision_guest_user`'s caller
-  check (UNAUTHENTICATED / FORBIDDEN), global `EMAIL_TAKEN` check, and the
-  `pending_guest_<32 hex>` clerk_id construction/length (46 chars, fits
-  `varchar(50)`).
-- **Handler code** (`app/api/invitations/handler.ts`,
-  `app/api/service-weeks/[id]/member-view/handler.ts`,
-  `app/api/service-weeks/[id]/handler.ts`,
-  `app/api/service-weeks/[id]/setlist/handler.ts`, `app/api/events/handler.ts`,
-  `lib/invitations/guest-access.ts`, `schemas/invitations.ts`,
-  `lib/supabase/types.ts`, `middleware.ts`,
-  `app/(app)/week/[id]/week-view.tsx`, `app/(public)/guest/[token]/*`): read
-  every changed file and confirmed each matches its corresponding spec
-  section line-for-line (existing-vs-new-user branch, BR-08/BR-05 reuse,
-  orphan-cleanup-on-insert-failure, `guestHasWeekAccess` semantics and its
-  four call sites, the guest-filtered `team` query, the `"/guest(.*)"`
-  middleware addition — confirmed it does NOT also match
-  `/api/invitations/guest` or `/api/invitations/guest/claim`, since
-  `createRouteMatcher` anchors from the path start and those paths begin with
-  `/api`, not `/guest`).
-- Confirmed the existing coder-written test suites
-  (`tests/unit/lib/invitations/guest-access.test.ts`,
-  `tests/unit/app/api/invitations-guest-route.test.ts`,
-  `tests/unit/app/api/invitations-guest-claim-route.test.ts`, and the guest
-  additions to `tests/unit/app/api/service-weeks-member-view-route.test.ts`)
-  cover every case the spec's "Tests the coder must add" section names.
+Read and compared against the spec line-by-line:
+- `schemas/service-weeks.ts` — append-only addition of
+  `serviceWeekStatusFilters`/`ServiceWeekStatusFilter` and
+  `serviceWeeksOverviewQuerySchema` with the exact `.superRefine` validation
+  rules specified (invalid calendar date via `isValidDateString`,
+  `startDate > endDate`); `createServiceWeekSchema`/`updateServiceWeekSchema`
+  untouched. Matches spec exactly.
+- `app/api/service-weeks/overview/handler.ts` — matches the spec's order of
+  operations (auth → role gate → query parse → JWT → weeks query → zero-weeks
+  short-circuit → setlists → invitations (explicit columns, no `select("*")`)
+  → conflicts → aggregate). Aggregation rules (latest-invitation-wins,
+  `withdrawn` excluded from both numerator/denominator, orphaned-conflict
+  ignored) match the spec's "exact — the tests assert these" section.
+- `app/api/service-weeks/overview/route.ts` — thin GET wrapper, matches
+  `app/api/availability/team/route.ts` shape.
+- `app/(app)/dashboard/admin-dashboard.tsx` — state machine, fetch/cancelled
+  guard, URL building (`status` always set, dates only when non-empty),
+  403/400/error/success handling, and render branches (badges, fill-rate
+  text, empty-list message, filter controls with labelled inputs) all match
+  the spec verbatim, including copy text or the four view-state branches.
+- `app/(app)/dashboard/admin-dashboard.module.css` — `.container` widened to
+  860px as specified; reuses existing CSS custom properties only.
+- `app/(app)/dashboard/page.tsx` — placeholder replaced with the server
+  wrapper, mirrors `conflicts/page.tsx`.
+- No changes to `app/(app)/week/**`, existing endpoints, handlers, or
+  migrations — scope guard respected (confirmed only the files listed in
+  `changes.md` were touched).
 
-## Gap found and closed: two new supplemental test files
+## Independent verification: coder's own new tests
 
-The coder's own fixtures for `createGuestInvitation` and `listEvents` use
-pass-through `.eq()`/`.is()`/`.in()` mocks that ignore their arguments and
-always return the same canned fixture regardless of what was actually
-queried. That means a regression in the *query shape itself* — e.g. the
-existing-user lookup forgetting to filter by `church_group_id` or
-`anonymized_at`, or the guest-only `.in("status", GUEST_ACCESS_STATUSES)`
-filter in `app/api/events/handler.ts` silently being dropped — would not have
-been caught by the existing suite (the fixture would still be returned
-either way). I wrote two new suites that record the actual arguments passed
-and assert on them, following this repo's established
-`*-tester-supplement.test.ts` pattern:
+- `tests/unit/app/api/service-weeks-overview-route.test.ts` (13 tests) — ran
+  in isolation, all pass. Covers 401 (no user)/403 (member, guest)/401 (no
+  JWT)/400 (bad date, start>end, bad status)/zero-weeks short-circuit (asserts
+  `setlists`/`invitations`/`conflicts` never queried)/happy-path aggregation
+  (fill rate, latest-invitation-wins, withdrawn exclusion, null setlist,
+  orphaned conflict ignored, no `response_token`/`denial_reason` leak)/
+  status=active/status=cancelled filter wiring/inclusive date bounds/500 on
+  `service_weeks` and `conflicts` errors. All assertions independently
+  re-checked against the spec's aggregation rules by hand — correct.
+- `tests/unit/app/admin-dashboard.test.tsx` (7 tests) — ran in isolation, all
+  pass. Covers loading, happy path (fill rate, all three publish badges,
+  cancelled badge, singular/plural conflict badges, untitled-service
+  fallback, card href), empty list, Status-select re-fetch, 403 forbidden,
+  network-error, and 400-with-inline-alert-and-usable-filters. Confirmed the
+  noted `Badge` `class="undefined undefined"` jsdom quirk is pre-existing and
+  unrelated to this change (text-content assertions unaffected).
 
-- `tests/unit/app/api/invitations-guest-route-tester-supplement.test.ts`
-  - existing-user lookup is scoped by `church_group_id`, the invited
-    (lowercased) email, and excludes anonymized users.
-  - an email belonging to a user in a *different* group is invisible to that
-    lookup and correctly falls through to the new-user/provisioning branch
-    (edge case 2 from spec.md).
-  - `EMAIL_TAKEN` from `provision_guest_user` maps to 409 CONFLICT with an
-    error message that never mentions "group" (no cross-tenant leak).
-- `tests/unit/app/api/events-route-guest-scoping-tester-supplement.test.ts`
-  - `member`/`set_leader` callers do NOT get a `.in("status", ...)` filter
-    (any invitation status still counts for them, unchanged).
-  - a `guest` caller's invitations query is filtered with exactly
-    `.in("status", GUEST_ACCESS_STATUSES)`.
-  - (failure/edge case) a guest whose only invitation for a week is `denied`
-    sees zero events for that week, and the `events` table is never even
-    queried once the guest has no accessible weeks.
+## New tests added this stage (independent verification, not just re-running the coder's suite)
 
-**I verified these new tests actually catch regressions**, not just that
-they pass: I temporarily reverted the `.is("anonymized_at", null)` +
-`church_group_id` filter in the existing-user lookup, and separately removed
-the guest-only `.in("status", GUEST_ACCESS_STATUSES)` branch in
-`app/api/events/handler.ts`, and confirmed each corresponding new test failed
-as expected. Both files were then restored to their original (coder-shipped)
-content — `git status` / `git diff --stat` confirm zero changes to any
-source file, only the two new test files are new/untracked.
+Per AGENTS.md, this stage must independently verify claims rather than trust
+them. Two new test files were added to close gaps the coder's own tests left
+open, all of which pass against the as-shipped code:
 
-## Manual/logical review of UI (no dedicated tests required by spec)
+### `tests/unit/app/api/service-weeks-overview-route-tester-supplement.test.ts` (8 tests)
+- Tie-break rule: when two invitation rows for the same member/week share the
+  exact same `created_at`, the **first-encountered** row wins (not the last)
+  — verified against the spec's "replace only when strictly greater" wording,
+  which the coder's suite didn't test directly (its tie scenario used
+  differing timestamps).
+- Single-bound date filtering: `startDate` alone calls `.gte` and never
+  `.lte`; `endDate` alone calls `.lte` and never `.gte` (spec edge case 7 —
+  the coder's suite only tested both bounds supplied together).
+- `status=all` (default) never adds an `is_cancelled` filter at all (as
+  opposed to just checking `active`/`cancelled` add the right filter).
+- Invitations query selects the exact explicit column list
+  (`"id, service_week_id, user_id, status, created_at"`) and never a `"*"` —
+  a direct check on the `select()` call argument, stronger than the coder's
+  "no response_token in the JSON response" check (that alone wouldn't catch
+  a `select("*")` that got mapped away in code but still traveled over the
+  wire in a real DB round trip).
+- **Failure cases** the coder's suite didn't cover: 500 INTERNAL when the
+  `setlists` query errors, 500 INTERNAL when the `invitations` query errors
+  (spec edge case 11 says "any of the four queries" — coder only tested
+  `service_weeks` and `conflicts`), and a rejected `getToken()` promise is
+  still caught by the outer `try/catch` and returns a clean 500 without
+  leaking the raw error message.
 
-- `app/(app)/week/[id]/week-view.tsx`: `rosterMembers`/`guestEntries` split
-  is derived correctly from `members.filter(role)`; `guestEntries` further
-  filters to only guests with a `getCurrentInvitation` match, so an
-  uninvited guest member never shows a card. `handleInviteGuest` posts the
-  correct body shape and surfaces `accountSetupUrl` only when
-  `isNewUser === true`, matching spec item 12.
-- `app/(public)/guest/[token]/page.tsx` + `guest-claim-form.tsx`: signed-out
-  branch renders sign-up/sign-in links with a correctly `encodeURIComponent`-ed
-  `redirect_url` back to `/guest/:token`; signed-in renders the claim form;
-  the form POSTs the exact body shape `claimGuestInvitationSchema` expects
-  and links to `/invite/:token` on success.
+### `tests/unit/app/admin-dashboard-tester-supplement.test.tsx` (3 tests)
+- `startDate`/`endDate` are appended to the fetch URL incrementally and
+  independently as each field is set (not just "both present" as the coder's
+  suite implicitly exercised via the Status filter only).
+- A failure on a **re-fetch** (after a prior successful load already
+  rendered data) correctly replaces the screen with the error state rather
+  than leaving stale data visible — the coder's error-branch test only
+  covered failure on the very first load.
+- Unmounting the component while a fetch is in flight does not trigger a
+  React "setState on an unmounted component" warning/error — exercises the
+  `cancelled` guard's cleanup path, which the coder's suite never triggered
+  (`console.error` asserted not called).
 
-## Failure case coverage confirmed
+Note: an initial draft of a fourth supplement test attempted to reproduce the
+"stale in-flight response overwritten by a newer one" race by firing two
+rapid `Status` changes through the rendered `<select>`. That scenario turned
+out to be unreachable through normal UI interaction with the shipped
+component, because the view synchronously blanks to the `"loading"` screen
+(removing the filter controls) on every filter change, before a second
+change could be fired — so a real user cannot trigger two overlapping
+requests through this UI. This is not a bug the reviewer needs to act on; it
+was replaced with the unmount-during-fetch test above, which does exercise
+the same `cancelled` guard via a path that actually is reachable.
 
-At least one genuine failure/negative case is present and passing in every
-touched area: 401/403/400/404/409/500 mappings in both guest route test
-files, `dbError: true` in `guest-access.test.ts`, guest-denied-only -> 404 in
-the member-view tests, and the two new regression-catching failure
-assertions above.
+## Result
 
-## Recommendation
-
-No blocking issues found. Ready for Review stage.
+All 86 suites / 1083 tests pass, including the 11 new independently-written
+tests. No failures to report. Proceeding to review.

@@ -1,121 +1,103 @@
-# Changes — Issue #72: Guest invitation flow (existing vs. new user)
+# Changes — Issue #74: Admin Global Dashboard screen
 
-Implements the spec in `.pipeline/spec.md` in full. `bun run lint`,
-`bun run typecheck`, `bun run test` (1084 tests, all passing), and
-`bun run check:service-role` all pass.
+## Summary
+
+Implemented the read-only Admin Global Dashboard (PRD wireframe screen 8,
+`/dashboard`): one new aggregate read endpoint
+(`GET /api/service-weeks/overview`) plus the client screen that consumes it.
+No changes to existing endpoints, handlers, RLS/migrations, or
+`app/(app)/week/**`, per the spec's scope guard.
 
 ## New files
 
-- `supabase/migrations/20260805000001_guest_invitation_flow.sql` — three
-  `SECURITY DEFINER` functions:
-  - `provision_guest_user(p_email, p_name)` — admin/set_leader-only; creates a
-    placeholder `users` row (`role='guest'`, synthetic
-    `clerk_id = 'pending_guest_' || md5(...)`) for a brand-new guest email.
-    Raises `UNAUTHENTICATED` / `FORBIDDEN` / `EMAIL_TAKEN`.
-  - `claim_guest_invitation(p_response_token, p_name)` — swaps a signed-in
-    Clerk user's real `sub` in for the placeholder's synthetic `clerk_id`.
-    Idempotent re-claim, and raises `UNAUTHENTICATED` / `NOT_FOUND` /
-    `ALREADY_CLAIMED` / `NOT_CLAIMABLE` / `USER_ALREADY_IN_GROUP`.
-  - `CREATE OR REPLACE accept_invitation(...)` — supersedes
-    `20260712000001`'s version with one added branch: a `guest`-role invitee
-    gets zero `event_attendees` rows inserted (`attendees_added: 0`), since
-    that table is the music-roster slot a guest must never occupy. Everything
-    else (status flip, notify, audit) is byte-for-byte unchanged.
-  - Not run by CI; self-consistent, `CREATE OR REPLACE` throughout.
-- `lib/invitations/guest-access.ts` — `guestHasWeekAccess()` +
-  `GUEST_ACCESS_STATUSES = ["pending", "accepted"]`. Awaited directly (never
-  `.maybeSingle()`), so a re-invited guest with multiple invitation rows for
-  the same week doesn't error.
-- `app/api/invitations/guest/route.ts`, `app/api/invitations/guest/claim/route.ts`
-  — thin route wrappers calling the two new handlers below.
-- `app/(public)/guest/[token]/page.tsx` + `guest-claim-form.tsx` — guest
-  account-setup screen. Signed-out renders sign-up/sign-in links with
-  `redirect_url` back to `/guest/:token`; signed-in renders the claim form,
-  which POSTs to `/api/invitations/guest/claim` and links to
-  `/invite/:token` on success.
-- Tests: `tests/unit/lib/invitations/guest-access.test.ts`,
-  `tests/unit/app/api/invitations-guest-route.test.ts`,
-  `tests/unit/app/api/invitations-guest-claim-route.test.ts`.
+- **`schemas/service-weeks.ts`** (modified, append-only) — added
+  `serviceWeekStatusFilters` / `ServiceWeekStatusFilter` and
+  `serviceWeeksOverviewQuerySchema` (optional `startDate`/`endDate`, `status`
+  defaulting to `"all"`), with a `.superRefine` rejecting invalid calendar
+  dates and `startDate > endDate`. `createServiceWeekSchema` /
+  `updateServiceWeekSchema` untouched.
 
-## Modified files
+- **`app/api/service-weeks/overview/handler.ts`** (new) — `getServiceWeeksOverview`.
+  Gate: `requireAuth` + `requireRole(["admin", "set_leader"])`. Query flow:
+  1. `service_weeks` filtered by group + optional date bounds + status, ordered
+     by `service_date` desc (same ordering as `listServiceWeeks`).
+  2. Short-circuits with `{ serviceWeeks: [] }` when there are zero weeks
+     (skips the three follow-up queries).
+  3. `setlists` → map of week id → status.
+  4. `invitations` (explicit columns only — `id, service_week_id, user_id,
+     status, created_at`; never `select("*")`, so `response_token` /
+     `denial_reason` never leak) → reduced to the latest row per
+     `(service_week_id, user_id)` by `created_at` (mirrors
+     `getCurrentInvitation` in `week-view.tsx`). `rosterSize` counts members
+     whose latest status is not `withdrawn`; `confirmedCount` counts those
+     whose latest status is `accepted`.
+  5. `conflicts` (`resolved_at IS NULL`) mapped to a week via the invitation
+     rows from step 4; a conflict whose invitation isn't in that map (i.e.
+     belongs to a filtered-out week) is silently ignored — no crash.
+  6. Aggregates and returns `serviceWeeks` in the step-1 order.
+  All reads go through the caller's RLS-scoped client — no service-role
+  client, no RPC, no migration.
 
-- `schemas/invitations.ts` — added `createGuestInvitationSchema` (email
-  normalized to lowercase) and `claimGuestInvitationSchema`.
-- `lib/supabase/types.ts` — hand-added `provision_guest_user` and
-  `claim_guest_invitation` to `Database["public"]["Functions"]` only (no
-  wholesale regeneration).
-- `app/api/invitations/handler.ts` — added `createGuestInvitation` and
-  `claimGuestInvitation` (+ `GuestInvitationResponse` type and a
-  module-private `appUrl()` helper). `createGuestInvitation` branches on
-  whether the invited email already belongs to a non-anonymized user in the
-  caller's group: existing-user path runs the *unchanged* BR-08/BR-05 checks
-  against that `user_id` (role untouched); new-user path calls
-  `provision_guest_user` then skips BR-08/BR-05 (a fresh row has no prior
-  invitations). On an invitation-insert failure after provisioning a new
-  guest, best-effort deletes the orphan `users` row before returning 500.
-  Leaves `// TODO(#68): dispatch the guest invitation email...` — never
-  calls `sendEmail` (still a stub on this branch per OPEN QUESTION 1).
-  `claimGuestInvitation` does not call `requireAuth` (mirrors
-  `app/api/church-group/join/route.ts`'s auth preamble) and maps RPC errors
-  to 401/404/409/409/409/500.
-- `app/api/service-weeks/[id]/member-view/handler.ts` — `requireRole` now
-  includes `"guest"`; guests get a `guestHasWeekAccess` check (404, never
-  403) right after the week lookup; the team-directory query now also
-  selects `role` and filters out `role === "guest"` rows (defense in depth
-  for a member later demoted to guest).
-- `app/api/service-weeks/[id]/handler.ts` and
-  `app/api/service-weeks/[id]/setlist/handler.ts` — replaced the inline
-  `.maybeSingle()` guest-invitation check with `guestHasWeekAccess`, fixing
-  the latent bug where a re-invited guest with 2+ invitation rows for the
-  same week would 500 instead of 200/404.
-- `app/api/events/handler.ts` — for `ctx.role === "guest"` only, added
-  `.in("status", GUEST_ACCESS_STATUSES)` to the existing per-caller
-  invitations query (member/set_leader scoping is unchanged: any status
-  still counts for them).
-- `app/(app)/week/[id]/week-view.tsx` + `.module.css` — `DirectoryMember`
-  gained `role`; the Roster grid now excludes guests; a new "Guests" section
-  lists guest members with a live invitation for the week (status badge via
-  `getGuestStatusLabel`) and an "Invite a guest" form (email + optional role
-  note) that POSTs to `/api/invitations/guest`; on a new-user response the
-  returned `accountSetupUrl` is shown as selectable text.
-- `middleware.ts` — added `"/guest(.*)"` to `isPublicRoute` (next to
-  `"/join(.*)"`); `/api/invitations/guest` and
-  `/api/invitations/guest/claim` are untouched and remain protected (path
-  doesn't match the new pattern).
-- Existing tests updated for the `guestHasWeekAccess` query-shape change:
-  `tests/unit/app/api/service-weeks-id-route.test.ts` and
-  `service-weeks-setlist-route.test.ts` (invitations fixture is now an array
-  + chain gained `.in()`/`.limit()`), and
-  `tests/unit/app/api/service-weeks-member-view-route.test.ts` (users rows
-  gained `role`; replaced the old "403 for guest" test with a `guest role`
-  describe block covering accepted→200, denied-only→404, no-invitation→404,
-  access-check DB error→500, and guest-filtered-out-of-team).
-- `.pipeline/spec.md` — the Planning stage's spec for this run (was
-  previously issue #66's spec still on disk, uncommitted before this run
-  started); included in this commit since it's the git-tracked handoff
-  artifact for this run.
+- **`app/api/service-weeks/overview/route.ts`** (new) — thin `GET` wrapper,
+  same shape as `app/api/availability/team/route.ts`.
 
-## Where the Tester should focus
+- **`app/(app)/dashboard/admin-dashboard.tsx`** (new, client component) —
+  `AdminDashboard`. State machine (`loading` / `ready` / `forbidden` /
+  `error`) copied from `conflicts-list.tsx`, plus `startDate`/`endDate`/
+  `status`/`filterError` state. `useEffect` keyed on the three filters, with
+  the `cancelled` guard so a stale response can't overwrite a newer one.
+  Fetches `/api/service-weeks/overview` with `status` always set and
+  `startDate`/`endDate` appended only when non-empty. `403` → forbidden;
+  `400` → stays `ready` with `weeks: []` and an inline `role="alert"` message
+  (filters remain usable); other failures → `error`. Renders `From`/`To`/
+  `Status` filter controls, and per-week cards linking to `/week/{id}` with
+  the publish badge (`Published` / `Draft` / `No setlist`), a `Cancelled`
+  badge when applicable, the roster fill line (`No one invited yet` when
+  `rosterSize === 0`, else `"N of M confirmed"`), and an open-conflict badge
+  (singular/plural) when `openConflictCount > 0`.
 
-- The three new/changed RPCs in the migration file are **not exercised by
-  CI** (per spec, "not executed by CI") — the Jest suite mocks
-  `supabase.rpc(...)` at the boundary, so RPC *behavior* (SQL logic) is only
-  verified by reading the migration, not by a passing test run. Worth a
-  careful read of `claim_guest_invitation`'s ordering (lock → idempotent
-  check → anonymized check → already-claimed check → claimability check →
-  already-in-group check → update → audit) against the spec's numbered
-  steps.
-- `createGuestInvitation`'s existing-vs-new-user branch and the orphan
-  cleanup path (delete-on-insert-failure) are the most intricate parts of
-  the handler — see the dedicated tests in
-  `tests/unit/app/api/invitations-guest-route.test.ts`.
-- The `guestHasWeekAccess` semantics (`pending`/`accepted` grant access;
-  everything else 404s) are shared across four call sites — worth
-  double-checking `app/api/events/handler.ts`'s query-builder branch (typed
-  as a mutable `let` reassigned only for guests) didn't regress
-  member/set_leader scoping.
-- UI changes in `week-view.tsx` have no new dedicated tests (not required by
-  spec) but the existing `week-view.test.tsx` / `week-view-tester-supplement.test.tsx`
-  suites still pass unmodified — worth a manual sanity check of the new
-  "Guests" section and invite-a-guest form if the Tester wants UI coverage
-  beyond what's already there.
+- **`app/(app)/dashboard/admin-dashboard.module.css`** (new) — based on
+  `conflicts-list.module.css` (`.container` widened to `860px`), plus
+  `.filters` / `.filterField` / `.cardMeta`.
+
+- **`app/(app)/dashboard/page.tsx`** (modified) — replaced the 4-line
+  placeholder with the server component wrapper rendering `AdminDashboard`,
+  mirroring `app/(app)/conflicts/page.tsx`.
+
+- **`tests/unit/app/api/service-weeks-overview-route.test.ts`** (new) — 401
+  (no Clerk user, lookup never consulted), 403 for `member`/`guest`, 401
+  (missing JWT), 400 (invalid date, `startDate > endDate`, unknown `status`),
+  zero-weeks short-circuit (asserts the three follow-up tables are never
+  queried), happy-path aggregation (asserts fill rate, latest-invitation-wins
+  for a re-invited member, a `withdrawn` invitation excluded from both
+  numerator and denominator, `setlistStatus: null` for a week with no setlist
+  row, and an orphaned conflict ignored without crashing), `status=active` /
+  `status=cancelled` filter wiring, inclusive `gte`/`lte` date-bound wiring,
+  and 500 on both a `service_weeks` and a `conflicts` query error. Uses the
+  chainable `makeChain` mock pattern from
+  `service-weeks-member-view-route.test.ts`.
+
+- **`tests/unit/app/admin-dashboard.test.tsx`** (new, jsdom) — loading state,
+  happy path (fill rate `"5 of 7 confirmed"`, `Published`/`Draft`/`No setlist`
+  badges, `Cancelled` badge, singular/plural open-conflict badges,
+  `"No one invited yet"`, `"Untitled service"` title fallback, card `href`),
+  empty-list message, Status-select change re-fetching with
+  `status=cancelled` in the URL, the 403 forbidden branch, the network-error
+  branch, and the 400 branch (inline alert text, filter controls still
+  rendered, list falls back to the empty-list message).
+
+## Notes for the Tester
+
+- A pre-existing, unrelated environment quirk: `components/ui/Badge.tsx`
+  renders `class="undefined undefined"` under the current Jest CSS-module
+  mock in this jsdom test environment (verified via a standalone repro
+  render of `<Badge>` outside this screen's code) — text content and
+  `toBeInTheDocument()` assertions are unaffected and were used throughout;
+  this is not something introduced by this change and is out of scope for
+  issue #74.
+- The Status `<select>`'s `"Cancelled"` option text collides with the
+  `Cancelled` badge's text in `getByText` queries — the test disambiguates
+  with `within(card)`.
+- Verification run: `bun run lint`, `bun run typecheck`, and `bun run test`
+  (84 suites / 1072 tests) all pass, including the 21 new tests across the
+  two new test files.
