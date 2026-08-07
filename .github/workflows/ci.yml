@@ -94,12 +94,20 @@ jobs:
     runs-on: ubuntu-latest
     # Only runs when staging (#13) is provisioned and its secrets are
     # configured — otherwise skipped, not failed (issue #52, OQ4). Exercises
-    # the invitation accept/deny/reminder and conflict-detection E2E flows
+    # the invitation accept/deny/reminder and conflict-detection E2E flows,
+    # plus the setlist publish and Google Calendar sync flows (issue #66),
     # against the real staging deployment: a real Clerk test-mode instance
     # (via @clerk/testing, OQ1) plus the staging Supabase project
     # (service-role client for seed/teardown only — see tests/e2e/support/).
-    # Does NOT add a Vercel deploy step (documentation/staging-environment.md
-    # §3): Vercel's Git integration owns staging deploys entirely.
+    # calendar-sync.spec.ts additionally gates itself on the four
+    # GOOGLE_SYNC_VARS secrets below (documentation/staging-environment.md
+    # §7.1) and skips (not fails) when any is absent, same pattern as the
+    # rest of the suite gating on e2eAuthEnabled. E2E_GOOGLE_CALENDAR_ID
+    # (also below) is not part of that gate — it only sets which calendar
+    # the spec targets, defaulting to "primary" when unset. Does NOT add a
+    # Vercel deploy step
+    # (documentation/staging-environment.md §3): Vercel's Git integration
+    # owns staging deploys entirely.
     if: needs.check-secrets.outputs.has-e2e-secrets == 'true'
     env:
       STAGING_APP_URL: ${{ secrets.STAGING_APP_URL }}
@@ -110,6 +118,11 @@ jobs:
       E2E_SUPABASE_URL: ${{ secrets.E2E_SUPABASE_URL }}
       E2E_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.E2E_SUPABASE_SERVICE_ROLE_KEY }}
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      E2E_TOKEN_ENCRYPTION_KEY: ${{ secrets.E2E_TOKEN_ENCRYPTION_KEY }}
+      E2E_GOOGLE_CLIENT_ID: ${{ secrets.E2E_GOOGLE_CLIENT_ID }}
+      E2E_GOOGLE_CLIENT_SECRET: ${{ secrets.E2E_GOOGLE_CLIENT_SECRET }}
+      E2E_GOOGLE_REFRESH_TOKEN: ${{ secrets.E2E_GOOGLE_REFRESH_TOKEN }}
+      E2E_GOOGLE_CALENDAR_ID: ${{ secrets.E2E_GOOGLE_CALENDAR_ID }}
     steps:
       - uses: actions/checkout@v4
 

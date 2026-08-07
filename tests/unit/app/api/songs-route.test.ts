@@ -183,7 +183,7 @@ describe("GET /api/songs", () => {
 
     const fromResult = client.from.mock.results[0]!.value;
     const selectChain = fromResult.select.mock.results[0]!.value;
-    expect(selectChain.or).toHaveBeenCalledWith("title.ilike.%amaz%,artist.ilike.%amaz%");
+    expect(selectChain.or).toHaveBeenCalledWith('title.ilike."%amaz%",artist.ilike."%amaz%"');
   });
 
   it("treats an empty q as no filter", async () => {

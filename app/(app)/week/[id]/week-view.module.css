@@ -93,6 +93,27 @@
   margin: 0 0 1rem;
 }
 
+.guestForm {
+  margin-top: 1rem;
+}
+
+.guestFormRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.guestSetupUrl {
+  display: inline-block;
+  word-break: break-all;
+  user-select: all;
+  font-family: monospace;
+  background: #f3f4f6;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+}
+
 .sidebar {
   width: 320px;
   flex-shrink: 0;
