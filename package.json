@@ -6,6 +6,7 @@
   "overrides": {
     "brace-expansion": "^5.0.9",
     "js-yaml": "^3.15.1",
+    "nanoid": "^3.3.17",
     "postcss": "^8.5.12",
     "sharp": "^0.35.0"
   },
@@ -22,7 +23,8 @@
     "test:rls": "jest --config jest.config.integration.js",
     "test:e2e": "playwright test",
     "check:service-role": "node scripts/check-service-role.mjs",
-    "check:workflows": "node scripts/check-workflows.mjs"
+    "check:workflows": "node scripts/check-workflows.mjs",
+    "check:git-secrets": "node scripts/check-git-secrets.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1105.0",

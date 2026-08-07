@@ -1,137 +1,223 @@
-# Test Results — Issue #75: [Sprint 4] PWA manifest & install prompt
+# Test Results — Issue #78: [Sprint 4] Run infrastructure security pass (HTTPS, CSP, secret scan)
 
-This overwrites the stale `test-results.md` for issue #65 that was still
-sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
-recent run).
+## Fix-pass verdict: ALL PASS (BLOCK from `.pipeline/review.md` resolved)
 
-## Verdict: PASS, with one flagged finding for Review
+Re-verified end-to-end after the fix pass described in `.pipeline/changes.md`
+(root-layout `force-dynamic`, `check-git-secrets.mjs` fixes, recreated test
+files, branch rebased onto current `main`):
 
-All automated checks pass (lint/typecheck/test/build), independently re-run and matching
-the Coder's claims in `changes.md`. No failing test to stop the pipeline on. However,
-manual verification against a real running production build (not a physical device, so
-this **was** performable in this pipeline stage, contrary to the "manual verification"
-checklist's blanket assumption) surfaced a genuine discrepancy between the spec's stated
-intent and the actual rendered output — see "Finding" below. Recommend the Reviewer weigh
-this before shipping.
+| Check | Command | Result |
+|---|---|---|
+| Typecheck | `bun run typecheck` | PASS |
+| Lint | `bun run lint` | PASS (pre-existing unrelated warning in generated `coverage/`) |
+| Unit tests | `bun run test` | PASS — **109 suites, 1315 tests** |
+| Format (touched files) | `bunx prettier --check` on every file this fix pass touched | PASS |
+| Git-history secret scan | `bun run check:git-secrets` | PASS — exit 0, clean, with widened merge-commit coverage |
+| Production build | `bun run build` (synthetic Clerk keys) | PASS — `.next/prerender-manifest.json` now lists only `/apple-icon` and `/manifest.webmanifest` (no HTML routes) |
+| Live hydration check | `bun run start` + `curl` on `/` | PASS — response `content-security-policy` nonce matches all 19 inline `<script nonce="...">` tags in the served HTML; this is the exact route/mechanism BLOCKER 1 reported broken |
 
-## Re-run verification (independent)
+`/dashboard`, `/documents`, `/notifications`, `/conflicts` could not be
+curled all the way to a hydrated page in this sandbox — Clerk's
+`auth.protect()` needs a real dev-browser JWT handshake that synthetic keys
+can't complete, so these return a 404 rewrite with no CSP header at all
+(pre-existing sandbox limitation, same one the original test-results.md
+below already flagged for `bun run test:e2e`; unrelated to and unaffected by
+this fix). What *is* directly verified for all of them: none appear in
+`.next/prerender-manifest.json` anymore, meaning Next now renders them
+per-request through the same code path proven correct on `/`.
 
-- `bun run lint` — clean. Matches the Coder's claim.
-- `bun run typecheck` — clean. Matches the Coder's claim.
-- `bun run test` — **84 suites / 1068 tests passed**, exact match to the Coder's reported
-  numbers, 0 failures. Also re-ran the 3 new PWA suites in isolation:
-  `tests/unit/lib/pwa/install.test.ts`, `tests/unit/app/manifest.test.ts`,
-  `tests/unit/app/install-prompt.test.tsx` → 3 suites / 28 tests passed.
-- `bun run build` (with throwaway well-formed dummy Clerk keys, same approach the Coder
-  used — no local `.env` in this worktree, nothing committed) — succeeds. Route list
-  confirms `○ /apple-icon` and `○ /manifest.webmanifest` as static routes, matching the
-  Coder's claim.
-- Confirmed `.next/` build output is gitignored and `git status` is clean — no build
-  artifacts or stray files were left behind by this verification.
+### New/changed test coverage
 
-## Manual/behavioral verification actually performed in this stage
+- **`tests/unit/middleware-csp.test.ts`** (new, 5 tests) — the CSP-specific
+  coverage originally described below under `tests/unit/middleware.test.ts`.
+  Renamed because `tests/unit/middleware.test.ts` was independently claimed
+  by #76's rate-limiting tests, which merged into `main` first (confirmed via
+  `git log -- tests/unit/middleware.test.ts`). Same 5 scenarios, unmodified
+  in substance: public route gets the header without `auth.protect()`;
+  protected route calls `auth.protect()` once and still gets the header; the
+  request-header nonce (spied via `NextResponse.next`) matches the response
+  header nonce; two requests get two different nonces; prod CSP excludes
+  `'unsafe-eval'`/`ws:` and includes `upgrade-insecure-requests`. 5/5 passed.
+- **`tests/unit/scripts/check-git-secrets.test.ts`** (new, 8 tests) — the
+  original 6 scenarios described below, plus 2 new cases added for this fix
+  pass: a path containing `check-git-secrets` outside `tests/` is still
+  scanned (proves the narrowed path bypass), and a value containing an
+  allowlist substring like `example` mid-string is still suppressed (locks
+  in the documented substring-match behavior). 8/8 passed.
 
-Ran `bun run start` against the production build and hit it with `curl` (no physical
-device needed for this subset of the spec's "Manual verification" checklist):
+---
 
-- `GET /manifest.webmanifest` while signed out → **200**, body matches every field in the
-  spec's table exactly (name, short_name, description, id, start_url, scope, display,
-  background_color, theme_color, both icons with `sizes: "any"`).
-- `GET /apple-icon` while signed out → **200**. Confirms E9 / the middleware change works
-  end-to-end: `middleware.ts`'s `isPublicRoute` correctly exempts both new paths, and
-  `config.matcher`/`auth.protect()` are otherwise untouched (also diff-reviewed directly).
-- `/` page source (shares the root layout/metadata with `/dashboard`) contains
-  `<link rel="manifest" href="/manifest.webmanifest">`,
-  `<meta name="theme-color" content="#4f46e5">`,
-  `<meta name="application-name" content="Graceful">`,
-  `<meta name="apple-mobile-web-app-title" content="Graceful">`, and
-  `<meta name="apple-mobile-web-app-status-bar-style" content="default">`.
-- `public/icons/icon.svg` / `icon-maskable.svg` checked numerically against spec:
-  `icon.svg` has `rx="96"` rounding and `font-size="307"` (~60% of 512, matches spec);
-  `icon-maskable.svg` has no rounding and `font-size="205"` (~40% of 512, matches the
-  maskable safe-area requirement). `app/apple-icon.tsx` renders the same mark at 180x180
-  PNG, flex-centered, no rounding, no custom font — matches spec exactly (correctly not
-  imported from Jest per spec; verified only via `bun run build` + this curl check, as the
-  spec intended).
-- Could not directly hit `/dashboard` signed-out (Clerk's dev-browser rewrite returns 404
-  for unauthenticated requests to protected routes when using dummy keys with no real
-  Clerk dev-browser cookie — pre-existing Clerk/dummy-key interaction unrelated to this
-  change, not a regression). Used `/` instead, which shares the same root layout/metadata,
-  to check the meta tags.
+## Original verdict: ALL PASS
 
-## Finding (flagged for Review — not a Jest failure, but a real behavioral gap)
+Independently re-ran every verification `.pipeline/changes.md` claimed, from a
+clean `node_modules` (this worktree had none checked out — ran `bun install`
+first), and added two new test files covering the two seams the spec/changes.md
+flagged as not yet independently exercised: `middleware.ts`'s request/response
+CSP-header plumbing, and `scripts/check-git-secrets.mjs`'s exit-code behavior
+against disposable scratch git repos.
 
-**`app/layout.tsx`'s `appleWebApp: { capable: true, ... }` does not render the
-`<meta name="apple-mobile-web-app-capable" content="yes">` tag that the spec's own manual
-verification checklist and AC-bullet-3 rationale both explicitly call for.**
+## New test files added by this stage
 
-Confirmed by inspecting the actual rendered `<head>` HTML from the production build (Next
-15.5.22, the version installed in this worktree per `node_modules/next/package.json`):
-only `<meta name="mobile-web-app-capable" content="yes">` (no `apple-` prefix) is emitted,
-alongside `apple-mobile-web-app-title` and `apple-mobile-web-app-status-bar-style`. There
-is no `apple-mobile-web-app-capable` tag anywhere in the response body.
+### `tests/unit/middleware.test.ts` (new, 5 tests)
 
-Root cause traced to `node_modules/next/dist/lib/metadata/generate/basic.js`
-(`AppleWebAppMeta`): in this installed Next version, `capable: true` is wired to emit only
-`name: 'mobile-web-app-capable'`, not the Apple-prefixed variant:
+`middleware.ts` wraps its handler in `clerkMiddleware`, so it can't be
+exercised the way a pure module can. Mocked `@clerk/nextjs/server` down to an
+identity function for `clerkMiddleware` only (`clerkMiddleware: (handler) =>
+handler`), keeping the real `createRouteMatcher` (pure route matching against
+`req.nextUrl.pathname`, no external calls), so the actual handler body in
+`middleware.ts` runs against a real `NextRequest`.
 
-```js
-function AppleWebAppMeta({ appleWebApp }) {
-    ...
-    capable ? (0, _meta.Meta)({
-        name: 'mobile-web-app-capable',
-        content: 'yes'
-    }) : null,
-```
+- **Happy path**: a public route (`/sign-in`) gets a
+  `content-security-policy` response header containing `default-src 'self'`,
+  a `script-src 'self' 'nonce-...'` token, and `frame-ancestors 'none'`,
+  without `auth.protect()` being called.
+- **Edge case (spec-named auth interaction)**: a non-public route
+  (`/dashboard`) calls `auth.protect()` exactly once and still returns a
+  response carrying the CSP header.
+- **Edge case (the plumbing changes.md specifically flagged as worth
+  checking)**: spied on `NextResponse.next` to confirm the *same* nonce that
+  ends up in the response header is also stamped onto the *request* headers
+  object passed to `NextResponse.next({ request: { headers } })` — this is
+  the mechanism the spec relies on for Next to sign its own inline scripts.
+- **Edge case**: two consecutive requests get two different CSP strings
+  (nonce uniqueness carried through the full handler, not just
+  `generateNonce()` in isolation).
+- **Edge case (dev/prod branching)**: with `NODE_ENV=production`, the
+  response CSP contains neither `'unsafe-eval'` nor `ws:`, and does contain
+  `upgrade-insecure-requests`.
 
-Why this matters: `changes.md` states `appleWebApp` "is what gives iOS the full-screen,
-no-browser-chrome launch — AC bullet 3," and the spec's own manual checklist explicitly
-targets "iOS Safari (iOS 16+)". Historically, iOS Safari's standalone-mode detection has
-relied specifically on the `apple-` prefixed tag; the un-prefixed standards-track tag is a
-comparatively recent WebKit addition. If the iOS versions in the spec's own target range
-(16+) don't yet honor the un-prefixed tag, this implementation — despite following the
-spec's `appleWebApp` API shape exactly as written — may silently fail AC bullet 3's
-full-screen launch behavior on precisely the devices the manual checklist says to test.
+Result: **5/5 passed**.
 
-This is not the Coder deviating from the spec (the spec asked for the `appleWebApp.capable`
-field, which is the correct/only Next.js public API for this); it's a gap between what the
-installed framework version actually outputs and what the spec assumed it would output —
-worth a human decision (e.g. whether to add an explicit
-`other: { "apple-mobile-web-app-capable": "yes" }` override in `app/layout.tsx`) before
-this ships. No code was modified to work around this — flagging per the pipeline contract
-for Review/human judgment rather than patching around it myself.
+### `tests/unit/scripts/check-git-secrets.test.ts` (new, 6 tests)
 
-## Everything else checked and consistent with spec/changes.md
+Integration-style test (real `git`/`node` subprocesses against disposable
+scratch repos under `os.tmpdir()`, cleaned up per-test) — the behavior under
+test (git history semantics, shallow-clone detection, exit codes) is only
+meaningfully verified end-to-end, matching the spec's own named verification
+scenarios.
 
-- `lib/pwa/install.ts`: all four exports match the spec's declared signatures and edge-case
-  rules (E3, E5, E6) exactly; existing unit tests exercise iPhone Safari, iPadOS-13+
-  spoofed-Mac-with-touch, real desktop Mac, `CriOS`/`FxiOS` exclusion, Android Chrome, and
-  both storage-throw paths (E3) — re-run and confirmed passing; manually re-verified the
-  assertions are non-tautological by reading the implementation alongside each test.
-- `components/pwa/InstallPrompt.tsx`: E1 (null on mount before the effect fires), E2
-  (standalone → no listeners/render), E4 (sticky dismissal across unmount/remount), E7
-  (single-use `prompt()` guarded via clearing `deferred` before awaiting; a rejected
-  `prompt()` still finalizes without an unhandled rejection — confirmed via a
-  `jest.fn().mockRejectedValue` test), E8 (`appinstalled` hides + marks dismissed) are all
-  covered and passing.
-- `app/manifest.ts`: exact field match to the spec's table, plus the explicit
-  `start_url`-inside-`scope` installability check (E10) the spec names.
-- `middleware.ts`: diffed against the spec's file-10 instructions — only the two new
-  entries were added to `isPublicRoute`; `config.matcher` and the `auth.protect()` call are
-  byte-for-byte unchanged. Confirmed live via curl (both new paths return 200 while signed
-  out).
-- Out-of-scope guardrails respected: no service worker, no `next-pwa`/`workbox`, no new
-  dependency (`next/og` is bundled with Next 15, not added to `package.json` — confirmed).
-- The manual-verification checklist was correctly copied verbatim into `changes.md` and
-  left unchecked, as the spec required.
+- **Happy path**: a clean scratch repo (one commit, no secrets) → exit 0,
+  stdout contains `OK:`.
+- **Failure case (spec-named)**: a scratch repo with a commit containing a
+  fake `sk_live_...` key → exit 1, stderr names the `Clerk secret key`
+  pattern, stderr does **not** contain the raw fake secret anywhere, and the
+  redaction format matches `sk_l…(len=<n>)` exactly as the script's `redact()`
+  function specifies.
+- **Edge case**: a committed `.env` file, even after being deleted in a later
+  commit, still triggers a `Committed .env file` finding (history scan, not
+  working-tree scan) → exit 1.
+- **Edge case**: a committed `.env.example` file is correctly *not* flagged →
+  exit 0.
+- **Edge case (spec-named)**: a shallow clone (`git clone --depth 1`) of a
+  2-commit repo → exit 1 with a stderr message containing "shallow",
+  regardless of whether the shallow history itself contains a secret — i.e.
+  the shallow-clone guard fires before/instead of reporting a false "clean".
+- **Failure case**: running the script outside any git working tree → exit 1
+  with a "git working tree" error message.
 
-## Files touched by this stage (Testing)
+Result: **6/6 passed**.
 
-None — no new test files were added. The Coder's existing test suite
-(`tests/unit/lib/pwa/install.test.ts`, `tests/unit/app/manifest.test.ts`,
-`tests/unit/app/install-prompt.test.tsx`) already covers the happy path, every named edge
-case, and at least one failure case (rejected `prompt()`) called for by the pipeline
-contract, and was independently re-run rather than trusted. This stage's contribution was
-re-running lint/typecheck/test/build and performing the additional live-server behavioral
-verification described above, which surfaced the finding above that unit tests alone could
-not catch.
+## Independent re-verification of the Coding stage's claims
+
+All run fresh in this worktree
+(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-78`), after `bun
+install` (node_modules was absent at the start of this stage):
+
+| Check | Command | Result |
+|---|---|---|
+| Typecheck | `bun run typecheck` | PASS — no errors |
+| Lint | `bun run lint` | PASS — no errors/warnings |
+| Unit tests (baseline, before this stage's new files) | `bun run test` | PASS — **83 suites, 1064 tests** — matches changes.md's claimed count exactly |
+| Unit tests (after this stage's 2 new test files) | `bun run test` | PASS — **85 suites, 1075 tests** (1064 + 5 middleware + 6 check-git-secrets, no regressions) |
+| Format check (repo-wide) | `bun run format:check` | FAILS — but confirmed pre-existing: same 79-file drift changes.md described, none of which are files this issue touches or the 2 files this stage added (`prettier --check` on the new test files individually passes) |
+| Format check (new test files only) | `bunx prettier --check tests/unit/middleware.test.ts tests/unit/scripts/check-git-secrets.test.ts` | PASS |
+| Git-history secret scan | `bun run check:git-secrets` | PASS — exit 0, `OK: no secrets found in git history.` against this repo's real history |
+| Production build | `bun run build` (with synthetic `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`/`CLERK_SECRET_KEY` set, since none are configured in this sandbox) | PASS — exit 0, all 37 routes + Middleware bundle produced, confirming `next.config.ts`'s `headers()` shape is valid Next.js config |
+
+## Manual review against the spec (spot-checked, not just trusted changes.md)
+
+- **`lib/security/csp.ts`**: directive order, tokens, and dev/prod branching
+  in `buildContentSecurityPolicy` match the spec's directive table exactly
+  (verified by reading the source against the table line by line, plus the
+  coder's own `tests/unit/lib/security/csp.test.ts`, which independently
+  looks correct and complete — re-ran it as part of the full suite above).
+  `clerkFrontendApiOrigin`'s prefix-strip / `atob` / `$`-split / host-regex
+  sequence matches the spec's five bullet points exactly.
+- **`middleware.ts`**: `isPublicRoute`, the `clerkMiddleware` wrapper, the
+  `auth.protect()` gate, and the exported `config` matcher are byte-for-byte
+  unchanged from what the spec said to preserve. The nonce/CSP addition
+  matches the spec's 5-step description; the redirect-short-circuit comment
+  is present and accurate. No stray `x-nonce` header (confirmed by grep).
+- **`next.config.ts`**: single `headers()` entry, exact HSTS value from the
+  spec (`max-age=63072000; includeSubDomains; preload`), `source: "/:path*"`.
+  No CSP here (correctly deferred to middleware). `reactStrictMode`,
+  `outputFileTracingRoot`, `eslint.dirs` untouched (confirmed via diff-free
+  read).
+- **`scripts/check-git-secrets.mjs`**: all 7 `PATTERNS` entries match the
+  spec's regexes verbatim, including the 20-name `SECRET_ENV_VAR_NAMES` list.
+  Both allowlists carry a `reason` per entry as required. `PATH_ALLOWLIST` is
+  narrowly scoped to the script's own path plus `check-git-secrets`-fragment
+  paths — confirmed `.pipeline/**` and `documentation/**` are NOT allowlisted
+  (grepped `PATH_ALLOWLIST`/`isAllowedPath`, only the two entries described in
+  changes.md exist). Redaction format matches spec exactly (`<first 4
+  chars>…(len=<n>)`) — confirmed with a live scratch-repo run above. The
+  deliberate no-hardcoded-`cwd` deviation from `check-service-role.mjs` is
+  real and is exactly what makes the scratch-repo test cases in this stage's
+  new test file work.
+- **`.github/workflows/ci.yml`**: new `git-secret-scan` job matches the
+  spec's YAML verbatim (`fetch-depth: 0`, `setup-bun@v2` at `1.2.x`, no `bun
+  install` step, `bun run check:git-secrets`). Every other job
+  (`checks`, `check-secrets`, `rls-integration`, `e2e`) is untouched —
+  confirmed by reading the full file (reproduced above).
+- **`.github/dependabot.yml`**: matches the spec's YAML verbatim, header
+  comment present.
+- **`README.md`**: both additions (Scripts bullet, Environments link) present
+  and match the spec's requested wording/placement; nothing else changed.
+- **`documentation/infrastructure-security.md`**: read in full — covers all
+  five spec sections (purpose/scope, HTTPS, CSP, git-history scan, Dependabot)
+  with the operator checklists as `- [ ]` items, and records the actual scan
+  run (date, commit SHA, `OK:` result) as required. The recorded commit SHA
+  (`43050470ea60ca3637c4abaf02a843aa2321e728`) is the repo HEAD immediately
+  prior to this issue's own commits, consistent with changes.md's explanation.
+- Confirmed the two `VALUE_ALLOWLIST` additions beyond the spec's seed set
+  (`"test-..."` and `"client-(id|secret)..."` regexes) by reading the actual
+  matched fixture files via `git show` — both are genuinely Jest test-double
+  strings (`"test-cron-secret"`, `"test-api-key"`, `"client-secret-456"`),
+  not real credentials. No overly broad allowlist entries found.
+
+## Not independently exercised (environment limitation, not a gap in the diff)
+
+- The two OPEN QUESTION items (Vercel's actual HTTP→HTTPS redirect behavior
+  on a deployed URL; Dependabot actually running on GitHub) are explicitly
+  post-merge human-action items per the spec and were not — and could not be
+  — exercised from this sandbox.
+- `bun run test:e2e` was not re-run: no `STAGING_APP_URL`/Clerk/E2E secrets
+  are configured in this sandbox (same limitation prior pipeline runs in this
+  repo have hit), and this issue's scope doesn't touch any E2E-covered flow.
+  Not required by this issue's spec.
+- A live end-to-end HTTP round-trip against a running `next dev`/`next start`
+  server (to see the `content-security-policy`/`Strict-Transport-Security`
+  headers on an actual HTTP response, as opposed to the in-process handler
+  test added above) was not performed — this repo's E2E harness needs real
+  Clerk credentials to boot the app (`clerkMiddleware` throws without a
+  publishable/secret key pair), which are not present in this sandbox. The
+  `tests/unit/middleware.test.ts` added by this stage exercises the same
+  handler code path in-process instead, which is the closest substitute
+  available without those credentials.
+
+## Failure case coverage summary (per AGENTS.md's Testing-stage requirement)
+
+- `clerkFrontendApiOrigin` invalid-input failure cases: covered by the
+  coder's `tests/unit/lib/security/csp.test.ts` (undefined, empty string,
+  non-`pk_` string, garbage base64, invalid decoded host) — re-verified
+  green.
+- `check-git-secrets.mjs` failure cases: fake-secret-in-history, shallow
+  clone, and non-git-directory all covered by this stage's new test file
+  above, each independently confirmed to exit 1 with the expected message.
+- `middleware.ts`: no distinct failure-mode branch exists in this handler
+  beyond the auth redirect (which the spec explicitly says is out of scope
+  to test — "that redirect response carries no CSP header... state it in a
+  comment so it doesn't read as a bug" — not a code path the tester needs to
+  assert on).
+
+No product bugs found. No failing tests. Ready for Review.

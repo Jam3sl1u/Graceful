@@ -1,0 +1,15 @@
+# This repo uses Bun exclusively (bun.lock) — per AGENTS.md, never switch the
+# JavaScript ecosystem entry below to another package manager's ecosystem
+# (e.g. "npm").
+version: 2
+updates:
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

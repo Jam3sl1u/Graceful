@@ -1,167 +1,192 @@
-# Review — Issue #75: [Sprint 4] PWA manifest & install prompt
+# Review — Issue #78: [Sprint 4] Infrastructure security pass (HTTPS, CSP, secret scan)
 
-## VERDICT: NEEDS WORK
+VERDICT: SHIP (fix pass applied — see below; original BLOCK review preserved beneath)
 
-The Android/Chrome half of this feature is solid and well tested. The **iOS half is
-broken in a way no test in this repo can see**: the generated apple-touch-icon is
-built but never referenced by any page, and the `apple-mobile-web-app-capable` tag
-the spec's own checklist requires is not emitted. Two of the issue's acceptance
-criteria (iOS home-screen icon, iOS full-screen launch) would fail on a real device
-today, with 1068/1068 tests green.
+## Fix-pass resolution
 
-Both fixes are in one file (`app/layout.tsx`) and total ~4 lines.
+Every item below was addressed and independently re-verified; see
+`.pipeline/changes.md`'s "Fix pass" section and `.pipeline/test-results.md`'s
+matching section for the full detail. Summary:
 
----
+- **BLOCKER 1 (nonce CSP breaks prerendered routes) — fixed and verified.**
+  `app/layout.tsx` now forces dynamic rendering site-wide
+  (`export const dynamic = "force-dynamic"`), which is the exact fix this
+  review suggested. Re-ran the same empirical check this review used to find
+  the bug: `bun run build` → `.next/prerender-manifest.json` no longer lists
+  any HTML route; `bun run start` + `curl /` shows the response
+  `content-security-policy` nonce matching all 19 inline
+  `<script nonce="...">` tags in the served HTML. `/dashboard` and the other
+  three authenticated routes are confirmed out of the prerender manifest
+  (same fix, same mechanism as `/`) but couldn't be curled to a fully
+  hydrated page in this sandbox — Clerk's `auth.protect()` needs a real
+  dev-browser JWT handshake unavailable with synthetic keys, a pre-existing
+  environment limitation unrelated to this fix (that response carries no CSP
+  header at all, so there's no nonce mismatch to break).
+- **BLOCKER 2 (false "renders per-request" premise) — fixed.**
+  `documentation/infrastructure-security.md`'s §3 now states the real
+  mechanism: the nonce only works for routes Next renders per-request, which
+  is why `app/layout.tsx` explicitly forces that. `middleware.ts`'s own
+  comment was re-checked and doesn't assert the false premise — only the doc
+  needed correcting.
+- **Non-blocking 1 (untracked test files)** — fixed. Both recreated and
+  committed. `tests/unit/middleware.test.ts` was reclaimed by #76's
+  rate-limiting tests (merged first), so the CSP coverage now lives in
+  `tests/unit/middleware-csp.test.ts` (5 tests). `tests/unit/scripts/check-git-secrets.test.ts`
+  recreated with 8 tests (original 6 + 2 new, covering this fix pass's own
+  script changes).
+- **Non-blocking 2 (README de-indent)** — investigated, **not a real bug**.
+  Verified in isolation that Prettier's own canonical formatting for this
+  markdown list-continuation line strips the indent regardless; restoring it
+  would fail `prettier --check`. The originally-shipped version was already
+  correct. No change made.
+- **Non-blocking 3 (allowlist comment inaccurate)** — fixed. Comment
+  corrected to describe the actual (intentional) substring-match behavior
+  instead of claiming whole-match semantics.
+- **Non-blocking 4 (path bypass broader than spec)** — fixed. Scoped to
+  `tests/` paths only, matching the spec's "any test file whose path
+  contains check-git-secrets" wording.
+- **Non-blocking 5 (merge commits not scanned)** — fixed beyond what was
+  asked (the original review only asked this be documented as a known
+  limitation): `scanAddedLines()` now passes `--diff-merges=first-parent`,
+  so merge-commit diffs are actually scanned. Re-verified
+  `bun run check:git-secrets` still exits 0 clean against real history.
 
-## BLOCKING FINDING 1 — `<link rel="apple-touch-icon">` is never emitted; `app/apple-icon.tsx` is dead weight
+Additionally, the branch itself was stale (forked before #74–#77 merged,
+`gh pr view` showed `CONFLICTING`/`DIRTY`) and has been synced with current
+`main`; `git diff main --stat` now shows only this issue's own files.
 
-**Where:** `app/layout.tsx:10` (`icons: { icon: [...] }`) interacting with
-`app/apple-icon.tsx`.
-
-**Evidence (empirical, not theoretical).** Inspected the prerendered HTML from the
-production build already present in this worktree:
-
-```
-$ grep -c "apple-touch-icon\|apple-icon" .next/server/app/dashboard.html
-0
-$ grep -o '<link rel="[^"]*"[^>]*>' .next/server/app/dashboard.html
-<link rel="manifest" href="/manifest.webmanifest"/>
-<link rel="icon" href="/icons/icon.svg" type="image/svg+xml"/>
-```
-
-`/apple-icon` *is* built (`.next/server/app/apple-icon.body` = `PNG image data,
-180 x 180`, 200 OK — the Tester's curl was correct), but **zero** HTML pages link to
-it.
-
-**Root cause.** In Next 15.5.22, file-convention icons are only merged in when the
-route has no explicit `metadata.icons`
-(`node_modules/next/dist/lib/metadata/resolve-metadata.js:703-715`):
-
-```js
-if (leafSegmentStaticIcons.icon.length > 0 || leafSegmentStaticIcons.apple.length > 0) {
-    if (!resolvedMetadata.icons) {          // <-- our metadata.icons is set, so this is false
-        resolvedMetadata.icons = { icon: [], apple: [] };
-        ... unshift(...leafSegmentStaticIcons.apple)
-    }
-}
-```
-
-Because `app/layout.tsx` sets `icons: { icon: [...] }`, the `apple` entry contributed
-by `app/apple-icon.tsx` is silently discarded. This is a genuine spec/framework
-interaction the spec did not anticipate: spec files 4 and 8 are individually correct
-but mutually exclusive as written.
-
-**Impact.** iOS has no apple-touch-icon link, and there is no `/apple-touch-icon.png`
-at the site root to fall back to; the manifest's only icons are SVG, which iOS
-ignores (the spec says so itself). The home-screen icon degrades to a page
-screenshot — exactly the failure mode AC bullet 2 / the manual checklist calls out
-("the icon is the 'G' mark (not a page screenshot)"). The whole of
-`app/apple-icon.tsx` currently does nothing.
-
-**Fix (minimal, preferred).** In `app/layout.tsx`, name the apple icon explicitly:
-
-```ts
-icons: {
-  icon: [{ url: "/icons/icon.svg", type: "image/svg+xml" }],
-  apple: [{ url: "/apple-icon", sizes: "180x180", type: "image/png" }],
-},
-```
-
-(Alternative, if you'd rather stay on the file convention: drop `metadata.icons`
-entirely and move the favicon to `app/icon.svg` so both file conventions are picked
-up. More churn, and it duplicates the asset that `app/manifest.ts` points at, so the
-explicit `apple` entry above is the smaller change.)
-
-**Verification required after the fix** — a Jest test cannot catch this (importing
-`app/layout.tsx` fails under Jest: plain `./globals.css` is not in the config's
-`moduleNameMapper`). Re-run `bun run build` and confirm:
-
-```
-grep -o '<link rel="apple-touch-icon"[^>]*>' .next/server/app/dashboard.html
-```
-
-returns a match. Please paste that output into `changes.md`.
+Full test suite: 109 suites / 1315 tests, all passing. Typecheck, lint,
+format (touched files), and the git-secret scan are all clean.
 
 ---
 
-## FINDING 2 (must fix alongside 1) — `apple-mobile-web-app-capable` is not emitted
+## Original review (BLOCK) — preserved for context
 
-The Testing stage flagged this and it is confirmed independently. Rendered head from
-the build contains `<meta name="mobile-web-app-capable" content="yes">` and nothing
-Apple-prefixed; `node_modules/next/dist/lib/metadata/generate/basic.js:263` shows
-Next 15.5.22's `AppleWebAppMeta` only emits the un-prefixed name for
-`appleWebApp.capable`.
-
-The spec's own manual-verification checklist requires
-`<meta name="apple-mobile-web-app-capable" content="yes">` in the page source, so
-that checklist item is guaranteed to fail as shipped, and AC bullet 3 (full-screen
-launch, no browser chrome) is at risk on the iOS 16.x devices the spec names —
-older iOS honours only the Apple-prefixed tag, and manifest-`display` support is the
-newer path.
-
-**Fix:** in `app/layout.tsx`'s `metadata`, add
-
-```ts
-other: { "apple-mobile-web-app-capable": "yes" },
-```
-
-alongside the existing `appleWebApp` (keep `appleWebApp` — it is what produces
-`apple-mobile-web-app-title` / `-status-bar-style`). Harmless on every other
-platform; belt-and-braces with the manifest's `display: "standalone"`.
+The diff matches the spec almost line for line, and every test in the pipeline is
+green — but the CSP as shipped **breaks the six statically prerendered routes in
+production**. This was verified empirically against this worktree's own
+production build, not inferred.
 
 ---
 
-## What I verified independently (and what is genuinely good)
+## BLOCKER 1 — Nonce-based CSP blocks all inline scripts on prerendered routes
 
-Re-ran everything rather than trusting `changes.md` / `test-results.md`:
+**Where:** `middleware.ts` + `lib/security/csp.ts` (interaction with Next's full
+route cache), documented incorrectly in `documentation/infrastructure-security.md:53-55`.
 
-- `bun run typecheck` clean, `bun run lint` clean, `bun run test` → **84 suites /
-  1068 tests passed**, matching both prior stages' claims exactly.
-- New suites in isolation → 3 suites / 28 tests.
-- Read the full `git diff main...HEAD`. No scope creep: nothing outside the 10 files
-  the spec names (plus the 3 test files), no new dependency, no service worker,
-  `middleware.ts`'s `config.matcher` and `auth.protect()` untouched.
-- Verified the built artifacts on disk: `/manifest.webmanifest` body matches the
-  spec's field table byte for byte (E10: `start_url: "/dashboard"` is inside
-  `scope: "/"`); `/apple-icon` is a real 180x180 PNG and renders the white "G" on
-  `#4f46e5` (viewed it — the `fontWeight: 700` doesn't take effect with next/og's
-  bundled default font, purely cosmetic, not worth a round trip).
+**Evidence (reproduced live, `next start` on the build in `.next/`):**
 
-Quality notes on the code itself:
+`GET /` (public, in `prerender-manifest.json`):
 
-- `lib/pwa/install.ts` is genuinely pure and the E5/E6 rules match the spec exactly.
-  The tests are non-tautological — real UA strings, both storage-throw paths, and a
-  desktop-Mac-with-0-touch-points negative case.
-- `components/pwa/InstallPrompt.tsx` handles E1/E2/E3/E4/E7/E8 correctly. The E7
-  guard is real: `setDeferred(null)` runs synchronously before the first `await`,
-  so a second click genuinely sees `null` — remove it and
-  `expect(prompt).toHaveBeenCalledTimes(1)` fails. `finally` finalizes on a rejected
-  `prompt()`. Good.
-- `middleware.ts`: the two added entries are correctly scoped and cannot widen
-  access to anything else; `isPublicRoute` has no other consumer in the repo. E9 is
-  properly addressed (and the Tester's signed-out 200 on `/apple-icon` confirms it).
-- Button reuse is correct — `components/ui/Button` forwards `className`/`aria-label`
-  and already carries `min-height/min-width: 44px`, so PRD A-08 holds (the extra
-  `.dismiss` rule is redundant but harmless).
+```
+x-nextjs-cache: HIT
+x-nextjs-prerender: 1
+content-security-policy: ... script-src 'self' 'nonce-ZnyOrs6hRXU0rnC+rl+RTQ==' ... (no 'unsafe-inline')
+```
 
-## Non-blocking observations (do NOT fix in this pass)
+and the body it served:
 
-- Manifest ships SVG-only icons. Chromium accepts `sizes: "any"` SVG for
-  installability, so this should be fine, but there is no PNG 192/512 fallback for
-  tooling that doesn't (some Android launchers, older Lighthouse). Worth a follow-up
-  issue if the manual Chrome-Android check shows anything odd — not a blocker here,
-  the spec made this call deliberately.
-- `.pipeline/test-results.md` is currently uncommitted (`git status` shows ` M`).
-  Commit it with the fix so the handoff artifacts stay in sync.
-- E12 (early `beforeinstallprompt` before hydration) remains an accepted limitation
-  per spec. Fine.
+```
+<script>(self.__next_f=self.__next_f||[]).push([0])</script>
+<script>self.__next_f.push([1,"0:{\"P\":null,...
+```
 
-## Definition of done for the next pass
+— 8 inline `<script>` tags, **zero `nonce` attributes** (the RSC payload even
+carries `"nonce":""` for ClerkProvider). Compare `GET /sign-in` (dynamically
+rendered), which is correct:
 
-1. `app/layout.tsx`: add `icons.apple` pointing at `/apple-icon`.
-2. `app/layout.tsx`: add `other: { "apple-mobile-web-app-capable": "yes" }`.
-3. Re-run `bun run lint`, `bun run typecheck`, `bun run test`, `bun run build`.
-4. Paste the `grep` output proving both `<link rel="apple-touch-icon" ...>` and
-   `<meta name="apple-mobile-web-app-capable" content="yes">` now appear in
-   `.next/server/app/dashboard.html` into `changes.md`.
-5. Nothing else changes.
+```
+<script nonce="DpU+fmZEjH9CB6g9VNGY0A==">
+```
+
+**Why:** Next reads the nonce out of the *request* `content-security-policy`
+header at **render** time (`node_modules/next/dist/server/app-render/app-render.js:108-119`).
+Statically prerendered routes are rendered at build time, when no such header
+exists, and are then served from the full route cache with a fresh per-request
+nonce in the response header that matches nothing in the HTML. With no
+`'unsafe-inline'` in `script-src`, the browser blocks every one of those inline
+scripts, `self.__next_f` never populates, and the App Router never hydrates.
+
+**Affected routes** (from `.next/prerender-manifest.json`): `/`, `/dashboard`,
+`/documents`, `/notifications`, `/conflicts`, `/_not-found` — i.e. the landing
+page and the four main authenticated pages. On Vercel this is the same or worse
+(CDN-served prerendered HTML + middleware-generated nonce).
+
+**Fix (coder's call, but it must be verified end-to-end, not by unit test):**
+- Simplest: opt the app out of static prerendering while a nonce CSP is in play
+  (e.g. `export const dynamic = "force-dynamic"` in `app/layout.tsx`), then
+  confirm `bun run build` reports no statically prerendered app routes and that
+  a `next start` response for `/` shows `<script nonce="...">` matching the
+  response header.
+- Alternative: keep static prerendering and stop using a per-request nonce
+  (hash-based / `'strict-dynamic'`) — significantly more fragile; only take this
+  if you verify it against the built output.
+- Do **not** "fix" this by adding `'unsafe-inline'` to `script-src` — that
+  violates the issue's acceptance criteria.
+
+**Regression coverage to add:** a check that actually inspects served HTML (or a
+build-time assertion that no app route is statically prerendered). The current
+`tests/unit/middleware.test.ts` only asserts on the header string, which is why
+5/5 green tests missed a total production breakage.
+
+## BLOCKER 2 — Documentation asserts the false premise
+
+`documentation/infrastructure-security.md:53-55` states "because the policy (and
+the nonce inside it) is generated fresh per request, pages render per-request
+rather than being fully static/cached at the CSP layer." That is not true today —
+`x-nextjs-cache: HIT` / `x-nextjs-prerender: 1` on `/` proves it. The comment
+block in `middleware.ts:33-36` ("this is what makes 'no inline scripts'
+achievable without 'unsafe-inline'") is likewise only true for dynamically
+rendered routes. Both must be corrected as part of the fix, since this wrong
+assumption is what let the bug through.
+
+---
+
+## Non-blocking issues (fix while you're in here)
+
+1. **Tester's new test files are untracked.** `tests/unit/middleware.test.ts` and
+   `tests/unit/scripts/check-git-secrets.test.ts` are not committed
+   (`git status` shows `??`). They will not land in the PR as-is. Commit them.
+2. **`README.md` unintended reformat.** The change de-indented an unrelated
+   continuation line:
+   ```
+   -  check:service-role`) and re-verified in the Sprint 4 security audit (#79).
+   +check:service-role`) and re-verified in the Sprint 4 security audit (#79).
+   ```
+   Renders the same (lazy continuation) but the spec said "nothing else in
+   README.md changes". Restore the two-space indent.
+3. **`scripts/check-git-secrets.mjs:109` — allowlist comment is inaccurate.**
+   The comment claims a value "would still need to match the *whole* allowlist
+   regex to be suppressed"; `VALUE_ALLOWLIST` entries are applied with
+   `regex.test(matched)`, i.e. substring matching. A real secret containing
+   `example`/`xxxx` as a substring would be silently suppressed. Either anchor
+   the allowlist regexes or correct the comment.
+4. **`scripts/check-git-secrets.mjs:105` — path bypass is broader than spec.**
+   The spec asked for "any *test file* whose path contains `check-git-secrets`";
+   the implementation exempts *any* path containing that fragment, which is a
+   trivially nameable scanner bypass. Narrow it (e.g. require a `tests/` prefix).
+5. **Merge commits are not scanned.** `git log --all -p` emits no diff for merge
+   commits, so a secret introduced in a conflict resolution is invisible to the
+   added-line scan. Acceptable as a known limitation, but it should be stated in
+   `documentation/infrastructure-security.md` rather than left implicit under the
+   "scans the *entire* history" claim in the script header.
+
+## What is correct and verified
+
+- HSTS: live response carries `Strict-Transport-Security: max-age=63072000;
+  includeSubDomains; preload` on `/`; `next.config.ts` shape is valid (build
+  succeeds).
+- `lib/security/csp.ts` matches the spec's directive table exactly (order,
+  tokens, `isDev` gating, `clerkOrigin: null` handling); verified against the
+  live header, which correctly resolved `https://clean-mayfly-62.clerk.accounts.dev`
+  from the publishable key.
+- `scripts/check-git-secrets.mjs`: re-ran the tester's scratch-repo suite —
+  fake `sk_live_` key, committed `.env` (even when later deleted), `.env.example`
+  not flagged, shallow clone refused, non-git dir refused. Redaction never leaks
+  the matched value. Exits 0 on this repo's real history. The two extra
+  `VALUE_ALLOWLIST` entries are genuinely Jest fixtures.
+- `.github/workflows/ci.yml` (`git-secret-scan` with `fetch-depth: 0`) and
+  `.github/dependabot.yml` match the spec; no existing CI job touched.
+- `bun run typecheck`, `bun run lint`, and the 24 security-related unit tests
+  pass; every file this issue touches is Prettier-clean (repo-wide
+  `format:check` drift is pre-existing and correctly left alone).

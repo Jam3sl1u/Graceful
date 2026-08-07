@@ -1,343 +1,366 @@
-# Spec — Issue #75: [Sprint 4] PWA manifest & install prompt
+# Spec — Issue #78: [Sprint 4] Run infrastructure security pass (HTTPS, CSP, secret scan)
 
 ## OPEN QUESTIONS
 
-**None blocking.** The pipeline may proceed.
+**None blocking — do not stop the pipeline.** Two items need a human *action*
+(not a decision) after merge; they are recorded in the new documentation file as
+operator checklist items and must not block implementation:
 
-Decisions made in the absence of an explicit brand/design source (the repo has zero
-image assets, no logo, no design tokens beyond `app/globals.css`). Implement these as
-written; do not re-litigate them:
+1. Vercel's HTTP→HTTPS redirect is platform behavior, not repo code. The
+   repo-side deliverable is HSTS + verification steps; a human confirms the
+   redirect on the deployed URL.
+2. Dependabot must be verified as actually running (GitHub UI → Insights →
+   Dependency graph → Dependabot) after `.github/dependabot.yml` lands on the
+   default branch. If GitHub reports the config as invalid, that is a follow-up
+   fix, not a reason to stall this issue.
 
-- Brand colors come from `app/globals.css`: `theme_color` = `#4f46e5` (`--color-accent`),
-  `background_color` = `#ffffff` (`--color-bg`).
-- The app icon is a plain wordmark: white capital "G" centered on a solid `#4f46e5`
-  square. No logo exists to use instead.
-- Icons ship as SVG (Chrome/Android accepts SVG manifest icons with `sizes: "any"` for
-  installability) plus one generated PNG for the iOS `apple-touch-icon` (iOS ignores SVG
-  there). No binary assets are checked in.
-- AC bullet 4 ("Verified on iOS Safari and Chrome Android") is a **manual** step that no
-  stage of this pipeline can perform. See "Manual verification" below — the Coder must
-  copy that checklist verbatim into `.pipeline/changes.md` and mark it as not-yet-done
-  rather than claiming it.
+## Goal
 
-## Scope
+Add the infrastructure-level security baseline the PRD requires before first
+deploy (PRD §25.7 in `documentation/prd/graceful_requirements_v10.md`, cited as
+§15.7 in the issue):
 
-Install/launch experience only. **Out of scope:** service worker, offline caching,
-`next-pwa`/`workbox` or any new dependency, push notifications, native app, any change to
-existing screens other than the two layout files named below.
+1. HTTPS enforced on every route (HSTS header from the app; Vercel does the
+   redirect) — no exceptions, including `app/api/**` and webhook routes.
+2. Strict, nonce-based CSP: `script-src` limited to `'self'`, a per-request
+   nonce, and Clerk's origins. No `'unsafe-inline'` in `script-src`, no
+   `'unsafe-eval'` in production.
+3. A repeatable git-history secret scan, wired into CI, plus the result of the
+   scan run for this issue recorded in documentation.
+4. Dependabot config committed to the repo.
 
-## Current state (verified, do not re-assume)
+Out of scope (do not touch): rate limiting, input validation, anything in
+`schemas/`, `supabase/`, or existing route handlers.
 
-- No `public/` directory exists; no image asset of any kind exists in the repo.
-- `app/layout.tsx` exports only `metadata` (`title`, `description`). No `viewport` export,
-  no icons, no manifest link, no `appleWebApp`.
-- No `app/manifest.ts`, no `app/icon.*`, no `app/apple-icon.*`.
-- `middleware.ts` runs `clerkMiddleware` with `config.matcher = ["/((?!_next|.*\\..*).*)",
-  "/(api|trpc)(.*)"]`. Paths **containing a dot** (e.g. `/manifest.webmanifest`,
-  `/icons/icon.svg`) are already excluded from the matcher. Paths **without** a dot (e.g.
-  `/apple-icon`) are matched and hit `auth.protect()` — see edge case E9.
-- `NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in` (`.env.example`), so sign-in is in-app and
-  stays inside the manifest scope.
-- Jest: `testEnvironment: "node"`, `testMatch: ["**/tests/unit/**/*.test.ts(x)"]`,
-  `@/*` → repo root, `*.module.css` mocked. Component tests opt into jsdom with a
-  `/** @jest-environment jsdom */` docblock (see `tests/unit/app/conflicts-list.test.tsx`).
-- Prettier: 100 cols, double quotes, semicolons, trailing commas.
+## Current state (verified by reading the code)
 
-## Files to create
+- `next.config.ts` has **no** `headers()` — zero security headers today.
+- `middleware.ts` wraps `clerkMiddleware`, matcher
+  `["/((?!_next|.*\\..*).*)", "/(api|trpc)(.*)"]` (covers pages **and** API
+  routes; excludes `_next` and dotted static files). The handler currently
+  returns nothing.
+- No `vercel.json`, no `.github/dependabot.yml` anywhere in the repo.
+- `.github/workflows/ci.yml` jobs: `checks`, `check-secrets` (this one only
+  detects whether *GitHub Actions secrets* are configured — unrelated to secret
+  scanning; do not modify it or reuse its name), `rls-integration`, `e2e`.
+- No app code uses `dangerouslySetInnerHTML`, `next/script`, or any external
+  script tag (grepped). All client `fetch()` calls are same-origin `/api/...`.
+  Supabase and R2 are server-only. R2 presigned downloads are opened as plain
+  `<a href target="_blank">` navigations (`app/(app)/member-week/[id]/member-week-view.tsx`),
+  which CSP `connect-src`/`img-src` do not govern.
+- `app/layout.tsx` wraps everything in `<ClerkProvider>` — Clerk's browser JS is
+  the only third-party script.
+- Existing guard-script pattern to copy: `scripts/check-service-role.mjs`
+  (node builtins only, `REPO_ROOT` via `fileURLToPath(import.meta.url)`, prints
+  violations to stderr, `process.exit(1)` on findings / `0` on clean).
+  `scripts/check-workflows.mjs` is the pattern for shelling out via
+  `execFileSync` from `node:child_process`.
+- Jest: `testMatch` is `tests/unit/**/*.test.ts(x)`, `@/` maps to repo root,
+  `testEnvironment: "node"`.
+- `bun.lock` (text format) is the lockfile; there is no `song2score/` directory
+  in this checkout, so Dependabot only needs the root manifest.
 
-### 1. `app/manifest.ts` (new)
+---
 
-Next.js `MetadataRoute.Manifest` file convention; served at `/manifest.webmanifest` and
-auto-linked by Next (do **not** also set `metadata.manifest` in the root layout — that
-would emit a duplicate `<link rel="manifest">`).
+## 1. `lib/security/csp.ts` (NEW)
 
-```ts
-import type { MetadataRoute } from "next";
-
-export default function manifest(): MetadataRoute.Manifest;
-```
-
-Returned object, exactly these fields:
-
-| field              | value                                                                 |
-| ------------------ | --------------------------------------------------------------------- |
-| `name`             | `"Graceful"`                                                          |
-| `short_name`       | `"Graceful"`                                                          |
-| `description`      | `"Scheduling, setlist, and music coordination for worship teams."` (same string as `app/layout.tsx` metadata) |
-| `id`               | `"/"`                                                                 |
-| `start_url`        | `"/dashboard"`                                                        |
-| `scope`            | `"/"`                                                                 |
-| `display`          | `"standalone"`                                                        |
-| `background_color` | `"#ffffff"`                                                           |
-| `theme_color`      | `"#4f46e5"`                                                           |
-| `icons`            | two entries, below                                                    |
-
-```
-{ src: "/icons/icon.svg",          sizes: "any", type: "image/svg+xml", purpose: "any" }
-{ src: "/icons/icon-maskable.svg", sizes: "any", type: "image/svg+xml", purpose: "maskable" }
-```
-
-If `MetadataRoute.Manifest` does not type the `id` property in the installed Next
-version, drop `id` — do **not** add a type cast or `@ts-expect-error`. Everything else is
-mandatory.
-
-### 2. `public/icons/icon.svg` (new)
-
-512×512 `viewBox`, full-bleed `#4f46e5` background with rounded corners (~96 radius),
-white capital "G" centered, sans-serif, heavy weight, roughly 60% of the canvas height.
-Must be a standalone static SVG (no external font/image refs, no CSS `@import`).
-
-### 3. `public/icons/icon-maskable.svg` (new)
-
-Same mark, but built for the Android maskable safe zone: full-bleed `#4f46e5` square with
-**no** corner rounding, and the "G" confined to the centered 80% safe area (i.e. ~40%
-of canvas height) so platform masking never clips it.
-
-### 4. `app/apple-icon.tsx` (new)
-
-Next.js `apple-icon` file convention using `ImageResponse` from `next/og` (bundled with
-Next 15 — do not add a dependency). Produces the PNG `apple-touch-icon` iOS needs.
-
-```tsx
-import { ImageResponse } from "next/og";
-
-export const size = { width: 180, height: 180 };
-export const contentType = "image/png";
-
-export default function AppleIcon(): ImageResponse;
-```
-
-Render the same mark (white "G" on `#4f46e5`, flex-centered, no rounded corners — iOS
-applies its own mask). Use only inline `style` objects and system-default text; do not
-load a custom font.
-
-### 5. `lib/pwa/install.ts` (new)
-
-Pure, DOM-free-where-possible helpers so the logic is unit-testable without a browser.
-Follow the "isolated, exhaustively-testable module" doc-comment style of
-`lib/invitations/state-machine.ts`. Exact exports:
+Pure, dependency-free module (node/edge-safe). **Do not** `import "server-only"`
+here — this module is imported by Edge middleware.
 
 ```ts
-export const INSTALL_DISMISSED_KEY = "graceful:pwa-install-dismissed";
-
-// Chrome's non-standard install event. Not in lib.dom, so declare it here.
-export type BeforeInstallPromptEvent = Event & {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
-};
-
-type StandaloneWindow = {
-  matchMedia?: (query: string) => { matches: boolean };
-  navigator?: { standalone?: boolean };
-};
-
-type DismissalStorage = Pick<Storage, "getItem" | "setItem">;
-
-/**
- * True when the page is already running as an installed app:
- * `(display-mode: standalone)` matches (Android/Chrome) or the non-standard
- * `navigator.standalone` is true (iOS Safari). Tolerates a missing matchMedia.
- */
-export function isRunningStandalone(win: StandaloneWindow): boolean;
-
-/**
- * True only for iOS/iPadOS in a browser that can actually "Add to Home Screen"
- * (Safari). iPadOS 13+ reports a "Macintosh" UA, hence the maxTouchPoints arg.
- */
-export function isIosInstallCapable(userAgent: string, maxTouchPoints: number): boolean;
-
-/** Never throws — a storage failure reads as "not dismissed". */
-export function isInstallPromptDismissed(storage: DismissalStorage | undefined): boolean;
-
-/** Never throws. */
-export function markInstallPromptDismissed(storage: DismissalStorage | undefined): void;
+export function clerkFrontendApiOrigin(publishableKey: string | undefined): string | null;
+export function generateNonce(): string;
+export function buildContentSecurityPolicy(options: {
+  nonce: string;
+  clerkOrigin: string | null;
+  isDev: boolean;
+}): string;
 ```
 
-`isIosInstallCapable` rules:
+### `clerkFrontendApiOrigin(publishableKey)`
 
-- iOS device if `/iPad|iPhone|iPod/` matches the UA, **or** `/Macintosh/` matches and
-  `maxTouchPoints > 1` (iPadOS 13+).
-- Return `false` if the UA contains `CriOS`, `FxiOS`, `EdgiOS`, or `OPiOS` — those iOS
-  browsers cannot add to the home screen.
-- Return `false` for everything else.
+A Clerk publishable key is `pk_test_` / `pk_live_` + base64 of the instance's
+frontend-API host with a trailing `$` (e.g. decoding yields
+`clean-mayfly-62.clerk.accounts.dev$`). Derive the origin from the key rather
+than hardcoding a domain — the production domain is not known yet.
 
-### 6. `components/pwa/InstallPrompt.tsx` (new)
+- Strip the `pk_test_` or `pk_live_` prefix; any other prefix (or
+  `undefined`/empty) → return `null`.
+- `atob()` the remainder inside `try/catch`; on throw → `null`.
+- Take the decoded string up to the first `$`.
+- Validate against `/^[a-z0-9.-]+$/i`; otherwise → `null`.
+- Return `` `https://${host}` `` (no trailing slash).
 
-Client component, named export (matches `components/layout/AppShell.tsx` and
-`components/ui/Button.tsx` conventions — `export function InstallPrompt()`, no default
-export). Reuse `components/ui/Button.tsx` for the install action.
+### `generateNonce()`
 
-```tsx
-"use client";
-export function InstallPrompt(): React.ReactElement | null;
+16 random bytes from `crypto.getRandomValues(new Uint8Array(16))`, base64-encoded
+via `btoa(String.fromCharCode(...bytes))`. Must be unique per call. Do not use
+`Math.random`.
+
+### `buildContentSecurityPolicy({ nonce, clerkOrigin, isDev })`
+
+Returns a **single-line** header value: directives joined by `"; "`, each
+directive `name SP value SP value...`, no trailing `;`, no newlines, no double
+spaces. Emit directives in exactly this order:
+
+| Directive | Value |
+| --- | --- |
+| `default-src` | `'self'` |
+| `script-src` | `'self' 'nonce-<nonce>' https://challenges.cloudflare.com` + `clerkOrigin` (when non-null) + `'unsafe-eval'` **only when `isDev`** |
+| `style-src` | `'self' 'unsafe-inline'` |
+| `img-src` | `'self' data: blob: https://img.clerk.com` |
+| `font-src` | `'self' data:` |
+| `connect-src` | `'self' https://clerk-telemetry.com` + `clerkOrigin` (when non-null) + `ws:` **only when `isDev`** |
+| `worker-src` | `'self' blob:` |
+| `frame-src` | `'self' https://challenges.cloudflare.com` |
+| `object-src` | `'none'` |
+| `base-uri` | `'self'` |
+| `form-action` | `'self'` |
+| `frame-ancestors` | `'none'` |
+| `upgrade-insecure-requests` | present with no value, **omitted when `isDev`** |
+
+Rationale to keep in a comment at the top of the file: `challenges.cloudflare.com`
+and `img.clerk.com` are Clerk's own documented CSP requirements (bot-protection
+widget and avatar CDN), so they fall under "self and Clerk";
+`style-src 'unsafe-inline'` is required by Next/Clerk injected styles and is
+explicitly *not* prohibited by the AC (which prohibits inline **scripts** and
+`eval`).
+
+Edge cases the implementation must handle:
+
+- `clerkOrigin === null` → the Clerk token is simply absent from `script-src` /
+  `connect-src`; no `undefined`, no empty token, no stray double space.
+- `isDev === false` → the string must contain neither `'unsafe-eval'` nor `ws:`.
+- Nonce is embedded exactly as `'nonce-<value>'` (single quotes, no spaces).
+
+## 2. `middleware.ts` (MODIFY)
+
+Keep `isPublicRoute`, the `clerkMiddleware` wrapper, the auth behavior, and the
+exported `config` matcher exactly as they are. Add CSP emission inside the
+existing handler:
+
+1. `const nonce = generateNonce();`
+2. `const csp = buildContentSecurityPolicy({ nonce, clerkOrigin: clerkFrontendApiOrigin(process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY), isDev: process.env.NODE_ENV !== "production" });`
+3. Keep the existing `if (!isPublicRoute(req)) await auth.protect();`.
+4. Build `const requestHeaders = new Headers(req.headers);` and
+   `requestHeaders.set("content-security-policy", csp);` — Next.js reads the
+   nonce back out of the **request** CSP header to stamp its own streaming
+   inline scripts. This is what makes "no inline scripts" achievable without
+   `'unsafe-inline'`.
+5. `const res = NextResponse.next({ request: { headers: requestHeaders } });`
+   then `res.headers.set("content-security-policy", csp);` and `return res;`
+   (`NextResponse` imported from `next/server`).
+
+Notes / edge cases:
+
+- Do **not** set an `x-nonce` header: no app code reads it, and unused surface
+  is scope creep here.
+- Compute the nonce/CSP before `auth.protect()`, but accept that when
+  `auth.protect()` redirects an unauthenticated request it short-circuits and
+  that redirect response carries no CSP header. That is fine (empty body) —
+  state it in a comment so it doesn't read as a bug.
+- Returning a response from the `clerkMiddleware` handler is supported; Clerk
+  merges its own headers into the returned response. Do not bypass
+  `clerkMiddleware`.
+
+## 3. `next.config.ts` (MODIFY)
+
+Add an `async headers()` returning one entry:
+
+- `source: "/:path*"` (all routes, including `/api/*`)
+- header `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`
+
+Keep `reactStrictMode`, `outputFileTracingRoot`, and `eslint.dirs` unchanged. Do
+**not** put CSP here — it must be per-request (nonce), which only middleware can
+do. Do not add any other headers; anything beyond HSTS + CSP is out of scope for
+this issue.
+
+## 4. `scripts/check-git-secrets.mjs` (NEW) + `package.json` script
+
+Follow `scripts/check-service-role.mjs` for structure/exit-code conventions and
+`scripts/check-workflows.mjs` for `execFileSync` usage. Node builtins only
+(`node:child_process`, `node:path`, `node:url`) — must run without
+`bun install`. Add to `package.json` scripts:
+
+```
+"check:git-secrets": "node scripts/check-git-secrets.mjs"
 ```
 
-State: `mode: "hidden" | "android" | "ios"` (initial `"hidden"`) and
-`deferred: BeforeInstallPromptEvent | null`.
+Behavior, in order:
 
-Mount effect (all `window`/`navigator`/`localStorage` access lives here, never in render):
+1. `git rev-parse --is-inside-work-tree` → if it fails, print an error and exit 1.
+2. `git rev-parse --is-shallow-repository` → if it prints `true`, print an error
+   explaining the scan is meaningless on a shallow clone (CI must use
+   `fetch-depth: 0`) and **exit 1**. A shallow scan silently reporting "clean" is
+   the main failure mode this guard exists to prevent.
+3. Added-line scan: `git log --all --full-history --no-color -p -U0 --pretty=format:__COMMIT__%H`
+   via `execFileSync` with `{ encoding: "utf8", maxBuffer: 512 * 1024 * 1024 }`.
+   Parse line by line: `__COMMIT__<sha>` updates the current commit; `+++ b/<path>`
+   updates the current file; a line starting with `+` that is not `+++` is a
+   candidate added line. Test every candidate line against `PATTERNS`.
+4. Committed-env-file scan:
+   `git log --all --full-history --diff-filter=A --name-only --pretty=format:__COMMIT__%H`.
+   Flag any added path whose basename matches `.env` or starts with `.env.`
+   **except** `.env.example` (e.g. `.env`, `.env.local`, `.env.production` are
+   findings).
+5. Print each finding to stderr as
+   `<sha> <path> - <patternName>: <redacted>` and exit 1; otherwise print a
+   single `OK: ...` line and exit 0.
 
-1. If `isRunningStandalone(window)` → return (stay hidden, register nothing).
-2. If `isInstallPromptDismissed(window.localStorage)` → return.
-3. Register `beforeinstallprompt`: `event.preventDefault()`, store the event, set mode
-   `"android"`.
-4. Register `appinstalled`: `markInstallPromptDismissed(window.localStorage)`, set mode
-   `"hidden"`, clear the deferred event.
-5. If `isIosInstallCapable(navigator.userAgent, navigator.maxTouchPoints)` → set mode
-   `"ios"`.
-6. Cleanup removes both listeners.
+`PATTERNS` — array of `{ name, regex }`, at minimum:
 
-Render:
+- Clerk secret key: `/\bsk_(test|live)_[A-Za-z0-9]{20,}/`
+- Resend API key: `/\bre_[A-Za-z0-9]{20,}/`
+- Google OAuth client secret: `/\bGOCSPX-[A-Za-z0-9_-]{10,}/`
+- AWS/R2 access key id: `/\bAKIA[0-9A-Z]{16}\b/`
+- Private key block: `/-----BEGIN [A-Z ]*PRIVATE KEY-----/`
+- JWT (Supabase anon/service-role keys are JWTs):
+  `/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/`
+- Assigned secret env var: the names from `.env.example` that hold secrets
+  (`SUPABASE_SERVICE_ROLE_KEY`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET`,
+  `PINGRAM_API_KEY`, `PINGRAM_WEBHOOK_SECRET`, `RESEND_API_KEY`,
+  `RESEND_WEBHOOK_SECRET`, `GOOGLE_CLIENT_SECRET`, `TOKEN_ENCRYPTION_KEY`,
+  `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `UPSTASH_REDIS_REST_TOKEN`,
+  `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY`,
+  `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `MODAL_WEBHOOK_SECRET`,
+  `SPOTIFY_CLIENT_SECRET`, `CRON_SECRET`, `SUPABASE_JWT_SECRET`) followed by
+  `\s*[=:]\s*` and a quoted-or-bare value of 12+ chars from
+  `[A-Za-z0-9_\-/+]`.
 
-- `mode === "hidden"` → `null`.
-- Otherwise a banner `<div className={styles.banner} role="region" aria-label="Install
-  Graceful">` containing:
-  - `"android"`: heading text `Install Graceful`, body
-    `Add Graceful to your home screen for one-tap access.`, a `<Button>Install</Button>`,
-    and the dismiss button.
-  - `"ios"`: heading text `Install Graceful`, body
-    `Tap the Share button, then "Add to Home Screen".`, and the dismiss button (no
-    Install button — iOS exposes no programmatic prompt).
-  - Dismiss button in both modes: `aria-label="Dismiss install prompt"`, visible label
-    `Not now`.
+Two allowlists, each with a `reason` string per entry and a comment explaining
+why allowlisting is safe:
 
-Handlers:
+- `VALUE_ALLOWLIST`: regexes applied to the **matched text**; seed with obvious
+  non-secrets (`/placeholder/i`, `/example/i`, `/changeme/i`, `/^your[-_]/i`,
+  `/xxxx/i`).
+- `PATH_ALLOWLIST`: exact paths skipped entirely — seed with
+  `scripts/check-git-secrets.mjs` (the pattern list would otherwise scan itself)
+  and any test file whose path contains `check-git-secrets` (fixtures for it
+  will contain fake-secret-looking strings). Nothing else — `.pipeline/**` and
+  `documentation/**` must stay in scope, since a pasted real secret there is a
+  genuine finding.
 
-- Install: if no deferred event, hide and return. Otherwise `await deferred.prompt()`,
-  `await deferred.userChoice`, then — in all outcomes, including a thrown/rejected
-  `prompt()` — set mode `"hidden"`, clear the deferred event, and call
-  `markInstallPromptDismissed(window.localStorage)`. Guard against a second
-  `prompt()` call (the event is single-use): clear `deferred` before/while awaiting so a
-  double click cannot re-invoke it.
-- Dismiss: `markInstallPromptDismissed(window.localStorage)` then mode `"hidden"`.
+**Redaction requirement:** never print a matched secret verbatim. Print the
+first 4 characters, then `…`, then `(len=<n>)`. The scanner's own output must not
+become a new leak (it lands in CI logs and `.pipeline/*.md`).
 
-### 7. `components/pwa/InstallPrompt.module.css` (new)
+## 5. `.github/workflows/ci.yml` (MODIFY)
 
-Copy the token/style conventions of `app/(app)/conflicts/conflicts-list.module.css`
-(`var(--color-border)`, `var(--color-fg)`, 8px radius, rem spacing). Requirements:
+Add one new top-level job (leave every existing job untouched, especially the
+existing `check-secrets` job which is about Actions-secret availability):
 
-- `.banner` fixed to the bottom of the viewport, centered, `max-width: 480px`,
-  above page content (`z-index`), 1px `var(--color-border)` border,
-  `background: var(--color-bg)`, and
-  `padding-bottom: max(1rem, env(safe-area-inset-bottom));` so it clears the iOS home
-  indicator in standalone mode.
-- Buttons meet PRD A-08: `min-height: 44px; min-width: 44px;`.
-
-## Files to modify
-
-### 8. `app/layout.tsx`
-
-- Keep `title`/`description` unchanged. Add to `metadata`:
-  - `applicationName: "Graceful"`
-  - `appleWebApp: { capable: true, title: "Graceful", statusBarStyle: "default" }`
-    (this is what gives iOS the full-screen, no-browser-chrome launch — AC bullet 3)
-  - `icons: { icon: [{ url: "/icons/icon.svg", type: "image/svg+xml" }] }`
-- Add a new export (Next 15 warns on `themeColor` inside `metadata`):
-
-```ts
-import type { Metadata, Viewport } from "next";
-
-export const viewport: Viewport = {
-  themeColor: "#4f46e5",
-  width: "device-width",
-  initialScale: 1,
-  viewportFit: "cover",
-};
+```yaml
+  git-secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history — a shallow clone makes the scan meaningless
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.x
+      - run: bun run check:git-secrets
 ```
 
-- Do **not** add `metadata.manifest` (see file 1). Do not touch `ClerkProvider` or the
-  `html`/`body` structure.
+No `bun install` step — the script uses node builtins only.
 
-### 9. `app/(app)/layout.tsx`
+## 6. `.github/dependabot.yml` (NEW)
 
-Render the prompt inside the existing shell; leave the TODO comment intact:
-
-```tsx
-<AppShell>
-  {children}
-  <InstallPrompt />
-</AppShell>
+```yaml
+version: 2
+updates:
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
 ```
 
-Import as `import { InstallPrompt } from "@/components/pwa/InstallPrompt";`. Do not mount
-it in `(marketing)`, `(auth)`, or `(public)` layouts.
+Add a header comment noting this repo uses Bun exclusively (`bun.lock`), so the
+JavaScript ecosystem entry is `bun` — do not switch it to another package
+manager's ecosystem, per `AGENTS.md`.
 
-### 10. `middleware.ts`
+## 7. `documentation/infrastructure-security.md` (NEW)
 
-Add `"/apple-icon(.*)"` and `"/manifest.webmanifest"` to the `createRouteMatcher` array in
-`isPublicRoute`, with a one-line comment explaining why (PWA install assets must be
-fetchable by the browser/OS with no session). Change nothing else in the file — the
-`config.matcher` and `auth.protect()` logic stay as-is.
+Follow the house style of `documentation/staging-environment.md`: numbered `##`
+sections, tables, and human-operator checklists as `- [ ]` items. Sections:
 
-## Edge cases the implementation must handle
+1. **Purpose & scope** — PRD §25.7, issue #78; what is *not* here (rate
+   limiting #76, input validation #77, OWASP review #79).
+2. **HTTPS enforcement** — Vercel auto-redirects HTTP→HTTPS on all routes incl.
+   `/api/*` and webhooks (platform behavior, no repo config); the app also sends
+   HSTS from `next.config.ts`. Operator checklist: verify a plain-`http://`
+   request to the deployed app, to one `/api/` route, and to a webhook path each
+   returns a 3xx to `https://`, and that `Strict-Transport-Security` is present
+   on the HTTPS response.
+3. **Content Security Policy** — where it is set (`middleware.ts` +
+   `lib/security/csp.ts`), the full directive table, why a per-request nonce is
+   used instead of `'unsafe-inline'`, the note that nonce-based CSP means pages
+   render per-request, the dev-only relaxations (`'unsafe-eval'`, `ws:`) and that
+   they are gated on `NODE_ENV`, and that any new third-party script requires a
+   deliberate directive change. Pre-launch checklist: run the deployed URL
+   through an OWASP/Google CSP evaluator, and click through sign-in, sign-up,
+   and one authenticated page with the browser console open to confirm zero CSP
+   violations.
+4. **Git-history secret scan** — how to run (`bun run check:git-secrets`), what
+   it covers, the allowlist policy, the CI job and its `fetch-depth: 0`
+   requirement. Record the run performed for this issue: date, the commit SHA
+   scanned (`git rev-parse HEAD`), and the result. If there are findings, record
+   only the redacted output — never the secret value — and note that remediation
+   order is **rotate the credential first, then purge history**.
+5. **Dependabot** — what the config covers and the post-merge verification
+   checklist item from OPEN QUESTIONS #2.
 
-- **E1 — SSR/hydration:** the component must render `null` on the server and on first
-  client render. No `window`, `navigator`, `localStorage`, or `matchMedia` access outside
-  `useEffect`.
-- **E2 — Already installed:** when launched from the home screen
-  (`display-mode: standalone`, or `navigator.standalone === true` on iOS), the banner
-  never renders and no listeners are attached.
-- **E3 — Storage unavailable:** Safari private mode / disabled storage makes
-  `localStorage` access throw. `isInstallPromptDismissed` and
-  `markInstallPromptDismissed` swallow the error; a read failure means "not dismissed" and
-  a write failure must not break the dismiss/install click.
-- **E4 — Dismissal is sticky:** once dismissed (or installed, or prompted), the banner
-  does not come back on later visits in that browser.
-- **E5 — Non-Safari iOS browsers:** Chrome/Firefox/Edge/Opera on iOS (`CriOS`, `FxiOS`,
-  `EdgiOS`, `OPiOS`) get no banner — they cannot add to the home screen and the
-  instructions would be wrong.
-- **E6 — iPadOS 13+ UA spoofing:** a `Macintosh` UA with `maxTouchPoints > 1` counts as
-  iOS; a real desktop Mac (`maxTouchPoints === 0`) does not.
-- **E7 — Single-use prompt:** `BeforeInstallPromptEvent.prompt()` may be called at most
-  once; a rejected `prompt()`/`userChoice` must hide the banner without an unhandled
-  rejection or crash.
-- **E8 — `appinstalled` fired from elsewhere** (e.g. the browser's own menu install) hides
-  the banner and records the dismissal.
-- **E9 — Auth-gated PWA assets:** `/apple-icon` has no dot in its path, so the existing
-  `middleware.ts` matcher *does* run Clerk on it and would 302 an unauthenticated
-  request to sign-in — which breaks the iOS home-screen icon. File 10 is not optional.
-- **E10 — Chrome installability:** the manifest must keep `display: "standalone"`, a
-  same-origin `start_url` inside `scope`, and at least one icon Chrome accepts
-  (SVG with `sizes: "any"` qualifies). Any `start_url` outside `scope` silently kills
-  installability.
-- **E11 — Desktop Chrome also fires `beforeinstallprompt`:** the banner appearing on
-  desktop Chrome is intended behavior, not a bug. Do not gate the Android branch on a UA
-  check.
-- **E12 — Early `beforeinstallprompt`:** Chrome can fire the event before React mounts, in
-  which case the banner will not appear until a reload. Accepted limitation for this
-  issue; do **not** add a document-level capture script to work around it.
+## 8. `README.md` (MODIFY)
 
-## Testability notes (for the Testing stage)
+- Add to the Scripts list, matching the existing bullet style:
+  `- `bun run check:git-secrets` — scan the full git history for committed secrets`
+- Add one line to the "Environments" section (or immediately after it) linking
+  to `documentation/infrastructure-security.md` for the HTTPS/CSP/secret-scan
+  baseline.
 
-- `lib/pwa/install.ts` is pure and runs under the default `node` Jest environment; feed it
-  literal UA strings and plain `{ getItem, setItem }` / `{ matchMedia, navigator }` stubs.
-  Suggested path: `tests/unit/lib/pwa/install.test.ts`.
-- `app/manifest.ts` is a plain function — import the default export and assert the fields
-  in the table above. Suggested path: `tests/unit/app/manifest.test.ts`.
-- `components/pwa/InstallPrompt.tsx` needs the `/** @jest-environment jsdom */` docblock
-  and `@testing-library/react`, exactly like `tests/unit/app/conflicts-list.test.tsx`.
-  Drive the Android path by dispatching a fake `beforeinstallprompt` event on `window`
-  carrying `prompt`/`userChoice`; drive the iOS path by stubbing
-  `navigator.userAgent`/`maxTouchPoints`.
-- **Do not import `app/apple-icon.tsx` from a Jest test** — `next/og` pulls in
-  edge/wasm-only code that `@swc/jest` will not load. It is verified by `bun run build`.
+Nothing else in `README.md` changes.
 
-## Verification the Coder must run
+---
 
-`bun run lint`, `bun run typecheck`, `bun run test`, and `bun run build` (the build is the
-only thing that exercises `app/manifest.ts` and `app/apple-icon.tsx` as routes).
+## Required verification before finishing
 
-## Manual verification (copy into `.pipeline/changes.md`, unchecked)
+1. `bun run check:git-secrets` — must run against this repo's real history and
+   exit 0. **If it exits 1 with a genuine finding, stop: do not rewrite history,
+   do not weaken the patterns to make it pass, and do not paste the secret
+   anywhere.** Record the redacted output in `.pipeline/changes.md` and flag it
+   for the human.
+   If it exits 1 on an obvious false positive (a placeholder/fixture value), add
+   a narrowly-scoped `VALUE_ALLOWLIST` entry with a `reason` and say so in
+   `.pipeline/changes.md`.
+2. `bun run typecheck`, `bun run lint`, `bun run test`, `bun run format:check`
+   all pass.
+3. `bun run build` succeeds (catches an invalid `next.config.ts` `headers()`
+   shape, which typecheck alone will not).
 
-Not performable by any pipeline stage — requires physical devices per PRD §28.5.
+## Behaviors the tester should be able to verify
 
-- [ ] Chrome Android: install banner appears, "Install" adds the icon, launched app shows
-      no browser chrome and lands on `/dashboard`.
-- [ ] iOS Safari (iOS 16+): instruction banner appears; Share → Add to Home Screen; the
-      icon is the "G" mark (not a page screenshot); launched app is full-screen.
-- [ ] Chrome desktop DevTools → Application → Manifest: no errors, both icons resolve,
-      "Installability: yes".
-- [ ] View source of `/dashboard` contains `<link rel="manifest" href="/manifest.webmanifest">`,
-      `<meta name="theme-color" content="#4f46e5">`, and
-      `<meta name="apple-mobile-web-app-capable" content="yes">`.
-- [ ] `/manifest.webmanifest` and `/apple-icon` both return 200 while signed out.
+These are the seams the implementation must leave testable (unit tests belong in
+`tests/unit/lib/security/csp.test.ts`, importing via `@/lib/security/csp`):
+
+- `clerkFrontendApiOrigin`: valid `pk_test_`/`pk_live_` key → `https://<host>`;
+  `undefined`, `""`, a non-`pk_` string, and a key whose base64 payload is
+  garbage → `null`.
+- `generateNonce`: two calls differ; result is valid base64 decoding to 16 bytes.
+- `buildContentSecurityPolicy` with `isDev: false`: contains
+  `'nonce-<nonce>'` in `script-src`, contains `frame-ancestors 'none'`,
+  `object-src 'none'`, `upgrade-insecure-requests`; contains **no**
+  `'unsafe-eval'`, no `'unsafe-inline'` inside `script-src`, no `ws:`; is one
+  line with no double spaces.
+- `buildContentSecurityPolicy` with `isDev: true`: adds `'unsafe-eval'` and
+  `ws:`, drops `upgrade-insecure-requests`.
+- `buildContentSecurityPolicy` with `clerkOrigin: null`: well-formed output, no
+  `undefined`/empty token.
+- `check-git-secrets`: exits 0 on the current history; exits 1 (failure case)
+  when run against a scratch git repo whose history contains a fake key matching
+  one of the patterns; refuses to report clean on a shallow clone.

@@ -29,6 +29,19 @@ jobs:
 
       - run: bun audit --audit-level=high
 
+  git-secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history — a shallow clone makes the scan meaningless
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.x
+
+      - run: bun run check:git-secrets
+
   check-secrets:
     runs-on: ubuntu-latest
     outputs:
