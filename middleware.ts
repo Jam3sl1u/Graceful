@@ -15,6 +15,10 @@ export const isPublicRoute = createRouteMatcher([
   "/api/invitations/(.*)/accept",
   "/api/invitations/(.*)/deny",
   "/api/invitations/respond/(.*)",
+  // PWA install assets must be fetchable by the browser/OS with no session;
+  // /apple-icon has no dot in its path so it isn't excluded by config.matcher.
+  "/apple-icon(.*)",
+  "/manifest.webmanifest",
 ]);
 
 export default clerkMiddleware(async (auth, req) => {

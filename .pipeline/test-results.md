@@ -1,124 +1,137 @@
-# Test Results — Issue #77: [Sprint 4] Audit input validation (Zod) across all Phase 1 routes
+# Test Results — Issue #75: [Sprint 4] PWA manifest & install prompt
 
-## Verdict: PASS
+This overwrites the stale `test-results.md` for issue #65 that was still
+sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
+recent run).
 
-All verification commands pass, and all newly-added independent tests
-(happy path, spec-named edge cases, and failure cases) pass.
+## Verdict: PASS, with one flagged finding for Review
 
-## Verification commands (re-run independently from `.pipeline/changes.md`'s claims)
+All automated checks pass (lint/typecheck/test/build), independently re-run and matching
+the Coder's claims in `changes.md`. No failing test to stop the pipeline on. However,
+manual verification against a real running production build (not a physical device, so
+this **was** performable in this pipeline stage, contrary to the "manual verification"
+checklist's blanket assumption) surfaced a genuine discrepancy between the spec's stated
+intent and the actual rendered output — see "Finding" below. Recommend the Reviewer weigh
+this before shipping.
 
+## Re-run verification (independent)
+
+- `bun run lint` — clean. Matches the Coder's claim.
+- `bun run typecheck` — clean. Matches the Coder's claim.
+- `bun run test` — **84 suites / 1068 tests passed**, exact match to the Coder's reported
+  numbers, 0 failures. Also re-ran the 3 new PWA suites in isolation:
+  `tests/unit/lib/pwa/install.test.ts`, `tests/unit/app/manifest.test.ts`,
+  `tests/unit/app/install-prompt.test.tsx` → 3 suites / 28 tests passed.
+- `bun run build` (with throwaway well-formed dummy Clerk keys, same approach the Coder
+  used — no local `.env` in this worktree, nothing committed) — succeeds. Route list
+  confirms `○ /apple-icon` and `○ /manifest.webmanifest` as static routes, matching the
+  Coder's claim.
+- Confirmed `.next/` build output is gitignored and `git status` is clean — no build
+  artifacts or stray files were left behind by this verification.
+
+## Manual/behavioral verification actually performed in this stage
+
+Ran `bun run start` against the production build and hit it with `curl` (no physical
+device needed for this subset of the spec's "Manual verification" checklist):
+
+- `GET /manifest.webmanifest` while signed out → **200**, body matches every field in the
+  spec's table exactly (name, short_name, description, id, start_url, scope, display,
+  background_color, theme_color, both icons with `sizes: "any"`).
+- `GET /apple-icon` while signed out → **200**. Confirms E9 / the middleware change works
+  end-to-end: `middleware.ts`'s `isPublicRoute` correctly exempts both new paths, and
+  `config.matcher`/`auth.protect()` are otherwise untouched (also diff-reviewed directly).
+- `/` page source (shares the root layout/metadata with `/dashboard`) contains
+  `<link rel="manifest" href="/manifest.webmanifest">`,
+  `<meta name="theme-color" content="#4f46e5">`,
+  `<meta name="application-name" content="Graceful">`,
+  `<meta name="apple-mobile-web-app-title" content="Graceful">`, and
+  `<meta name="apple-mobile-web-app-status-bar-style" content="default">`.
+- `public/icons/icon.svg` / `icon-maskable.svg` checked numerically against spec:
+  `icon.svg` has `rx="96"` rounding and `font-size="307"` (~60% of 512, matches spec);
+  `icon-maskable.svg` has no rounding and `font-size="205"` (~40% of 512, matches the
+  maskable safe-area requirement). `app/apple-icon.tsx` renders the same mark at 180x180
+  PNG, flex-centered, no rounding, no custom font — matches spec exactly (correctly not
+  imported from Jest per spec; verified only via `bun run build` + this curl check, as the
+  spec intended).
+- Could not directly hit `/dashboard` signed-out (Clerk's dev-browser rewrite returns 404
+  for unauthenticated requests to protected routes when using dummy keys with no real
+  Clerk dev-browser cookie — pre-existing Clerk/dummy-key interaction unrelated to this
+  change, not a regression). Used `/` instead, which shares the same root layout/metadata,
+  to check the meta tags.
+
+## Finding (flagged for Review — not a Jest failure, but a real behavioral gap)
+
+**`app/layout.tsx`'s `appleWebApp: { capable: true, ... }` does not render the
+`<meta name="apple-mobile-web-app-capable" content="yes">` tag that the spec's own manual
+verification checklist and AC-bullet-3 rationale both explicitly call for.**
+
+Confirmed by inspecting the actual rendered `<head>` HTML from the production build (Next
+15.5.22, the version installed in this worktree per `node_modules/next/package.json`):
+only `<meta name="mobile-web-app-capable" content="yes">` (no `apple-` prefix) is emitted,
+alongside `apple-mobile-web-app-title` and `apple-mobile-web-app-status-bar-style`. There
+is no `apple-mobile-web-app-capable` tag anywhere in the response body.
+
+Root cause traced to `node_modules/next/dist/lib/metadata/generate/basic.js`
+(`AppleWebAppMeta`): in this installed Next version, `capable: true` is wired to emit only
+`name: 'mobile-web-app-capable'`, not the Apple-prefixed variant:
+
+```js
+function AppleWebAppMeta({ appleWebApp }) {
+    ...
+    capable ? (0, _meta.Meta)({
+        name: 'mobile-web-app-capable',
+        content: 'yes'
+    }) : null,
 ```
-$ bun run lint
-$ eslint .
-(clean, no warnings/errors)
 
-$ bun run typecheck
-$ tsc --noEmit
-(clean, no errors)
+Why this matters: `changes.md` states `appleWebApp` "is what gives iOS the full-screen,
+no-browser-chrome launch — AC bullet 3," and the spec's own manual checklist explicitly
+targets "iOS Safari (iOS 16+)". Historically, iOS Safari's standalone-mode detection has
+relied specifically on the `apple-` prefixed tag; the un-prefixed standards-track tag is a
+comparatively recent WebKit addition. If the iOS versions in the spec's own target range
+(16+) don't yet honor the un-prefixed tag, this implementation — despite following the
+spec's `appleWebApp` API shape exactly as written — may silently fail AC bullet 3's
+full-screen launch behavior on precisely the devices the manual checklist says to test.
 
-$ bun run test
-Test Suites: 88 passed, 88 total
-Tests:       1099 passed, 1099 total
-```
+This is not the Coder deviating from the spec (the spec asked for the `appleWebApp.capable`
+field, which is the correct/only Next.js public API for this); it's a gap between what the
+installed framework version actually outputs and what the spec assumed it would output —
+worth a human decision (e.g. whether to add an explicit
+`other: { "apple-mobile-web-app-capable": "yes" }` override in `app/layout.tsx`) before
+this ships. No code was modified to work around this — flagging per the pipeline contract
+for Review/human judgment rather than patching around it myself.
 
-Before adding new tests, I also ran the pre-existing suite in isolation to
-confirm the Coder's claim of "82 suites / 1051 tests, all passing" —
-confirmed exactly (82 suites, 1051 tests, all green), including the single
-intentionally-changed assertion in `tests/unit/app/api/songs-route.test.ts:186`
-and the unmodified `tests/unit/app/api/google-calendar-callback-route.test.ts`.
+## Everything else checked and consistent with spec/changes.md
 
-## Code review of the diff (independent read, not just trusting changes.md)
+- `lib/pwa/install.ts`: all four exports match the spec's declared signatures and edge-case
+  rules (E3, E5, E6) exactly; existing unit tests exercise iPhone Safari, iPadOS-13+
+  spoofed-Mac-with-touch, real desktop Mac, `CriOS`/`FxiOS` exclusion, Android Chrome, and
+  both storage-throw paths (E3) — re-run and confirmed passing; manually re-verified the
+  assertions are non-tautological by reading the implementation alongside each test.
+- `components/pwa/InstallPrompt.tsx`: E1 (null on mount before the effect fires), E2
+  (standalone → no listeners/render), E4 (sticky dismissal across unmount/remount), E7
+  (single-use `prompt()` guarded via clearing `deferred` before awaiting; a rejected
+  `prompt()` still finalizes without an unhandled rejection — confirmed via a
+  `jest.fn().mockRejectedValue` test), E8 (`appinstalled` hides + marks dismissed) are all
+  covered and passing.
+- `app/manifest.ts`: exact field match to the spec's table, plus the explicit
+  `start_url`-inside-`scope` installability check (E10) the spec names.
+- `middleware.ts`: diffed against the spec's file-10 instructions — only the two new
+  entries were added to `isPublicRoute`; `config.matcher` and the `auth.protect()` call are
+  byte-for-byte unchanged. Confirmed live via curl (both new paths return 200 while signed
+  out).
+- Out-of-scope guardrails respected: no service worker, no `next-pwa`/`workbox`, no new
+  dependency (`next/og` is bundled with Next 15, not added to `package.json` — confirmed).
+- The manual-verification checklist was correctly copied verbatim into `changes.md` and
+  left unchecked, as the spec required.
 
-Read every changed/created file directly and confirmed it matches spec.md:
-- `lib/api/postgrest.ts` — pure function, escapes `\` before `"`, no
-  `server-only` import, matches the spec's exact signature/doc comment.
-- `app/api/songs/handler.ts` — `listSongs` now escapes `q` and wraps both
-  `ilike` terms in double quotes; rest of the function unchanged.
-- `schemas/service-weeks.ts` / `schemas/events.ts` — `.max(200)` /
-  `.max(2000)` added exactly where the spec said, with the required rationale
-  comments, no other limits touched.
-- `schemas/google-calendar.ts` — placeholder replaced with the real
-  `googleCalendarCallbackQuerySchema` (code/state/error, matching
-  min/max bounds from the spec).
-- `app/api/google-calendar/callback/handler.ts` — validates query params via
-  `safeParse`, redirects (never `fail(...)`) on failure; rest of the control
-  flow (error short-circuit, code/state guard, CSRF check, upsert,
-  best-effort sync) is untouched.
-- `schemas/invitations.ts` / `app/api/invitations/handler.ts` —
-  `invitationIdParamSchema` added; `denyInvitation` validates `id` as the
-  first statement in the `try` (covers both the token and in-app branches);
-  `withdrawInvitation` validates `id` after `requireAuth`+`requireRole`
-  (401/403 still precede 400). Matches spec exactly.
+## Files touched by this stage (Testing)
 
-No scope creep found: `git status --porcelain` before I added tests showed
-no uncommitted changes beyond what `.pipeline/changes.md` describes, and the
-"Explicitly OUT of scope" items (blanket `:id` validation, rate limiting,
-`schemas/notifications.ts`, the two inline `targetIdSchema` helpers,
-`lib/supabase/types.ts`/RLS/migrations) were left untouched.
-
-## New tests added (6 files, 48 new test cases, all passing)
-
-All added under `tests/unit/`, following this repo's existing Jest
-conventions (`jest.mock`, `makeReq`/`makeLookup`/`setUpAuth` helper patterns
-copied from sibling test files). No existing test file was modified.
-
-1. **`tests/unit/lib/api/postgrest.test.ts`** (8 tests) — unit tests for
-   `escapePostgrestFilterValue`: plain string unchanged, quote escaped,
-   backslash escaped, the tricky "backslash immediately before a quote"
-   ordering case (escaping backslash first is required or the result would
-   let a quote leak through unescaped), reserved-but-not-special chars
-   (`,().`) left alone, wildcards (`%`, `*`) untouched, empty string, and a
-   value with multiple quotes/backslashes.
-
-2. **`tests/unit/app/api/songs-search-injection-tester-supplement.test.ts`**
-   (8 tests) — the adversarial cases the spec explicitly assigned to this
-   stage: `q` containing `,`, `(`, `)`, `.`, `"`, `\`, and all combined,
-   asserting `.or()` is called exactly once with a single well-formed,
-   correctly-quoted filter string, that reversing the escaping recovers the
-   original `q` exactly, that a crafted `q` cannot smuggle in a third
-   top-level filter clause via a raw comma, and that a plain non-adversarial
-   `q` still produces the exact expected unescaped-looking output (no
-   false-positive escaping).
-
-3. **`tests/unit/schemas/service-weeks.test.ts`** (11 tests, new file — none
-   existed before) — `createServiceWeekSchema`/`updateServiceWeekSchema`
-   `sermonTopic`/`sermonScripture` `.max(200)`: valid body, exact 200-char
-   boundary (accept), 201-char (reject), a 2MB string (reject — the
-   unbounded-input case this issue closes), empty string still rejected
-   (`.min(1)` unchanged), and optional-omission still allowed on update.
-
-4. **`tests/unit/schemas/events-notes-max-tester-supplement.test.ts`**
-   (7 tests) — `createEventSchema`/`updateEventSchema` `notes` `.max(2000)`:
-   exact 2000-char boundary (accept), 2001-char (reject), 2MB string
-   (reject), omitted/explicit-null still accepted (`.nullish()` unchanged).
-
-5. **`tests/unit/app/api/google-calendar-callback-validation-tester-supplement.test.ts`**
-   (7 tests) — oversized `code` (>2048), `state` (>512), `error` (>200), and
-   empty-but-present `code` all redirect to `/profile?calendar=error` (307,
-   state cookie cleared, `exchangeCode` never called, no JSON content-type);
-   confirms `code:"abc"` and `error:"access_denied"` still work unchanged;
-   confirms the exact 2048-char boundary is still accepted.
-
-6. **`tests/unit/app/api/invitations-id-param-validation-tester-supplement.test.ts`**
-   (6 tests) — `denyInvitation` malformed `:id` returns 400
-   `VALIDATION_FAILED` before any Supabase/RPC call on both the in-app and
-   token branches; a well-formed uuid still passes validation (reaches the DB
-   lookup, distinct from the 400 the malformed-id tests get);
-   `withdrawInvitation` malformed `:id` returns 400 when authorized, and
-   confirms 401 (no Clerk session) and 403 (wrong role) both still take
-   precedence over the 400 for a malformed id, matching the spec's ordering
-   requirement.
-
-## Failure cases covered (explicit, per pipeline contract)
-
-- Malformed/adversarial `q` values that would have broken out of the
-  PostgREST filter grammar pre-fix.
-- Over-limit `sermonTopic`/`sermonScripture`/`notes` (both boundary and
-  grossly-oversized).
-- Malformed Google OAuth callback query params (oversized/empty) — must
-  redirect, never leak to `exchangeCode()`.
-- Malformed `:id` invitation route params on both `denyInvitation` branches
-  and `withdrawInvitation`, plus the 401/403-before-400 ordering.
-
-No failures encountered. Nothing patched around — this file records only
-independently-run, all-green results.
+None — no new test files were added. The Coder's existing test suite
+(`tests/unit/lib/pwa/install.test.ts`, `tests/unit/app/manifest.test.ts`,
+`tests/unit/app/install-prompt.test.tsx`) already covers the happy path, every named edge
+case, and at least one failure case (rejected `prompt()`) called for by the pipeline
+contract, and was independently re-run rather than trusted. This stage's contribution was
+re-running lint/typecheck/test/build and performing the additional live-server behavioral
+verification described above, which surfaced the finding above that unit tests alone could
+not catch.

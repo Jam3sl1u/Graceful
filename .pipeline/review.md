@@ -1,141 +1,167 @@
-# Review — Issue #77: [Sprint 4] Audit input validation (Zod) across all Phase 1 routes
+# Review — Issue #75: [Sprint 4] PWA manifest & install prompt
 
-VERDICT: SHIP
+## VERDICT: NEEDS WORK
 
-Reviewed: `.pipeline/spec.md`, `.pipeline/changes.md`, `.pipeline/test-results.md`,
-`git diff main...HEAD`, the six untracked new test files, and the surrounding
-source I needed to check the claims independently.
+The Android/Chrome half of this feature is solid and well tested. The **iOS half is
+broken in a way no test in this repo can see**: the generated apple-touch-icon is
+built but never referenced by any page, and the `apple-mobile-web-app-capable` tag
+the spec's own checklist requires is not emitted. Two of the issue's acceptance
+criteria (iOS home-screen icon, iOS full-screen launch) would fail on a real device
+today, with 1068/1068 tests green.
 
-## Independently re-run verification
+Both fixes are in one file (`app/layout.tsx`) and total ~4 lines.
+
+---
+
+## BLOCKING FINDING 1 — `<link rel="apple-touch-icon">` is never emitted; `app/apple-icon.tsx` is dead weight
+
+**Where:** `app/layout.tsx:10` (`icons: { icon: [...] }`) interacting with
+`app/apple-icon.tsx`.
+
+**Evidence (empirical, not theoretical).** Inspected the prerendered HTML from the
+production build already present in this worktree:
 
 ```
-bun run lint       # clean
-bun run typecheck  # clean
-bun run test       # 88 suites / 1099 tests, all passing
+$ grep -c "apple-touch-icon\|apple-icon" .next/server/app/dashboard.html
+0
+$ grep -o '<link rel="[^"]*"[^>]*>' .next/server/app/dashboard.html
+<link rel="manifest" href="/manifest.webmanifest"/>
+<link rel="icon" href="/icons/icon.svg" type="image/svg+xml"/>
 ```
 
-1099 − 1051 = 48 new cases, which matches the per-file count I did by hand
-(8 + 8 + 12 + 7 + 7 + 6). The Testing stage's numbers are honest.
+`/apple-icon` *is* built (`.next/server/app/apple-icon.body` = `PNG image data,
+180 x 180`, 200 OK — the Tester's curl was correct), but **zero** HTML pages link to
+it.
 
-## Does the code match the spec?
+**Root cause.** In Next 15.5.22, file-convention icons are only merged in when the
+route has no explicit `metadata.icons`
+(`node_modules/next/dist/lib/metadata/resolve-metadata.js:703-715`):
 
-Yes, exactly, and nothing beyond it. `git diff main...HEAD --stat` touches only
-the nine files the spec's "Files touched" list names, plus the two `.pipeline/`
-artifacts. I checked each of the four changes against the spec text:
+```js
+if (leafSegmentStaticIcons.icon.length > 0 || leafSegmentStaticIcons.apple.length > 0) {
+    if (!resolvedMetadata.icons) {          // <-- our metadata.icons is set, so this is false
+        resolvedMetadata.icons = { icon: [], apple: [] };
+        ... unshift(...leafSegmentStaticIcons.apple)
+    }
+}
+```
 
-- **Change 1 (PostgREST injection)** — `lib/api/postgrest.ts` is pure, has no
-  `server-only` import, and escapes `\` *before* `"`, which is the ordering that
-  actually matters (quote-first would turn a trailing `\"` into `\\"`, leaking an
-  unescaped quote). `listSongs` wraps both `ilike` terms in double quotes and
-  passes the escaped value. I grepped `app/**` and `lib/**` for `.or(`,
-  `.filter(`, `.ilike(`, `.like(`, `textSearch`, and backtick-templates passed to
-  `select/eq/in/match/order` — the fixed line in `app/api/songs/handler.ts:74` is
-  the only interpolation site in either tree. AC 3 holds.
-- **Change 2 (unbounded strings)** — the three caps are in place with the
-  rationale comments; no pre-existing limit was altered. I re-ran the audit
-  myself: `grep 'z\.string()' schemas/*.ts` minus `.max()`/`uuid`/`datetime`/
-  `regex`/`email`/`url` leaves only `schemas/availability.ts` `date`/`startDate`/
-  `endDate`, and those are constrained to 10 chars in practice by
-  `isValidDateString`'s `^\d{4}-\d{2}-\d{2}$` in the `superRefine`. So the
-  "everything else is bounded" claim holds for string fields.
-- **Change 3 (OAuth callback query schema)** — `safeParse` +
-  `Object.fromEntries(searchParams)`, failure returns `redirectError()`, never
-  `fail(...)`. I traced the whole function: the `null` → `undefined` change for
-  absent params is harmless (`if (error)` and `if (!code || !state)` behave
-  identically), and `?code=` empty-string still lands on the same redirect (now
-  via `min(1)` instead of the falsy guard). The `state` cap of 512 is safe —
-  `connect/handler.ts` mints `randomBytes(32).toString("base64url")`, i.e. 43
-  chars. Nothing anywhere still imports the deleted `googleCalendarSchema` /
-  `GoogleCalendarInput` (grepped repo-wide).
-- **Change 4 (invitation `:id`)** — `denyInvitation` validates first inside the
-  `try`, which does cover both the token and in-app branches;
-  `withdrawInvitation` validates after `requireAuth`/`requireRole`, so 401/403
-  still precede 400.
-- **Change 5 (audit record)** — I machine-diffed the inventory table against
-  `find app/api -name route.ts`: **57 files listed, 57 files on disk, exact
-  match, no omissions**. The `notImplemented` claim checks out (10 stub files:
-  5 notifications, 4 webhooks, `GET /api/church-group`). The RPC list matches
-  `grep -o 'rpc("[a-z_]*"'` exactly — same 12, no more, no fewer. The coder also
-  corrected the spec's own "58 files" estimate to the real 57 and said so.
+Because `app/layout.tsx` sets `icons: { icon: [...] }`, the `apple` entry contributed
+by `app/apple-icon.tsx` is silently discarded. This is a genuine spec/framework
+interaction the spec did not anticipate: spec files 4 and 8 are individually correct
+but mutually exclusive as written.
 
-## Are the tests meaningful?
+**Impact.** iOS has no apple-touch-icon link, and there is no `/apple-touch-icon.png`
+at the site root to fall back to; the manifest's only icons are SVG, which iOS
+ignores (the spec says so itself). The home-screen icon degrades to a page
+screenshot — exactly the failure mode AC bullet 2 / the manual checklist calls out
+("the icon is the 'G' mark (not a page screenshot)"). The whole of
+`app/apple-icon.tsx` currently does nothing.
 
-Mostly yes, and several are genuinely adversarial rather than decorative:
+**Fix (minimal, preferred).** In `app/layout.tsx`, name the apple icon explicitly:
 
-- `tests/unit/lib/api/postgrest.test.ts` includes the backslash-before-quote
-  ordering case, which is the one case a naive implementation gets wrong. That
-  test would fail if someone "simplified" the two `.replace()` calls into the
-  wrong order.
-- `songs-search-injection-tester-supplement.test.ts` doesn't just assert a
-  string equality — it regex-parses the emitted filter, asserts exactly two
-  `ilike` clauses, and asserts that reversing the escaping recovers `q` byte for
-  byte. That is a real breakout test.
-- `service-weeks`/`events` schema tests cover both sides of the boundary (200/201,
-  2000/2001) plus a 2MB payload, and confirm `min(1)`/`nullish()`/`optional()`
-  were not disturbed.
-- `google-calendar-callback-validation-*` proves `exchangeCode` is never reached
-  and that the response is a redirect with no JSON content-type.
-- `invitations-id-param-validation-*` asserts the 401 → 403 → 400 ordering on
-  withdraw and that no Supabase client / RPC is constructed on the 400 path.
+```ts
+icons: {
+  icon: [{ url: "/icons/icon.svg", type: "image/svg+xml" }],
+  apple: [{ url: "/apple-icon", sizes: "180x180", type: "image/png" }],
+},
+```
 
-One weak test, not worth blocking on: "redirects to error when error exceeds 200
-chars" passes identically before and after the change (any truthy `error` already
-short-circuited to `redirectError()`), so it does not discriminate the fix. The
-oversized-`state` test *does* discriminate, because the cookie is set to the same
-513-char value, so pre-fix it would have proceeded to `exchangeCode`.
+(Alternative, if you'd rather stay on the file convention: drop `metadata.icons`
+entirely and move the favicon to `app/icon.svg` so both file conventions are picked
+up. More churn, and it duplicates the asset that `app/manifest.ts` points at, so the
+explicit `apple` entry above is the smaller change.)
 
-## Findings
+**Verification required after the fix** — a Jest test cannot catch this (importing
+`app/layout.tsx` fails under Jest: plain `./globals.css` is not in the config's
+`moduleNameMapper`). Re-run `bun run build` and confirm:
 
-### Must do before merge (process, not code)
+```
+grep -o '<link rel="apple-touch-icon"[^>]*>' .next/server/app/dashboard.html
+```
 
-1. **The six new test files are untracked.** `git status` shows
-   `tests/unit/lib/api/postgrest.test.ts`,
-   `tests/unit/schemas/service-weeks.test.ts`,
-   `tests/unit/schemas/events-notes-max-tester-supplement.test.ts`,
-   `tests/unit/app/api/songs-search-injection-tester-supplement.test.ts`,
-   `tests/unit/app/api/google-calendar-callback-validation-tester-supplement.test.ts`,
-   `tests/unit/app/api/invitations-id-param-validation-tester-supplement.test.ts`
-   as `??`, and `.pipeline/test-results.md` as modified. The only commit on this
-   branch (`7f22d48`) contains **none** of the Testing stage's tests. Commit them
-   before opening/updating the PR or the entire test deliverable is lost.
+returns a match. Please paste that output into `changes.md`.
 
-### Non-blocking, worth a human's eyes
+---
 
-2. **The PostgREST quoting fix is verified only against mocks.** Every test
-   asserts on the *string handed to a jest mock* `.or()`; nothing in this repo
-   exercises `title.ilike."%…%"` against a live PostgREST. The syntax is correct
-   per PostgREST's reserved-character rules (double-quoted values, `\"` and `\\`
-   escapes inside them, `%`/`*` wildcard handling unaffected by quoting), and
-   `tests/integration/rls/` has no song-search coverage to extend cheaply. Still:
-   if this form were rejected, `GET /api/songs?q=…` would 500 in production and
-   the green unit suite would not notice. Suggest one manual `curl` against a dev
-   Supabase before merge, or a follow-up integration test.
-3. **`denyInvitation` now returns 400 before 401/403 on the in-app branch.** The
-   spec mandated this ordering (it is the only way to cover the tokenless branch
-   with one check), but it inverts the "auth before validate" convention the same
-   spec lists in its own patterns table and that `withdrawInvitation` follows. No
-   information is disclosed — the id is entirely caller-supplied — so this is a
-   consistency nit, not a security issue. Flagging it so it is a conscious choice.
-4. **`Object.fromEntries(searchParams)` takes the last duplicate; `.get()` took
-   the first.** A `?code=a&code=b` now resolves to `b` instead of `a`. Both are
-   schema-bounded and Google does not send duplicates, so impact is nil, but it is
-   a real (undocumented) behavior delta introduced by this diff.
-5. **Audit gap the record does not mention: unbounded array cardinality.**
-   `reorderSetlistSchema.songs` is `z.array(...)` with no `.max()`, unlike
-   `setAvailabilitySchema.entries` (`.min(1).max(400)`), which sets the repo
-   precedent. Practical impact is limited — `PUT /api/setlists/:id` rejects any
-   body whose song set does not exactly match the stored setlist, so an oversized
-   array 400s before the per-row update loop — but a validation *audit* should say
-   so rather than be silent. Suggest adding a line to the audit record or filing a
-   follow-up alongside the already-documented blanket-`:id` gap.
-6. **`.max(200)` on `sermonTopic`/`sermonScripture` is a tightening on live data.**
-   Nothing in `app/`/`components/` renders these fields yet (grepped), so there is
-   no client/server `maxLength` mismatch, but any pre-existing row over 200 chars
-   would now fail a PUT. Low risk for a Sprint-4 app; noted for completeness.
+## FINDING 2 (must fix alongside 1) — `apple-mobile-web-app-capable` is not emitted
 
-## Bottom line
+The Testing stage flagged this and it is confirmed independently. Rendered head from
+the build contains `<meta name="mobile-web-app-capable" content="yes">` and nothing
+Apple-prefixed; `node_modules/next/dist/lib/metadata/generate/basic.js:263` shows
+Next 15.5.22's `AppleWebAppMeta` only emits the un-prefixed name for
+`appleWebApp.capable`.
 
-The diff is small, correct, matches the spec line for line, and the audit record
-is the rare kind that survives being machine-checked against the repo. Items 3–6
-are observations for a human, not defects. Item 1 is the only thing that has to
-happen before this ships.
+The spec's own manual-verification checklist requires
+`<meta name="apple-mobile-web-app-capable" content="yes">` in the page source, so
+that checklist item is guaranteed to fail as shipped, and AC bullet 3 (full-screen
+launch, no browser chrome) is at risk on the iOS 16.x devices the spec names —
+older iOS honours only the Apple-prefixed tag, and manifest-`display` support is the
+newer path.
+
+**Fix:** in `app/layout.tsx`'s `metadata`, add
+
+```ts
+other: { "apple-mobile-web-app-capable": "yes" },
+```
+
+alongside the existing `appleWebApp` (keep `appleWebApp` — it is what produces
+`apple-mobile-web-app-title` / `-status-bar-style`). Harmless on every other
+platform; belt-and-braces with the manifest's `display: "standalone"`.
+
+---
+
+## What I verified independently (and what is genuinely good)
+
+Re-ran everything rather than trusting `changes.md` / `test-results.md`:
+
+- `bun run typecheck` clean, `bun run lint` clean, `bun run test` → **84 suites /
+  1068 tests passed**, matching both prior stages' claims exactly.
+- New suites in isolation → 3 suites / 28 tests.
+- Read the full `git diff main...HEAD`. No scope creep: nothing outside the 10 files
+  the spec names (plus the 3 test files), no new dependency, no service worker,
+  `middleware.ts`'s `config.matcher` and `auth.protect()` untouched.
+- Verified the built artifacts on disk: `/manifest.webmanifest` body matches the
+  spec's field table byte for byte (E10: `start_url: "/dashboard"` is inside
+  `scope: "/"`); `/apple-icon` is a real 180x180 PNG and renders the white "G" on
+  `#4f46e5` (viewed it — the `fontWeight: 700` doesn't take effect with next/og's
+  bundled default font, purely cosmetic, not worth a round trip).
+
+Quality notes on the code itself:
+
+- `lib/pwa/install.ts` is genuinely pure and the E5/E6 rules match the spec exactly.
+  The tests are non-tautological — real UA strings, both storage-throw paths, and a
+  desktop-Mac-with-0-touch-points negative case.
+- `components/pwa/InstallPrompt.tsx` handles E1/E2/E3/E4/E7/E8 correctly. The E7
+  guard is real: `setDeferred(null)` runs synchronously before the first `await`,
+  so a second click genuinely sees `null` — remove it and
+  `expect(prompt).toHaveBeenCalledTimes(1)` fails. `finally` finalizes on a rejected
+  `prompt()`. Good.
+- `middleware.ts`: the two added entries are correctly scoped and cannot widen
+  access to anything else; `isPublicRoute` has no other consumer in the repo. E9 is
+  properly addressed (and the Tester's signed-out 200 on `/apple-icon` confirms it).
+- Button reuse is correct — `components/ui/Button` forwards `className`/`aria-label`
+  and already carries `min-height/min-width: 44px`, so PRD A-08 holds (the extra
+  `.dismiss` rule is redundant but harmless).
+
+## Non-blocking observations (do NOT fix in this pass)
+
+- Manifest ships SVG-only icons. Chromium accepts `sizes: "any"` SVG for
+  installability, so this should be fine, but there is no PNG 192/512 fallback for
+  tooling that doesn't (some Android launchers, older Lighthouse). Worth a follow-up
+  issue if the manual Chrome-Android check shows anything odd — not a blocker here,
+  the spec made this call deliberately.
+- `.pipeline/test-results.md` is currently uncommitted (`git status` shows ` M`).
+  Commit it with the fix so the handoff artifacts stay in sync.
+- E12 (early `beforeinstallprompt` before hydration) remains an accepted limitation
+  per spec. Fine.
+
+## Definition of done for the next pass
+
+1. `app/layout.tsx`: add `icons.apple` pointing at `/apple-icon`.
+2. `app/layout.tsx`: add `other: { "apple-mobile-web-app-capable": "yes" }`.
+3. Re-run `bun run lint`, `bun run typecheck`, `bun run test`, `bun run build`.
+4. Paste the `grep` output proving both `<link rel="apple-touch-icon" ...>` and
+   `<meta name="apple-mobile-web-app-capable" content="yes">` now appear in
+   `.next/server/app/dashboard.html` into `changes.md`.
+5. Nothing else changes.
