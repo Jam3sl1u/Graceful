@@ -1,232 +1,88 @@
-# Review — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
+# Review — Issue #70: Notification preferences API (BR-14 minimum-channel guard)
 
-VERDICT: SHIP (after two post-review fix passes below — see "Independent
-second-pass review" for the pass that confirmed this; original run below is
-historical)
+VERDICT: SHIP
 
-## Independent second-pass review (2026-08-04)
+Reviewed: `.pipeline/spec.md`, `.pipeline/changes.md`, `.pipeline/test-results.md`,
+`git diff main...HEAD` (all 7 files), the untracked tester supplement, the PRD
+(§6.9.1, §7 BR-14, §22.12), issue #70's acceptance criteria, the
+`notification_preferences` migration, and its RLS policies.
 
-An independent reviewer agent re-audited the whole branch (not just the fix
-commit) with fresh eyes, specifically checking whether the first fix pass
-introduced any new bug and re-deriving the `getByText` fixes against the
-actual component source rather than trusting the commit message. Findings:
+## Independently re-run in this worktree
 
-- Confirmed both original BLOCKING items are genuinely fixed — re-derived
-  independently against `app/(app)/setlists/[id]/setlist-builder.tsx` and
-  `app/(app)/member-week/[id]/member-week-view.tsx`, each now resolves to
-  exactly one element.
-- Found a **real regression introduced by the first fix pass**: moving
-  `adminContext.close()`/`memberContext.close()`/`leaderContext.close()` into
-  `finally` made `teardownFixtures` (the DB cleanup) unreachable if the
-  `.close()` call itself threw, since nothing after a throw in the same
-  `finally` block runs — a change from the pre-fix behavior, where
-  `teardownFixtures` was the sole `finally` statement and always ran. Fixed
-  by wrapping each cleanup step in its own `try`/`catch` (mirroring
-  `calendar-sync.spec.ts`'s existing failure-tolerant pattern), so a failed
-  `.close()` (or, in `setlist-duplicate-song.spec.ts`, a failed role restore)
-  no longer blocks the steps after it.
-- Found a latent version of the *same* strict-mode bug class at
-  `setlist-publish.spec.ts:72` (`getByText("Draft")`, non-exact, at a point
-  where the full staging song catalog is rendered) — added `{ exact: true }`
-  for consistency/robustness.
-- Found the "five secrets gate the skip" inaccuracy (the same class just
-  fixed in `documentation/staging-environment.md`) also present in
-  `.github/workflows/ci.yml`'s e2e-job comment and
-  `tests/e2e/calendar-sync.spec.ts`'s header comment — both corrected to
-  "four" with `E2E_GOOGLE_CALENDAR_ID` called out as separate from the gate.
-- Swept every other `getByText`/`getByRole` call across the three new specs
-  against the actual rendered DOM — no further collisions found.
-- Checked the whole diff for the network-beaconing pattern from this repo's
-  prior rogue-commit incident — no unexpected hosts; `tests/e2e/support/google.ts`
-  only calls `oauth2.googleapis.com` and `www.googleapis.com`, no secrets are
-  logged, and scope is unchanged (`tests/`, `.github/workflows/ci.yml`,
-  `documentation/staging-environment.md`, `.pipeline/` only).
-- Independently re-ran `bun run lint`, `bun run typecheck`, and `bun run
-  test` — all green (82 suites / 1051 tests).
+- `bun run lint` — clean.
+- `bun run typecheck` — clean.
+- `bun run test` — 83 suites / 1069 tests, 0 failures (matches test-results.md).
+- `bun run test -- notification-preferences` — 29 tests across the two dedicated suites.
 
-All fixes from this pass were applied; re-verified again after applying them
-(`lint`, `typecheck`, `test`: 1051/1051, `test:e2e`: 1 passed / 10 skipped,
-same shape). Two informational (non-actionable) notes from this pass, kept
-here for a future reader's awareness rather than as blockers:
-- `setlist-publish.spec.ts` now keeps two browser contexts open
-  concurrently (admin stays open while the member context signs in) — an
-  unproven-but-plausible-safe pattern in this suite (contexts have isolated
-  cookie jars); no other spec does this yet.
-- `setlist-duplicate-song.spec.ts` is the first spec depending on DB-only
-  role elevation granting RLS write access; this only works today because
-  `auth_user_role()` falls back to the DB when the JWT has no `role` claim —
-  worth remembering if Clerk custom-claim sync (#5/#6) ever changes that.
+## Correctness — verified against source, not summaries
 
-## Post-review fix pass (2026-08-04, first pass)
+- **BR-14 is enforced on the merged state, before any write** (`handler.ts:150-158`),
+  which is the only placement that catches the dangerous case (body disables the
+  last enabled channel while the other two are already `false` in the DB). Both
+  the direct and via-merge variants are tested, and the direct test asserts *no
+  upsert is issued*, so the guard is load-bearing, not decorative — deleting it
+  flips those tests to 200.
+- **422 + `VALIDATION_FAILED` for the business-rule violation, 400 for shape
+  failures** matches the repo convention (`church-group/members/[id]/role/handler.ts`,
+  `events/handler.ts`, `songs/handler.ts`).
+- **Defaults match the PRD table and the migration exactly** (invitation×3 true,
+  reminder_sms true / reminder_email false, hours 24, setlist×2 true, gcal false).
+- **`user_id` always comes from `ctx.userId`**, never the body; Zod strips unknown
+  keys, and a body carrying `userId`/`id`/`chatPreference` is proven not to reach
+  the payload. Combined with the existing user-scoped RLS
+  (`user_id = auth_user_id()` on select/insert/update), a caller cannot read or
+  retarget another user's row.
+- **`chat_preference` is never selected or written**, so an existing row's value
+  survives a PUT and a new row gets the DB default `'mentions'`. Confirmed in the
+  shared `COLUMNS` constant, the upsert payload, and the hand-rolled Insert type
+  (`Omit<Row,"id">` with no `chat_preference` field).
+- **Upsert writes the complete merged row**, which also makes concurrent PUTs safe:
+  the final state is always some single client's fully-validated view, so two
+  interleaved partial updates cannot combine into a BR-14-violating state.
+- **GET does not create a row** (synthesized defaults only) — asserted.
+- `.select(COLUMNS)` uses `", "` separators; supabase-js strips whitespace and this
+  matches every other handler in the repo, so no PostgREST issue.
+- No migration, RLS, UI, or unrelated-route changes. Diff is exactly the 5 files
+  the spec names plus the two pipeline artifacts. No scope creep.
 
-Applied targeted fixes for MUST FIX items #1 and #2 below, plus NON-BLOCKING
-items #4 and #5 (item #3 was already resolved on the branch before this
-pass). This was a direct fix pass in response to this review's own findings,
-not a fresh independent run of the Review stage — see "Independent
-second-pass review" above for the pass that actually re-verified it.
+## Tests — meaningful, not superficial
 
-- **#1/#2** (`getByText` strict-mode collisions): added `{ exact: true }` to
-  `tests/e2e/setlist-publish.spec.ts:94`, `:189` (`"Published"`), and `:133`
-  (`"Confirmed"`) — the same option already used for every `getByRole(...,
-  { name, exact: true })` call in these specs.
-- **#4** (`try`/`finally` scope): hoisted `adminContext`/`memberContext`
-  (`setlist-publish.spec.ts`, both tests) and `leaderContext`
-  (`setlist-duplicate-song.spec.ts`) to `let` declarations above `try`, and
-  moved their `.close()` calls into the existing `finally` blocks, matching
-  `calendar-sync.spec.ts`'s established pattern. In
-  `setlist-duplicate-song.spec.ts`, `.close()` was placed *after* the
-  `setMemberRole(svc, "member")` restore, preserving the file's documented
-  "restore role as the first `finally` statement" invariant (safe only
-  because the suite is serialized, per the top-of-file comment).
-- **#5** (doc mislabel): reworded `documentation/staging-environment.md` §7's
-  `E2E_GOOGLE_CALENDAR_ID` row and the §7.1 intro paragraph — it is not part
-  of `GOOGLE_SYNC_VARS`/the skip gate, it only sets the default calendar id.
+The coder's 22 tests assert the captured upsert payload and the `onConflict`
+option, not just status codes, and assert *absence* of a write on the rejection
+paths. The tester's 7 supplements close real gaps rather than padding: the coder's
+fixture couples the pre-write select and post-upsert result to the same
+`error`/`data` fields, so the upsert's own `error || !data` branch was never
+isolated; the supplement isolates both halves, adds the inclusive `[1, 168]`
+boundary values, adds the "no Clerk session at all" PUT variant, and drives the
+real `route.ts` `GET`/`PUT` exports through the default `requireAuth` DB lookup.
+That last one is the only test that proves the route wrapper is actually wired to
+the handler. Failure cases (400 malformed/out-of-range, 401 no JWT and no session,
+422 BR-14 ×2, 500 on select error, upsert error, and upsert-returns-nothing) are
+all covered, and no error path leaks a driver message.
 
-Re-verified after the fixes: `bun run lint`, `bun run typecheck`, `bun run
-test` (82 suites / 1051 tests, unchanged), and `bun run test:e2e` (1 passed /
-10 skipped, same shape as the original run, no new failures). See
-`.pipeline/test-results.md`'s "Post-review fix pass" section for details.
+## Non-blocking notes for the human (no rework required)
 
-## Why (original BLOCK verdict)
-
-The deliverable of this issue *is* the tests. Two of the four new specs
-(`tests/e2e/setlist-publish.spec.ts`, both tests) contain assertions that are
-**guaranteed to fail** the moment a human provisions the staging secrets — they
-are Playwright strict-mode violations, not flakiness. Everything green so far
-(lint / typecheck / 1051 Jest tests / "10 skipped, 1 passed" E2E run) only
-proves the specs *skip* cleanly; nothing in the pipeline exercised a single
-assertion inside them. This is exactly the "green tests are not correct
-behavior" case.
-
-I independently re-ran, in this worktree (`node_modules` was missing, so I ran
-`bun install --frozen-lockfile` first):
-
-| Check | Result |
-|---|---|
-| `bun run typecheck` | PASS |
-| `bun run lint` | PASS |
-| `bun run test` | PASS — 82 suites / 1051 tests |
-| `bun run test:e2e` (no secrets) | 1 passed, 10 skipped — new specs skip cleanly, no collect-time errors |
-
-and I empirically reproduced both failures below with a real Chromium +
-Playwright `expect` against the exact DOM the components render.
-
-## MUST FIX (blocking)
-
-### 1. `getByText("Published")` resolves to 2 elements — both tests fail
-`tests/e2e/setlist-publish.spec.ts:94` and `tests/e2e/setlist-publish.spec.ts:189`
-
-`getByText(string)` defaults to `exact: false`, which is **case-insensitive
-substring** matching (`playwright-core` builds `internal:text="Published"i`).
-In the published state `app/(app)/setlists/[id]/setlist-builder.tsx` renders
-both:
-
-- the badge `<Badge>Published</Badge>` (line 398), and
-- the locked banner `<p>This setlist is published and locked for editing.</p>`
-  (line 404) — which contains "published".
-
-Reproduced verbatim:
-
-```
-Error: strict mode violation: getByText('Published') resolved to 2 elements:
-    1) <span>Published</span> aka getByText('Published', { exact: true })
-    2) <p>This setlist is published and locked for editing.</p>
-```
-
-Fix: `getByText("Published", { exact: true })` (or scope to the header/badge).
-Note test A asserts the locked-banner sentence on line 92, so both elements are
-provably on the page at that point; test B renders the same banner after
-publishing.
-
-### 2. `getByText("Confirmed")` resolves to 2 elements — test A fails
-`tests/e2e/setlist-publish.spec.ts:133`
-
-`app/(app)/member-week/[id]/member-week-view.tsx` renders the `Confirmed`
-badge (line 100 via `confirmationBadge`) **and**, when the team list is empty,
-`<p>No confirmed team yet</p>` (line 262). The team list is derived from
-`event_attendees` (`app/api/service-weeks/[id]/member-view/handler.ts:224`),
-and this test creates no events — so the team is *always* empty here and the
-"No confirmed team yet" paragraph is *always* present. Case-insensitive
-substring matching makes `getByText("Confirmed")` match both.
-
-Fix: `getByText("Confirmed", { exact: true })` (whole-string, case-sensitive —
-"No confirmed team yet" then no longer matches).
-
-While fixing 1 and 2, sweep the rest of the new specs for the same class of
-bug. I checked the others: `"Draft"`, `"1 song"`, `"0 songs"`, the two modal
-sentences, `"No songs added yet"`, `"Setlist not yet released"` and the
-`getByRole(... exact: true)` locators are all unambiguous on the pages as
-rendered today, but adding `exact: true` to the short, badge-like strings is
-the cheap way to keep them that way.
-
-### 3. The Testing stage's own new test file is not committed
-`tests/unit/e2e-support/google.test.ts` is **untracked** (`git status` shows
-`?? tests/unit/e2e-support/google.test.ts`), and `.pipeline/test-results.md` is
-modified but uncommitted. That file is a real deliverable (the spec explicitly
-assigned it to the Testing stage, and it is the only thing preventing silent
-drift between `tests/e2e/support/google.ts` and `lib/google-calendar/`). It
-must be committed before the PR, or the drift guard ships as nothing.
-
-## SHOULD FIX (non-blocking)
-
-4. **Browser contexts are closed inside `try`, not `finally`** —
-   `tests/e2e/setlist-publish.spec.ts` (lines 96, 134, 191, 222) and
-   `tests/e2e/setlist-duplicate-song.spec.ts:74`. Spec edge case 5 explicitly
-   requires the `context.close()` calls to be in `finally`; as written, any
-   failing assertion (including the two above) leaks the context for the rest
-   of the worker. `calendar-sync.spec.ts` does this correctly — copy that
-   shape.
-
-5. **`documentation/staging-environment.md` §7 table mislabels
-   `E2E_GOOGLE_CALENDAR_ID`** as "optional — `calendar-sync.spec.ts` skips when
-   absent". It is *not* in `GOOGLE_SYNC_VARS`; the spec does not skip when it is
-   absent, it defaults to `primary` (the same row then says so, contradicting
-   itself). Drop the "skips when absent" clause on that one row.
-
-## What is good (verified, not taken on trust)
-
-- Scope is respected: the feature commit touches only `tests/`,
-  `.github/workflows/ci.yml`, `documentation/staging-environment.md` and
-  `.pipeline/`. No `app/`, `lib/`, `schemas/`, `components/`, or
-  `supabase/migrations/` changes — confirmed against `git show --stat 9cb333b`.
-  (The larger `main...HEAD` diff is the already-merged #64/#65 work, not this
-  issue.)
-- Gating is correct: `REQUIRED_VARS` untouched; `googleSyncEnabled` via
-  `checkEnv(GOOGLE_SYNC_VARS)`; both `test.skip(...)` calls are the first
-  statement in their `describe`; verified all four new tests skip with no
-  import-time errors.
-- Fixture helpers match the DB: `songs` (`created_by` FK, `default_key
-  varchar(5)`), `users` (`clerk_id varchar(50)` — the 46-char synthetic id
-  fits; `anonymized_at` exists via `20260710000001_member_removal_rpc.sql`),
-  `google_calendar_tokens` (`is_valid` added by
-  `20260716000001_google_calendar_sync.sql`). Teardown order is FK-safe and the
-  `userIds` branch is correctly fenced with a comment.
-- `tests/e2e/support/google.ts` duplicates match their sources byte-for-byte
-  (`encryptToken` format `iv:authTag:ciphertext`, 12-byte IV, 32-byte key;
-  `toGoogleEventId`), imports nothing from `lib/`/`app/`, and never logs a
-  token or secret. The tester's `google.test.ts` machine-verifies both against
-  the real `lib/` implementations — genuinely meaningful coverage, not
-  superficial.
-- API contract assertions are right: `POST /api/service-weeks/:id/setlist`
-  asserted via `res.ok()` (200-or-201 get-or-create), `POST
-  /api/setlists/:id/songs` 201 then 409 `{ error, code: "CONFLICT" }` matching
-  `app/api/setlists/[id]/handler.ts:344/362` and `lib/api/response.ts`,
-  `POST /api/events` 201 / `POST /api/events/:id/attendees` 201, `PUT
-  /api/events/:id` accepts the partial body (`updateEventSchema` is all-optional).
-- `calendar-sync.spec.ts` is well constructed: attendee-POST as the real
-  create-propagation trigger, BR-10-safe timestamps, `expect.poll` (never
-  `waitForTimeout`) for both create and update, `summary`/`location`/
-  `start.dateTime` assertions that match `upsertCalendarEvent`'s payload
-  (`lib/google-calendar/sync.ts:81`), and a fully failure-tolerant `finally`
-  with both app-side DELETE and a direct Google delete.
-- The OPEN QUESTION 1 resolution (assert notification recipients, not read
-  visibility) is correctly reasoned and correctly documented in the spec header
-  comment; it does not paper over the AC/behavior mismatch.
-
-## Re-review scope
-
-Fix items 1–3 (and ideally 4–5), re-run `bun run lint`, `bun run typecheck`,
-`bun run test`, `bun run test:e2e`, and re-submit. Note that items 1 and 2
-still cannot be proven green without staging secrets — the reviewer's
-reproduction above is the evidence, so the fix should be locator-level and
-obviously correct by inspection.
+1. `handler.ts:141` — `as unknown as ...["Insert"]` on the upsert payload. I
+   verified the object literal *is* assignable to that Insert type on its own
+   (unlike `app/api/profile/handler.ts`, whose cast is genuinely required because
+   its Insert marks `created_at` required). If supabase-js's `upsert()` generic
+   accepts it without the cast, dropping it would restore compile-time checking of
+   the ten column names on the write path; today a snake_case typo there would only
+   be caught by the payload assertion in the tests. The spec said to add the cast
+   only if typecheck demanded it, and the inline comment justifies it by
+   `chat_preference` rather than by a compiler error. Cosmetic, mitigated by tests.
+2. PRD §14.1 (line 452) lists a "30 minutes" reminder lead-time option, which an integer
+   `reminder_hours_before` column cannot represent; the spec consciously scoped that
+   out and set the range to `[1, 168]`. When the settings UI lands, either the
+   option list narrows to whole hours or the column needs a schema change. Flagging
+   so it is a deliberate product decision, not a silent gap.
+3. Defaults now exist in two places (SQL column defaults and
+   `NOTIFICATION_PREFERENCE_DEFAULTS`). They agree today; a future migration that
+   changes one must change the other.
+4. Working-tree state at review time: the tester's supplement
+   (`tests/unit/app/api/notification-preferences-route-tester-supplement.test.ts`)
+   is untracked and `.pipeline/test-results.md` is modified but uncommitted. Both
+   must be committed before the PR, or the PR ships without the supplemental tests.
+5. An empty-body `PUT {}` still issues an upsert, so it will create a defaults row
+   for a user who had none. Harmless and consistent with the spec, just noting the
+   write is not a true no-op.

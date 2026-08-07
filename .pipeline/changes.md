@@ -1,88 +1,67 @@
-# Changes — Issue #66: Sprint 3 E2E tests for setlist & calendar flows
+# Changes — Issue #70: Notification preferences API (BR-14 minimum-channel guard)
 
-Implemented exactly per `.pipeline/spec.md`. Tests only — no `app/`, `lib/`,
-`schemas/`, `components/`, or `supabase/migrations/` changes.
+## Summary
+
+Replaced the 501 stub at `app/api/notifications/preferences/route.ts` with a real
+`GET`/`PUT` implementation, following `.pipeline/spec.md` exactly (pattern copied
+from `app/api/profile/handler.ts` / `route.ts`).
 
 ## Files changed
 
-### `tests/e2e/support/fixtures.ts` (modified)
-- Added `seedSong(svc, churchGroupId, opts?)` — inserts one `songs` row with a
-  unique default title (`E2E Song ${randomSuffix}`), returns `{ id, title }`.
-- Added `seedSyntheticUser(svc, churchGroupId, opts?)` — inserts a `users` row
-  with no real Clerk identity (`clerk_id: e2e_synthetic_<uuid-no-dashes>`),
-  used only as a notification recipient / invitation target; documented that
-  it must never be signed in via `signInAs`.
-- Extended `TeardownIds` with `invitationIds`, `songIds`,
-  `googleTokenUserIds`, `userIds`.
-- Extended `teardownFixtures` to delete, in FK-safe order (children first):
-  each id in `invitationIds` (alongside the existing single `invitationId`),
-  then `songs` (`in songIds`), `google_calendar_tokens` (`in
-  googleTokenUserIds`), and finally `users` (`in userIds`) — commented that
-  `userIds` must only ever contain ids from `seedSyntheticUser`, never the
-  stable `FIXTURE.adminUserId`/`FIXTURE.memberUserId`.
+- **`lib/supabase/types.ts`** — added `NotificationPreferencesRow` type and
+  registered `notification_preferences` in `Database["public"]["Tables"]`,
+  immediately after the `notifications` entry. `chat_preference` is
+  deliberately omitted from the row shape (see inline comment): it's a Phase 2
+  chat concern, and `types/domain.ts`'s `ChatPref` union doesn't match the DB
+  enum, so it's out of scope for this API surface. No other table entries were
+  touched.
 
-### `tests/e2e/support/google.ts` (new)
-Google-side helpers for the calendar sync spec. Does not import from `lib/`
-or `app/` (those start with `import "server-only"`, which throws under the
-plain-Node Playwright runner) — `toGoogleEventId` and the AES-256-GCM
-`encryptE2EToken` are hand-duplicated from `lib/google-calendar/sync.ts` and
-`lib/google-calendar/token-crypto.ts` respectively, each commented with its
-source of truth. Also exports `GOOGLE_SYNC_VARS`/`googleSyncEnabled` (checked
-via `checkEnv`, deliberately not added to `env.ts`'s `REQUIRED_VARS`),
-`e2eCalendarId`, `seedGoogleCalendarToken` (upserts a
-`google_calendar_tokens` row with `token_expiry` in the past so the app
-always takes the refresh-token path), `getGoogleAccessToken` (test-side
-refresh-token exchange), `getGoogleCalendarEvent`, and
-`deleteGoogleCalendarEvent` (never throws — cleanup-only).
+- **`schemas/notifications.ts`** — left the existing placeholder
+  `notificationsSchema`/`NotificationsInput` untouched (owned by other Sprint 4
+  issues) and appended:
+  - `NOTIFICATION_PREFERENCE_DEFAULTS` (PRD §6.9.1 defaults)
+  - `MIN_REMINDER_HOURS_BEFORE` (1) / `MAX_REMINDER_HOURS_BEFORE` (168)
+  - `updateNotificationPreferencesSchema` (all fields optional — partial merge)
+    and its inferred `UpdateNotificationPreferencesInput` type.
 
-### `tests/e2e/setlist-publish.spec.ts` (new, AC #1/#2)
-- Test A: admin builds a setlist in `/setlists/[id]` (search → Add → 1 song →
-  Publish → confirm-modal Publish), asserts `setlists.status === "published"`
-  and `published_at` truthy, asserts the confirmed member (`accepted`
-  invitation) gets exactly one `setlist_released` notification with
-  `body === null`, asserts a synthetic **pending**-invitation member gets
-  **zero** notifications, then confirms the member sees the song + `Confirmed`
-  badge on `/member-week/[id]`.
-- Test B: same flow with zero songs — asserts the zero-song copy in both the
-  publish confirm modal and the resulting notification `body` (exact string,
-  em dash included), and that the member view shows `No songs added yet`
-  (not `Setlist not yet released`).
-- Both resolve the "two buttons named Publish" ambiguity (bottom bar + modal,
-  `Modal` has no `role="dialog"`) by asserting `toHaveCount(2)` then clicking
-  `.last()`, per spec edge case 3.
-- Header comment documents OPEN QUESTION 1's resolution (published setlists
-  are tenant-readable per RLS; the actual confirmed/pending distinction is in
-  notification recipients, not read access).
+- **`app/api/notifications/preferences/handler.ts`** (new) — exports
+  `getNotificationPreferences` and `updateNotificationPreferences`, both
+  `(req: NextRequest, lookup?: UserLookup) => Promise<Response>`, matching
+  `app/api/profile/handler.ts`'s auth → JWT → Supabase client → `ok`/`fail` →
+  `ApiException` catch shape. No role gate (PRD auth = Any).
+  - `GET`: selects the caller's row by `user_id`; returns PRD defaults (no
+    insert) when no row exists; maps snake_case → camelCase.
+  - `PUT`: validates body against `updateNotificationPreferencesSchema` (400 on
+    failure), reads the current row (or defaults if none), merges the parsed
+    partial body onto it, then runs the **BR-14 guard against the merged
+    state** — rejects with 422 `VALIDATION_FAILED` if all three invitation
+    channels (`invitation_sms`, `invitation_email`, `invitation_inapp`) would
+    end up disabled — before issuing any write. On success, upserts the full
+    merged row (`onConflict: "user_id"`, `chat_preference` never read/written)
+    and returns the updated preferences.
+  - `user_id` always comes from `ctx.userId` (never the request body), so a
+    body carrying another user's `userId` cannot retarget the write; unknown
+    keys are stripped by Zod's default strip behavior.
 
-### `tests/e2e/setlist-duplicate-song.spec.ts` (new, AC #3)
-One test, driven by the member fixture temporarily elevated to `set_leader`
-(restored in `finally`, first statement, mirroring
-`conflict-detection.spec.ts`'s self-exclusion test). Adds a song via
-`POST /api/setlists/:id/songs` (201), repeats the same request (409,
-`error: "That song is already in the setlist.", code: "CONFLICT"`), asserts
-exactly one `setlist_songs` row persisted, then confirms the builder UI shows
-the catalog row's button as `Added` and disabled.
+- **`app/api/notifications/preferences/route.ts`** — replaced the
+  `notImplemented` stub with thin `GET`/`PUT` delegation to the new handler
+  (same shape as `app/api/profile/route.ts`).
 
-### `tests/e2e/calendar-sync.spec.ts` (new, AC #4)
-Gated on `e2eAuthEnabled && googleSyncEnabled` (`calendarSyncReady`) — skips
-without both the base E2E secrets and the five new Google secrets. Seeds an
-accepted invitation + a Google Calendar token for the member, creates an
-event as admin, assigns the member as attendee (the create-propagation
-trigger — a brand-new event has no attendees, so creation alone syncs
-nothing), polls the real Google Calendar API (`expect.poll`, 30s timeout)
-until the event appears with the right `summary`/`location`/`start.dateTime`,
-then `PUT`s an update and polls again until the summary/start reflect the
-change (proving update propagation, not just create). `finally` is fully
-failure-tolerant: best-effort `DELETE /api/events/:id` (app-side unsync),
-then a direct Google delete as a belt-and-braces cleanup, then context close,
-then `teardownFixtures`.
-
-### `.github/workflows/ci.yml` (modified)
-Appended the five new `E2E_GOOGLE_*`/`E2E_TOKEN_ENCRYPTION_KEY` secrets to
-the `e2e` job's `env:` block (the `check-secrets` gate on `STAGING_APP_URL`
-is unchanged — `calendar-sync.spec.ts` self-gates on top of that via
-`googleSyncEnabled`). Updated the job's leading comment to mention the
-setlist publish and Google Calendar sync coverage (issue #66).
+- **`tests/unit/app/api/notification-preferences-route.test.ts`** (new) — 22
+  tests mirroring `tests/unit/app/api/profile-route.test.ts`'s structure
+  (`jest.mock` for `@clerk/nextjs/server` and `@/lib/supabase/client`,
+  `makeReq`/`makeLookup`/`setUpAuth`/`makeSupabaseClient` helpers). The
+  Supabase fake supports an `upsertResult` fixture override so the post-upsert
+  `.select().maybeSingle()` can echo back a different row than the pre-write
+  select (needed for the "no row yet" PUT case) and an `onUpsert` capture
+  callback to assert both the written payload and that no upsert fires when a
+  request is rejected. Covers: GET with existing row / no row (defaults, no
+  upsert issued) / DB error; PUT happy path (captured merged snake_case
+  payload), empty-body no-op, insert-on-first-write, BR-14 direct violation
+  (no upsert issued), BR-14-via-merge violation, one-channel-remains-enabled
+  success, re-enabling a channel, malformed body (null/array/wrong types),
+  out-of-range `reminderHoursBefore` (0, 169, 1.5, string), unknown-key
+  stripping, missing JWT (401, no Supabase client built), and DB error (500).
 
 ### `documentation/staging-environment.md` (modified)
 Added the five new secrets to §7's table (each marked "optional —
@@ -95,28 +74,25 @@ test account + same OAuth client as staging, one-time consent flow for
 `E2E_GOOGLE_CALENDAR_ID` defaults to `primary`, and the "Testing" OAuth
 publishing-status refresh-token-expiry caveat).
 
-### `.pipeline/spec.md`
-Overwritten by the Planning stage for this run (was previously issue #65's
-spec still on disk, uncommitted before this run started); included in this
-commit since it's the git-tracked handoff artifact for this run.
+- `bun run lint` — clean.
+- `bun run typecheck` — clean.
+- `bun run test` — full suite: 82 suites / 1062 tests passed, including the 22
+  new tests in `notification-preferences-route.test.ts`.
 
-## Verification run (all passed)
-- `bun run typecheck`
-- `bun run lint`
-- `bun run test` (1040 tests, 81 suites — Jest ignores `tests/e2e/`)
-- `bun run check:workflows`
-- `bun run test:e2e` locally (no staging/Google secrets set): all 4 new
-  tests (calendar-sync ×1, setlist-publish ×2, setlist-duplicate-song ×1)
-  skip cleanly with no import/collect-time errors; `health.spec.ts` still
-  passes (1 passed, 10 skipped).
+## Notes for the Tester
 
-## For the Testing stage to focus on
-- The spec explicitly assigns `tests/unit/e2e-support/google.test.ts`
-  (verifying `toGoogleEventId`/`encryptE2EToken` agree with their `lib/`
-  counterparts) to the Testing stage, not this one — it does not exist yet.
-- No product bugs were found while writing these tests; OPEN QUESTION 1 in
-  `.pipeline/spec.md` documents a pre-existing behavior/AC-wording mismatch
-  that this issue intentionally does not fix (out of scope).
-- `calendar-sync.spec.ts` cannot be exercised end-to-end without a human
-  provisioning the five Google secrets (§7.1) — verify it skips cleanly
-  rather than trying to make it pass.
+- No migration or RLS changes were made or are needed — the
+  `notification_preferences` table and its RLS policies already existed with
+  the PRD-matching defaults (verified in the spec's "Current state" section).
+- `chat_preference` must never appear in a `select` or upsert payload for this
+  route — worth an explicit spot-check if you write any additional tests.
+- BR-14 is deliberately checked against the **merged** state, not the raw
+  request body, so the interesting edge case is a body that only sets one
+  field but disables the last remaining enabled invitation channel because the
+  other two are already `false` in the stored row.
+- `PUT` is a partial merge (not full replace) — this is the one intentional
+  divergence from `PUT /api/profile`, called out explicitly in spec Decisions.
+- `.pipeline/spec.md` was already updated in the working tree (issue #70's
+  spec, produced by the Planning stage) before this Coding session started;
+  included in this commit as part of the normal pipeline handoff. No further
+  edits made to it by the Coding stage.
