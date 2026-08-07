@@ -28,7 +28,13 @@ type ViewState = "loading" | "ready" | "unavailable" | "accepted-success" | "dec
 
 // Terminal statuses the lookup/accept/deny calls can report, keyed to a
 // friendly message — never surfaced as a raw error/code/status (#51).
-type UnavailableReason = "expired" | "accepted" | "denied" | "withdrawn" | "not-found";
+type UnavailableReason =
+  | "expired"
+  | "accepted"
+  | "denied"
+  | "withdrawn"
+  | "not-found"
+  | "rate-limited";
 
 const UNAVAILABLE_MESSAGES: Record<UnavailableReason, string> = {
   expired: "This invitation has expired.",
@@ -36,7 +42,18 @@ const UNAVAILABLE_MESSAGES: Record<UnavailableReason, string> = {
   denied: "You've already responded to this invitation.",
   withdrawn: "This invitation was withdrawn.",
   "not-found": "We couldn't find this invitation.",
+  "rate-limited": "Too many attempts. Please try again in a moment.",
 };
+
+// A 429's Retry-After header is a whole number of seconds; anything else
+// (missing, non-numeric, negative) falls back to the generic message above.
+function rateLimitedMessage(retryAfterHeader: string | null): string {
+  const seconds = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : NaN;
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return `Too many attempts. Please try again in ${seconds}s.`;
+  }
+  return UNAVAILABLE_MESSAGES["rate-limited"];
+}
 
 function isUnavailableReason(status: InvitationStatus): status is Exclude<InvitationStatus, "pending"> {
   return status !== "pending";
@@ -62,6 +79,11 @@ function formatTimeRange(startTime: string, endTime: string): string {
 export default function InviteResponse({ token }: { token: string }) {
   const [view, setView] = useState<ViewState>("loading");
   const [unavailableReason, setUnavailableReason] = useState<UnavailableReason>("not-found");
+  // Overrides UNAVAILABLE_MESSAGES[unavailableReason] when the message needs
+  // a value only known at request time (the Retry-After seconds on a 429).
+  const [unavailableMessageOverride, setUnavailableMessageOverride] = useState<string | null>(
+    null,
+  );
   const [invitation, setInvitation] = useState<Lookup | null>(null);
   const [serviceWeekId, setServiceWeekId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -75,6 +97,14 @@ export default function InviteResponse({ token }: { token: string }) {
     async function load() {
       try {
         const res = await fetch(`/api/invitations/respond/${token}`);
+        if (res.status === 429) {
+          if (cancelled) return;
+          setUnavailableMessageOverride(rateLimitedMessage(res.headers.get("Retry-After")));
+          setUnavailableReason("rate-limited");
+          setView("unavailable");
+          return;
+        }
+
         const body = await res.json();
         if (cancelled) return;
 
@@ -126,6 +156,11 @@ export default function InviteResponse({ token }: { token: string }) {
         return;
       }
 
+      if (res.status === 429) {
+        setActionError(rateLimitedMessage(res.headers.get("Retry-After")));
+        return;
+      }
+
       if (!res.ok) {
         setActionError("Something went wrong. Please try again.");
         return;
@@ -168,6 +203,11 @@ export default function InviteResponse({ token }: { token: string }) {
         return;
       }
 
+      if (res.status === 429) {
+        setActionError(rateLimitedMessage(res.headers.get("Retry-After")));
+        return;
+      }
+
       if (!res.ok) {
         setActionError("Something went wrong. Please try again.");
         return;
@@ -205,7 +245,7 @@ export default function InviteResponse({ token }: { token: string }) {
   if (view === "unavailable") {
     return (
       <main className={styles.container}>
-        <h1>{UNAVAILABLE_MESSAGES[unavailableReason]}</h1>
+        <h1>{unavailableMessageOverride ?? UNAVAILABLE_MESSAGES[unavailableReason]}</h1>
         <a className={styles.appLink} href={appLink}>
           Go to the app
         </a>

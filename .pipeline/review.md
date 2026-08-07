@@ -1,133 +1,126 @@
-# Review — Issue #74: Admin Global Dashboard screen
+# Review — Issue #76: Rate limiting on auth, SMS, and write endpoints
 
-## VERDICT: SHIP
+VERDICT: NEEDS WORK
 
-(with three non-blocking follow-ups listed at the bottom — none of them are
-defects against this issue's spec or acceptance criteria.)
+Reviewed: `.pipeline/spec.md`, `.pipeline/changes.md`, `.pipeline/test-results.md`,
+`git diff main...HEAD` (commit 9518e7b), plus the two untracked tester-supplement
+files, plus the real call sites that consume these endpoints.
 
-## What I verified firsthand
+Independently re-run in this worktree:
+- `bun run typecheck` — pass
+- `bun run lint` — pass
+- `bun run test` — pass, 86 suites / 1093 tests
 
-- `git diff main...HEAD` read in full (10 files, +1380/-624; 624 of the
-  deletions are the previous run's `.pipeline/spec.md` / `changes.md` being
-  overwritten, which is the expected per-run behaviour).
-- Re-ran the verification suite myself in this worktree:
-  - `bun run lint` — clean.
-  - `bun run typecheck` — clean.
-  - `bun run test` — **86 suites / 1083 tests, all passing** (matches
-    `test-results.md`; the count includes the tester's 2 supplement files).
-- Scanned every added line for network/env/eval/child_process content: the
-  only `fetch(` added is the screen's own call to
-  `/api/service-weeks/overview`. Nothing unexpected in the diff.
+## What is right
 
-## Correctness — checked against the DB, not just the mocks
+- `lib/api/rate-limit.ts` implements the spec faithfully: the exact `resolveTier`
+  precedence order, anchored `^...$` / `[^/]+` regexes, trailing-slash + method-case
+  normalization, the `${tier}:${identifier}` key, the fixed-window counter that
+  increments on denial without sliding `windowStartMs`, the `Retry-After` +
+  `{ error, code: "RATE_LIMITED" }` envelope matching `types/api.ts` `ApiError`,
+  and the bounded-store prune.
+- `middleware.ts` runs the limiter before `auth.protect()` and before the
+  `isPublicRoute` check, so the public invitation-token endpoints are covered;
+  `config.matcher` and `isPublicRoute` are untouched as required.
+- No scope creep: nothing under `app/`, `schemas/`, `supabase/`; no new deps or
+  env vars. No suspicious/unrelated content in the diff.
+- The tests are genuine, not superficial: they exercise the N+1 denial, window
+  rollover, the "denial does not extend the window" subtlety via `resetAtMs`
+  equality, and a real end-to-end 429 through `middleware.ts`. The tester
+  supplements correctly found and closed the two blind spots in the coder's
+  suite (throwing `auth()`; tier-prefixed key built by `checkRequestRateLimit`).
 
-The unit tests mock Supabase, so I checked the queries against the actual
-migrations rather than trusting the mocks:
+## Required fixes
 
-- `service_weeks(id, service_date, title, is_cancelled, church_group_id)`,
-  `setlists(service_week_id, status, church_group_id)`,
-  `invitations(id, service_week_id, user_id, status, created_at,
-  church_group_id)`, `conflicts(id, invitation_id, resolved_at,
-  church_group_id)` — every column and table the handler selects/filters on
-  exists (`20260702000003_cluster_3_scheduling_core.sql`). No mock-only column.
-- RLS (`20260704000001_rls_policies.sql`): `invitations_select_leader_admin`,
-  `conflicts_select_leader_admin`, `setlists_select_published_members` (leader/
-  admin branch) and `service_weeks_select_tenant` all grant the group-wide read
-  this screen needs for the `admin` / `set_leader` gate it uses. So the
-  "group-wide regardless of the caller's own roster status" AC actually holds
-  under RLS — it is not silently self-scoped. Members/guests are stopped twice
-  (403 in the handler, and RLS would scope them to their own rows anyway).
-- Aggregation semantics match the spec exactly: latest invitation per
-  `(week, user)` with strict `>` (so a `created_at` tie keeps the
-  first-encountered row — the tester's supplement asserts this directly),
-  `withdrawn` excluded from both numerator and denominator, `denied`/`pending`
-  in the denominator only, `setlistStatus: null` when no setlist row, open
-  conflicts counted per row and mapped through the invitation map with an
-  explicit `if (!invitation) continue;` orphan guard.
-- Open-conflict counting is consistent with `GET /api/conflicts`
-  (`resolved_at IS NULL`, all rows, no dedupe by member) — the dashboard's
-  per-week counts will sum to what the Conflicts screen shows.
+### 1. The tester stage's work is not committed (blocking for the PR)
 
-## Security
+`git status` in this worktree:
+- untracked: `tests/unit/middleware-tester-supplement.test.ts`
+- untracked: `tests/unit/lib/api/rate-limit-tester-supplement.test.ts`
+- modified, uncommitted: `.pipeline/test-results.md`
 
-- `requireAuth` + `requireRole(["admin", "set_leader"])` before any DB access;
-  a test asserts `getSupabaseClient` is never even constructed on the 403 path.
-- Caller-JWT RLS client only — no service-role client, no RPC, no migration.
-- `invitations` is selected with an explicit column list
-  (`"id, service_week_id, user_id, status, created_at"`), never `select("*")`,
-  so `response_token` / `denial_reason` never leave the DB. The tester's
-  supplement asserts the literal `select()` argument, which is the right
-  assertion (the coder's "not in the JSON response" check alone would not have
-  caught a `select("*")` that got mapped away in code but still travelled over
-  the wire).
-- All four query-error paths return a generic `500 INTERNAL`; supplement tests
-  assert the raw DB message (`"boom"`) never appears in the body, and that a
-  rejected `getToken()` is caught by the outer handler rather than leaking.
+Commit 9518e7b contains only the coder's files. If the branch is pushed as-is,
+the PR ships **without** the only tests that cover spec edge case #6
+(`await auth()` throwing must not 500 → IP fallback), the only test that would
+catch dropping the `${tier}:` key prefix, and the only test that `auth.protect()`
+is not reached on a denied request. Commit them (cf. the analogous
+"Add tester supplement coverage..." commit on the #68 branch).
 
-## Scope
+### 2. `auth` tier (10/min per IP) breaks the public invite-response flow, and a
+### 429 there is rendered to the member as "invitation not found"
 
-Scope guard respected: no changes to existing endpoints/handlers, no
-migrations, nothing under `app/(app)/week/**`, and the hardcoded
-`TODO(Sprint 3 #64)` badge in `week-view.tsx` was correctly left alone.
-`schemas/service-weeks.ts` is append-only; `createServiceWeekSchema` /
-`updateServiceWeekSchema` are byte-identical.
+`app/(public)/invite/[token]/invite-response.tsx:76-84` treats **any** non-OK
+response from `GET /api/invitations/respond/{token}` as
+`setUnavailableReason("not-found")` → the "unavailable" screen. A 429 therefore
+tells a legitimate member their invitation does not exist, with no retry path.
+The lookup + the subsequent `POST .../accept` are both `auth` tier, i.e. 2 units
+per responding member, against a **10/min bucket keyed by IP** for signed-out
+users. A worship team responding from one church wifi (or any carrier CGNAT)
+shares that bucket: past ~5 members per minute the rest get a false
+"invitation unavailable". This is a realistic, user-visible regression of a core
+Sprint-2 flow, and no test covers it because every test asserts the limiter, not
+the flows behind it.
 
-## Are the tests meaningful?
+Fix (either is acceptable, the choice is a human's):
+- raise `RATE_LIMIT_POLICIES.auth.limit` to something that survives a shared-NAT
+  congregation (and/or bucket the respond-token lookup by token rather than IP), **and/or**
+- add a 429-specific branch in `invite-response.tsx` (surface "too many attempts,
+  try again in N seconds" from `Retry-After` instead of "not found") — if that is
+  considered out of scope for #76, file it as a follow-up issue and say so.
 
-Yes, not superficial. They assert behaviour, not implementation echo:
-- The aggregation test uses a fixture with a genuinely tricky shape (a stale
-  `denied` row superseded by a newer `accepted` one, a `withdrawn` member, a
-  `pending` member, an orphaned conflict) and asserts the whole response object
-  with `toEqual`, so a wrong count fails loudly.
-- Failure coverage is real: 401 (no session), 401 (no JWT), 403 (member and
-  guest), 400 (non-calendar date, start>end, unknown status), and 500 on each
-  of the four queries.
-- The zero-weeks test asserts the three follow-up tables are *never* queried,
-  which is the actual behavioural claim (no `.in()` with an empty list).
-- The UI tests cover all four view states, both fill-rate branches, all three
-  publish badges, singular/plural conflict copy, the `href` into `/week/{id}`,
-  and the 400 branch keeping the filter controls usable.
-- The tester's note that the "two rapid filter changes" race is unreachable
-  through the UI is accurate — the component synchronously blanks to
-  `"loading"` (unmounting the controls) on every filter change, so a second
-  change can't be fired from the rendered controls. Replacing that with the
-  unmount-during-flight test was the right call; the `cancelled` guard is still
-  exercised.
+### 3. `sms` tier (5/min) breaks per-member inviting from the week view
 
-## Non-blocking follow-ups (do not hold this PR)
+`app/(app)/week/[id]/week-view.tsx:274-300` invites **one member per POST**
+(`+ Invite` button per roster row). Staffing a roster of more than 5 members
+inside a minute 429s, and the BR-05 conflict path sends a second POST for the
+same invite, so a couple of conflicts can exhaust the budget after 3 invites.
+The user-visible result is the generic
+`"Something went wrong sending the invitation. Please try again."`, and retrying
+immediately just burns more budget. The same 5/min bucket is additionally shared
+with `POST /api/setlists/{id}/publish` and `.../deny` for the same admin.
 
-1. **Uncommitted artifacts.** `tests/unit/app/api/service-weeks-overview-route-tester-supplement.test.ts`,
-   `tests/unit/app/admin-dashboard-tester-supplement.test.tsx` and the modified
-   `.pipeline/test-results.md` are still untracked/unstaged. They must be in the
-   commit before the PR goes up, otherwise 11 of the 1083 green tests don't
-   exist for CI or for the human reviewer.
-2. **Unbounded reads / PostgREST row cap.** With `status=all` and no date
-   bounds (the default first load), the endpoint reads every service week ever,
-   then every invitation for all of them. Supabase's default "Max rows" cap
-   (1000) would silently truncate the `invitations` result and produce *wrong*
-   fill rates — quietly, with no error — once a group accumulates enough
-   history (~2 years at ~10 invites/week). Also, `.in("service_week_id",
-   weekIds)` grows the request URL linearly with week count. Not a defect
-   against the spec (the planner explicitly chose no range cap and this matches
-   existing repo patterns), and not reachable at current scale, but worth a
-   follow-up issue: a default date window (e.g. last/next 90 days) plus an
-   explicit `.limit()`, or moving the aggregation into a single SQL view/RPC.
-   Also, `conflicts` is fetched group-wide rather than narrowed by the
-   invitation ids already in hand — a cheap `.in("invitation_id", ...)` would
-   avoid pulling conflicts for filtered-out weeks.
-3. **`/dashboard` is a member-facing landing link.** `app/(public)/invite/[token]/invite-response.tsx`
-   sends every invitee (usually role `member`) to `/dashboard` via its "Go to
-   the app" link. That route used to be a "coming soon" placeholder; it now
-   renders "You don't have access to this page." Neither destination was
-   useful, so this isn't a regression created here, and fixing it would breach
-   this issue's scope guard — but it should be retargeted (likely at
-   `/member-week`) in a separate issue.
-   Related: `components/layout/AppShell.tsx` still has no nav, so there is no
-   in-app way for an admin to *reach* `/dashboard` yet (pre-existing
-   `TODO(Sprint 1+)`).
+Fix: raise the invite/sms budget (or give invitation creation its own tier), or
+get explicit human sign-off that 5/min across invite+deny+publish is intended.
+The spec itself flagged these numbers as "a first pass meant to be tuned by a
+human" — this review is that tuning point, not a rubber stamp.
 
-Minor UX note (spec-sanctioned, no action needed): resetting `view` to
-`"loading"` on every filter change unmounts the filter controls, so changing a
-date loses focus on that input. The spec explicitly allowed this and the tests
-assume it; a future pass could keep the controls mounted and show an inline
-spinner instead.
+## Recommended (non-blocking)
+
+4. `middleware.ts:20-25` — `await auth()` now runs on **every** matched request,
+   including all page navigations, which previously resolved no session on public
+   routes. Since `resolveTier` returns `null` for non-`/api` paths, resolving the
+   tier first and only calling `auth()` when the tier is non-null would avoid a
+   per-navigation session resolution and would also make the "reject an
+   unauthenticated flood cheaply" claim actually true (today the flood still pays
+   the JWT verification before the limiter runs).
+5. `lib/api/rate-limit.ts:92-106` — the identity for anonymous callers is derived
+   entirely from client-supplied headers. First-hop `x-forwarded-for` is only
+   trustworthy if the platform overwrites it; if it is ever appended, or the app
+   is ever fronted by something else, the whole `auth` tier (the anti-brute-force
+   point of this issue) is bypassable by rotating one header. Worth an explicit
+   comment stating the trust assumption, and consider preferring the
+   platform-set `x-real-ip`. Related: `ip:unknown` is a shared bucket, so a single
+   caller sending header-less requests can exhaust the `auth`/`sms` budget for
+   every other header-less caller.
+6. `tests/unit/lib/api/rate-limit-tester-supplement.test.ts:65-77` — the
+   "ignores the query string" test never constructs a query string
+   (`req2 = { ...req1 }` is the same object shape, and the fake `nextUrl` has only
+   `pathname`). It passes trivially and proves nothing about query strings; either
+   put a `search`/`href` on the fake or rename it to what it actually asserts
+   (two calls with the same pathname share a bucket).
+7. `resolveTier` has no negative-precedence coverage: `HEAD`/`OPTIONS` → `read`,
+   a non-`POST` verb on `/deny` or `/publish` → `write`, `PUT /api/setlists/{id}`
+   not matching `SETLIST_PUBLISH_RE`, and the `/api` root. Cheap to add and they
+   guard the ordering that matters most.
+8. Store pruning at 10,000 keys is untestable through the public API (noted
+   honestly by the tester). If it is ever worth asserting, export a size accessor
+   behind the same test-only door as `resetRateLimitStore()`.
+
+## Not blocking / accepted
+
+- In-memory, per-instance counters (spec OQ #2) — documented limitation.
+- `bun run build` failing at static generation on `Missing publishableKey` —
+  independently reproduced as a pre-existing sandbox env gap on both branches;
+  the middleware bundle compiles, so the `server-only` question is settled and
+  the primary (non-fallback) branch was correctly taken.
+- Clerk-hosted `/sign-in` / `/sign-up` not being throttled (spec OQ #1).

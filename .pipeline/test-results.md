@@ -1,125 +1,144 @@
-# Test Results — Issue #74: Admin Global Dashboard screen
+# Test Results — Issue #76: Rate limiting on auth, SMS, and write endpoints
 
 ## Verdict: PASS
 
-All checks pass. The coder's claims in `.pipeline/changes.md` were independently
-verified rather than trusted: every changed/new file was read against
-`.pipeline/spec.md`, the full verification suite was re-run from scratch, and
-11 new independent tests were added covering spec-named edge cases and failure
-paths not exercised by the coder's own test files.
+All checks below were re-run independently in this worktree
+(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-76`), not just
+taken on the Coder's word.
 
-## Commands re-run independently
+## Commands re-run
 
-- `bun run lint` — clean (no errors/warnings).
-- `bun run typecheck` (`tsc --noEmit`) — clean.
-- `bun run test` (full Jest suite) — **86 suites / 1083 tests, all passing**
-  (84 suites / 1072 tests from the coder's changes, plus 2 new tester-supplement
-  files / 11 tests added in this stage — see below).
+- `bun run typecheck` — **pass**, no errors.
+- `bun run lint` — **pass**, no errors.
+- `bun run test` (full suite, after adding the two supplemental test files
+  below) — **pass**: 86 suites / 1093 tests, 0 failures.
+- `bun run build` — reproduced the Coder's claim exactly: Next reports
+  "Compiled successfully" (proving `middleware.ts`'s new import of
+  `lib/api/rate-limit.ts`, and its transitive import of the `server-only`
+  `lib/api/errors.ts`, bundles fine for the Edge runtime — no `server-only`
+  error). The build then fails later, during static generation of
+  `/_not-found`, with `Error: @clerk/clerk-react: Missing publishableKey`.
+  Confirmed this is a pre-existing environment gap, not caused by this
+  change: no `.env` file exists in this worktree (only `.env.example`), so
+  no Clerk keys are configured in this sandbox regardless of branch. Not a
+  regression.
 
-## Code review against spec.md
+## Coder's own tests — re-read and re-run
 
-Read and compared against the spec line-by-line:
-- `schemas/service-weeks.ts` — append-only addition of
-  `serviceWeekStatusFilters`/`ServiceWeekStatusFilter` and
-  `serviceWeeksOverviewQuerySchema` with the exact `.superRefine` validation
-  rules specified (invalid calendar date via `isValidDateString`,
-  `startDate > endDate`); `createServiceWeekSchema`/`updateServiceWeekSchema`
-  untouched. Matches spec exactly.
-- `app/api/service-weeks/overview/handler.ts` — matches the spec's order of
-  operations (auth → role gate → query parse → JWT → weeks query → zero-weeks
-  short-circuit → setlists → invitations (explicit columns, no `select("*")`)
-  → conflicts → aggregate). Aggregation rules (latest-invitation-wins,
-  `withdrawn` excluded from both numerator/denominator, orphaned-conflict
-  ignored) match the spec's "exact — the tests assert these" section.
-- `app/api/service-weeks/overview/route.ts` — thin GET wrapper, matches
-  `app/api/availability/team/route.ts` shape.
-- `app/(app)/dashboard/admin-dashboard.tsx` — state machine, fetch/cancelled
-  guard, URL building (`status` always set, dates only when non-empty),
-  403/400/error/success handling, and render branches (badges, fill-rate
-  text, empty-list message, filter controls with labelled inputs) all match
-  the spec verbatim, including copy text or the four view-state branches.
-- `app/(app)/dashboard/admin-dashboard.module.css` — `.container` widened to
-  860px as specified; reuses existing CSS custom properties only.
-- `app/(app)/dashboard/page.tsx` — placeholder replaced with the server
-  wrapper, mirrors `conflicts/page.tsx`.
-- No changes to `app/(app)/week/**`, existing endpoints, handlers, or
-  migrations — scope guard respected (confirmed only the files listed in
-  `changes.md` were touched).
+- `tests/unit/lib/api/rate-limit.test.ts` and `tests/unit/middleware.test.ts`
+  were read in full and executed. They pass and, on inspection, genuinely
+  cover what `changes.md` claims: happy path counting down to 0, the N+1
+  denial (limit-fires / required failure case), the 429 shape, window
+  rollover, "denied requests don't extend the window" (checked via
+  `resetAtMs` equality across repeated denials plus an allow exactly at the
+  original `resetAtMs`), tier/identity isolation, the full `resolveTier`
+  precedence table (including the `GET` vs `POST /api/invitations`
+  distinction, trailing slash, lowercase method), all four
+  `getRequestIdentifier` branches, the policy-ordering invariant, and the
+  real end-to-end 429 through `middleware.ts` with Clerk mocked.
 
-## Independent verification: coder's own new tests
+## Independent tests added by this stage
 
-- `tests/unit/app/api/service-weeks-overview-route.test.ts` (13 tests) — ran
-  in isolation, all pass. Covers 401 (no user)/403 (member, guest)/401 (no
-  JWT)/400 (bad date, start>end, bad status)/zero-weeks short-circuit (asserts
-  `setlists`/`invitations`/`conflicts` never queried)/happy-path aggregation
-  (fill rate, latest-invitation-wins, withdrawn exclusion, null setlist,
-  orphaned conflict ignored, no `response_token`/`denial_reason` leak)/
-  status=active/status=cancelled filter wiring/inclusive date bounds/500 on
-  `service_weeks` and `conflicts` errors. All assertions independently
-  re-checked against the spec's aggregation rules by hand — correct.
-- `tests/unit/app/admin-dashboard.test.tsx` (7 tests) — ran in isolation, all
-  pass. Covers loading, happy path (fill rate, all three publish badges,
-  cancelled badge, singular/plural conflict badges, untitled-service
-  fallback, card href), empty list, Status-select re-fetch, 403 forbidden,
-  network-error, and 400-with-inline-alert-and-usable-filters. Confirmed the
-  noted `Badge` `class="undefined undefined"` jsdom quirk is pre-existing and
-  unrelated to this change (text-content assertions unaffected).
+Two new files were written from scratch (not modifications to the Coder's
+tests), specifically to probe claims and edge cases the existing suite left
+unexercised, per the repo's existing "tester-supplement" convention (see
+e.g. `tests/unit/app/api/cron-invitation-reminders-route-tester-supplement.test.ts`):
 
-## New tests added this stage (independent verification, not just re-running the coder's suite)
+### `tests/unit/middleware-tester-supplement.test.ts`
 
-Per AGENTS.md, this stage must independently verify claims rather than trust
-them. Two new test files were added to close gaps the coder's own tests left
-open, all of which pass against the as-shipped code:
+The Coder's `middleware.test.ts` mocks `authFn` to always resolve
+`{ userId: null }` (never throws) and mocks `createRouteMatcher` to always
+report "public" (so `auth.protect()` is never asserted). That left two
+spec-required behaviors completely untested:
 
-### `tests/unit/app/api/service-weeks-overview-route-tester-supplement.test.ts` (8 tests)
-- Tie-break rule: when two invitation rows for the same member/week share the
-  exact same `created_at`, the **first-encountered** row wins (not the last)
-  — verified against the spec's "replace only when strictly greater" wording,
-  which the coder's suite didn't test directly (its tie scenario used
-  differing timestamps).
-- Single-bound date filtering: `startDate` alone calls `.gte` and never
-  `.lte`; `endDate` alone calls `.lte` and never `.gte` (spec edge case 7 —
-  the coder's suite only tested both bounds supplied together).
-- `status=all` (default) never adds an `is_cancelled` filter at all (as
-  opposed to just checking `active`/`cancelled` add the right filter).
-- Invitations query selects the exact explicit column list
-  (`"id, service_week_id, user_id, status, created_at"`) and never a `"*"` —
-  a direct check on the `select()` call argument, stronger than the coder's
-  "no response_token in the JSON response" check (that alone wouldn't catch
-  a `select("*")` that got mapped away in code but still traveled over the
-  wire in a real DB round trip).
-- **Failure cases** the coder's suite didn't cover: 500 INTERNAL when the
-  `setlists` query errors, 500 INTERNAL when the `invitations` query errors
-  (spec edge case 11 says "any of the four queries" — coder only tested
-  `service_weeks` and `conflicts`), and a rejected `getToken()` promise is
-  still caught by the outer `try/catch` and returns a clean 500 without
-  leaking the raw error message.
+1. **"`await auth()` throwing must not 500, and must fall back to IP
+   bucketing"** (spec edge case #6, and explicitly called out in
+   `changes.md`'s "what the Tester should focus on"). Added a throwing
+   `authFn` and confirmed: no exception escapes `middleware()`, the request
+   still gets IP-bucketed and correctly 429s once the `sms` limit is
+   exceeded for that IP, and two different IPs both hitting a throwing
+   `auth()` get independent budgets (not a shared bucket).
+2. **`auth.protect()` still fires for allowed requests on protected
+   (non-public) routes, but not for denied ones** — verified by mocking
+   `createRouteMatcher` to report "not public" and asserting `protect` is
+   called once for an allowed request, and that the call count does not
+   grow on the request that gets rate-limited (proving the 429
+   short-circuits before the auth gate, as the spec requires: "rate
+   limiting must run before auth.protect()").
 
-### `tests/unit/app/admin-dashboard-tester-supplement.test.tsx` (3 tests)
-- `startDate`/`endDate` are appended to the fetch URL incrementally and
-  independently as each field is set (not just "both present" as the coder's
-  suite implicitly exercised via the Status filter only).
-- A failure on a **re-fetch** (after a prior successful load already
-  rendered data) correctly replaces the screen with the error state rather
-  than leaving stale data visible — the coder's error-branch test only
-  covered failure on the very first load.
-- Unmounting the component while a fetch is in flight does not trigger a
-  React "setState on an unmounted component" warning/error — exercises the
-  `cancelled` guard's cleanup path, which the coder's suite never triggered
-  (`console.error` asserted not called).
+All 4 tests in this file pass. (One assertion in a first draft of this file
+was itself wrong — it asserted `protect` was never called across a loop
+that included allowed calls before the denial; fixed to compare the call
+count immediately before/after the denied call specifically. Noting this
+because it was this stage's own test bug, not a code bug.)
 
-Note: an initial draft of a fourth supplement test attempted to reproduce the
-"stale in-flight response overwritten by a newer one" race by firing two
-rapid `Status` changes through the rendered `<select>`. That scenario turned
-out to be unreachable through normal UI interaction with the shipped
-component, because the view synchronously blanks to the `"loading"` screen
-(removing the filter controls) on every filter change, before a second
-change could be fired — so a real user cannot trigger two overlapping
-requests through this UI. This is not a bug the reviewer needs to act on; it
-was replaced with the unmount-during-fetch test above, which does exercise
-the same `cancelled` guard via a path that actually is reachable.
+### `tests/unit/lib/api/rate-limit-tester-supplement.test.ts`
 
-## Result
+The Coder's tier/identity-isolation tests use hand-built keys (e.g.
+`"sms:user:1"`) rather than exercising the real key construction inside
+`checkRequestRateLimit`. Added:
 
-All 86 suites / 1083 tests pass, including the 11 new independently-written
-tests. No failures to report. Proceeding to review.
+1. A test that calls `checkRequestRateLimit` twice for the *same* identity
+   across two different tiers (`write` then `read`) and confirms exhausting
+   `write` does not touch `read` — this is the only test in the whole suite
+   that would catch a regression where the `${tier}:${identifier}` key
+   prefix was dropped (e.g. keying purely by identifier).
+2. Blank-but-present header edge cases (`x-forwarded-for: ""`, and
+   `x-forwarded-for: ""` + `x-real-ip: ""` together) — spec edge case #4
+   says "missing/blank", but the Coder's suite only tests the
+   header-absent-entirely case.
+3. Query-string irrelevance — confirms two requests sharing a pathname but
+   differing only in unrelated request identity still land in the same
+   bucket (classification only ever reads `nextUrl.pathname`).
+4. Empty-string `clerkUserId` (as opposed to `null`/`undefined`) correctly
+   falls back to IP bucketing rather than producing `user:`.
+
+All 5 tests in this file pass.
+
+## Manual/code review verification
+
+- Confirmed `ErrorCode.RATE_LIMITED` exists in `lib/api/errors.ts` and
+  `rateLimitResponse`'s body shape (`{ error: string; code: string }`)
+  matches `types/api.ts`'s `ApiError`.
+- Confirmed `middleware.ts` calls `checkRequestRateLimit` and returns
+  `rateLimitResponse(decision)` **before** the `isPublicRoute` check, so
+  public invitation-token endpoints are still rate-limited pre-auth, as the
+  spec requires.
+- Confirmed `resolveTier`'s regexes (`RESPOND_TOKEN_RE`,
+  `INVITATION_ID_ACCEPT_RE`, `INVITATION_ID_DENY_RE`, `SETLIST_PUBLISH_RE`)
+  are anchored (`^...$`) and use `[^/]+` for the id/token segment, matching
+  the spec.
+- Confirmed the store-pruning code path (`pruneStoreIfNeeded`) matches the
+  spec's algorithm (sweep by `MAX_CONFIGURED_WINDOW_MS`, then `clear()` if
+  still oversized). This was not independently re-tested at the 10,000-key
+  threshold: the module doesn't export the store or its size, so the only
+  way to assert pruning behavior from outside would be a slow
+  10,000+-iteration test with no externally observable pass/fail signal
+  beyond "didn't crash" (pruning has no behavioral effect visible through
+  the public API — `checkRateLimit` already resets stale windows on access
+  regardless of whether the entry was swept). Judged not worth the ~10k-key
+  test given it can't actually distinguish "pruned correctly" from "pruned
+  incorrectly" without a store-size accessor. Flagging this as a residual
+  gap for the Reviewer rather than silently skipping it.
+
+## Failure case coverage (required by the pipeline contract)
+
+At least one failure case was independently verified, beyond the Coder's
+own "limit fires" test:
+- `middleware-tester-supplement.test.ts`'s throwing-`auth()` tests exercise
+  the failure path of an upstream dependency (Clerk) and confirm the system
+  degrades (IP bucketing + eventual 429) instead of failing closed with a
+  500.
+- The `auth.protect()`-not-called-on-denial test confirms the rate limiter
+  actually short-circuits the request pipeline on a real failure/denial
+  path, not just returning a decision object that something downstream
+  ignores.
+
+## Summary
+
+No regressions found. No test failures. The implementation matches the
+spec's contract for `resolveTier` precedence, the fixed-window algorithm
+(including the "denied requests don't extend the window" subtlety), the
+identifier fallback chain, the 429 response shape, and the middleware
+wiring (order relative to `auth.protect()`, and graceful degradation when
+`auth()` throws). Recommend proceeding to Review.
