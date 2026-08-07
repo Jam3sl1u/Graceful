@@ -27,14 +27,22 @@ function makeAuthFn(): AuthFn {
   return Object.assign(async () => ({ userId: null }), { protect: jest.fn() });
 }
 
+function makeSpyAuthFn(): AuthFn {
+  return Object.assign(jest.fn(async () => ({ userId: null })), { protect: jest.fn() });
+}
+
 describe("middleware rate limiting", () => {
   beforeEach(() => {
     resetRateLimitStore();
   });
 
-  it("does not 429 requests within the sms limit to POST /api/invitations", async () => {
+  it("does not 429 requests within the sms limit to POST /api/invitations/:id/deny", async () => {
     const authFn = makeAuthFn();
-    const req = makeReq("/api/invitations", "POST", { "x-forwarded-for": "1.2.3.4" });
+    const req = makeReq(
+      "/api/invitations/11111111-1111-1111-1111-111111111111/deny",
+      "POST",
+      { "x-forwarded-for": "1.2.3.4" },
+    );
 
     for (let i = 0; i < RATE_LIMIT_POLICIES.sms.limit; i++) {
       const res = await middleware(authFn, req);
@@ -44,7 +52,11 @@ describe("middleware rate limiting", () => {
 
   it("returns 429 with Retry-After and RATE_LIMITED on the first request past the sms limit", async () => {
     const authFn = makeAuthFn();
-    const req = makeReq("/api/invitations", "POST", { "x-forwarded-for": "5.5.5.5" });
+    const req = makeReq(
+      "/api/invitations/11111111-1111-1111-1111-111111111111/deny",
+      "POST",
+      { "x-forwarded-for": "5.5.5.5" },
+    );
 
     for (let i = 0; i < RATE_LIMIT_POLICIES.sms.limit; i++) {
       await middleware(authFn, req);
@@ -70,5 +82,14 @@ describe("middleware rate limiting", () => {
       const res = await middleware(authFn, req);
       expect(res?.status).not.toBe(429);
     }
+  });
+
+  it("skips the session fetch entirely for a page navigation (resolveTier returns null)", async () => {
+    const authFn = makeSpyAuthFn();
+    const req = makeReq("/dashboard", "GET");
+
+    await middleware(authFn, req);
+
+    expect(authFn as unknown as jest.Mock).not.toHaveBeenCalled();
   });
 });

@@ -29,6 +29,19 @@ function makeReq(pathname: string, method = "GET", headers: Record<string, strin
   } as unknown as NextRequest;
 }
 
+function makeReqWithSearch(
+  pathname: string,
+  search: string,
+  method = "GET",
+  headers: Record<string, string> = {},
+): NextRequest {
+  return {
+    nextUrl: { pathname, search, href: `${pathname}${search}` },
+    method,
+    headers: new Headers(headers),
+  } as unknown as NextRequest;
+}
+
 describe("lib/api/rate-limit — tester supplement", () => {
   beforeEach(() => {
     resetRateLimitStore();
@@ -64,11 +77,12 @@ describe("lib/api/rate-limit — tester supplement", () => {
 
   it("ignores the query string entirely — only nextUrl.pathname drives classification", () => {
     // checkRequestRateLimit only ever reads req.nextUrl.pathname (never
-    // req.nextUrl.search / req.url), so a query string on the same pathname
-    // must land in the exact same bucket, not a separate one.
+    // req.nextUrl.search / req.url), so two requests with the same pathname
+    // but genuinely different query strings must land in the exact same
+    // bucket, not a separate one.
     const now = 3_000_000;
-    const req1 = makeReq("/api/events", "GET");
-    const req2 = { ...req1 } as NextRequest; // same pathname, "different" request object
+    const req1 = makeReqWithSearch("/api/events", "?page=1");
+    const req2 = makeReqWithSearch("/api/events", "?page=2");
 
     const d1 = checkRequestRateLimit(req1, "clerk_qs_user", now);
     const d2 = checkRequestRateLimit(req2, "clerk_qs_user", now);

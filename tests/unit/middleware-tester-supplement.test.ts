@@ -52,6 +52,10 @@ function makeAuthFn(userId: string | null = null): AuthFn {
   return Object.assign(async () => ({ userId }), { protect: jest.fn() });
 }
 
+function makeSpyAuthFn(userId: string | null = null): AuthFn {
+  return Object.assign(jest.fn(async () => ({ userId })), { protect: jest.fn() });
+}
+
 describe("middleware rate limiting — tester supplement", () => {
   beforeEach(() => {
     resetRateLimitStore();
@@ -61,8 +65,8 @@ describe("middleware rate limiting — tester supplement", () => {
     const authFn = makeThrowingAuthFn();
     const req = makeReq("/api/invitations", "POST", { "x-forwarded-for": "7.7.7.7" });
 
-    // Exhaust the sms limit for this IP; none of these calls should throw.
-    for (let i = 0; i < RATE_LIMIT_POLICIES.sms.limit; i++) {
+    // Exhaust the invite limit for this IP; none of these calls should throw.
+    for (let i = 0; i < RATE_LIMIT_POLICIES.invite.limit; i++) {
       await expect(middleware(authFn, req)).resolves.not.toThrow();
     }
 
@@ -82,7 +86,7 @@ describe("middleware rate limiting — tester supplement", () => {
     const reqA = makeReq("/api/invitations", "POST", { "x-forwarded-for": "8.8.8.8" });
     const reqB = makeReq("/api/invitations", "POST", { "x-forwarded-for": "9.9.9.9" });
 
-    for (let i = 0; i < RATE_LIMIT_POLICIES.sms.limit; i++) {
+    for (let i = 0; i < RATE_LIMIT_POLICIES.invite.limit; i++) {
       await middleware(authFn, reqA);
     }
     const aDenied = await middleware(authFn, reqA);
@@ -106,7 +110,7 @@ describe("middleware rate limiting — tester supplement", () => {
     const authFn = makeAuthFn("clerk_user_2");
     const req = makeReq("/api/invitations", "POST");
 
-    for (let i = 0; i < RATE_LIMIT_POLICIES.sms.limit; i++) {
+    for (let i = 0; i < RATE_LIMIT_POLICIES.invite.limit; i++) {
       await middleware(authFn, req);
     }
     const protectCallsBeforeDenial = authFn.protect.mock.calls.length;
@@ -116,5 +120,16 @@ describe("middleware rate limiting — tester supplement", () => {
     // The denied call itself must short-circuit before auth.protect() —
     // the call count must not grow from the denied request.
     expect(authFn.protect.mock.calls.length).toBe(protectCallsBeforeDenial);
+  });
+
+  it("skips the session fetch for a page navigation but still calls auth.protect() on a protected route", async () => {
+    const authFn = makeSpyAuthFn("clerk_user_3");
+    const req = makeReq("/dashboard", "GET");
+
+    const res = await middleware(authFn, req);
+
+    expect(res?.status).not.toBe(429);
+    expect(authFn as unknown as jest.Mock).not.toHaveBeenCalled();
+    expect(authFn.protect).toHaveBeenCalledTimes(1);
   });
 });

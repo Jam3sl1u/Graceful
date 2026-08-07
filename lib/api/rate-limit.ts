@@ -10,7 +10,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { ErrorCode } from "@/lib/api/errors";
 import type { ApiError } from "@/types/api";
 
-export type RateLimitTier = "webhook" | "sms" | "auth" | "write" | "read";
+export type RateLimitTier = "webhook" | "sms" | "invite" | "auth" | "write" | "read";
 
 export type RateLimitPolicy = { limit: number; windowMs: number };
 
@@ -24,15 +24,19 @@ export type RateLimitDecision = {
 };
 
 // Tier -> policy table. Exported so tests assert the ordering invariant
-// (sms < auth < write < read) instead of hardcoding numbers twice.
+// (sms < invite < auth < write < read) instead of hardcoding numbers twice.
 // These are first-pass numbers meant to be tuned by a human later; limits
 // are in-memory/per-instance, not a global/distributed count (see
-// .pipeline/spec.md OPEN QUESTIONS for the rationale).
+// .pipeline/spec.md OPEN QUESTIONS for the rationale). `auth` and `invite`
+// were tuned up from the original #76 pass after review found the original
+// numbers false-positived on real flows (shared-NAT congregations hitting
+// `auth`, roster-sized invite bursts hitting `sms`) — see PR #167.
 export const RATE_LIMIT_POLICIES: Record<RateLimitTier, RateLimitPolicy> = {
   webhook: { limit: 600, windowMs: 60_000 },
   read: { limit: 240, windowMs: 60_000 },
   write: { limit: 60, windowMs: 60_000 },
-  auth: { limit: 10, windowMs: 60_000 },
+  auth: { limit: 50, windowMs: 60_000 },
+  invite: { limit: 30, windowMs: 60_000 },
   sms: { limit: 5, windowMs: 60_000 },
 };
 
@@ -59,8 +63,11 @@ export function resolveTier(pathname: string, method: string): RateLimitTier | n
     return "webhook";
   }
 
+  if (verb === "POST" && path === "/api/invitations") {
+    return "invite";
+  }
+
   if (
-    (verb === "POST" && path === "/api/invitations") ||
     (verb === "POST" && INVITATION_ID_DENY_RE.test(path)) ||
     (verb === "POST" && SETLIST_PUBLISH_RE.test(path)) ||
     path === "/api/cron/invitation-reminders"
@@ -84,6 +91,13 @@ export function resolveTier(pathname: string, method: string): RateLimitTier | n
 }
 
 // Stable per-caller bucket identity.
+//
+// Trust assumption: for anonymous callers this derives identity entirely
+// from client-supplied headers. `x-forwarded-for`'s first hop is only a
+// trustworthy client IP because Vercel's edge overwrites it rather than
+// appending to a caller-supplied value; if this app is ever fronted by
+// something else (or a caller could reach it bypassing Vercel), the `auth`
+// tier's anti-brute-force property is bypassable by rotating one header.
 export function getRequestIdentifier(req: NextRequest, clerkUserId: string | null): string {
   if (clerkUserId && clerkUserId.length > 0) {
     return `user:${clerkUserId}`;

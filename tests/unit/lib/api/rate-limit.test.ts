@@ -141,7 +141,7 @@ describe("lib/api/rate-limit", () => {
 
   describe("resolveTier", () => {
     it.each([
-      ["/api/invitations", "POST", "sms"],
+      ["/api/invitations", "POST", "invite"],
       ["/api/invitations", "GET", "read"],
       ["/api/invitations/11111111-1111-1111-1111-111111111111/deny", "POST", "sms"],
       ["/api/invitations/11111111-1111-1111-1111-111111111111/accept", "POST", "auth"],
@@ -156,12 +156,20 @@ describe("lib/api/rate-limit", () => {
       ["/api/health", "GET", null],
       ["/dashboard", "GET", null],
       ["/api/health/", "GET", null],
+      // Negative-precedence cases: verbs/paths that must NOT match the
+      // higher-precedence tiers above them and fall through correctly.
+      ["/api/events", "HEAD", "read"],
+      ["/api/events", "OPTIONS", "read"],
+      ["/api/invitations/11111111-1111-1111-1111-111111111111/deny", "GET", "read"],
+      ["/api/setlists/22222222-2222-2222-2222-222222222222/publish", "GET", "read"],
+      ["/api/setlists/22222222-2222-2222-2222-222222222222", "PUT", "write"],
+      ["/api", "GET", "read"],
     ] as const)("%s %s -> %s", (path, method, expected) => {
       expect(resolveTier(path, method)).toBe(expected);
     });
 
     it("classifies a lowercase method the same as its uppercase equivalent", () => {
-      expect(resolveTier("/api/invitations", "post")).toBe("sms");
+      expect(resolveTier("/api/invitations", "post")).toBe("invite");
     });
   });
 
@@ -203,8 +211,9 @@ describe("lib/api/rate-limit", () => {
   });
 
   describe("policy ordering invariant", () => {
-    it("sms.limit < auth.limit < write.limit < read.limit", () => {
-      expect(RATE_LIMIT_POLICIES.sms.limit).toBeLessThan(RATE_LIMIT_POLICIES.auth.limit);
+    it("sms.limit < invite.limit < auth.limit < write.limit < read.limit", () => {
+      expect(RATE_LIMIT_POLICIES.sms.limit).toBeLessThan(RATE_LIMIT_POLICIES.invite.limit);
+      expect(RATE_LIMIT_POLICIES.invite.limit).toBeLessThan(RATE_LIMIT_POLICIES.auth.limit);
       expect(RATE_LIMIT_POLICIES.auth.limit).toBeLessThan(RATE_LIMIT_POLICIES.write.limit);
       expect(RATE_LIMIT_POLICIES.write.limit).toBeLessThan(RATE_LIMIT_POLICIES.read.limit);
     });
