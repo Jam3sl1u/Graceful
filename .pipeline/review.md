@@ -1,126 +1,141 @@
-# Review — Issue #76: Rate limiting on auth, SMS, and write endpoints
+# Review — Issue #77: [Sprint 4] Audit input validation (Zod) across all Phase 1 routes
 
-VERDICT: NEEDS WORK
+VERDICT: SHIP
 
 Reviewed: `.pipeline/spec.md`, `.pipeline/changes.md`, `.pipeline/test-results.md`,
-`git diff main...HEAD` (commit 9518e7b), plus the two untracked tester-supplement
-files, plus the real call sites that consume these endpoints.
+`git diff main...HEAD`, the six untracked new test files, and the surrounding
+source I needed to check the claims independently.
 
-Independently re-run in this worktree:
-- `bun run typecheck` — pass
-- `bun run lint` — pass
-- `bun run test` — pass, 86 suites / 1093 tests
+## Independently re-run verification
 
-## What is right
+```
+bun run lint       # clean
+bun run typecheck  # clean
+bun run test       # 88 suites / 1099 tests, all passing
+```
 
-- `lib/api/rate-limit.ts` implements the spec faithfully: the exact `resolveTier`
-  precedence order, anchored `^...$` / `[^/]+` regexes, trailing-slash + method-case
-  normalization, the `${tier}:${identifier}` key, the fixed-window counter that
-  increments on denial without sliding `windowStartMs`, the `Retry-After` +
-  `{ error, code: "RATE_LIMITED" }` envelope matching `types/api.ts` `ApiError`,
-  and the bounded-store prune.
-- `middleware.ts` runs the limiter before `auth.protect()` and before the
-  `isPublicRoute` check, so the public invitation-token endpoints are covered;
-  `config.matcher` and `isPublicRoute` are untouched as required.
-- No scope creep: nothing under `app/`, `schemas/`, `supabase/`; no new deps or
-  env vars. No suspicious/unrelated content in the diff.
-- The tests are genuine, not superficial: they exercise the N+1 denial, window
-  rollover, the "denial does not extend the window" subtlety via `resetAtMs`
-  equality, and a real end-to-end 429 through `middleware.ts`. The tester
-  supplements correctly found and closed the two blind spots in the coder's
-  suite (throwing `auth()`; tier-prefixed key built by `checkRequestRateLimit`).
+1099 − 1051 = 48 new cases, which matches the per-file count I did by hand
+(8 + 8 + 12 + 7 + 7 + 6). The Testing stage's numbers are honest.
 
-## Required fixes
+## Does the code match the spec?
 
-### 1. The tester stage's work is not committed (blocking for the PR)
+Yes, exactly, and nothing beyond it. `git diff main...HEAD --stat` touches only
+the nine files the spec's "Files touched" list names, plus the two `.pipeline/`
+artifacts. I checked each of the four changes against the spec text:
 
-`git status` in this worktree:
-- untracked: `tests/unit/middleware-tester-supplement.test.ts`
-- untracked: `tests/unit/lib/api/rate-limit-tester-supplement.test.ts`
-- modified, uncommitted: `.pipeline/test-results.md`
+- **Change 1 (PostgREST injection)** — `lib/api/postgrest.ts` is pure, has no
+  `server-only` import, and escapes `\` *before* `"`, which is the ordering that
+  actually matters (quote-first would turn a trailing `\"` into `\\"`, leaking an
+  unescaped quote). `listSongs` wraps both `ilike` terms in double quotes and
+  passes the escaped value. I grepped `app/**` and `lib/**` for `.or(`,
+  `.filter(`, `.ilike(`, `.like(`, `textSearch`, and backtick-templates passed to
+  `select/eq/in/match/order` — the fixed line in `app/api/songs/handler.ts:74` is
+  the only interpolation site in either tree. AC 3 holds.
+- **Change 2 (unbounded strings)** — the three caps are in place with the
+  rationale comments; no pre-existing limit was altered. I re-ran the audit
+  myself: `grep 'z\.string()' schemas/*.ts` minus `.max()`/`uuid`/`datetime`/
+  `regex`/`email`/`url` leaves only `schemas/availability.ts` `date`/`startDate`/
+  `endDate`, and those are constrained to 10 chars in practice by
+  `isValidDateString`'s `^\d{4}-\d{2}-\d{2}$` in the `superRefine`. So the
+  "everything else is bounded" claim holds for string fields.
+- **Change 3 (OAuth callback query schema)** — `safeParse` +
+  `Object.fromEntries(searchParams)`, failure returns `redirectError()`, never
+  `fail(...)`. I traced the whole function: the `null` → `undefined` change for
+  absent params is harmless (`if (error)` and `if (!code || !state)` behave
+  identically), and `?code=` empty-string still lands on the same redirect (now
+  via `min(1)` instead of the falsy guard). The `state` cap of 512 is safe —
+  `connect/handler.ts` mints `randomBytes(32).toString("base64url")`, i.e. 43
+  chars. Nothing anywhere still imports the deleted `googleCalendarSchema` /
+  `GoogleCalendarInput` (grepped repo-wide).
+- **Change 4 (invitation `:id`)** — `denyInvitation` validates first inside the
+  `try`, which does cover both the token and in-app branches;
+  `withdrawInvitation` validates after `requireAuth`/`requireRole`, so 401/403
+  still precede 400.
+- **Change 5 (audit record)** — I machine-diffed the inventory table against
+  `find app/api -name route.ts`: **57 files listed, 57 files on disk, exact
+  match, no omissions**. The `notImplemented` claim checks out (10 stub files:
+  5 notifications, 4 webhooks, `GET /api/church-group`). The RPC list matches
+  `grep -o 'rpc("[a-z_]*"'` exactly — same 12, no more, no fewer. The coder also
+  corrected the spec's own "58 files" estimate to the real 57 and said so.
 
-Commit 9518e7b contains only the coder's files. If the branch is pushed as-is,
-the PR ships **without** the only tests that cover spec edge case #6
-(`await auth()` throwing must not 500 → IP fallback), the only test that would
-catch dropping the `${tier}:` key prefix, and the only test that `auth.protect()`
-is not reached on a denied request. Commit them (cf. the analogous
-"Add tester supplement coverage..." commit on the #68 branch).
+## Are the tests meaningful?
 
-### 2. `auth` tier (10/min per IP) breaks the public invite-response flow, and a
-### 429 there is rendered to the member as "invitation not found"
+Mostly yes, and several are genuinely adversarial rather than decorative:
 
-`app/(public)/invite/[token]/invite-response.tsx:76-84` treats **any** non-OK
-response from `GET /api/invitations/respond/{token}` as
-`setUnavailableReason("not-found")` → the "unavailable" screen. A 429 therefore
-tells a legitimate member their invitation does not exist, with no retry path.
-The lookup + the subsequent `POST .../accept` are both `auth` tier, i.e. 2 units
-per responding member, against a **10/min bucket keyed by IP** for signed-out
-users. A worship team responding from one church wifi (or any carrier CGNAT)
-shares that bucket: past ~5 members per minute the rest get a false
-"invitation unavailable". This is a realistic, user-visible regression of a core
-Sprint-2 flow, and no test covers it because every test asserts the limiter, not
-the flows behind it.
+- `tests/unit/lib/api/postgrest.test.ts` includes the backslash-before-quote
+  ordering case, which is the one case a naive implementation gets wrong. That
+  test would fail if someone "simplified" the two `.replace()` calls into the
+  wrong order.
+- `songs-search-injection-tester-supplement.test.ts` doesn't just assert a
+  string equality — it regex-parses the emitted filter, asserts exactly two
+  `ilike` clauses, and asserts that reversing the escaping recovers `q` byte for
+  byte. That is a real breakout test.
+- `service-weeks`/`events` schema tests cover both sides of the boundary (200/201,
+  2000/2001) plus a 2MB payload, and confirm `min(1)`/`nullish()`/`optional()`
+  were not disturbed.
+- `google-calendar-callback-validation-*` proves `exchangeCode` is never reached
+  and that the response is a redirect with no JSON content-type.
+- `invitations-id-param-validation-*` asserts the 401 → 403 → 400 ordering on
+  withdraw and that no Supabase client / RPC is constructed on the 400 path.
 
-Fix (either is acceptable, the choice is a human's):
-- raise `RATE_LIMIT_POLICIES.auth.limit` to something that survives a shared-NAT
-  congregation (and/or bucket the respond-token lookup by token rather than IP), **and/or**
-- add a 429-specific branch in `invite-response.tsx` (surface "too many attempts,
-  try again in N seconds" from `Retry-After` instead of "not found") — if that is
-  considered out of scope for #76, file it as a follow-up issue and say so.
+One weak test, not worth blocking on: "redirects to error when error exceeds 200
+chars" passes identically before and after the change (any truthy `error` already
+short-circuited to `redirectError()`), so it does not discriminate the fix. The
+oversized-`state` test *does* discriminate, because the cookie is set to the same
+513-char value, so pre-fix it would have proceeded to `exchangeCode`.
 
-### 3. `sms` tier (5/min) breaks per-member inviting from the week view
+## Findings
 
-`app/(app)/week/[id]/week-view.tsx:274-300` invites **one member per POST**
-(`+ Invite` button per roster row). Staffing a roster of more than 5 members
-inside a minute 429s, and the BR-05 conflict path sends a second POST for the
-same invite, so a couple of conflicts can exhaust the budget after 3 invites.
-The user-visible result is the generic
-`"Something went wrong sending the invitation. Please try again."`, and retrying
-immediately just burns more budget. The same 5/min bucket is additionally shared
-with `POST /api/setlists/{id}/publish` and `.../deny` for the same admin.
+### Must do before merge (process, not code)
 
-Fix: raise the invite/sms budget (or give invitation creation its own tier), or
-get explicit human sign-off that 5/min across invite+deny+publish is intended.
-The spec itself flagged these numbers as "a first pass meant to be tuned by a
-human" — this review is that tuning point, not a rubber stamp.
+1. **The six new test files are untracked.** `git status` shows
+   `tests/unit/lib/api/postgrest.test.ts`,
+   `tests/unit/schemas/service-weeks.test.ts`,
+   `tests/unit/schemas/events-notes-max-tester-supplement.test.ts`,
+   `tests/unit/app/api/songs-search-injection-tester-supplement.test.ts`,
+   `tests/unit/app/api/google-calendar-callback-validation-tester-supplement.test.ts`,
+   `tests/unit/app/api/invitations-id-param-validation-tester-supplement.test.ts`
+   as `??`, and `.pipeline/test-results.md` as modified. The only commit on this
+   branch (`7f22d48`) contains **none** of the Testing stage's tests. Commit them
+   before opening/updating the PR or the entire test deliverable is lost.
 
-## Recommended (non-blocking)
+### Non-blocking, worth a human's eyes
 
-4. `middleware.ts:20-25` — `await auth()` now runs on **every** matched request,
-   including all page navigations, which previously resolved no session on public
-   routes. Since `resolveTier` returns `null` for non-`/api` paths, resolving the
-   tier first and only calling `auth()` when the tier is non-null would avoid a
-   per-navigation session resolution and would also make the "reject an
-   unauthenticated flood cheaply" claim actually true (today the flood still pays
-   the JWT verification before the limiter runs).
-5. `lib/api/rate-limit.ts:92-106` — the identity for anonymous callers is derived
-   entirely from client-supplied headers. First-hop `x-forwarded-for` is only
-   trustworthy if the platform overwrites it; if it is ever appended, or the app
-   is ever fronted by something else, the whole `auth` tier (the anti-brute-force
-   point of this issue) is bypassable by rotating one header. Worth an explicit
-   comment stating the trust assumption, and consider preferring the
-   platform-set `x-real-ip`. Related: `ip:unknown` is a shared bucket, so a single
-   caller sending header-less requests can exhaust the `auth`/`sms` budget for
-   every other header-less caller.
-6. `tests/unit/lib/api/rate-limit-tester-supplement.test.ts:65-77` — the
-   "ignores the query string" test never constructs a query string
-   (`req2 = { ...req1 }` is the same object shape, and the fake `nextUrl` has only
-   `pathname`). It passes trivially and proves nothing about query strings; either
-   put a `search`/`href` on the fake or rename it to what it actually asserts
-   (two calls with the same pathname share a bucket).
-7. `resolveTier` has no negative-precedence coverage: `HEAD`/`OPTIONS` → `read`,
-   a non-`POST` verb on `/deny` or `/publish` → `write`, `PUT /api/setlists/{id}`
-   not matching `SETLIST_PUBLISH_RE`, and the `/api` root. Cheap to add and they
-   guard the ordering that matters most.
-8. Store pruning at 10,000 keys is untestable through the public API (noted
-   honestly by the tester). If it is ever worth asserting, export a size accessor
-   behind the same test-only door as `resetRateLimitStore()`.
+2. **The PostgREST quoting fix is verified only against mocks.** Every test
+   asserts on the *string handed to a jest mock* `.or()`; nothing in this repo
+   exercises `title.ilike."%…%"` against a live PostgREST. The syntax is correct
+   per PostgREST's reserved-character rules (double-quoted values, `\"` and `\\`
+   escapes inside them, `%`/`*` wildcard handling unaffected by quoting), and
+   `tests/integration/rls/` has no song-search coverage to extend cheaply. Still:
+   if this form were rejected, `GET /api/songs?q=…` would 500 in production and
+   the green unit suite would not notice. Suggest one manual `curl` against a dev
+   Supabase before merge, or a follow-up integration test.
+3. **`denyInvitation` now returns 400 before 401/403 on the in-app branch.** The
+   spec mandated this ordering (it is the only way to cover the tokenless branch
+   with one check), but it inverts the "auth before validate" convention the same
+   spec lists in its own patterns table and that `withdrawInvitation` follows. No
+   information is disclosed — the id is entirely caller-supplied — so this is a
+   consistency nit, not a security issue. Flagging it so it is a conscious choice.
+4. **`Object.fromEntries(searchParams)` takes the last duplicate; `.get()` took
+   the first.** A `?code=a&code=b` now resolves to `b` instead of `a`. Both are
+   schema-bounded and Google does not send duplicates, so impact is nil, but it is
+   a real (undocumented) behavior delta introduced by this diff.
+5. **Audit gap the record does not mention: unbounded array cardinality.**
+   `reorderSetlistSchema.songs` is `z.array(...)` with no `.max()`, unlike
+   `setAvailabilitySchema.entries` (`.min(1).max(400)`), which sets the repo
+   precedent. Practical impact is limited — `PUT /api/setlists/:id` rejects any
+   body whose song set does not exactly match the stored setlist, so an oversized
+   array 400s before the per-row update loop — but a validation *audit* should say
+   so rather than be silent. Suggest adding a line to the audit record or filing a
+   follow-up alongside the already-documented blanket-`:id` gap.
+6. **`.max(200)` on `sermonTopic`/`sermonScripture` is a tightening on live data.**
+   Nothing in `app/`/`components/` renders these fields yet (grepped), so there is
+   no client/server `maxLength` mismatch, but any pre-existing row over 200 chars
+   would now fail a PUT. Low risk for a Sprint-4 app; noted for completeness.
 
-## Not blocking / accepted
+## Bottom line
 
-- In-memory, per-instance counters (spec OQ #2) — documented limitation.
-- `bun run build` failing at static generation on `Missing publishableKey` —
-  independently reproduced as a pre-existing sandbox env gap on both branches;
-  the middleware bundle compiles, so the `server-only` question is settled and
-  the primary (non-fallback) branch was correctly taken.
-- Clerk-hosted `/sign-in` / `/sign-up` not being throttled (spec OQ #1).
+The diff is small, correct, matches the spec line for line, and the audit record
+is the rare kind that survives being machine-checked against the repo. Items 3–6
+are observations for a human, not defects. Item 1 is the only thing that has to
+happen before this ships.

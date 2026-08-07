@@ -1,368 +1,322 @@
-# Spec — Issue #76: [Sprint 4] Implement rate limiting on auth, SMS, and write endpoints
+# Spec — Issue #77: [Sprint 4] Audit input validation (Zod) across all Phase 1 routes
 
 ## OPEN QUESTIONS
 
-**None blocking — do not stop the pipeline.** Two things a human should know are
-recorded here because they shape the design; both already have a defensible
-resolution baked into this spec.
+None. Proceed.
 
-1. **This repo has no login/signup API route to rate limit.** Verified: sign-in
-   and sign-up are Clerk-hosted components (`app/(auth)/sign-in/[[...sign-in]]/page.tsx`,
-   `app/(auth)/sign-up/[[...sign-up]]/page.tsx`); credential submission goes to
-   Clerk's own API, not to this app, and Clerk rate-limits it. The "auth" tier in
-   this spec therefore covers the app's own credential-checking surfaces — invite
-   code redemption and the no-session invitation response tokens — which are the
-   brute-forceable auth endpoints this codebase actually owns. If the human wants
-   the Clerk-hosted `/sign-in` / `/sign-up` *page* routes throttled too, that is a
-   separate decision; this spec deliberately limits only `/api/*`.
-2. **Limits are in-memory, not Redis-backed.** The AC explicitly allows either.
-   In-memory keeps the change dependency-free (`@upstash/redis` is present but is
-   reserved for the Phase 3/4 transcription queue and its env vars are unset —
-   see `lib/upstash/redis.ts`). Known limitation to state in `changes.md`: on
-   serverless each instance holds its own counters, so the effective limit is
-   per-instance, not global. The concrete numbers below are a first pass and are
-   meant to be tuned by a human later.
-
-## Goal
-
-Add an application-layer rate limiter that runs in `middleware.ts` for every
-`/api/*` request, with stricter tiers for SMS-triggering, auth-credential, and
-write endpoints. Exceeding a limit returns `429` with a `Retry-After` header and
-the repo's standard `{ error, code }` envelope. Cover it with unit tests that
-prove the limit actually fires.
-
-PRD ref: Phase 1 PRD §25.3 ("Rate limiting") and §26 ("Rate limit tests").
-
-## Current state (verified by reading the code)
-
-- **No rate limiting exists anywhere.** The only trace is the already-defined
-  `ErrorCode.RATE_LIMITED` in `lib/api/errors.ts` (unused today).
-- `middleware.ts` (repo root) is `clerkMiddleware(...)` with
-  `createRouteMatcher` for public routes; its `config.matcher` already matches
-  `/(api|trpc)(.*)`, so **no matcher change is needed**.
-- Route files under `app/api/**/route.ts` are thin and delegate to a sibling
-  `handler.ts`. Do **not** touch any of them — rate limiting is applied once, in
-  middleware.
-- `lib/api/response.ts` exposes `ok()` / `fail()` / `notImplemented()`. `fail()`
-  cannot attach headers. **Do not modify `lib/api/response.ts`** — the 429 is
-  built in the new module instead (see "server-only constraint" below).
-- Unit tests live in `tests/unit/**`, run by Jest via `bun run test`
-  (`jest.config.js`, `testMatch: **/tests/unit/**/*.test.ts`,
-  `moduleNameMapper: ^@/(.*)$ -> <rootDir>/$1`, `server-only` mapped to
-  `tests/mocks/server-only.js`). `collectCoverageFrom` already includes
-  `lib/api/**/*.ts`, so no Jest config change is needed.
-- SMS/email dispatch is still stubbed (`lib/pingram/client.ts`,
-  `lib/resend/client.ts`), but the SMS-triggering *endpoints* exist and are
-  identified by `TODO(#67/#68)` markers plus the live `sendSms` call site.
-
-## Files
-
-### Create
-
-1. `lib/api/rate-limit.ts` — the limiter (all logic, pure and testable).
-2. `tests/unit/lib/api/rate-limit.test.ts` — unit tests for the limiter.
-3. `tests/unit/middleware.test.ts` — proves the 429 actually fires through
-   `middleware.ts`.
-
-### Modify
-
-4. `middleware.ts` — call the limiter before anything else.
-
-Nothing else. No new dependencies (`package.json` unchanged), no new env vars
-(`.env.example` unchanged), no changes under `app/`, `schemas/`, or
-`supabase/`.
+(Reviewer note, not a blocker: PRD §15.3 is not checked into this repo, so the
+three previously-unbounded free-text limits below were chosen to match the
+nearest existing precedent already in `schemas/` rather than a PRD number.
+They are documented explicitly in "Change 2".)
 
 ---
 
-## 1. `lib/api/rate-limit.ts`
+## Context — what the audit already found
 
-### server-only constraint (important)
+I read every file under `app/api/**` and every file under `schemas/`. The
+codebase is already in good shape: 21 of 21 JSON-body endpoints already
+`safeParse` through a Zod schema in `schemas/`, all query-param endpoints
+except one already do, and all DB access already goes through the Supabase
+SDK (`.from()/.eq()/.rpc()`), which parameterizes.
 
-Every other `lib/**` module starts with `import "server-only"`. **This file must
-NOT import `server-only`, and must not import `lib/api/response.ts`** — it is
-imported by `middleware.ts`, which Next bundles for the Edge runtime, and the
-repo has no existing precedent for pulling a `server-only` module into that
-bundle. Add a short comment at the top of the file saying exactly that, so the
-deviation from the `lib/**` convention is not read as an oversight.
-
-It **may** import `{ ErrorCode }` from `@/lib/api/errors` (which does import
-`server-only`) — this is the single source of truth for the `RATE_LIMITED`
-string and duplicating the literal is worse. Verify it with `bun run build` (see
-"Verification"). If and only if that build fails with a `server-only` error
-originating from the middleware bundle, fall back to a local
-`const RATE_LIMITED_CODE = "RATE_LIMITED"` in this file and add an assertion in
-`tests/unit/lib/api/rate-limit.test.ts` that it equals `ErrorCode.RATE_LIMITED`
-(the test runs under Jest, where `server-only` is mocked). Record which branch
-you took in `.pipeline/changes.md`.
-
-### Exported interface
-
-```ts
-import { NextRequest, NextResponse } from "next/server";
-
-export type RateLimitTier = "webhook" | "sms" | "auth" | "write" | "read";
-
-export type RateLimitPolicy = { limit: number; windowMs: number };
-
-export type RateLimitDecision = {
-  tier: RateLimitTier;
-  allowed: boolean;
-  limit: number;
-  remaining: number;        // 0 once the limit is hit
-  retryAfterSeconds: number; // integer >= 1 when denied, 0 when allowed
-  resetAtMs: number;         // epoch ms at which the current window ends
-};
-
-// Tier -> policy table. Exported so tests assert the ordering invariant
-// (sms < auth < write < read) instead of hardcoding numbers twice.
-export const RATE_LIMIT_POLICIES: Record<RateLimitTier, RateLimitPolicy>;
-
-// Pure path/method -> tier classification. Returns null when the request is
-// exempt from rate limiting entirely.
-export function resolveTier(pathname: string, method: string): RateLimitTier | null;
-
-// Stable per-caller bucket identity.
-export function getRequestIdentifier(req: NextRequest, clerkUserId: string | null): string;
-
-// Fixed-window counter against the module-level store. `now` defaults to
-// Date.now() and is injectable so tests never need fake timers.
-export function checkRateLimit(
-  key: string,
-  policy: RateLimitPolicy,
-  now?: number,
-): Omit<RateLimitDecision, "tier">;
-
-// Test-only: clears the module-level store.
-export function resetRateLimitStore(): void;
-
-// Full request-level entry point used by middleware. Returns null when the
-// request is exempt. Consumes one unit of budget when it does not return null.
-export function checkRequestRateLimit(
-  req: NextRequest,
-  clerkUserId: string | null,
-  now?: number,
-): RateLimitDecision | null;
-
-// Builds the 429. Only ever called with a denied decision.
-export function rateLimitResponse(decision: RateLimitDecision): NextResponse;
-```
-
-### Policies
-
-```
-webhook: { limit: 600, windowMs: 60_000 }
-read:    { limit: 240, windowMs: 60_000 }
-write:   { limit: 60,  windowMs: 60_000 }
-auth:    { limit: 10,  windowMs: 60_000 }
-sms:     { limit: 5,   windowMs: 60_000 }
-```
-
-### `resolveTier(pathname, method)` — first match wins, in this exact order
-
-Normalize first: `const path = pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;`
-and `const verb = method.toUpperCase();`.
-
-1. `!path.startsWith("/api/")` and `path !== "/api"` → `null` (page routes are
-   never rate limited).
-2. `path === "/api/health"` → `null` (uptime monitor + `tests/e2e/health.spec.ts`).
-3. `path.startsWith("/api/webhooks/")` → `"webhook"`.
-4. `"sms"` if any of:
-   - `POST /api/invitations` (exact — create invitation, #40 SMS dispatch)
-   - `POST /api/invitations/{id}/deny` (SMS + email to the admin)
-   - `POST /api/setlists/{id}/publish` (member SMS/email fan-out)
-   - `/api/cron/invitation-reminders` (any method — #45 reminder SMS)
-5. `"auth"` if any of:
-   - `POST /api/church-group/join` (invite-code brute force)
-   - `GET /api/invitations/respond/{token}` (response-token brute force)
-   - `POST /api/invitations/{id}/accept` (response-token brute force)
-6. `verb` not in `["GET", "HEAD", "OPTIONS"]` → `"write"`.
-7. otherwise → `"read"`.
-
-`{id}` / `{token}` are single path segments — match with `[^/]+`, anchored
-(`^...$`). `GET /api/invitations` (the roster list) must resolve to `"read"`,
-not `"sms"` — the method is part of the rule.
-
-### `getRequestIdentifier`
-
-- If `clerkUserId` is a non-empty string → `` `user:${clerkUserId}` ``.
-- Else derive the client IP: first comma-separated entry of the
-  `x-forwarded-for` header, trimmed; if absent/empty, `x-real-ip`, trimmed; if
-  that is also absent/empty, the literal `"unknown"`. Return `` `ip:${ip}` ``.
-
-### `checkRateLimit` (fixed window)
-
-- Module-level `const store = new Map<string, { count: number; windowStartMs: number }>()`.
-- On call with `now`: if no entry, or `now - entry.windowStartMs >= policy.windowMs`,
-  start a fresh window (`count = 1`, `windowStartMs = now`). Otherwise `count += 1`.
-- `resetAtMs = windowStartMs + policy.windowMs`.
-- `allowed = count <= policy.limit`.
-- `remaining = Math.max(0, policy.limit - count)`.
-- `retryAfterSeconds = allowed ? 0 : Math.max(1, Math.ceil((resetAtMs - now) / 1000))`.
-- The counter increments on denied requests too, but `windowStartMs` is **never**
-  moved forward by them — a blocked caller must not have its own ban extended.
-- Store pruning: after writing, if `store.size > 10_000`, delete every entry
-  whose `windowStartMs + windowMs` is `<= now` (use the largest configured
-  `windowMs` as the sweep threshold); if the size is still `> 10_000` after the
-  sweep, `store.clear()`. This keeps memory bounded.
-
-### `checkRequestRateLimit`
-
-`resolveTier(req.nextUrl.pathname, req.method)` → if `null`, return `null`.
-Otherwise look up the policy, build the key as
-`` `${tier}:${getRequestIdentifier(req, clerkUserId)}` `` (tier is part of the
-key so a caller's read budget and write budget are independent), call
-`checkRateLimit`, and return `{ tier, ...decision }`.
-
-### `rateLimitResponse(decision)`
-
-```ts
-NextResponse.json(
-  { error: "Rate limit exceeded", code: ErrorCode.RATE_LIMITED },
-  { status: 429, headers: { "Retry-After": String(decision.retryAfterSeconds) } },
-);
-```
-
-Body shape must match `types/api.ts`'s `ApiError`. `Retry-After` is the only
-header to set — do not add `X-RateLimit-*` headers.
+This issue is therefore **four small, surgical changes plus a written audit
+record** — not a rewrite. Do exactly what is listed below and nothing else.
 
 ---
 
-## 2. `middleware.ts` (modify)
+## Change 1 — PostgREST filter-string injection in the song search (AC 3)
 
-Keep `isPublicRoute` and `config` exactly as they are. Inside the
-`clerkMiddleware` callback, before `auth.protect()`:
+**This is the only place in `app/**` or `lib/**` where a database filter is
+built by string interpolation from user input**, and it is a real breakout:
+
+`app/api/songs/handler.ts:72`
+```ts
+query = query.or(`title.ilike.%${q}%,artist.ilike.%${q}%`);
+```
+`q` comes straight from `?q=` (`songSearchQuerySchema`, which only trims and
+caps length). A `q` containing `,`, `(`, `)` or `.` breaks out of the
+`or=(...)` grammar and lets the caller append arbitrary PostgREST filters to
+the query.
+
+### 1a. Create `lib/api/postgrest.ts`
 
 ```ts
-export default clerkMiddleware(async (auth, req) => {
-  let clerkUserId: string | null = null;
-  try {
-    clerkUserId = (await auth()).userId;
-  } catch {
-    clerkUserId = null; // malformed/expired session -> fall back to IP bucketing
-  }
+/**
+ * Escapes a user-supplied value for use inside a PostgREST filter string
+ * (e.g. the argument to `.or()`), where reserved characters like `,` `.`
+ * `(` `)` would otherwise break out of the filter grammar.
+ *
+ * PostgREST allows a filter value to be double-quoted; inside those quotes
+ * only `"` and `\` are special. Callers must wrap the returned value in
+ * double quotes themselves, e.g. `title.ilike."%${escaped}%"`.
+ */
+export function escapePostgrestFilterValue(value: string): string;
+```
 
-  const decision = checkRequestRateLimit(req, clerkUserId);
-  if (decision && !decision.allowed) {
-    return rateLimitResponse(decision);
-  }
+Implementation: escape backslashes first, then double quotes. No other
+transformation — do **not** strip or escape `%`/`*`; wildcard semantics of the
+existing search are unchanged.
 
-  if (!isPublicRoute(req)) {
-    await auth.protect();
-  }
+Notes:
+- Do **not** add `import "server-only"` — this must stay unit-testable as a
+  pure function (compare `lib/invitations/state-machine.ts`, which has no
+  `server-only` import; `lib/api/response.ts` does, and is not the model here).
+- Pure, no I/O, no dependencies.
+
+### 1b. Use it in `app/api/songs/handler.ts`
+
+Replace the interpolation in `listSongs` with a double-quoted, escaped form:
+
+```ts
+const escaped = escapePostgrestFilterValue(q);
+query = query.or(`title.ilike."%${escaped}%",artist.ilike."%${escaped}%"`);
+```
+
+Keep everything else in that function identical (the `if (q)` guard, ordering,
+error mapping).
+
+### 1c. Update the one existing assertion this changes
+
+`tests/unit/app/api/songs-route.test.ts:186` currently asserts:
+```ts
+expect(selectChain.or).toHaveBeenCalledWith("title.ilike.%amaz%,artist.ilike.%amaz%");
+```
+Update it to the new quoted form for `q: "amaz"`. Change only this line; do
+not restructure the test file. (Additional adversarial cases are the Testing
+stage's job, not yours.)
+
+---
+
+## Change 2 — Unbounded string fields (AC 2)
+
+Three request fields currently have **no `.max()`** at all, so a multi-megabyte
+body reaches Postgres. Every other string field in `schemas/` is already
+bounded (verified field by field: church-group 100/50/100/2048, songs
+200/200/5/50, instruments 100, song-documents 200/50/1024, profile bio 2000,
+availability note 500, invitations roleNote 500 + denial reason 200,
+setlists notes 1000 / keyOverride 5, events name 100 / location 200).
+
+Add these caps, and nothing else:
+
+**`schemas/service-weeks.ts`**
+- `createServiceWeekSchema.sermonTopic`: `z.string().trim().min(1).max(200)`
+- `createServiceWeekSchema.sermonScripture`: `z.string().trim().min(1).max(200)`
+- `updateServiceWeekSchema.sermonTopic`: same, `.optional()`
+- `updateServiceWeekSchema.sermonScripture`: same, `.optional()`
+
+**`schemas/events.ts`**
+- `createEventSchema.notes`: `z.string().trim().min(1).max(2000).nullish()`
+- `updateEventSchema.notes`: same
+
+Rationale to put in a short code comment above each changed field: these are
+`text` columns in Postgres (`service_weeks.sermon_topic`,
+`service_weeks.sermon_scripture`, `events.notes` — see
+`supabase/migrations/20260702000003_cluster_3_scheduling_core.sql`), so the
+cap is an app-layer limit. 200 matches the repo's existing "short titled
+text" convention (`songs.title`, `song_documents.name`); 2000 matches the
+existing long-free-text convention (`schemas/profile.ts` `bio`).
+
+Do **not** change any limit that already exists. In particular leave
+`denyInvitationSchema.reason` at `.max(200)` — it already satisfies the AC's
+named "denial reason ≤200 chars".
+
+---
+
+## Change 3 — Missing query-param schema on the Google Calendar OAuth callback (AC 1)
+
+`app/api/google-calendar/callback/handler.ts` is the **only** route that reads
+query params without a Zod schema: it pulls `error`, `code`, `state` straight
+off `req.nextUrl.searchParams` (lines 36-39) and hands `code` to
+`exchangeCode()`.
+
+### 3a. `schemas/google-calendar.ts`
+
+Replace the placeholder `googleCalendarSchema` stub (and its TODO comment)
+with a real schema:
+
+```ts
+// GET /api/google-calendar/callback query params. Google sends either
+// `error` (user denied consent) or `code` + `state`. All three are opaque
+// provider-supplied strings — bound their length so a hostile redirect
+// can't push an unbounded value into exchangeCode()/the CSRF comparison.
+export const googleCalendarCallbackQuerySchema = z.object({
+  code: z.string().min(1).max(2048).optional(),
+  state: z.string().min(1).max(512).optional(),
+  error: z.string().min(1).max(200).optional(),
 });
+export type GoogleCalendarCallbackQuery = z.infer<typeof googleCalendarCallbackQuerySchema>;
 ```
 
-Rate limiting must run **before** `auth.protect()` so an unauthenticated flood is
-rejected cheaply, and it must apply to public API routes too (the invitation
-token endpoints are public and are precisely what the auth tier is for).
+Do not add `.trim()` — these are provider-issued opaque tokens.
 
----
+Check with a repo-wide search that nothing imports the removed
+`googleCalendarSchema` / `GoogleCalendarInput` before deleting them; if
+anything does, keep them and just add the new export.
 
-## 3. Tests
+### 3b. `app/api/google-calendar/callback/handler.ts`
 
-### `tests/unit/lib/api/rate-limit.test.ts`
-
-No Clerk mocks needed. Build `NextRequest`-ish fakes as plain objects cast
-through `as unknown as NextRequest` (same style as `makeJsonReq` in
-`tests/support/api-auth.ts`), e.g.
-`{ nextUrl: { pathname }, method, headers: new Headers({ ... }) }`.
-Call `resetRateLimitStore()` in `beforeEach`. Always pass an explicit `now`.
-
-Must cover:
-- **Happy path**: requests 1..N of an N-limit policy are all `allowed`, with
-  `remaining` counting down to 0.
-- **Limit fires (the AC's required case)**: request N+1 is `allowed === false`,
-  `remaining === 0`, `retryAfterSeconds >= 1`.
-- **429 shape**: `rateLimitResponse(denied)` has `status === 429`,
-  `headers.get("Retry-After")` parses to an integer `>= 1`, and the JSON body is
-  `{ error: <string>, code: "RATE_LIMITED" }`.
-- **Window rollover**: at `now = windowStart + windowMs` the caller is allowed
-  again and `remaining` resets.
-- **Denied requests do not extend the window**: hammer past the limit, then
-  assert `resetAtMs` is unchanged from the first denial and the caller is allowed
-  again at the original `resetAtMs`.
-- **Tier isolation**: exhausting `sms` for an identity still allows that
-  identity's `read` requests (separate keys), and two different identities do not
-  share a bucket.
-- **`resolveTier` table**, at minimum: `POST /api/invitations` → `sms`;
-  `GET /api/invitations` → `read`; `POST /api/invitations/<uuid>/deny` → `sms`;
-  `POST /api/invitations/<uuid>/accept` → `auth`;
-  `GET /api/invitations/respond/<token>` → `auth`;
-  `POST /api/church-group/join` → `auth`;
-  `POST /api/setlists/<uuid>/publish` → `sms`;
-  `GET /api/cron/invitation-reminders` → `sms`;
-  `POST /api/webhooks/clerk` → `webhook`; `PATCH /api/profile` → `write`;
-  `DELETE /api/events/<uuid>` → `write`; `GET /api/events` → `read`;
-  `GET /api/health` → `null`; `GET /dashboard` → `null`;
-  trailing slash (`/api/health/`) → `null`; lowercase method (`post`) is
-  classified the same as `POST`.
-- **Identifier**: signed-in user → `user:<id>`; anonymous with
-  `x-forwarded-for: "1.2.3.4, 5.6.7.8"` → `ip:1.2.3.4`; anonymous with only
-  `x-real-ip` → that IP; anonymous with neither → `ip:unknown`.
-- **Policy ordering invariant**: `sms.limit < auth.limit < write.limit < read.limit`.
-
-### `tests/unit/middleware.test.ts`
-
-Proves the limit fires through the real middleware. Mock Clerk:
+Follow the existing query-param pattern from
+`app/api/church-group/audit-log/handler.ts:28-33`:
 
 ```ts
-jest.mock("@clerk/nextjs/server", () => ({
-  clerkMiddleware: (handler: unknown) => handler,
-  createRouteMatcher: () => () => true, // treat everything as public
-}));
+const parsedQuery = googleCalendarCallbackQuerySchema.safeParse(
+  Object.fromEntries(req.nextUrl.searchParams),
+);
+if (!parsedQuery.success) {
+  return redirectError();
+}
+const { error, code, state } = parsedQuery.data;
 ```
 
-With `clerkMiddleware` as the identity function, the default export *is* the
-handler, so call it as `middleware(authFn, req)` where `authFn` is
-`Object.assign(async () => ({ userId: null }), { protect: jest.fn() })`.
+**Critical edge case:** this route must *never* return JSON. Every failure
+path — including the new validation failure — returns `redirectError()`
+(302 to `/profile?calendar=error`, state cookie cleared), not
+`fail(...)`. Keep the rest of the function (the `if (error)` short-circuit,
+the `if (!code || !state)` guard, the CSRF cookie comparison, the upsert,
+the best-effort `syncAllEventsForUser`) behaviourally identical.
 
-Must cover:
-- Requests within the `sms` limit to `POST /api/invitations` are not 429 (the
-  handler returns `undefined` when it falls through — assert it is not a 429
-  response rather than asserting an exact value).
-- The first request past the `sms` limit returns status `429` with a
-  `Retry-After` header and `code: "RATE_LIMITED"`.
-- `GET /api/health` never 429s no matter how many times it is called.
-- Call `resetRateLimitStore()` in `beforeEach` so tests do not leak counters into
-  each other.
+Existing tests in `tests/unit/app/api/google-calendar-callback-route.test.ts`
+pass `code: "abc"` / a base64url `state` / `error: "access_denied"`; all three
+must still pass unchanged. Do not modify that test file.
 
 ---
 
-## Edge cases the implementation must handle
+## Change 4 — Invitation `:id` path param validated in deny/withdraw (AC 1)
 
-1. Trailing slashes on the pathname must not change the tier.
-2. Method casing must not change the tier.
-3. Query strings are irrelevant — always classify on `req.nextUrl.pathname`.
-4. Missing/blank `x-forwarded-for` **and** `x-real-ip` → the shared
-   `ip:unknown` bucket (accepted trade-off; note it in a code comment).
-5. `x-forwarded-for` with multiple hops → use the first entry only.
-6. `await auth()` throwing must not 500 the request — fall back to IP bucketing.
-7. `retryAfterSeconds` must never be `0` or fractional on a denial.
-8. Denied requests increment the counter but must not slide the window forward.
-9. The store must stay bounded (pruning rule above).
-10. Non-`/api` page navigations must never be rate limited.
-11. `GET /api/invitations` (roster read) must not fall into the `sms` tier.
+`acceptInvitation` already validates its `:id` route param
+(`acceptInvitationParamSchema`, `app/api/invitations/handler.ts:520`), but its
+two siblings in the same file do not: `denyInvitation` passes the raw `id`
+into the `deny_invitation` RPC's `uuid` argument (line ~301), and
+`withdrawInvitation` passes it into `.eq("id", id)`. A malformed id currently
+surfaces as a 500 "Internal error" instead of a 400.
 
-## Verification
+### 4a. `schemas/invitations.ts`
 
-Run all of these from the repo root and report results in `.pipeline/changes.md`:
+Add:
+```ts
+// Route param for /api/invitations/:id/* (deny, withdraw). Same shape as
+// acceptInvitationParamSchema.
+export const invitationIdParamSchema = z.string().uuid();
+```
+Leave `acceptInvitationParamSchema` and the unused `invitationsSchema` stub
+exactly as they are.
 
-- `bun run typecheck`
-- `bun run lint`
-- `bun run test`
-- `bun run build` — required for this issue specifically, because `middleware.ts`
-  is bundled at build time and neither Jest nor CI would catch a middleware
-  bundling failure. If the build fails for reasons unrelated to rate limiting
-  (e.g. missing Clerk/Supabase env vars in this environment), say so explicitly in
-  `changes.md` and move on; if it fails with a `server-only` error from the
-  middleware bundle, apply the documented fallback in §1.
+### 4b. `app/api/invitations/handler.ts`
 
-## Out of scope
+- In `denyInvitation`: validate `id` with `invitationIdParamSchema` as the
+  **first** statement inside the `try`, before `req.json()`, returning
+  `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)` on failure.
+  This must run before either branch (token / in-app) so both are covered.
+- In `withdrawInvitation`: validate `id` immediately after the existing
+  `requireAuth` + `requireRole` calls (keep 401/403 taking precedence over
+  400, matching `patchMemberRole` in
+  `app/api/church-group/members/[id]/role/handler.ts:24-34`), same 400 on
+  failure.
+- Continue passing the original `id` variable to the RPC/queries — no
+  renaming, no behaviour change for well-formed UUIDs.
 
-- Redis/Upstash-backed distributed counters.
-- Any DDoS protection above the application layer (Vercel/Cloudflare).
-- Throttling the Clerk-hosted `/sign-in` / `/sign-up` page routes.
-- Per-user transcription job-submission limits (Phase 3, PRD §25.4).
-- Changes to any `app/api/**` route or handler.
-- The broader rate-limit test suite tracked separately as #81 — this issue ships
-  only the unit tests listed above.
+Every existing test for these two handlers already passes a real UUID
+(`INVITATION_ID = "33333333-..."`), so no test file changes are needed here.
+
+---
+
+## Change 5 — Write the audit record (AC 1, 3, 4)
+
+The issue is an audit; the audit result is a deliverable. Put it in
+`.pipeline/changes.md` (the normal Coding-stage artifact) — **do not create a
+new standalone `.md` report file anywhere in the repo.** Include, in addition
+to your usual summary of changes:
+
+1. **Route inventory table** — one row per `app/api/**/route.ts` (58 files)
+   with: path, HTTP methods, and the validation status of each input surface
+   (body / query / route param), naming the schema used. Mark the routes that
+   are still `notImplemented()` 501 stubs (`app/api/notifications/**` ×5,
+   `app/api/webhooks/**` ×4, `GET /api/church-group`) as "no input surface —
+   501 stub", and note that `schemas/notifications.ts` is a deliberately empty
+   placeholder with no route consuming it.
+2. **AC 3 result** — the exact search commands you ran and their output,
+   confirming that after Change 1 there is no remaining SQL or PostgREST
+   filter string built by interpolation from user input in `app/**` or
+   `lib/**`. Search at minimum for: `` .or(` ``, `.filter(`, `.rpc(`,
+   `` sql` ``, `exec_sql`, and `${` inside template literals passed to
+   Supabase methods. Record the one remaining hit —
+   `tests/integration/rls/setup.ts:149` (`svc.rpc("exec_sql", { query: sql })`)
+   — and state explicitly that `sql` there is the static file
+   `supabase/seed-rls-test.sql` read from disk in test setup, with no user
+   input, so it is not a finding.
+3. **AC 4 result** — confirmation that every DB call in `app/**` and `lib/**`
+   goes through the Supabase JS SDK (`.from(...)`, `.rpc(...)`), with the
+   RPC list enumerated (`create_church_group`, `join_church_group`,
+   `remove_church_group_member`, `write_audit_log`, `accept_invitation`,
+   `deny_invitation`, `get_invitation_by_token`, `send_invitation_reminders`,
+   `record_availability_conflict`, `get_event_sync_targets`,
+   `get_user_sync_targets`, `flag_calendar_token_invalid`) and the note that
+   all arguments are passed as named RPC parameters, never interpolated.
+
+---
+
+## Explicitly OUT of scope — do not do these
+
+- **Blanket UUID validation of every `:id` route param.** ~20 handlers pass a
+  route param straight into `.eq("id", id)`. These are *not* an injection risk
+  (the SDK parameterizes) — the only symptom is a 500 instead of a 404 for a
+  malformed id. Fixing it repo-wide would require rewriting ~25 existing tests
+  that deliberately pass non-UUID ids (`"missing-id"`, `"instr-1"` — see
+  `tests/unit/app/api/instruments-route.test.ts`,
+  `tests/unit/app/api/auth-matrix.test.ts`,
+  `tests/unit/app/api/service-weeks-*.test.ts`). That is its own issue. Change
+  4 is limited to deny/withdraw *because* it makes them consistent with their
+  own sibling `acceptInvitation` at zero test cost. Mention this finding in
+  the `.pipeline/changes.md` audit record as a known, deliberate gap.
+- Rate limiting (issue #76).
+- Writing new tests (that is the Testing stage). The only test edit you make
+  is the single assertion line in Change 1c.
+- Filling in `schemas/notifications.ts`, or implementing any `notImplemented`
+  route.
+- Refactoring the two existing inline `const targetIdSchema = z.string().uuid()`
+  declarations in `app/api/church-group/members/[id]/handler.ts` and
+  `app/api/church-group/members/[id]/role/handler.ts` into a shared helper.
+- Any change to `lib/supabase/types.ts`, RLS policies, or migrations.
+
+---
+
+## Patterns to copy
+
+| For | Copy from |
+| --- | --- |
+| Body validation + 400 shape | `app/api/songs/handler.ts:95-100` (`createSong`) |
+| Query-param validation + 400 shape | `app/api/church-group/audit-log/handler.ts:28-34` |
+| Route-param validation + 400 shape | `app/api/invitations/handler.ts:520-523` (`acceptInvitation`) |
+| Auth-then-validate ordering (401/403 before 400) | `app/api/church-group/members/[id]/role/handler.ts:24-36` |
+| Schema file style (comment naming the route + BR/PRD ref, `z.infer` type export) | `schemas/invitations.ts` |
+| Pure, unit-testable `lib/` helper with no `server-only` | `lib/invitations/state-machine.ts` |
+
+## Files touched (exact list)
+
+Create:
+- `lib/api/postgrest.ts`
+
+Modify:
+- `app/api/songs/handler.ts`
+- `schemas/service-weeks.ts`
+- `schemas/events.ts`
+- `schemas/google-calendar.ts`
+- `app/api/google-calendar/callback/handler.ts`
+- `schemas/invitations.ts`
+- `app/api/invitations/handler.ts`
+- `tests/unit/app/api/songs-route.test.ts` (one assertion line only)
+- `.pipeline/changes.md`
+
+Nothing else.
+
+## Verification before you finish
+
+```
+bun run lint
+bun run typecheck
+bun run test
+```
+All three must pass. The full existing suite must stay green — if any test
+other than `tests/unit/app/api/songs-route.test.ts:186` starts failing, you
+have changed behaviour beyond this spec; revert that part rather than editing
+the test.

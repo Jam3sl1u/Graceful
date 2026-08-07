@@ -13,6 +13,7 @@ import {
   acceptInvitationSchema,
   respondTokenParamSchema,
   listInvitationsQuerySchema,
+  invitationIdParamSchema,
   createGuestInvitationSchema,
   claimGuestInvitationSchema,
 } from "@/schemas/invitations";
@@ -609,6 +610,19 @@ export async function denyInvitation(
   lookup?: UserLookup,
 ): Promise<Response> {
   try {
+    // Intentionally validates before auth, unlike the rest of this file
+    // (e.g. withdrawInvitation below) and the repo's usual auth-then-validate
+    // convention. This one check has to cover both branches below: the
+    // no-token path never calls requireAuth at all (the token itself
+    // authenticates it), so there's no single point after which auth is
+    // known to have run for both branches — validating first is what lets
+    // both share this code instead of duplicating it. Do not reorder this
+    // to auth-first without re-deriving the token-branch case too.
+    const parsedId = invitationIdParamSchema.safeParse(id);
+    if (!parsedId.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+
     const body = await req.json().catch(() => null);
     const parsedResult = denyInvitationSchema.safeParse(body ?? {});
     if (!parsedResult.success) {
@@ -750,6 +764,11 @@ export async function withdrawInvitation(
   try {
     const ctx = await requireAuth(req, lookup);
     requireRole(ctx, ["admin", "set_leader"]);
+
+    const parsedId = invitationIdParamSchema.safeParse(id);
+    if (!parsedId.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
 
     const { getToken } = await auth();
     const jwt = await getToken({ template: "supabase" });

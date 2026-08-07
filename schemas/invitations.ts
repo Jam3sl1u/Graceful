@@ -35,6 +35,10 @@ export type DenyInvitationInput = z.infer<typeof denyInvitationSchema>;
 
 export const acceptInvitationParamSchema = z.string().uuid();
 
+// Route param for /api/invitations/:id/* (deny, withdraw). Same shape as
+// acceptInvitationParamSchema.
+export const invitationIdParamSchema = z.string().uuid();
+
 // Body is optional: absent/empty for the in-app path; { responseToken } for the
 // no-session SMS/email path. Token is the 64-char hex response_token.
 export const acceptInvitationSchema = z.object({

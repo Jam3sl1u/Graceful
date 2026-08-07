@@ -1,144 +1,124 @@
-# Test Results — Issue #76: Rate limiting on auth, SMS, and write endpoints
+# Test Results — Issue #77: [Sprint 4] Audit input validation (Zod) across all Phase 1 routes
 
 ## Verdict: PASS
 
-All checks below were re-run independently in this worktree
-(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-76`), not just
-taken on the Coder's word.
+All verification commands pass, and all newly-added independent tests
+(happy path, spec-named edge cases, and failure cases) pass.
 
-## Commands re-run
+## Verification commands (re-run independently from `.pipeline/changes.md`'s claims)
 
-- `bun run typecheck` — **pass**, no errors.
-- `bun run lint` — **pass**, no errors.
-- `bun run test` (full suite, after adding the two supplemental test files
-  below) — **pass**: 86 suites / 1093 tests, 0 failures.
-- `bun run build` — reproduced the Coder's claim exactly: Next reports
-  "Compiled successfully" (proving `middleware.ts`'s new import of
-  `lib/api/rate-limit.ts`, and its transitive import of the `server-only`
-  `lib/api/errors.ts`, bundles fine for the Edge runtime — no `server-only`
-  error). The build then fails later, during static generation of
-  `/_not-found`, with `Error: @clerk/clerk-react: Missing publishableKey`.
-  Confirmed this is a pre-existing environment gap, not caused by this
-  change: no `.env` file exists in this worktree (only `.env.example`), so
-  no Clerk keys are configured in this sandbox regardless of branch. Not a
-  regression.
+```
+$ bun run lint
+$ eslint .
+(clean, no warnings/errors)
 
-## Coder's own tests — re-read and re-run
+$ bun run typecheck
+$ tsc --noEmit
+(clean, no errors)
 
-- `tests/unit/lib/api/rate-limit.test.ts` and `tests/unit/middleware.test.ts`
-  were read in full and executed. They pass and, on inspection, genuinely
-  cover what `changes.md` claims: happy path counting down to 0, the N+1
-  denial (limit-fires / required failure case), the 429 shape, window
-  rollover, "denied requests don't extend the window" (checked via
-  `resetAtMs` equality across repeated denials plus an allow exactly at the
-  original `resetAtMs`), tier/identity isolation, the full `resolveTier`
-  precedence table (including the `GET` vs `POST /api/invitations`
-  distinction, trailing slash, lowercase method), all four
-  `getRequestIdentifier` branches, the policy-ordering invariant, and the
-  real end-to-end 429 through `middleware.ts` with Clerk mocked.
+$ bun run test
+Test Suites: 88 passed, 88 total
+Tests:       1099 passed, 1099 total
+```
 
-## Independent tests added by this stage
+Before adding new tests, I also ran the pre-existing suite in isolation to
+confirm the Coder's claim of "82 suites / 1051 tests, all passing" —
+confirmed exactly (82 suites, 1051 tests, all green), including the single
+intentionally-changed assertion in `tests/unit/app/api/songs-route.test.ts:186`
+and the unmodified `tests/unit/app/api/google-calendar-callback-route.test.ts`.
 
-Two new files were written from scratch (not modifications to the Coder's
-tests), specifically to probe claims and edge cases the existing suite left
-unexercised, per the repo's existing "tester-supplement" convention (see
-e.g. `tests/unit/app/api/cron-invitation-reminders-route-tester-supplement.test.ts`):
+## Code review of the diff (independent read, not just trusting changes.md)
 
-### `tests/unit/middleware-tester-supplement.test.ts`
+Read every changed/created file directly and confirmed it matches spec.md:
+- `lib/api/postgrest.ts` — pure function, escapes `\` before `"`, no
+  `server-only` import, matches the spec's exact signature/doc comment.
+- `app/api/songs/handler.ts` — `listSongs` now escapes `q` and wraps both
+  `ilike` terms in double quotes; rest of the function unchanged.
+- `schemas/service-weeks.ts` / `schemas/events.ts` — `.max(200)` /
+  `.max(2000)` added exactly where the spec said, with the required rationale
+  comments, no other limits touched.
+- `schemas/google-calendar.ts` — placeholder replaced with the real
+  `googleCalendarCallbackQuerySchema` (code/state/error, matching
+  min/max bounds from the spec).
+- `app/api/google-calendar/callback/handler.ts` — validates query params via
+  `safeParse`, redirects (never `fail(...)`) on failure; rest of the control
+  flow (error short-circuit, code/state guard, CSRF check, upsert,
+  best-effort sync) is untouched.
+- `schemas/invitations.ts` / `app/api/invitations/handler.ts` —
+  `invitationIdParamSchema` added; `denyInvitation` validates `id` as the
+  first statement in the `try` (covers both the token and in-app branches);
+  `withdrawInvitation` validates `id` after `requireAuth`+`requireRole`
+  (401/403 still precede 400). Matches spec exactly.
 
-The Coder's `middleware.test.ts` mocks `authFn` to always resolve
-`{ userId: null }` (never throws) and mocks `createRouteMatcher` to always
-report "public" (so `auth.protect()` is never asserted). That left two
-spec-required behaviors completely untested:
+No scope creep found: `git status --porcelain` before I added tests showed
+no uncommitted changes beyond what `.pipeline/changes.md` describes, and the
+"Explicitly OUT of scope" items (blanket `:id` validation, rate limiting,
+`schemas/notifications.ts`, the two inline `targetIdSchema` helpers,
+`lib/supabase/types.ts`/RLS/migrations) were left untouched.
 
-1. **"`await auth()` throwing must not 500, and must fall back to IP
-   bucketing"** (spec edge case #6, and explicitly called out in
-   `changes.md`'s "what the Tester should focus on"). Added a throwing
-   `authFn` and confirmed: no exception escapes `middleware()`, the request
-   still gets IP-bucketed and correctly 429s once the `sms` limit is
-   exceeded for that IP, and two different IPs both hitting a throwing
-   `auth()` get independent budgets (not a shared bucket).
-2. **`auth.protect()` still fires for allowed requests on protected
-   (non-public) routes, but not for denied ones** — verified by mocking
-   `createRouteMatcher` to report "not public" and asserting `protect` is
-   called once for an allowed request, and that the call count does not
-   grow on the request that gets rate-limited (proving the 429
-   short-circuits before the auth gate, as the spec requires: "rate
-   limiting must run before auth.protect()").
+## New tests added (6 files, 48 new test cases, all passing)
 
-All 4 tests in this file pass. (One assertion in a first draft of this file
-was itself wrong — it asserted `protect` was never called across a loop
-that included allowed calls before the denial; fixed to compare the call
-count immediately before/after the denied call specifically. Noting this
-because it was this stage's own test bug, not a code bug.)
+All added under `tests/unit/`, following this repo's existing Jest
+conventions (`jest.mock`, `makeReq`/`makeLookup`/`setUpAuth` helper patterns
+copied from sibling test files). No existing test file was modified.
 
-### `tests/unit/lib/api/rate-limit-tester-supplement.test.ts`
+1. **`tests/unit/lib/api/postgrest.test.ts`** (8 tests) — unit tests for
+   `escapePostgrestFilterValue`: plain string unchanged, quote escaped,
+   backslash escaped, the tricky "backslash immediately before a quote"
+   ordering case (escaping backslash first is required or the result would
+   let a quote leak through unescaped), reserved-but-not-special chars
+   (`,().`) left alone, wildcards (`%`, `*`) untouched, empty string, and a
+   value with multiple quotes/backslashes.
 
-The Coder's tier/identity-isolation tests use hand-built keys (e.g.
-`"sms:user:1"`) rather than exercising the real key construction inside
-`checkRequestRateLimit`. Added:
+2. **`tests/unit/app/api/songs-search-injection-tester-supplement.test.ts`**
+   (8 tests) — the adversarial cases the spec explicitly assigned to this
+   stage: `q` containing `,`, `(`, `)`, `.`, `"`, `\`, and all combined,
+   asserting `.or()` is called exactly once with a single well-formed,
+   correctly-quoted filter string, that reversing the escaping recovers the
+   original `q` exactly, that a crafted `q` cannot smuggle in a third
+   top-level filter clause via a raw comma, and that a plain non-adversarial
+   `q` still produces the exact expected unescaped-looking output (no
+   false-positive escaping).
 
-1. A test that calls `checkRequestRateLimit` twice for the *same* identity
-   across two different tiers (`write` then `read`) and confirms exhausting
-   `write` does not touch `read` — this is the only test in the whole suite
-   that would catch a regression where the `${tier}:${identifier}` key
-   prefix was dropped (e.g. keying purely by identifier).
-2. Blank-but-present header edge cases (`x-forwarded-for: ""`, and
-   `x-forwarded-for: ""` + `x-real-ip: ""` together) — spec edge case #4
-   says "missing/blank", but the Coder's suite only tests the
-   header-absent-entirely case.
-3. Query-string irrelevance — confirms two requests sharing a pathname but
-   differing only in unrelated request identity still land in the same
-   bucket (classification only ever reads `nextUrl.pathname`).
-4. Empty-string `clerkUserId` (as opposed to `null`/`undefined`) correctly
-   falls back to IP bucketing rather than producing `user:`.
+3. **`tests/unit/schemas/service-weeks.test.ts`** (11 tests, new file — none
+   existed before) — `createServiceWeekSchema`/`updateServiceWeekSchema`
+   `sermonTopic`/`sermonScripture` `.max(200)`: valid body, exact 200-char
+   boundary (accept), 201-char (reject), a 2MB string (reject — the
+   unbounded-input case this issue closes), empty string still rejected
+   (`.min(1)` unchanged), and optional-omission still allowed on update.
 
-All 5 tests in this file pass.
+4. **`tests/unit/schemas/events-notes-max-tester-supplement.test.ts`**
+   (7 tests) — `createEventSchema`/`updateEventSchema` `notes` `.max(2000)`:
+   exact 2000-char boundary (accept), 2001-char (reject), 2MB string
+   (reject), omitted/explicit-null still accepted (`.nullish()` unchanged).
 
-## Manual/code review verification
+5. **`tests/unit/app/api/google-calendar-callback-validation-tester-supplement.test.ts`**
+   (7 tests) — oversized `code` (>2048), `state` (>512), `error` (>200), and
+   empty-but-present `code` all redirect to `/profile?calendar=error` (307,
+   state cookie cleared, `exchangeCode` never called, no JSON content-type);
+   confirms `code:"abc"` and `error:"access_denied"` still work unchanged;
+   confirms the exact 2048-char boundary is still accepted.
 
-- Confirmed `ErrorCode.RATE_LIMITED` exists in `lib/api/errors.ts` and
-  `rateLimitResponse`'s body shape (`{ error: string; code: string }`)
-  matches `types/api.ts`'s `ApiError`.
-- Confirmed `middleware.ts` calls `checkRequestRateLimit` and returns
-  `rateLimitResponse(decision)` **before** the `isPublicRoute` check, so
-  public invitation-token endpoints are still rate-limited pre-auth, as the
-  spec requires.
-- Confirmed `resolveTier`'s regexes (`RESPOND_TOKEN_RE`,
-  `INVITATION_ID_ACCEPT_RE`, `INVITATION_ID_DENY_RE`, `SETLIST_PUBLISH_RE`)
-  are anchored (`^...$`) and use `[^/]+` for the id/token segment, matching
-  the spec.
-- Confirmed the store-pruning code path (`pruneStoreIfNeeded`) matches the
-  spec's algorithm (sweep by `MAX_CONFIGURED_WINDOW_MS`, then `clear()` if
-  still oversized). This was not independently re-tested at the 10,000-key
-  threshold: the module doesn't export the store or its size, so the only
-  way to assert pruning behavior from outside would be a slow
-  10,000+-iteration test with no externally observable pass/fail signal
-  beyond "didn't crash" (pruning has no behavioral effect visible through
-  the public API — `checkRateLimit` already resets stale windows on access
-  regardless of whether the entry was swept). Judged not worth the ~10k-key
-  test given it can't actually distinguish "pruned correctly" from "pruned
-  incorrectly" without a store-size accessor. Flagging this as a residual
-  gap for the Reviewer rather than silently skipping it.
+6. **`tests/unit/app/api/invitations-id-param-validation-tester-supplement.test.ts`**
+   (6 tests) — `denyInvitation` malformed `:id` returns 400
+   `VALIDATION_FAILED` before any Supabase/RPC call on both the in-app and
+   token branches; a well-formed uuid still passes validation (reaches the DB
+   lookup, distinct from the 400 the malformed-id tests get);
+   `withdrawInvitation` malformed `:id` returns 400 when authorized, and
+   confirms 401 (no Clerk session) and 403 (wrong role) both still take
+   precedence over the 400 for a malformed id, matching the spec's ordering
+   requirement.
 
-## Failure case coverage (required by the pipeline contract)
+## Failure cases covered (explicit, per pipeline contract)
 
-At least one failure case was independently verified, beyond the Coder's
-own "limit fires" test:
-- `middleware-tester-supplement.test.ts`'s throwing-`auth()` tests exercise
-  the failure path of an upstream dependency (Clerk) and confirm the system
-  degrades (IP bucketing + eventual 429) instead of failing closed with a
-  500.
-- The `auth.protect()`-not-called-on-denial test confirms the rate limiter
-  actually short-circuits the request pipeline on a real failure/denial
-  path, not just returning a decision object that something downstream
-  ignores.
+- Malformed/adversarial `q` values that would have broken out of the
+  PostgREST filter grammar pre-fix.
+- Over-limit `sermonTopic`/`sermonScripture`/`notes` (both boundary and
+  grossly-oversized).
+- Malformed Google OAuth callback query params (oversized/empty) — must
+  redirect, never leak to `exchangeCode()`.
+- Malformed `:id` invitation route params on both `denyInvitation` branches
+  and `withdrawInvitation`, plus the 401/403-before-400 ordering.
 
-## Summary
-
-No regressions found. No test failures. The implementation matches the
-spec's contract for `resolveTier` precedence, the fixed-window algorithm
-(including the "denied requests don't extend the window" subtlety), the
-identifier fallback chain, the 429 response shape, and the middleware
-wiring (order relative to `auth.protect()`, and graceful degradation when
-`auth()` throws). Recommend proceeding to Review.
+No failures encountered. Nothing patched around — this file records only
+independently-run, all-green results.

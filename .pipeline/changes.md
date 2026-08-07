@@ -1,128 +1,273 @@
-# Changes — Issue #76: Rate limiting on auth, SMS, and write endpoints
+# Changes — Issue #77: [Sprint 4] Audit input validation (Zod) across all Phase 1 routes
 
-## Files created
+Four small, surgical fixes plus the audit record the issue requires as a
+deliverable. No rewrite, no scope creep — see "Explicitly OUT of scope" at
+the bottom for what was deliberately left alone.
 
-- **`lib/api/rate-limit.ts`** — the limiter, all pure/testable logic:
-  - `RATE_LIMIT_POLICIES` (webhook 600/min, read 240/min, write 60/min, auth
-    10/min, sms 5/min).
-  - `resolveTier(pathname, method)` — classifies any `/api/*` request into
-    `webhook | sms | auth | write | read | null` per the exact precedence
-    order in the spec (health/page exemptions first, then webhooks, then the
-    named SMS-triggering routes, then the named auth-brute-force routes,
-    then non-GET/HEAD/OPTIONS → write, else read). Normalizes trailing
-    slashes and method casing before matching.
-  - `getRequestIdentifier(req, clerkUserId)` — `user:<id>` for signed-in
-    callers, else `ip:<first x-forwarded-for hop>`, else `ip:<x-real-ip>`,
-    else the shared `ip:unknown` bucket (documented trade-off).
-  - `checkRateLimit(key, policy, now?)` — fixed-window counter against a
-    module-level `Map`. Denied requests still increment the counter but
-    never move `windowStartMs` forward (so a blocked caller's own window
-    isn't extended). Store is pruned once it exceeds 10,000 entries (sweep
-    stale entries using the largest configured `windowMs`, then
-    `store.clear()` if still oversized).
-  - `checkRequestRateLimit(req, clerkUserId, now?)` — the middleware entry
-    point; returns `null` for exempt requests, otherwise resolves tier +
-    policy, builds the `${tier}:${identifier}` key, and returns a full
-    `RateLimitDecision`.
-  - `rateLimitResponse(decision)` — builds the `429` with `{ error, code:
-    "RATE_LIMITED" }` body and a single `Retry-After` header.
-  - `resetRateLimitStore()` — test-only store reset.
+## Code changes
 
-  **Server-only branch taken**: the spec's primary path (importing
-  `{ ErrorCode }` from `@/lib/api/errors`, which itself is `server-only`
-  tagged) was verified via `bun run build`. The build **compiled
-  successfully** (middleware bundling completed with no `server-only`
-  error) before failing later, during static page generation, on a
-  pre-existing/unrelated issue (see "Build" below). So the primary path was
-  kept — no fallback `const RATE_LIMIT_CODE` literal was needed. A comment
-  at the top of the file documents the deviation from the `lib/**`
-  `server-only` convention as the spec requires.
+1. **`lib/api/postgrest.ts` (new)** — `escapePostgrestFilterValue(value)`,
+   a pure function that escapes `\` then `"` so a value can be safely
+   embedded inside a double-quoted PostgREST filter term. No I/O, no
+   `server-only` import (unit-testable), mirrors `lib/invitations/state-machine.ts`.
 
-- **`tests/unit/lib/api/rate-limit.test.ts`** — unit tests covering:
-  happy path (remaining counts down to 0), limit firing on request N+1,
-  the 429 shape (`status`, integer `Retry-After`, JSON envelope), window
-  rollover, "denied requests do not extend the window" (asserts
-  `resetAtMs` is unchanged across repeated denials and the caller is
-  allowed again exactly at the original `resetAtMs`), tier isolation
-  (`sms` exhaustion doesn't touch `read`) and identity isolation (two
-  different identities don't share a bucket), the full `resolveTier` table
-  from the spec (including trailing slash, lowercase method, and the
-  `GET /api/invitations` → `read` vs `POST /api/invitations` → `sms`
-  distinction), `getRequestIdentifier` for all four cases (`user:`,
-  first-hop XFF, `x-real-ip` fallback, `ip:unknown`), and the
-  `sms < auth < write < read` policy-ordering invariant.
+2. **`app/api/songs/handler.ts` (`listSongs`)** — fixed a real PostgREST
+   filter-string injection: `q` (the free-text search term, only
+   trimmed/length-capped by `songSearchQuerySchema`) was interpolated
+   directly into `.or(\`title.ilike.%${q}%,artist.ilike.%${q}%\`)`. A `q`
+   containing `,`, `(`, `)`, or `.` could break out of the `or=(...)` filter
+   grammar and append arbitrary PostgREST filters. Now:
+   ```ts
+   const escaped = escapePostgrestFilterValue(q);
+   query = query.or(`title.ilike."%${escaped}%",artist.ilike."%${escaped}%"`);
+   ```
+   Wildcard semantics (`%`/`*`) are unchanged — only `\` and `"` are escaped.
 
-- **`tests/unit/middleware.test.ts`** — proves the 429 fires through the
-  real `middleware.ts` with Clerk mocked as an identity function
-  (`clerkMiddleware: (handler) => handler`, `createRouteMatcher: () => ()
-  => true`). Covers: requests within the `sms` limit to
-  `POST /api/invitations` are not `429`; the first request past the `sms`
-  limit is `429` with a parsable integer `Retry-After` and
-  `code: "RATE_LIMITED"`; `GET /api/health` never `429`s regardless of call
-  count. `resetRateLimitStore()` runs in `beforeEach` so tests don't leak
-  counters into each other.
+3. **`tests/unit/app/api/songs-route.test.ts`** — updated the one assertion
+   this changes (line 186) from
+   `"title.ilike.%amaz%,artist.ilike.%amaz%"` to the new quoted form
+   `'title.ilike."%amaz%",artist.ilike."%amaz%"'`. No other lines touched.
 
-## Files modified
+4. **`schemas/service-weeks.ts`** — added `.max(200)` to
+   `createServiceWeekSchema.sermonTopic`, `createServiceWeekSchema.sermonScripture`,
+   `updateServiceWeekSchema.sermonTopic` (optional), and
+   `updateServiceWeekSchema.sermonScripture` (optional). These were the only
+   unbounded string fields in the file. Comment above each explains these are
+   `text` columns with no DB-level cap, so this is an app-layer limit,
+   matching the repo's existing "short titled text" convention (200, same
+   as `songs.title`/`song_documents.name`).
 
-- **`middleware.ts`** — `isPublicRoute` and `config.matcher` are untouched
-  (matcher already covers `/(api|trpc)(.*)`). Inside the `clerkMiddleware`
-  callback, before the existing `auth.protect()` call: resolves
-  `clerkUserId` from `await auth()` (catching and falling back to `null`/IP
-  bucketing if it throws on a malformed/expired session), calls
-  `checkRequestRateLimit(req, clerkUserId)`, and returns
-  `rateLimitResponse(decision)` immediately if the decision is non-null and
-  denied — before the `isPublicRoute` check, so unauthenticated floods
-  (including the public invitation-token endpoints) are rejected cheaply
-  pre-auth.
+5. **`schemas/events.ts`** — added `.max(2000)` to `createEventSchema.notes`
+   and `updateEventSchema.notes` (both stay `.nullish()`). Comment explains
+   `events.notes` is a `text` column with no DB-level cap, and 2000 matches
+   the repo's existing long-free-text convention (`schemas/profile.ts` bio).
 
-Nothing under `app/`, `schemas/`, or `supabase/` was touched. No new
-dependencies or env vars were added; `package.json` and `.env.example` are
-unchanged. `.pipeline/spec.md` was already updated by the Planning stage
-before this run started (not touched further here).
+6. **`schemas/google-calendar.ts`** — replaced the placeholder
+   `googleCalendarSchema`/`GoogleCalendarInput` stub (verified nothing
+   imported either — safe to remove entirely, not just add alongside) with
+   a real schema for the OAuth callback's query params:
+   ```ts
+   export const googleCalendarCallbackQuerySchema = z.object({
+     code: z.string().min(1).max(2048).optional(),
+     state: z.string().min(1).max(512).optional(),
+     error: z.string().min(1).max(200).optional(),
+   });
+   export type GoogleCalendarCallbackQuery = z.infer<typeof googleCalendarCallbackQuerySchema>;
+   ```
+   No `.trim()` — these are provider-issued opaque tokens.
 
-## Known limitation (carried from spec's OPEN QUESTIONS, non-blocking)
+7. **`app/api/google-calendar/callback/handler.ts` (`callback`)** — this was
+   the one route reading query params without going through Zod at all
+   (`error`, `code`, `state` pulled straight off `searchParams.get(...)`).
+   Now parses via `googleCalendarCallbackQuerySchema.safeParse(Object.fromEntries(...))`
+   (same pattern as `app/api/church-group/audit-log/handler.ts`); on parse
+   failure it calls `redirectError()` — never `fail(...)` — preserving the
+   route's "always redirect, never JSON" contract on every failure path.
+   Rest of the function (the `if (error)` short-circuit, the
+   `if (!code || !state)` guard, the CSRF cookie comparison, the upsert,
+   the best-effort `syncAllEventsForUser`) is behaviourally identical.
+   `tests/unit/app/api/google-calendar-callback-route.test.ts` was **not**
+   modified and still passes unchanged (its `code`/`state`/`error` values
+   all satisfy the new schema).
 
-Rate limiting is in-memory (module-level `Map`), not Redis-backed. On
-serverless/multi-instance deployments each instance holds its own counters,
-so the effective limit is per-instance, not global. The concrete limits
-(webhook 600, read 240, write 60, auth 10, sms 5, all per 60s) are a first
-pass meant to be tuned by a human later.
+8. **`schemas/invitations.ts`** — added
+   `export const invitationIdParamSchema = z.string().uuid();` (same shape
+   as `acceptInvitationParamSchema`, left untouched, as was the unused
+   `invitationsSchema` stub).
+
+9. **`app/api/invitations/handler.ts`**:
+   - `denyInvitation`: validates `id` with `invitationIdParamSchema` as the
+     first statement inside the `try` block, before `req.json()`, returning
+     `fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400)` on
+     failure. Runs before the token/in-app branch split, so both paths are
+     covered.
+   - `withdrawInvitation`: validates `id` immediately after the existing
+     `requireAuth` + `requireRole` calls (401/403 still take precedence
+     over 400, matching `patchMemberRole` in
+     `app/api/church-group/members/[id]/role/handler.ts`).
+   - Both still pass the original `id` variable through to the RPC/queries
+     unchanged — no behaviour change for well-formed UUIDs. No test file
+     changes needed (every existing test for these two handlers already
+     passes a real UUID).
 
 ## Verification
 
-- `bun run typecheck` — **pass**, no errors.
-- `bun run lint` — **pass**, no errors (initial `@typescript-eslint/no-explicit-any`
-  failures in `middleware.test.ts` were fixed by giving the mocked handler an
-  explicit type instead of casting through `any`).
-- `bun run test` — **pass**, 84 suites / 1084 tests total, including the 2
-  new test files added here.
-- `bun run build` — compiles successfully (Next reports "Compiled
-  successfully"), confirming `middleware.ts`'s new import of
-  `lib/api/rate-limit.ts` (and its transitive import of
-  `lib/api/errors.ts`, which is `server-only` tagged) bundles fine for the
-  Edge runtime with **no `server-only` error**. The build then fails later,
-  during static page generation of `/conflicts` (and other app pages), with
-  `Error: @clerk/clerk-react: Missing publishableKey` — this is a
-  pre-existing environment issue (no Clerk env vars are configured in this
-  sandbox), **not** caused by this change. Confirmed by stashing this
-  branch's diff and re-running `bun run build` against the unmodified
-  baseline: it fails at the exact same static-generation step with the
-  same missing-publishableKey error (on `/_not-found` instead of
-  `/conflicts` — which page prerenders first varies, but the root cause is
-  identical). No fallback branch (local `RATE_LIMITED_CODE` constant) was
-  needed.
+```
+bun run lint       # clean, no warnings
+bun run typecheck  # clean
+bun run test       # 82 suites / 1051 tests, all passing
+```
+The only intentional test-assertion change is
+`tests/unit/app/api/songs-route.test.ts:186`; nothing else in the suite
+changed behavior.
 
-## What the Tester should focus on
+---
 
-- The `resolveTier` precedence order, especially that `GET /api/invitations`
-  resolves to `read` (not `sms`) while `POST /api/invitations` resolves to
-  `sms` — method matters, not just path.
-- The "denied requests do not extend the window" behavior — this is the
-  subtlest part of the fixed-window implementation and is easy to get wrong
-  in a way that either bans callers forever or lets them reset their own
-  window by continuing to hammer it.
-- That the store-pruning threshold (10,000 keys) and `ip:unknown` shared
-  bucket are deliberate, documented trade-offs, not bugs.
-- `middleware.ts`'s Clerk `auth()` failure fallback (`try/catch` around
-  `await auth()`) — verify it degrades to IP bucketing rather than
-  throwing/500ing.
+## Audit record (issue deliverable — AC 1, 3, 4)
+
+### 1. Route inventory (`app/api/**/route.ts`, 57 files)
+
+*(The spec estimated 58; the repo actually contains 57 `route.ts` files —
+counted via `find app/api -name "route.ts" | wc -l`. All are covered below.)*
+
+Legend: "—" = no input surface on that method for that surface type.
+"raw, no schema (OUT OF SCOPE)" = existing, pre-issue gap, deliberately not
+touched — see "Known deliberate gap" below.
+
+| Path | Methods | Body validation | Query validation | Route param validation |
+| --- | --- | --- | --- | --- |
+| `app/api/_examples/admin-only/route.ts` | GET | — | — | — |
+| `app/api/availability/[date]/route.ts` | DELETE | — | — | `availabilityDateParamSchema` |
+| `app/api/availability/route.ts` | GET, PUT | PUT: `setAvailabilitySchema` | GET: `getAvailabilityQuerySchema` | — |
+| `app/api/availability/team/route.ts` | GET | — | `getTeamAvailabilityQuerySchema` | — |
+| `app/api/church-group/audit-log/route.ts` | GET | — | `auditLogQuerySchema` | — |
+| `app/api/church-group/join/route.ts` | POST | `joinChurchGroupSchema` | — | — |
+| `app/api/church-group/members/[id]/role/route.ts` | PATCH | `updateRoleSchema` | — | inline `targetIdSchema = z.string().uuid()` |
+| `app/api/church-group/members/[id]/route.ts` | DELETE | — | — | inline `targetIdSchema = z.string().uuid()` |
+| `app/api/church-group/members/route.ts` | GET | — | — | — |
+| `app/api/church-group/route.ts` | GET, PUT | PUT: `createChurchGroupSchema` | — | — (GET is a **501 stub**) |
+| `app/api/conflicts/[id]/resolve/route.ts` | POST | `resolveConflictSchema` | — | raw, no schema (OUT OF SCOPE) |
+| `app/api/conflicts/route.ts` | GET | — | — | — |
+| `app/api/cron/invitation-reminders/route.ts` | GET | — | — | — (auth is `CRON_SECRET` bearer token, not a body/query/param input) |
+| `app/api/events/[id]/attendees/[userId]/route.ts` | DELETE | — | — | raw `id`/`userId`, no schema (OUT OF SCOPE) |
+| `app/api/events/[id]/attendees/route.ts` | POST | `assignAttendeeSchema` | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/events/[id]/ics/route.ts` | GET | — | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/events/[id]/route.ts` | PUT, DELETE | PUT: `updateEventSchema` | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/events/ics/route.ts` | GET | — | inline `serviceWeekIdSchema = z.string().uuid()` | — |
+| `app/api/events/route.ts` | GET, POST | POST: `createEventSchema` | — | — |
+| `app/api/google-calendar/callback/route.ts` | GET | — | **`googleCalendarCallbackQuerySchema`** (Change 3, this issue) | — |
+| `app/api/google-calendar/connect/route.ts` | POST | — | — | — |
+| `app/api/google-calendar/disconnect/route.ts` | DELETE | — | — | — |
+| `app/api/health/route.ts` | GET | — | — | — |
+| `app/api/instruments/[id]/promote/route.ts` | POST | — | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/instruments/[id]/route.ts` | DELETE | — | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/instruments/custom/route.ts` | POST | `createInstrumentSchema` | — | — |
+| `app/api/instruments/route.ts` | GET, POST | POST: `createInstrumentSchema` | — | — |
+| `app/api/invitations/[id]/accept/route.ts` | POST | `acceptInvitationSchema` | — | `acceptInvitationParamSchema` |
+| `app/api/invitations/[id]/deny/route.ts` | POST | `denyInvitationSchema` | — | **`invitationIdParamSchema`** (Change 4, this issue) |
+| `app/api/invitations/[id]/route.ts` | DELETE (withdraw) | — | — | **`invitationIdParamSchema`** (Change 4, this issue) |
+| `app/api/invitations/respond/[token]/route.ts` | GET | — | — | `respondTokenParamSchema` |
+| `app/api/invitations/route.ts` | GET, POST | POST: `createInvitationSchema` | GET: `listInvitationsQuerySchema` | — |
+| `app/api/notifications/[id]/read/route.ts` | PATCH | no input surface — **501 stub** | | |
+| `app/api/notifications/mark-all-read/route.ts` | POST | no input surface — **501 stub** | | |
+| `app/api/notifications/preferences/route.ts` | GET, PUT | no input surface — **501 stub** | | |
+| `app/api/notifications/route.ts` | GET | no input surface — **501 stub** | | |
+| `app/api/notifications/unread-count/route.ts` | GET | no input surface — **501 stub** | | |
+| `app/api/profile/route.ts` | GET, PUT | PUT: `updateProfileSchema` | — | — |
+| `app/api/service-weeks/[id]/cancel/route.ts` | POST | — | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/service-weeks/[id]/member-view/route.ts` | GET | — | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/service-weeks/[id]/reactivate/route.ts` | POST | — | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/service-weeks/[id]/route.ts` | GET, PUT, DELETE | PUT: `updateServiceWeekSchema` | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/service-weeks/[id]/setlist/route.ts` | GET, POST | — | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/service-weeks/route.ts` | GET, POST | POST: `createServiceWeekSchema` | — | — |
+| `app/api/setlists/[id]/publish/route.ts` | POST | — | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/setlists/[id]/route.ts` | GET, PUT (reorder) | PUT: `reorderSetlistSchema` (`songs` bounded `.min(1).max(50)`) | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/setlists/[id]/songs/[songId]/route.ts` | DELETE | — | — | raw `id`/`songId`, no schema (OUT OF SCOPE) |
+| `app/api/setlists/[id]/songs/route.ts` | POST | `addSetlistSongSchema` | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/setlists/[id]/unlock/route.ts` | POST | — | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/songs/[id]/documents/[docId]/route.ts` | DELETE | — | — | raw `id`/`docId`, no schema (OUT OF SCOPE) |
+| `app/api/songs/[id]/documents/route.ts` | GET, POST | POST: `registerDocumentSchema` | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/songs/[id]/documents/upload-url/route.ts` | POST | `uploadUrlSchema` | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/songs/route.ts` | GET, POST | POST: `createSongSchema` | GET: `songSearchQuerySchema` | — |
+| `app/api/webhooks/clerk/route.ts` | POST | no input surface — **501 stub** | | |
+| `app/api/webhooks/modal/route.ts` | POST | no input surface — **501 stub** | | |
+| `app/api/webhooks/pingram/route.ts` | POST | no input surface — **501 stub** | | |
+| `app/api/webhooks/resend/route.ts` | POST | no input surface — **501 stub** | | |
+
+`schemas/notifications.ts` is a deliberately empty placeholder
+(`export const notificationsSchema = z.object({})`) — no route currently
+imports or consumes it; the five `app/api/notifications/**` routes above are
+all still `notImplemented()` 501 stubs.
+
+### 2. AC 3 result — PostgREST/SQL filter-string injection sweep
+
+Commands run (from repo root, after Change 1 landed) and their output:
+
+```
+$ grep -rn '\.or(`' app lib
+app/api/songs/handler.ts:74:      query = query.or(`title.ilike."%${escaped}%",artist.ilike."%${escaped}%"`);
+
+$ grep -rn '\.filter(`' app lib
+(no output)
+
+$ grep -rn '\.rpc(`' app lib
+(no output)
+
+$ grep -rn 'sql`' app lib
+(no output)
+
+$ grep -rn 'exec_sql' app lib tests
+tests/integration/rls/setup.ts:149:  const { error } = await svc.rpc("exec_sql", { query: sql }).single();
+tests/integration/rls/setup.ts:152:    // Fallback: execute via raw query if exec_sql RPC not available.
+tests/integration/rls/setup.ts:163: * the context around the RPC call
+
+$ grep -rn '\.\(or\|filter\|rpc\|eq\|match\)(`[^`]*\${' app lib
+app/api/songs/handler.ts:74:      query = query.or(`title.ilike."%${escaped}%",artist.ilike."%${escaped}%"`);
+```
+
+Result: after Change 1, the only remaining template-literal-interpolated
+filter/query construction anywhere in `app/**` or `lib/**` is the fixed,
+now-escaped `.or(...)` call in `app/api/songs/handler.ts`. The one
+`exec_sql` hit is `tests/integration/rls/setup.ts:149`
+(`svc.rpc("exec_sql", { query: sql })`) — `sql` there is the static file
+`supabase/seed-rls-test.sql` read from disk in test setup (not `app/**`/
+`lib/**`, and not user input), so it is **not a finding**.
+
+### 3. AC 4 result — all DB access goes through the Supabase SDK
+
+Every DB call in `app/**` and `lib/**` goes through `.from(...)`/`.rpc(...)`
+on the Supabase JS SDK client (`getSupabaseClient`/`getAnonSupabaseClient`
+in `lib/supabase/client.ts`), which parameterizes all values — confirmed by
+the same sweep above finding zero raw/templated SQL construction outside
+the one non-finding above.
+
+RPCs called (all arguments passed as named RPC parameters — `{ p_foo: ... }`
+object literals — never string-interpolated):
+- `create_church_group` (`app/api/church-group/route.ts`)
+- `join_church_group` (`app/api/church-group/join/route.ts`)
+- `remove_church_group_member` (`app/api/church-group/members/[id]/handler.ts`)
+- `write_audit_log` (`lib/audit/write-audit-log.ts`)
+- `accept_invitation` (`app/api/invitations/handler.ts`)
+- `deny_invitation` (`app/api/invitations/handler.ts`, no-session path)
+- `get_invitation_by_token` (`app/api/invitations/handler.ts`)
+- `send_invitation_reminders` (`app/api/cron/invitation-reminders/route.ts`)
+- `record_availability_conflict` (`lib/scheduling/conflict-detection.ts`)
+- `get_event_sync_targets` (`lib/google-calendar/sync.ts`)
+- `get_user_sync_targets` (`lib/google-calendar/sync.ts`)
+- `flag_calendar_token_invalid` (`lib/google-calendar/sync.ts`)
+
+### Known deliberate gap (not fixed here — mentioned per spec)
+
+~20 handlers pass a route `:id` param straight into `.eq("id", id)` without
+a `z.string().uuid()` check first (see "raw, no schema (OUT OF SCOPE)" rows
+in the inventory table above). This is **not** an injection risk — the
+Supabase SDK parameterizes the value regardless of shape — the only symptom
+is a malformed id surfacing as a 500 "Internal error" instead of a 404.
+Fixing it repo-wide would require rewriting ~25 existing tests that
+deliberately pass non-UUID ids (e.g. `"missing-id"`, `"instr-1"` in
+`tests/unit/app/api/instruments-route.test.ts`,
+`tests/unit/app/api/auth-matrix.test.ts`,
+`tests/unit/app/api/service-weeks-*.test.ts`). Per spec, that's out of
+scope for this issue — a separate issue if a human wants uniform
+route-param validation. Change 4 (this issue) only closed the gap for
+`denyInvitation`/`withdrawInvitation` because it made them consistent with
+their own sibling `acceptInvitation` at zero test cost.
+
+## What the Testing stage should focus on
+
+- The escaped PostgREST filter in `listSongs`: confirm a `q` containing
+  `,`, `(`, `)`, `.`, `"`, or `\` no longer breaks the filter grammar or lets
+  extra `.or()` clauses through (adversarial cases beyond the one existing
+  assertion are explicitly the Testing stage's job per spec).
+- The three new `.max()` caps (`service-weeks` sermonTopic/sermonScripture,
+  `events` notes) reject over-limit input with 400 and still accept
+  in-range input.
+- `google-calendar/callback`: confirm a malformed/oversized `code`/`state`/
+  `error` now redirects to `/profile?calendar=error` (302, state cookie
+  cleared) rather than reaching `exchangeCode()` — and that the three
+  existing passing cases (`code: "abc"`, base64url `state`,
+  `error: "access_denied"`) still pass unchanged.
+- `denyInvitation`/`withdrawInvitation` with a malformed `:id` now returning
+  400 VALIDATION_FAILED instead of a 500, on both the token and in-app
+  branches of `denyInvitation`, and confirm withdraw's 401/403-before-400
+  ordering.
