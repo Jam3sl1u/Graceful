@@ -97,7 +97,7 @@ describe("InviteResponse", () => {
     });
     expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute(
       "href",
-      "/dashboard",
+      `/member-week/${SERVICE_WEEK_ID}`,
     );
   });
 
@@ -128,6 +128,10 @@ describe("InviteResponse", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ responseToken: TOKEN, reason: "Can't make it that week" }),
     });
+    expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute(
+      "href",
+      `/member-week/${SERVICE_WEEK_ID}`,
+    );
   });
 
   it("decline flow: 'Keep it' cancels back to the two-button state without submitting", async () => {
@@ -188,7 +192,10 @@ describe("InviteResponse", () => {
 
     expect(screen.queryByText("accepted")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /accept/i })).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /go to the app/i })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute(
+      "href",
+      `/member-week/${SERVICE_WEEK_ID}`,
+    );
   });
 
   it("edge case: expired status from the lookup shows the unavailable view", async () => {
@@ -257,7 +264,8 @@ describe("InviteResponse", () => {
     render(<InviteResponse token={TOKEN} />);
 
     await waitFor(() => expect(screen.getByText(/couldn.t find this invitation/i)).toBeInTheDocument());
-    expect(screen.getByRole("link", { name: /go to the app/i })).toBeInTheDocument();
+    // No lookup ever succeeded, so no service week id is known — falls back to /dashboard.
+    expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute("href", "/dashboard");
   });
 
   it("failure case: a 404 lookup shows the unavailable view (never a raw error)", async () => {
@@ -268,6 +276,7 @@ describe("InviteResponse", () => {
 
     await waitFor(() => expect(screen.getByText(/couldn.t find this invitation/i)).toBeInTheDocument());
     expect(screen.queryByText("NOT_FOUND")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute("href", "/dashboard");
   });
 
   it("failure case: a non-terminal error on accept (e.g. 500) shows an inline alert and stays on the ready view", async () => {

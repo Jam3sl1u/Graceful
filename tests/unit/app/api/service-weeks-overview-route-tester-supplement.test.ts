@@ -53,6 +53,7 @@ function makeChain(result: QueryResult) {
     in: jest.fn(() => chain),
     is: jest.fn(() => chain),
     order: jest.fn(() => chain),
+    range: jest.fn(() => chain),
     select: jest.fn(() => chain),
     then: (resolve: (value: QueryResult) => unknown, reject?: (reason: unknown) => unknown) =>
       Promise.resolve(result).then(resolve, reject),

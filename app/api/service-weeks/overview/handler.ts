@@ -22,6 +22,27 @@ export type ServiceWeeksOverviewResponse = {
   serviceWeeks: ServiceWeekOverviewEntry[];
 };
 
+// Supabase/PostgREST caps unbounded reads at 1000 rows by default, which
+// would silently truncate (and understate) roster/conflict counts once a
+// group accumulates enough invitation history. Page through with .range()
+// so a large group-wide read is never silently cut off.
+const PAGE_SIZE = 1000;
+
+async function fetchAllPages<T>(
+  buildQuery: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: unknown }>,
+): Promise<{ data: T[]; error: unknown }> {
+  const rows: T[] = [];
+  let from = 0;
+  while (true) {
+    const { data, error } = await buildQuery(from, from + PAGE_SIZE - 1);
+    if (error) return { data: rows, error };
+    const page = data ?? [];
+    rows.push(...page);
+    if (page.length < PAGE_SIZE) return { data: rows, error: null };
+    from += PAGE_SIZE;
+  }
+}
+
 // GET /api/service-weeks/overview (#74) — one cross-week, group-wide read for
 // the Admin Global Dashboard screen (PRD wireframe screen 8). Admin/set_leader
 // only. All reads go through the caller's RLS-scoped Supabase client — no
@@ -93,11 +114,14 @@ export async function getServiceWeeksOverview(
 
     // 3. Invitations — explicit columns only, never select("*") (response_token
     // / denial_reason must not leak; see listInvitations).
-    const { data: invitationRows, error: invitationsError } = await supabase
-      .from("invitations")
-      .select("id, service_week_id, user_id, status, created_at")
-      .eq("church_group_id", ctx.churchGroupId)
-      .in("service_week_id", weekIds);
+    const { data: invitationRows, error: invitationsError } = await fetchAllPages((from, to) =>
+      supabase
+        .from("invitations")
+        .select("id, service_week_id, user_id, status, created_at")
+        .eq("church_group_id", ctx.churchGroupId)
+        .in("service_week_id", weekIds)
+        .range(from, to),
+    );
 
     if (invitationsError) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
@@ -134,21 +158,32 @@ export async function getServiceWeeksOverview(
       }
     }
 
-    // 4. Conflicts — mapped to a week via the invitation rows above; a
-    // conflict whose invitation belongs to a filtered-out week is ignored.
-    const { data: conflictRows, error: conflictsError } = await supabase
-      .from("conflicts")
-      .select("id, invitation_id")
-      .eq("church_group_id", ctx.churchGroupId)
-      .is("resolved_at", null);
+    // 4. Conflicts — scoped to the invitation ids already in hand (narrower
+    // read than group-wide) and mapped to a week via the invitation rows
+    // above; a conflict whose invitation belongs to a filtered-out week is
+    // ignored.
+    const invitationIds = (invitationRows ?? []).map((row) => row.id);
+    let conflictRows: { id: string; invitation_id: string }[] = [];
+    if (invitationIds.length > 0) {
+      const { data, error: conflictsError } = await fetchAllPages((from, to) =>
+        supabase
+          .from("conflicts")
+          .select("id, invitation_id")
+          .eq("church_group_id", ctx.churchGroupId)
+          .is("resolved_at", null)
+          .in("invitation_id", invitationIds)
+          .range(from, to),
+      );
 
-    if (conflictsError) {
-      return fail("Internal error", ErrorCode.INTERNAL, 500);
+      if (conflictsError) {
+        return fail("Internal error", ErrorCode.INTERNAL, 500);
+      }
+      conflictRows = data;
     }
 
     const invitationById = new Map((invitationRows ?? []).map((row) => [row.id, row]));
     const openConflictCountByWeekId = new Map<string, number>();
-    for (const conflict of conflictRows ?? []) {
+    for (const conflict of conflictRows) {
       const invitation = invitationById.get(conflict.invitation_id);
       if (!invitation) continue;
       openConflictCountByWeekId.set(

@@ -44,9 +44,9 @@ function setUpAuth(jwt: string | null = JWT) {
 type QueryResult = { data: unknown; error: unknown };
 
 // Generic chainable mock — every method returns `chain` itself (so any
-// combination of .eq/.gte/.lte/.in/.is/.order can be called in any order),
-// and the chain is thenable so `await`-ing it yields `result` (mirrors
-// tests/unit/app/api/service-weeks-member-view-route.test.ts).
+// combination of .eq/.gte/.lte/.in/.is/.order/.range can be called in any
+// order), and the chain is thenable so `await`-ing it yields `result`
+// (mirrors tests/unit/app/api/service-weeks-member-view-route.test.ts).
 function makeChain(result: QueryResult) {
   const chain: Record<string, unknown> & PromiseLike<QueryResult> = {
     eq: jest.fn(() => chain),
@@ -55,6 +55,7 @@ function makeChain(result: QueryResult) {
     in: jest.fn(() => chain),
     is: jest.fn(() => chain),
     order: jest.fn(() => chain),
+    range: jest.fn(() => chain),
     select: jest.fn(() => chain),
     then: (resolve: (value: QueryResult) => unknown, reject?: (reason: unknown) => unknown) =>
       Promise.resolve(result).then(resolve, reject),
@@ -304,5 +305,73 @@ describe("GET /api/service-weeks/overview", () => {
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.code).toBe("INTERNAL");
+  });
+
+  it("scopes the conflicts query to the invitation ids already fetched", async () => {
+    setUpAuth();
+    const client = makeSupabaseClient();
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await getServiceWeeksOverview(makeReq(), makeLookup());
+    expect(res.status).toBe(200);
+    expect(client.chains.conflicts!.in).toHaveBeenCalledWith(
+      "invitation_id",
+      invitationRows.map((row) => row.id),
+    );
+  });
+
+  it("skips the conflicts query entirely when there are no invitations", async () => {
+    setUpAuth();
+    const client = makeSupabaseClient({ invitations: { data: [], error: null } });
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await getServiceWeeksOverview(makeReq(), makeLookup());
+    expect(res.status).toBe(200);
+    expect(client.from).not.toHaveBeenCalledWith("conflicts");
+  });
+
+  it("pages through the invitations query when a group exceeds the 1000-row page size, never silently truncating", async () => {
+    setUpAuth();
+
+    const page1 = Array.from({ length: 1000 }, (_, i) => ({
+      id: `inv-page1-${i}`,
+      service_week_id: WEEK_1,
+      user_id: `user-page1-${i}`,
+      status: "accepted",
+      created_at: "2026-01-01T00:00:00Z",
+    }));
+    const page2 = [
+      {
+        id: "inv-page2-0",
+        service_week_id: WEEK_1,
+        user_id: "user-page2-0",
+        status: "accepted",
+        created_at: "2026-01-02T00:00:00Z",
+      },
+    ];
+
+    const client = makeSupabaseClient({ conflicts: { data: [], error: null } });
+    let invitationsCallCount = 0;
+    const baseFrom = client.from;
+    client.from = jest.fn((table: string) => {
+      if (table === "invitations") {
+        invitationsCallCount += 1;
+        const page = invitationsCallCount === 1 ? page1 : page2;
+        return { select: jest.fn(() => makeChain({ data: page, error: null })) };
+      }
+      return baseFrom(table as keyof Fixtures);
+    }) as unknown as typeof client.from;
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await getServiceWeeksOverview(makeReq(), makeLookup());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const data: ServiceWeeksOverviewResponse = body.data;
+    const week1 = data.serviceWeeks.find((w) => w.id === WEEK_1)!;
+
+    // 1000 rows from page 1 + 1 row from page 2 = 1001 -> both pages were read.
+    expect(week1.confirmedCount).toBe(1001);
+    expect(week1.rosterSize).toBe(1001);
+    expect(invitationsCallCount).toBe(2);
   });
 });
