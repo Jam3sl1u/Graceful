@@ -394,6 +394,20 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
         setGuestAccountSetupUrl(body.data.accountSetupUrl);
       }
 
+      // Refresh the directory so the new guest appears in the Guests
+      // section immediately, instead of only after a manual reload.
+      try {
+        const membersRes = await fetch(`/api/church-group/members`);
+        if (membersRes.ok) {
+          const membersBody = await membersRes.json();
+          setMembers(membersBody.data.members);
+        }
+      } catch {
+        // Non-critical: the accountSetupUrl feedback above already confirms
+        // the invite succeeded; the directory just won't refresh until the
+        // next load.
+      }
+
       setGuestEmail("");
       setGuestRoleNote("");
     } catch {

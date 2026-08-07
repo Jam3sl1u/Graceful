@@ -81,6 +81,7 @@ export async function getMemberWeekView(
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
     const supabase = getSupabaseClient(jwt);
+    const isGuestCaller = ctx.role === "guest";
 
     // 1. Service week
     const { data: weekRow, error: weekError } = await supabase
@@ -97,7 +98,7 @@ export async function getMemberWeekView(
       return fail("Not found", ErrorCode.NOT_FOUND, 404);
     }
 
-    if (ctx.role === "guest") {
+    if (isGuestCaller) {
       const access = await guestHasWeekAccess(supabase, id, ctx.userId);
       if (access.dbError) return fail("Internal error", ErrorCode.INTERNAL, 500);
       if (!access.allowed) return fail("Not found", ErrorCode.NOT_FOUND, 404);
@@ -184,7 +185,8 @@ export async function getMemberWeekView(
           title: song?.title ?? "",
           artist: song?.artist ?? null,
           position: row.position,
-          effectiveKey: row.key_override ?? song?.default_key ?? null,
+          // Guests get NO instrument/key UI (#72 AC bullet 4).
+          effectiveKey: isGuestCaller ? null : (row.key_override ?? song?.default_key ?? null),
         };
       });
 
@@ -283,6 +285,10 @@ export async function getMemberWeekView(
         .filter((user) => user.role !== "guest")
         .map((user) => {
           const profile = profileByUserId.get(user.id);
+          // Guests get NO instrument/key UI (#72 AC bullet 4).
+          if (isGuestCaller) {
+            return { userId: user.id, name: user.name, vocalCapability: "none" as const, instruments: [] };
+          }
           return {
             userId: user.id,
             name: user.name,

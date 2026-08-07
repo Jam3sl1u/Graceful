@@ -56,6 +56,10 @@ function makeRecordingChain(
       record?.("eq", args);
       return chain;
     }),
+    ilike: jest.fn((...args: unknown[]) => {
+      record?.("ilike", args);
+      return chain;
+    }),
     is: jest.fn((...args: unknown[]) => {
       record?.("is", args);
       return chain;
@@ -118,11 +122,51 @@ describe("createGuestInvitation — tester supplement (query-shape verification)
     );
 
     // Must filter by church_group_id (tenant scoping), by the (lowercased)
-    // invited email, and must exclude anonymized users — never a bare
-    // global email lookup that could leak cross-tenant existence.
+    // invited email via a case-insensitive match, and must exclude
+    // anonymized users — never a bare global email lookup that could leak
+    // cross-tenant existence.
     expect(calls).toContainEqual({ method: "eq", args: ["church_group_id", CHURCH_GROUP_ID] });
-    expect(calls).toContainEqual({ method: "eq", args: ["email", "guest@example.com"] });
+    expect(calls).toContainEqual({ method: "ilike", args: ["email", "guest@example.com"] });
     expect(calls).toContainEqual({ method: "is", args: ["anonymized_at", null] });
+  });
+
+  it("escapes _ in the invited email before passing it to ilike, so it can't act as a wildcard", async () => {
+    setUpAuth();
+    const calls: Array<{ method: string; args: unknown[] }> = [];
+
+    const client = {
+      from: jest.fn((table: string) => {
+        if (table === "service_weeks") {
+          return { select: jest.fn(() => makeRecordingChain({ data: serviceWeekRow, error: null })) };
+        }
+        if (table === "users") {
+          return {
+            select: jest.fn(() =>
+              makeRecordingChain({ data: [], error: null }, (method, args) =>
+                calls.push({ method, args }),
+              ),
+            ),
+          };
+        }
+        throw new Error(`Unexpected table in this test: ${table}`);
+      }),
+      rpc: jest.fn(() => Promise.resolve({ data: null, error: { message: "EMAIL_TAKEN" } })),
+    };
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    // "_" is legal in the local part of an email address and accepted by
+    // createGuestInvitationSchema's z.string().email() (unlike "%" and "\",
+    // which that validator already rejects) — it would otherwise become a
+    // LIKE wildcard matching unrelated rows if passed through unescaped.
+    await createGuestInvitation(
+      makeReq({ serviceWeekId: SERVICE_WEEK_ID, email: "under_score@example.com" }),
+      makeLookup(),
+    );
+
+    expect(calls).toContainEqual({
+      method: "ilike",
+      args: ["email", "under\\_score@example.com"],
+    });
   });
 
   it("an email belonging to a user in a DIFFERENT group is invisible to the existing-user lookup and falls through to the new-user (provisioning) branch", async () => {

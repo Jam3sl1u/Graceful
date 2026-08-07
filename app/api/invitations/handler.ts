@@ -277,6 +277,14 @@ function appUrl(path: string): string {
   return `${base}${path}`;
 }
 
+// .ilike() treats % and _ as wildcards; escape them (and the escape
+// character itself) so an exact-looking email can't match unrelated rows.
+// This is the repo's precedent for case-insensitive email matching — see
+// the existing-user lookup below, the only email comparison in the codebase.
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
 export type GuestInvitationResponse = {
   invitation: InvitationResponse;
   isNewUser: boolean;
@@ -336,11 +344,16 @@ export async function createGuestInvitation(
     // belonging to a user in a *different* group is invisible here and
     // falls through to the new-user branch below (provision_guest_user's
     // global EMAIL_TAKEN check then 409s without leaking who owns it).
+    // users.email is never normalized to lowercase on write, so this must be
+    // case-insensitive (parsed.email is already lowercased by the schema) —
+    // ilike with an escaped pattern, not eq, or an existing user whose
+    // stored email has an uppercase char would wrongly take the new-user
+    // branch and hit a permanent EMAIL_TAKEN 409.
     const { data: existingUsers, error: existingUserError } = await supabase
       .from("users")
       .select("id")
       .eq("church_group_id", ctx.churchGroupId)
-      .eq("email", parsed.email)
+      .ilike("email", escapeLikePattern(parsed.email))
       .is("anonymized_at", null)
       .limit(1);
 

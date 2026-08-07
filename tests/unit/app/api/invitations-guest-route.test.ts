@@ -105,6 +105,7 @@ function makeChain(result: QueryResult) {
   const chain: Record<string, unknown> & PromiseLike<QueryResult> = {
     eq: jest.fn(() => chain),
     neq: jest.fn(() => chain),
+    ilike: jest.fn(() => chain),
     in: jest.fn(() => chain),
     is: jest.fn(() => chain),
     limit: jest.fn(() => chain),
@@ -249,6 +250,32 @@ describe("POST /api/invitations/guest", () => {
 
     const insertPayload = capturedInserts.invitations as Record<string, unknown>;
     expect(insertPayload.user_id).toBe(EXISTING_USER_ID);
+  });
+
+  it("existing-user lookup is case-insensitive: a mixed-case stored email still matches a lowercased request email", async () => {
+    setUpAuth();
+    const rpc = jest.fn(() => Promise.resolve({ data: null, error: null }));
+    // Stored row's email has an uppercase char, as it would if it was never
+    // normalized on write (join_church_group inserts Clerk's address
+    // verbatim) — the request body's email is already lowercased by
+    // createGuestInvitationSchema before it reaches the handler.
+    const client = makeSupabaseClient(
+      { users: { selects: [{ data: [{ id: EXISTING_USER_ID }], error: null }] } },
+      { rpc },
+    );
+    mockGetSupabaseClient.mockReturnValue(client);
+
+    const res = await createGuestInvitation(
+      makeReq({ ...validBody, email: "guest@example.com" }),
+      makeLookup("admin"),
+    );
+    expect(res.status).toBe(201);
+
+    const body = await res.json();
+    const data: GuestInvitationResponse = body.data;
+    expect(data.isNewUser).toBe(false);
+    expect(data.guestUserId).toBe(EXISTING_USER_ID);
+    expect(rpc).not.toHaveBeenCalledWith("provision_guest_user", expect.anything());
   });
 
   it("new-user happy path: provisions a guest, isNewUser true, accountSetupUrl ends with /guest/<token>", async () => {

@@ -548,5 +548,29 @@ describe("GET /api/service-weeks/:id/member-view", () => {
       const body = await res.json();
       expect(body.data.team.map((m: { userId: string }) => m.userId)).toEqual([USER_ID]);
     });
+
+    it("a guest caller gets NO instrument/key UI: nulled effectiveKey, empty instruments, vocalCapability 'none'", async () => {
+      setUpAuth();
+      mockGetSupabaseClient.mockReturnValue(
+        makeSupabaseClient({
+          invitations: {
+            data: [{ status: "accepted", created_at: "2026-07-10T00:00:00Z" }],
+            error: null,
+          },
+        }),
+      );
+
+      const res = await getMemberWeekView(fakeReq, WEEK_ID, makeLookup("guest"));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      const data: MemberWeekViewResponse = body.data;
+
+      expect(data.setlist?.songs.every((s) => s.effectiveKey === null)).toBe(true);
+      expect(data.team.length).toBeGreaterThan(0);
+      for (const member of data.team) {
+        expect(member.vocalCapability).toBe("none");
+        expect(member.instruments).toEqual([]);
+      }
+    });
   });
 });
