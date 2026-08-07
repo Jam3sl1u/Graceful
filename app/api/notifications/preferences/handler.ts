@@ -4,7 +4,6 @@ import { requireAuth, type UserLookup } from "@/lib/api/auth";
 import { ok, fail } from "@/lib/api/response";
 import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
-import type { Database } from "@/lib/supabase/types";
 import {
   NOTIFICATION_PREFERENCE_DEFAULTS,
   updateNotificationPreferencesSchema,
@@ -168,7 +167,7 @@ export async function updateNotificationPreferences(
       setlist_sms: merged.setlistSms,
       setlist_email: merged.setlistEmail,
       gcal_sync_enabled: merged.gcalSyncEnabled,
-    } as unknown as Database["public"]["Tables"]["notification_preferences"]["Insert"];
+    };
 
     const { data, error } = await supabase
       .from("notification_preferences")
