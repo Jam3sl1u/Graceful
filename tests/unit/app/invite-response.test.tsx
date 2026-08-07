@@ -10,11 +10,12 @@ const TOKEN = "a".repeat(64);
 const INVITATION_ID = "11111111-1111-1111-1111-111111111111";
 const SERVICE_WEEK_ID = "22222222-2222-2222-2222-222222222222";
 
-function jsonResponse(status: number, body: unknown): Response {
+function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}): Response {
   return {
     ok: status >= 200 && status < 300,
     status,
     json: () => Promise.resolve(body),
+    headers: { get: (name: string) => headers[name] ?? null },
   } as unknown as Response;
 }
 
@@ -97,7 +98,7 @@ describe("InviteResponse", () => {
     });
     expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute(
       "href",
-      "/dashboard",
+      `/member-week/${SERVICE_WEEK_ID}`,
     );
   });
 
@@ -128,6 +129,10 @@ describe("InviteResponse", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ responseToken: TOKEN, reason: "Can't make it that week" }),
     });
+    expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute(
+      "href",
+      `/member-week/${SERVICE_WEEK_ID}`,
+    );
   });
 
   it("decline flow: 'Keep it' cancels back to the two-button state without submitting", async () => {
@@ -188,7 +193,10 @@ describe("InviteResponse", () => {
 
     expect(screen.queryByText("accepted")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /accept/i })).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /go to the app/i })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute(
+      "href",
+      `/member-week/${SERVICE_WEEK_ID}`,
+    );
   });
 
   it("edge case: expired status from the lookup shows the unavailable view", async () => {
@@ -257,7 +265,8 @@ describe("InviteResponse", () => {
     render(<InviteResponse token={TOKEN} />);
 
     await waitFor(() => expect(screen.getByText(/couldn.t find this invitation/i)).toBeInTheDocument());
-    expect(screen.getByRole("link", { name: /go to the app/i })).toBeInTheDocument();
+    // No lookup ever succeeded, so no service week id is known — falls back to /dashboard.
+    expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute("href", "/dashboard");
   });
 
   it("failure case: a 404 lookup shows the unavailable view (never a raw error)", async () => {
@@ -268,6 +277,41 @@ describe("InviteResponse", () => {
 
     await waitFor(() => expect(screen.getByText(/couldn.t find this invitation/i)).toBeInTheDocument());
     expect(screen.queryByText("NOT_FOUND")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /go to the app/i })).toHaveAttribute("href", "/dashboard");
+  });
+
+  it("failure case: a 429 lookup shows a rate-limited retry message, not 'not found'", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        429,
+        { error: "Rate limit exceeded", code: "RATE_LIMITED" },
+        { "Retry-After": "42" },
+      ),
+    );
+    render(<InviteResponse token={TOKEN} />);
+
+    await waitFor(() => expect(screen.getByText(/try again in 42s/i)).toBeInTheDocument());
+    expect(screen.queryByText(/couldn.t find this invitation/i)).not.toBeInTheDocument();
+  });
+
+  it("failure case: a 429 on accept shows an inline retry alert and stays on the ready view", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, { data: baseLookup() }))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          429,
+          { error: "Rate limit exceeded", code: "RATE_LIMITED" },
+          { "Retry-After": "7" },
+        ),
+      );
+
+    render(<InviteResponse token={TOKEN} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: /accept/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /accept/i }));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByRole("alert").textContent).toMatch(/try again in 7s/i);
+    expect(screen.getByRole("button", { name: /accept/i })).toBeInTheDocument();
   });
 
   it("failure case: a non-terminal error on accept (e.g. 500) shows an inline alert and stays on the ready view", async () => {

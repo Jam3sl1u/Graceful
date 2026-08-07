@@ -1,0 +1,38 @@
+.banner {
+  position: fixed;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  width: 100%;
+  max-width: 480px;
+  z-index: 100;
+  border: 1px solid var(--color-border);
+  border-radius: 8px 8px 0 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  padding: 1rem 1.25rem;
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  box-shadow: 0 -2px 12px rgba(0, 0, 0, 0.08);
+}
+
+.heading {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.body {
+  margin: 0.5rem 0 1rem;
+  opacity: 0.75;
+}
+
+.actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+}
+
+.dismiss {
+  min-height: 44px;
+  min-width: 44px;
+}
