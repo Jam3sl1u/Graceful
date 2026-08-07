@@ -26,7 +26,7 @@ describe("manifest", () => {
     expect(result.theme_color).toBe("#4f46e5");
   });
 
-  it("has both icons, including an any-purpose SVG Chrome accepts for installability", () => {
+  it("has all four icons, including an any-purpose SVG Chrome accepts for installability", () => {
     expect(result.icons).toEqual([
       { src: "/icons/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" },
       {
@@ -35,6 +35,16 @@ describe("manifest", () => {
         type: "image/svg+xml",
         purpose: "maskable",
       },
+      { src: "/icons/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+      { src: "/icons/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+    ]);
+  });
+
+  it("has PNG fallback icons for installers that don't support SVG manifest icons", () => {
+    const pngIcons = result.icons?.filter((icon) => icon.type === "image/png");
+    expect(pngIcons).toEqual([
+      { src: "/icons/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+      { src: "/icons/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
     ]);
   });
 });
