@@ -1,88 +1,161 @@
-# Review — Issue #70: Notification preferences API (BR-14 minimum-channel guard)
+# Review — Issue #72: Guest invitation flow (existing vs. new user)
 
-VERDICT: SHIP
+VERDICT: NEEDS WORK
 
-Reviewed: `.pipeline/spec.md`, `.pipeline/changes.md`, `.pipeline/test-results.md`,
-`git diff main...HEAD` (all 7 files), the untracked tester supplement, the PRD
-(§6.9.1, §7 BR-14, §22.12), issue #70's acceptance criteria, the
-`notification_preferences` migration, and its RLS policies.
+Scope of this review: `.pipeline/spec.md`, `.pipeline/changes.md`,
+`.pipeline/test-results.md`, `git diff main...HEAD` read in full, plus my own
+runs of `bun run lint`, `bun run typecheck`, `bun run test`
+(87 suites / 1091 tests, all green) and `bun run check:service-role` (OK).
 
-## Independently re-run in this worktree
+The design is sound and the implementation tracks the spec closely. Two
+things must change before a human sees this as done; two more are judgment
+calls a human should make explicitly.
 
-- `bun run lint` — clean.
-- `bun run typecheck` — clean.
-- `bun run test` — 83 suites / 1069 tests, 0 failures (matches test-results.md).
-- `bun run test -- notification-preferences` — 29 tests across the two dedicated suites.
+---
 
-## Correctness — verified against source, not summaries
+## MUST FIX
 
-- **BR-14 is enforced on the merged state, before any write** (`handler.ts:150-158`),
-  which is the only placement that catches the dangerous case (body disables the
-  last enabled channel while the other two are already `false` in the DB). Both
-  the direct and via-merge variants are tested, and the direct test asserts *no
-  upsert is issued*, so the guard is load-bearing, not decorative — deleting it
-  flips those tests to 200.
-- **422 + `VALIDATION_FAILED` for the business-rule violation, 400 for shape
-  failures** matches the repo convention (`church-group/members/[id]/role/handler.ts`,
-  `events/handler.ts`, `songs/handler.ts`).
-- **Defaults match the PRD table and the migration exactly** (invitation×3 true,
-  reminder_sms true / reminder_email false, hours 24, setlist×2 true, gcal false).
-- **`user_id` always comes from `ctx.userId`**, never the body; Zod strips unknown
-  keys, and a body carrying `userId`/`id`/`chatPreference` is proven not to reach
-  the payload. Combined with the existing user-scoped RLS
-  (`user_id = auth_user_id()` on select/insert/update), a caller cannot read or
-  retarget another user's row.
-- **`chat_preference` is never selected or written**, so an existing row's value
-  survives a PUT and a new row gets the DB default `'mentions'`. Confirmed in the
-  shared `COLUMNS` constant, the upsert payload, and the hand-rolled Insert type
-  (`Omit<Row,"id">` with no `chat_preference` field).
-- **Upsert writes the complete merged row**, which also makes concurrent PUTs safe:
-  the final state is always some single client's fully-validated view, so two
-  interleaved partial updates cannot combine into a BR-14-violating state.
-- **GET does not create a row** (synthesized defaults only) — asserted.
-- `.select(COLUMNS)` uses `", "` separators; supabase-js strips whitespace and this
-  matches every other handler in the repo, so no PostgREST issue.
-- No migration, RLS, UI, or unrelated-route changes. Diff is exactly the 5 files
-  the spec names plus the two pipeline artifacts. No scope creep.
+### 1. Existing-user email lookup is case-sensitive; the RPC guarding it is not
+`app/api/invitations/handler.ts:337-345`
 
-## Tests — meaningful, not superficial
+```ts
+.from("users").select("id")
+  .eq("church_group_id", ctx.churchGroupId)
+  .eq("email", parsed.email)      // parsed.email is lowercased by the schema
+  .is("anonymized_at", null)
+```
 
-The coder's 22 tests assert the captured upsert payload and the `onConflict`
-option, not just status codes, and assert *absence* of a write on the rejection
-paths. The tester's 7 supplements close real gaps rather than padding: the coder's
-fixture couples the pre-write select and post-upsert result to the same
-`error`/`data` fields, so the upsert's own `error || !data` branch was never
-isolated; the supplement isolates both halves, adds the inclusive `[1, 168]`
-boundary values, adds the "no Clerk session at all" PUT variant, and drives the
-real `route.ts` `GET`/`PUT` exports through the default `requireAuth` DB lookup.
-That last one is the only test that proves the route wrapper is actually wired to
-the handler. Failure cases (400 malformed/out-of-range, 401 no JWT and no session,
-422 BR-14 ×2, 500 on select error, upsert error, and upsert-returns-nothing) are
-all covered, and no error path leaks a driver message.
+`users.email` is never normalized on write: `join_church_group`
+(`supabase/migrations/20260706000002_church_group_join_rpc.sql:68-69`)
+inserts Clerk's `primaryEmailAddress.emailAddress` verbatim, and there is no
+lowercase constraint, trigger, or citext on the column. Meanwhile
+`provision_guest_user` guards with `lower(email) = lower(p_email)`
+(`supabase/migrations/20260805000001_guest_invitation_flow.sql`, step 3) — so
+the handler and the migration it was written alongside disagree about
+case-sensitivity.
 
-## Non-blocking notes for the human (no rework required)
+Consequence: for any existing user whose stored email contains an uppercase
+character, the group-scoped lookup misses, the code takes the **new-user**
+branch, `provision_guest_user` raises `EMAIL_TAKEN`, and the admin gets a
+permanent 409 with no way to invite that person as a guest. That silently
+defeats spec edge case 1 and AC bullet 2 ("Existing-user path: invitation
+created directly with the known user_id"). It fails closed (no data
+corruption, no leak), which is why it is NEEDS WORK and not BLOCK.
 
-1. `handler.ts:141` — `as unknown as ...["Insert"]` on the upsert payload. I
-   verified the object literal *is* assignable to that Insert type on its own
-   (unlike `app/api/profile/handler.ts`, whose cast is genuinely required because
-   its Insert marks `created_at` required). If supabase-js's `upsert()` generic
-   accepts it without the cast, dropping it would restore compile-time checking of
-   the ten column names on the write path; today a snake_case typo there would only
-   be caught by the payload assertion in the tests. The spec said to add the cast
-   only if typecheck demanded it, and the inline comment justifies it by
-   `chat_preference` rather than by a compiler error. Cosmetic, mitigated by tests.
-2. PRD §14.1 (line 452) lists a "30 minutes" reminder lead-time option, which an integer
-   `reminder_hours_before` column cannot represent; the spec consciously scoped that
-   out and set the range to `[1, 168]`. When the settings UI lands, either the
-   option list narrows to whole hours or the column needs a schema change. Flagging
-   so it is a deliberate product decision, not a silent gap.
-3. Defaults now exist in two places (SQL column defaults and
-   `NOTIFICATION_PREFERENCE_DEFAULTS`). They agree today; a future migration that
-   changes one must change the other.
-4. Working-tree state at review time: the tester's supplement
-   (`tests/unit/app/api/notification-preferences-route-tester-supplement.test.ts`)
-   is untracked and `.pipeline/test-results.md` is modified but uncommitted. Both
-   must be committed before the PR, or the PR ships without the supplemental tests.
-5. An empty-body `PUT {}` still issues an upsert, so it will create a defaults row
-   for a user who had none. Harmless and consistent with the spec, just noting the
-   write is not a true no-op.
+Fix, in `createGuestInvitation`: make the lookup case-insensitive without
+reintroducing LIKE semantics — note that a bare `.ilike("email", parsed.email)`
+is *not* a safe drop-in, because `_` and `%` are legal in the local part of an
+address and would become wildcards matching a different user's row. Either
+escape `%`/`_` before `.ilike`, or normalize `users.email` to lowercase at
+write time (`join_church_group` + a one-off data migration) and keep `.eq`.
+This is the only `eq("email", …)` in the codebase, so whichever rule is chosen
+becomes the precedent — state it in a comment.
+
+Add a test with a mixed-case stored email (e.g. row `Guest@Example.com`,
+request `guest@example.com`) asserting `isNewUser === false` and that
+`provision_guest_user` is never called.
+
+### 2. The Tester stage's two supplemental suites are not committed
+`git status` shows them untracked, so they are absent from
+`git diff main...HEAD` and would not reach the PR:
+
+- `tests/unit/app/api/events-route-guest-scoping-tester-supplement.test.ts`
+- `tests/unit/app/api/invitations-guest-route-tester-supplement.test.ts`
+
+These are the *only* tests in the change that assert on actual query
+arguments (every other fixture is a pass-through mock that returns the same
+canned data regardless of what was filtered), so losing them removes the
+regression protection the Testing stage specifically added. Commit both,
+along with the modified `.pipeline/test-results.md`.
+
+---
+
+## HUMAN DECISION REQUIRED (do not silently ship)
+
+### 3. AC bullet 4's "NO instrument/key UI" is not honoured
+Guests are now admitted to `GET /api/service-weeks/:id/member-view`
+(`app/api/service-weeks/[id]/member-view/handler.ts:76`), which returns
+`setlist.songs[].effectiveKey` and `team[].vocalCapability` /
+`team[].instruments`, and `app/(app)/member-week/[id]/member-week-view.tsx:228,272`
+renders both. The issue's AC says guests get "NO music roster slot, NO
+instrument/key UI"; the roster-slot half is correctly implemented (the
+`event_attendees` branch in `accept_invitation` plus the `role !== "guest"`
+filter on `team`), the instrument/key half is not.
+
+`.pipeline/spec.md` "Explicitly out of scope" deliberately deferred this, and
+the issue's own Out of Scope section ("guest-specific UI polish beyond reusing
+#49/#65's existing screens with scoped data") can be read either way. Cheapest
+honest fix is ~5 lines in the member-view handler: when `ctx.role === "guest"`,
+null out `effectiveKey` and emit `team` entries without
+`instruments`/`vocalCapability`. Otherwise get explicit sign-off that this AC
+bullet ships unmet and record it on the issue.
+
+### 4. A newly invited guest does not appear in the new "Guests" section
+`app/(app)/week/[id]/week-view.tsx` — `handleInviteGuest` pushes the new
+invitation into `invitations`, but `guestEntries` is derived from
+`members.filter((m) => m.role === "guest")` and `members` is only loaded once
+on mount. So after a successful new-user guest invite the section still reads
+"No guests invited for this week yet" until a manual reload; the only visible
+feedback is the `accountSetupUrl` blob. Either refetch
+`/api/church-group/members` on success or append a local directory entry from
+the response (`guestUserId` + `email`).
+
+---
+
+## Verified correct (I checked these myself, not just the summaries)
+
+- **`accept_invitation` supersede is faithful.** I extracted both function
+  bodies and diffed them: the only changes are the `v_invitee_role`
+  declaration and the guest branch around the `event_attendees` insert.
+  Status flip, expiry ordering, notification fan-out, and the audit insert are
+  untouched. No other migration defines `accept_invitation`, and
+  `20260805000001` sorts last, so nothing is silently reverted.
+- **Concurrency in `claim_guest_invitation`.** `SELECT … FOR UPDATE` on the
+  placeholder row before the `pending_guest_` / role checks correctly
+  serializes two racing claims — the loser gets `ALREADY_CLAIMED`, not a
+  double-claim. `email` is never overwritten, so the global unique index can't
+  be tripped. Step order matches the spec's numbered list exactly.
+- **`middleware.ts`.** `"/guest(.*)"` is anchored at the path start, so it does
+  not match `/api/invitations/guest` or `/api/invitations/guest/claim`; both
+  stay protected. Confirmed against `createRouteMatcher` semantics and the
+  neighbouring `/join(.*)` entry.
+- **Anti-enumeration.** All four guest branches return 404, never 403, and the
+  service-week lookup keeps the "missing and wrong-group are
+  indistinguishable" invariant.
+- **The latent `.maybeSingle()` bug is genuinely fixed.** `guestHasWeekAccess`
+  awaits an array query with `.limit(1)`, so a re-invited guest with two
+  invitation rows for one week no longer 500s. Covered by a real test.
+- **`app/api/events/handler.ts`.** The `.in("status", GUEST_ACCESS_STATUSES)`
+  filter is applied only for `ctx.role === "guest"`; member/set_leader scoping
+  is unchanged, and the tester supplement asserts both directions on the actual
+  call arguments.
+- **No service-role usage anywhere in the new code** (`check:service-role` OK);
+  both new RPCs are `SECURITY DEFINER` with `SET search_path = ''`, fully
+  schema-qualified, with the caller-role check (not RLS) as the documented
+  enforcement point, matching `remove_church_group_member`'s pattern.
+- **`clerk_id` construction** is 46 chars (`pending_guest_` + 32 hex), inside
+  `varchar(50)`, and the `md5(random()||clock_timestamp())`-over-`gen_random_uuid()`
+  rationale is correct for `search_path = ''`.
+- **Removal interaction.** `remove_church_group_member` sets `email = NULL`
+  (line 136), so re-inviting a removed member's address provisions cleanly —
+  spec edge case 3 holds.
+
+## Non-blocking notes for the record
+
+- The cross-group path returns 409 "A user with this email already exists",
+  which is an existence oracle for any address registered anywhere in
+  Graceful. `.pipeline/spec.md` edge case 2 accepts this tradeoff explicitly;
+  flagging so it is a decision, not an accident.
+- Two admins inviting the same brand-new email concurrently: both pass
+  `provision_guest_user`'s `EXISTS` check, the loser hits the unique index and
+  surfaces a generic error → 500 instead of 409. Mapping SQLSTATE `23505` to
+  `EMAIL_TAKEN` would close it.
+- `claim_guest_invitation` does not check `response_deadline`. A `pending`
+  invitation past its deadline is still claimable; the account is created, then
+  `accept_invitation` raises `EXPIRED` — but `pending` is in
+  `GUEST_ACCESS_STATUSES`, so that guest still has read access to the week.
+  Consistent with how members behave today; worth a follow-up issue rather than
+  a change here.
+- The migration is not exercised by CI (no local Postgres in the harness), so
+  all SQL confidence above comes from reading and diffing, not execution. Worth
+  one manual `supabase db push` against a scratch project before merge.

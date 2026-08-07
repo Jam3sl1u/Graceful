@@ -1,99 +1,123 @@
-# Test Results — Issue #70: Notification preferences API (BR-14 minimum-channel guard)
+# Test Results — Issue #72: Guest invitation flow (existing vs. new user)
 
-This overwrites the stale `test-results.md` for issue #65 that was still
-sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
-recent run).
+## Verdict: PASS
 
-## Verdict: ALL PASS
+All verification commands pass, both as originally claimed by the Coding
+stage and after re-running them independently, plus after adding two new
+supplemental test files (below) that close gaps left by the coder's own
+mocks.
 
-## What was independently verified
+```
+bun run lint             -> clean (0 errors, 0 warnings)
+bun run typecheck         -> clean
+bun run test              -> 87 suites, 1091 tests, all passing
+bun run check:service-role -> OK: no service-role key references outside comments
+```
 
-- `bun run lint` — clean, no warnings or errors.
-- `bun run typecheck` — clean (`tsc --noEmit`), no errors.
-- `bun run test` (full suite, before adding any tester tests) — 82 suites /
-  1062 tests passed, confirming the Coder's reported numbers in
-  `.pipeline/changes.md`.
-- Read `lib/supabase/types.ts`, `schemas/notifications.ts`,
-  `app/api/notifications/preferences/handler.ts`, and `route.ts` in full and
-  diffed them against every requirement in `.pipeline/spec.md` (column list,
-  defaults, BR-14 guard placement before the write, partial-merge semantics,
-  `chat_preference` exclusion, `user_id` always from `ctx.userId`, error
-  codes/status codes). All match the spec exactly.
+(1084 tests / 85 suites were the coder's; +7 tests / +2 suites are new,
+added below.)
 
-## Additional tests written this stage
+## What I independently verified
 
-Added `tests/unit/app/api/notification-preferences-route-tester-supplement.test.ts`
-(7 new tests) to independently probe gaps in the Coder's own
-`notification-preferences-route.test.ts` fixture, which couples the
-pre-write select and post-write upsert to the same `error`/`data` fields and
-so never actually isolates the upsert's own failure branch, never checks the
-`reminderHoursBefore` integer boundaries, never exercises `route.ts`'s `GET`/
-`PUT` exports directly (only the underlying `handler.ts` functions), and
-never explicitly asserts the SELECT column list excludes `chat_preference`.
+- **Migration SQL** (`supabase/migrations/20260805000001_guest_invitation_flow.sql`,
+  not run by CI): read in full and diffed `accept_invitation`'s body against
+  the prior `20260712000001` version — confirmed it is byte-for-byte
+  identical except the added guest branch (declares `v_invitee_role`, looks
+  up the invitee's role, and skips the `event_attendees` insert /
+  `GET DIAGNOSTICS` when `role = 'guest'`, else the original insert runs
+  unchanged). Confirmed `claim_guest_invitation`'s step order exactly matches
+  the spec's numbered list: auth -> resolve by token -> lock row -> idempotent
+  re-claim -> anonymized check -> already-claimed check (`pending_guest_`
+  prefix / role) -> claimability check (`pending`/`accepted`) ->
+  already-in-group check -> update (never touches `email`) -> direct
+  `audit_logs` insert -> return. Confirmed `provision_guest_user`'s caller
+  check (UNAUTHENTICATED / FORBIDDEN), global `EMAIL_TAKEN` check, and the
+  `pending_guest_<32 hex>` clerk_id construction/length (46 chars, fits
+  `varchar(50)`).
+- **Handler code** (`app/api/invitations/handler.ts`,
+  `app/api/service-weeks/[id]/member-view/handler.ts`,
+  `app/api/service-weeks/[id]/handler.ts`,
+  `app/api/service-weeks/[id]/setlist/handler.ts`, `app/api/events/handler.ts`,
+  `lib/invitations/guest-access.ts`, `schemas/invitations.ts`,
+  `lib/supabase/types.ts`, `middleware.ts`,
+  `app/(app)/week/[id]/week-view.tsx`, `app/(public)/guest/[token]/*`): read
+  every changed file and confirmed each matches its corresponding spec
+  section line-for-line (existing-vs-new-user branch, BR-08/BR-05 reuse,
+  orphan-cleanup-on-insert-failure, `guestHasWeekAccess` semantics and its
+  four call sites, the guest-filtered `team` query, the `"/guest(.*)"`
+  middleware addition — confirmed it does NOT also match
+  `/api/invitations/guest` or `/api/invitations/guest/claim`, since
+  `createRouteMatcher` anchors from the path start and those paths begin with
+  `/api`, not `/guest`).
+- Confirmed the existing coder-written test suites
+  (`tests/unit/lib/invitations/guest-access.test.ts`,
+  `tests/unit/app/api/invitations-guest-route.test.ts`,
+  `tests/unit/app/api/invitations-guest-claim-route.test.ts`, and the guest
+  additions to `tests/unit/app/api/service-weeks-member-view-route.test.ts`)
+  cover every case the spec's "Tests the coder must add" section names.
 
-Covered:
-1. **Upsert-specific 500** — pre-write select succeeds, but the upsert call
-   itself returns a Supabase error → 500 `INTERNAL` (previously only the
-   pre-write select's error path was isolated from the upsert's).
-2. **Upsert returns no error but no row** → 500 `INTERNAL` (the `!data`
-   half of the handler's `error || !data` check on the upsert result).
-3. **`reminderHoursBefore` boundary values** (`1` and `168`, both spec-valid
-   inclusive bounds) → 200, value round-trips unchanged.
-4. **Full unauthenticated PUT case** (Clerk `userId` null) → 401
-   `UNAUTHENTICATED`, `lookup` never consulted, `getSupabaseClient` never
-   called (the Coder's suite only had this variant for `GET`; `PUT` only had
-   the "JWT missing" variant, not the "no Clerk session at all" variant).
-5. **`route.ts` `GET` delegation**, driven through the actual exported
-   `GET`/`PUT` functions (not `handler.ts` directly) with a real
-   `requireAuth` → `users`-table lookup satisfied via a table-name-aware
-   Supabase fake, confirming the thin wrapper truly wires through to the
-   handler and returns its response untouched.
-6. **`route.ts` `PUT` delegation** with a malformed body → 400
-   `VALIDATION_FAILED`, same wiring check as above.
+## Gap found and closed: two new supplemental test files
 
-All 7 pass. Combined with the Coder's 22, the route now has 29 dedicated
-tests.
+The coder's own fixtures for `createGuestInvitation` and `listEvents` use
+pass-through `.eq()`/`.is()`/`.in()` mocks that ignore their arguments and
+always return the same canned fixture regardless of what was actually
+queried. That means a regression in the *query shape itself* — e.g. the
+existing-user lookup forgetting to filter by `church_group_id` or
+`anonymized_at`, or the guest-only `.in("status", GUEST_ACCESS_STATUSES)`
+filter in `app/api/events/handler.ts` silently being dropped — would not have
+been caught by the existing suite (the fixture would still be returned
+either way). I wrote two new suites that record the actual arguments passed
+and assert on them, following this repo's established
+`*-tester-supplement.test.ts` pattern:
 
-## Full suite after additions
+- `tests/unit/app/api/invitations-guest-route-tester-supplement.test.ts`
+  - existing-user lookup is scoped by `church_group_id`, the invited
+    (lowercased) email, and excludes anonymized users.
+  - an email belonging to a user in a *different* group is invisible to that
+    lookup and correctly falls through to the new-user/provisioning branch
+    (edge case 2 from spec.md).
+  - `EMAIL_TAKEN` from `provision_guest_user` maps to 409 CONFLICT with an
+    error message that never mentions "group" (no cross-tenant leak).
+- `tests/unit/app/api/events-route-guest-scoping-tester-supplement.test.ts`
+  - `member`/`set_leader` callers do NOT get a `.in("status", ...)` filter
+    (any invitation status still counts for them, unchanged).
+  - a `guest` caller's invitations query is filtered with exactly
+    `.in("status", GUEST_ACCESS_STATUSES)`.
+  - (failure/edge case) a guest whose only invitation for a week is `denied`
+    sees zero events for that week, and the `events` table is never even
+    queried once the guest has no accessible weeks.
 
-`bun run test` — **83 suites / 1069 tests passed**, 0 failures. No
-regressions in any pre-existing suite.
+**I verified these new tests actually catch regressions**, not just that
+they pass: I temporarily reverted the `.is("anonymized_at", null)` +
+`church_group_id` filter in the existing-user lookup, and separately removed
+the guest-only `.in("status", GUEST_ACCESS_STATUSES)` branch in
+`app/api/events/handler.ts`, and confirmed each corresponding new test failed
+as expected. Both files were then restored to their original (coder-shipped)
+content — `git status` / `git diff --stat` confirm zero changes to any
+source file, only the two new test files are new/untracked.
 
-## Spec edge cases: coverage confirmed
+## Manual/logical review of UI (no dedicated tests required by spec)
 
-All 15 edge cases enumerated in `.pipeline/spec.md` ("Edge cases the
-implementation MUST handle") are covered by the combined test files:
-no-row GET (defaults, no insert), no-row PUT (merge onto defaults + insert),
-BR-14 explicit / via-merge / not-violated / re-enable, empty-body no-op,
-malformed body (null, array, wrong types), out-of-range and boundary
-`reminderHoursBefore` (0, 169, 1.5, "24", 1, 168), unknown-key stripping,
-`chat_preference` never read/written, missing-JWT 401 (GET and PUT), fully
-unauthenticated 401 (GET and PUT), DB error on select and on upsert (500),
-and the `{ data: { preferences } }` / `{ error, code }` response envelopes.
+- `app/(app)/week/[id]/week-view.tsx`: `rosterMembers`/`guestEntries` split
+  is derived correctly from `members.filter(role)`; `guestEntries` further
+  filters to only guests with a `getCurrentInvitation` match, so an
+  uninvited guest member never shows a card. `handleInviteGuest` posts the
+  correct body shape and surfaces `accountSetupUrl` only when
+  `isNewUser === true`, matching spec item 12.
+- `app/(public)/guest/[token]/page.tsx` + `guest-claim-form.tsx`: signed-out
+  branch renders sign-up/sign-in links with a correctly `encodeURIComponent`-ed
+  `redirect_url` back to `/guest/:token`; signed-in renders the claim form;
+  the form POSTs the exact body shape `claimGuestInvitationSchema` expects
+  and links to `/invite/:token` on success.
 
-## Failure cases exercised
+## Failure case coverage confirmed
 
-- Malformed/invalid request bodies (null, array, wrong field types,
-  out-of-range and non-integer `reminderHoursBefore`) → 400.
-- BR-14 violation (direct and via-merge) → 422, confirmed no upsert issued.
-- Missing JWT and missing Clerk session → 401, confirmed no Supabase client
-  is even constructed.
-- DB error on the pre-write select, and on the upsert itself → 500, never
-  leaking the driver error message.
+At least one genuine failure/negative case is present and passing in every
+touched area: 401/403/400/404/409/500 mappings in both guest route test
+files, `dbError: true` in `guest-access.test.ts`, guest-denied-only -> 404 in
+the member-view tests, and the two new regression-catching failure
+assertions above.
 
-## Notes for the Reviewer
+## Recommendation
 
-- No implementation code in `app/`, `lib/`, or `schemas/` was modified by
-  this stage — only a new supplemental test file was added
-  (`tests/unit/app/api/notification-preferences-route-tester-supplement.test.ts`).
-- Confirmed by direct inspection (not just trusting `changes.md`) that
-  `chat_preference` never appears in the shared `COLUMNS` select string, the
-  upsert payload, or `NotificationPreferencesRow`/`NotificationPreferencesResponse`.
-- Confirmed no migration or RLS files were touched — matches what
-  `changes.md` claims.
-
-## Files added by this stage (Testing)
-
-- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-70/tests/unit/app/api/notification-preferences-route-tester-supplement.test.ts`
-
-No implementation files were modified. Ready for Review.
+No blocking issues found. Ready for Review stage.

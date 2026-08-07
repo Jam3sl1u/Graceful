@@ -1,98 +1,121 @@
-# Changes — Issue #70: Notification preferences API (BR-14 minimum-channel guard)
+# Changes — Issue #72: Guest invitation flow (existing vs. new user)
 
-## Summary
+Implements the spec in `.pipeline/spec.md` in full. `bun run lint`,
+`bun run typecheck`, `bun run test` (1084 tests, all passing), and
+`bun run check:service-role` all pass.
 
-Replaced the 501 stub at `app/api/notifications/preferences/route.ts` with a real
-`GET`/`PUT` implementation, following `.pipeline/spec.md` exactly (pattern copied
-from `app/api/profile/handler.ts` / `route.ts`).
+## New files
 
-## Files changed
+- `supabase/migrations/20260805000001_guest_invitation_flow.sql` — three
+  `SECURITY DEFINER` functions:
+  - `provision_guest_user(p_email, p_name)` — admin/set_leader-only; creates a
+    placeholder `users` row (`role='guest'`, synthetic
+    `clerk_id = 'pending_guest_' || md5(...)`) for a brand-new guest email.
+    Raises `UNAUTHENTICATED` / `FORBIDDEN` / `EMAIL_TAKEN`.
+  - `claim_guest_invitation(p_response_token, p_name)` — swaps a signed-in
+    Clerk user's real `sub` in for the placeholder's synthetic `clerk_id`.
+    Idempotent re-claim, and raises `UNAUTHENTICATED` / `NOT_FOUND` /
+    `ALREADY_CLAIMED` / `NOT_CLAIMABLE` / `USER_ALREADY_IN_GROUP`.
+  - `CREATE OR REPLACE accept_invitation(...)` — supersedes
+    `20260712000001`'s version with one added branch: a `guest`-role invitee
+    gets zero `event_attendees` rows inserted (`attendees_added: 0`), since
+    that table is the music-roster slot a guest must never occupy. Everything
+    else (status flip, notify, audit) is byte-for-byte unchanged.
+  - Not run by CI; self-consistent, `CREATE OR REPLACE` throughout.
+- `lib/invitations/guest-access.ts` — `guestHasWeekAccess()` +
+  `GUEST_ACCESS_STATUSES = ["pending", "accepted"]`. Awaited directly (never
+  `.maybeSingle()`), so a re-invited guest with multiple invitation rows for
+  the same week doesn't error.
+- `app/api/invitations/guest/route.ts`, `app/api/invitations/guest/claim/route.ts`
+  — thin route wrappers calling the two new handlers below.
+- `app/(public)/guest/[token]/page.tsx` + `guest-claim-form.tsx` — guest
+  account-setup screen. Signed-out renders sign-up/sign-in links with
+  `redirect_url` back to `/guest/:token`; signed-in renders the claim form,
+  which POSTs to `/api/invitations/guest/claim` and links to
+  `/invite/:token` on success.
+- Tests: `tests/unit/lib/invitations/guest-access.test.ts`,
+  `tests/unit/app/api/invitations-guest-route.test.ts`,
+  `tests/unit/app/api/invitations-guest-claim-route.test.ts`.
 
-- **`lib/supabase/types.ts`** — added `NotificationPreferencesRow` type and
-  registered `notification_preferences` in `Database["public"]["Tables"]`,
-  immediately after the `notifications` entry. `chat_preference` is
-  deliberately omitted from the row shape (see inline comment): it's a Phase 2
-  chat concern, and `types/domain.ts`'s `ChatPref` union doesn't match the DB
-  enum, so it's out of scope for this API surface. No other table entries were
-  touched.
+## Modified files
 
-- **`schemas/notifications.ts`** — left the existing placeholder
-  `notificationsSchema`/`NotificationsInput` untouched (owned by other Sprint 4
-  issues) and appended:
-  - `NOTIFICATION_PREFERENCE_DEFAULTS` (PRD §6.9.1 defaults)
-  - `MIN_REMINDER_HOURS_BEFORE` (1) / `MAX_REMINDER_HOURS_BEFORE` (168)
-  - `updateNotificationPreferencesSchema` (all fields optional — partial merge)
-    and its inferred `UpdateNotificationPreferencesInput` type.
+- `schemas/invitations.ts` — added `createGuestInvitationSchema` (email
+  normalized to lowercase) and `claimGuestInvitationSchema`.
+- `lib/supabase/types.ts` — hand-added `provision_guest_user` and
+  `claim_guest_invitation` to `Database["public"]["Functions"]` only (no
+  wholesale regeneration).
+- `app/api/invitations/handler.ts` — added `createGuestInvitation` and
+  `claimGuestInvitation` (+ `GuestInvitationResponse` type and a
+  module-private `appUrl()` helper). `createGuestInvitation` branches on
+  whether the invited email already belongs to a non-anonymized user in the
+  caller's group: existing-user path runs the *unchanged* BR-08/BR-05 checks
+  against that `user_id` (role untouched); new-user path calls
+  `provision_guest_user` then skips BR-08/BR-05 (a fresh row has no prior
+  invitations). On an invitation-insert failure after provisioning a new
+  guest, best-effort deletes the orphan `users` row before returning 500.
+  Leaves `// TODO(#68): dispatch the guest invitation email...` — never
+  calls `sendEmail` (still a stub on this branch per OPEN QUESTION 1).
+  `claimGuestInvitation` does not call `requireAuth` (mirrors
+  `app/api/church-group/join/route.ts`'s auth preamble) and maps RPC errors
+  to 401/404/409/409/409/500.
+- `app/api/service-weeks/[id]/member-view/handler.ts` — `requireRole` now
+  includes `"guest"`; guests get a `guestHasWeekAccess` check (404, never
+  403) right after the week lookup; the team-directory query now also
+  selects `role` and filters out `role === "guest"` rows (defense in depth
+  for a member later demoted to guest).
+- `app/api/service-weeks/[id]/handler.ts` and
+  `app/api/service-weeks/[id]/setlist/handler.ts` — replaced the inline
+  `.maybeSingle()` guest-invitation check with `guestHasWeekAccess`, fixing
+  the latent bug where a re-invited guest with 2+ invitation rows for the
+  same week would 500 instead of 200/404.
+- `app/api/events/handler.ts` — for `ctx.role === "guest"` only, added
+  `.in("status", GUEST_ACCESS_STATUSES)` to the existing per-caller
+  invitations query (member/set_leader scoping is unchanged: any status
+  still counts for them).
+- `app/(app)/week/[id]/week-view.tsx` + `.module.css` — `DirectoryMember`
+  gained `role`; the Roster grid now excludes guests; a new "Guests" section
+  lists guest members with a live invitation for the week (status badge via
+  `getGuestStatusLabel`) and an "Invite a guest" form (email + optional role
+  note) that POSTs to `/api/invitations/guest`; on a new-user response the
+  returned `accountSetupUrl` is shown as selectable text.
+- `middleware.ts` — added `"/guest(.*)"` to `isPublicRoute` (next to
+  `"/join(.*)"`); `/api/invitations/guest` and
+  `/api/invitations/guest/claim` are untouched and remain protected (path
+  doesn't match the new pattern).
+- Existing tests updated for the `guestHasWeekAccess` query-shape change:
+  `tests/unit/app/api/service-weeks-id-route.test.ts` and
+  `service-weeks-setlist-route.test.ts` (invitations fixture is now an array
+  + chain gained `.in()`/`.limit()`), and
+  `tests/unit/app/api/service-weeks-member-view-route.test.ts` (users rows
+  gained `role`; replaced the old "403 for guest" test with a `guest role`
+  describe block covering accepted→200, denied-only→404, no-invitation→404,
+  access-check DB error→500, and guest-filtered-out-of-team).
+- `.pipeline/spec.md` — the Planning stage's spec for this run (was
+  previously issue #66's spec still on disk, uncommitted before this run
+  started); included in this commit since it's the git-tracked handoff
+  artifact for this run.
 
-- **`app/api/notifications/preferences/handler.ts`** (new) — exports
-  `getNotificationPreferences` and `updateNotificationPreferences`, both
-  `(req: NextRequest, lookup?: UserLookup) => Promise<Response>`, matching
-  `app/api/profile/handler.ts`'s auth → JWT → Supabase client → `ok`/`fail` →
-  `ApiException` catch shape. No role gate (PRD auth = Any).
-  - `GET`: selects the caller's row by `user_id`; returns PRD defaults (no
-    insert) when no row exists; maps snake_case → camelCase.
-  - `PUT`: validates body against `updateNotificationPreferencesSchema` (400 on
-    failure), reads the current row (or defaults if none), merges the parsed
-    partial body onto it, then runs the **BR-14 guard against the merged
-    state** — rejects with 422 `VALIDATION_FAILED` if all three invitation
-    channels (`invitation_sms`, `invitation_email`, `invitation_inapp`) would
-    end up disabled — before issuing any write. On success, upserts the full
-    merged row (`onConflict: "user_id"`, `chat_preference` never read/written)
-    and returns the updated preferences.
-  - `user_id` always comes from `ctx.userId` (never the request body), so a
-    body carrying another user's `userId` cannot retarget the write; unknown
-    keys are stripped by Zod's default strip behavior.
+## Where the Tester should focus
 
-- **`app/api/notifications/preferences/route.ts`** — replaced the
-  `notImplemented` stub with thin `GET`/`PUT` delegation to the new handler
-  (same shape as `app/api/profile/route.ts`).
-
-- **`tests/unit/app/api/notification-preferences-route.test.ts`** (new) — 22
-  tests mirroring `tests/unit/app/api/profile-route.test.ts`'s structure
-  (`jest.mock` for `@clerk/nextjs/server` and `@/lib/supabase/client`,
-  `makeReq`/`makeLookup`/`setUpAuth`/`makeSupabaseClient` helpers). The
-  Supabase fake supports an `upsertResult` fixture override so the post-upsert
-  `.select().maybeSingle()` can echo back a different row than the pre-write
-  select (needed for the "no row yet" PUT case) and an `onUpsert` capture
-  callback to assert both the written payload and that no upsert fires when a
-  request is rejected. Covers: GET with existing row / no row (defaults, no
-  upsert issued) / DB error; PUT happy path (captured merged snake_case
-  payload), empty-body no-op, insert-on-first-write, BR-14 direct violation
-  (no upsert issued), BR-14-via-merge violation, one-channel-remains-enabled
-  success, re-enabling a channel, malformed body (null/array/wrong types),
-  out-of-range `reminderHoursBefore` (0, 169, 1.5, string), unknown-key
-  stripping, missing JWT (401, no Supabase client built), and DB error (500).
-
-### `documentation/staging-environment.md` (modified)
-Added the five new secrets to §7's table (each marked "optional —
-`calendar-sync.spec.ts` skips when absent"), a note that the setlist specs
-need no secrets beyond the existing seven, and a new **§7.1 Google Calendar
-E2E (issue #66)** subsection with the human setup steps (dedicated Google
-test account + same OAuth client as staging, one-time consent flow for
-`calendar.events` scope with `access_type=offline`/`prompt=consent`,
-`E2E_TOKEN_ENCRYPTION_KEY` must equal staging's `TOKEN_ENCRYPTION_KEY`,
-`E2E_GOOGLE_CALENDAR_ID` defaults to `primary`, and the "Testing" OAuth
-publishing-status refresh-token-expiry caveat).
-
-- `bun run lint` — clean.
-- `bun run typecheck` — clean.
-- `bun run test` — full suite: 82 suites / 1062 tests passed, including the 22
-  new tests in `notification-preferences-route.test.ts`.
-
-## Notes for the Tester
-
-- No migration or RLS changes were made or are needed — the
-  `notification_preferences` table and its RLS policies already existed with
-  the PRD-matching defaults (verified in the spec's "Current state" section).
-- `chat_preference` must never appear in a `select` or upsert payload for this
-  route — worth an explicit spot-check if you write any additional tests.
-- BR-14 is deliberately checked against the **merged** state, not the raw
-  request body, so the interesting edge case is a body that only sets one
-  field but disables the last remaining enabled invitation channel because the
-  other two are already `false` in the stored row.
-- `PUT` is a partial merge (not full replace) — this is the one intentional
-  divergence from `PUT /api/profile`, called out explicitly in spec Decisions.
-- `.pipeline/spec.md` was already updated in the working tree (issue #70's
-  spec, produced by the Planning stage) before this Coding session started;
-  included in this commit as part of the normal pipeline handoff. No further
-  edits made to it by the Coding stage.
+- The three new/changed RPCs in the migration file are **not exercised by
+  CI** (per spec, "not executed by CI") — the Jest suite mocks
+  `supabase.rpc(...)` at the boundary, so RPC *behavior* (SQL logic) is only
+  verified by reading the migration, not by a passing test run. Worth a
+  careful read of `claim_guest_invitation`'s ordering (lock → idempotent
+  check → anonymized check → already-claimed check → claimability check →
+  already-in-group check → update → audit) against the spec's numbered
+  steps.
+- `createGuestInvitation`'s existing-vs-new-user branch and the orphan
+  cleanup path (delete-on-insert-failure) are the most intricate parts of
+  the handler — see the dedicated tests in
+  `tests/unit/app/api/invitations-guest-route.test.ts`.
+- The `guestHasWeekAccess` semantics (`pending`/`accepted` grant access;
+  everything else 404s) are shared across four call sites — worth
+  double-checking `app/api/events/handler.ts`'s query-builder branch (typed
+  as a mutable `let` reassigned only for guests) didn't regress
+  member/set_leader scoping.
+- UI changes in `week-view.tsx` have no new dedicated tests (not required by
+  spec) but the existing `week-view.test.tsx` / `week-view-tester-supplement.test.tsx`
+  suites still pass unmodified — worth a manual sanity check of the new
+  "Guests" section and invite-a-guest form if the Tester wants UI coverage
+  beyond what's already there.
