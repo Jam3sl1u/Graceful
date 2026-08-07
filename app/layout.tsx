@@ -25,6 +25,17 @@ export const viewport: Viewport = {
   viewportFit: "cover",
 };
 
+// middleware.ts generates a fresh CSP nonce per request and signs Next's own
+// inline bootstrap scripts with it — but Next only does that signing at
+// render time. Static prerendering (the default whenever a route has
+// nothing else forcing dynamic rendering) bakes HTML at build time with no
+// nonce, so the browser's CSP blocks those scripts and the app never
+// hydrates. Forcing dynamic rendering here, at the root, guarantees every
+// route under this layout always renders per-request and gets a valid
+// nonce; a child segment cannot opt back into static rendering once a
+// parent forces dynamic.
+export const dynamic = "force-dynamic";
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <ClerkProvider>

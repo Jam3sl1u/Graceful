@@ -62,11 +62,13 @@ const PATTERNS = [
   },
 ];
 
-// Regexes applied to the *matched text* of a candidate finding. Each entry's
-// `reason` documents why it's safe to allowlist — allowlisting on the
-// matched value (not the pattern) keeps this narrow: a real secret that
-// happens to also contain e.g. "example" as a substring would still need to
-// match the *whole* allowlist regex to be suppressed, which none of these do.
+// Regexes applied to the *matched text* of a candidate finding (substring
+// match, not whole-string — e.g. /example/i suppresses "sk_live_exampleKey"
+// just as readily as "example"). Each entry's `reason` documents why it's
+// safe to allowlist; allowlisting on the matched value (not the pattern)
+// keeps this narrower than allowlisting the pattern itself, but a real
+// secret that happens to contain one of these substrings would still be
+// suppressed — keep this list to unambiguous placeholder/test-double shapes.
 const VALUE_ALLOWLIST = [
   { regex: /placeholder/i, reason: "obvious non-secret placeholder text" },
   { regex: /example/i, reason: "obvious non-secret example/documentation value" },
@@ -101,8 +103,10 @@ const PATH_ALLOWLIST = [
 function isAllowedPath(path) {
   if (PATH_ALLOWLIST.some((entry) => entry.path === path)) return true;
   // Fixtures for this script's own tests will contain fake-secret-looking
-  // strings by design.
-  if (path.includes("check-git-secrets")) return true;
+  // strings by design. Scoped to test paths so this can't be used to exempt
+  // an unrelated file that merely has "check-git-secrets" somewhere in its
+  // path (e.g. a future scripts/check-git-secrets-old.mjs).
+  if (/(^|\/)tests\//.test(path) && path.includes("check-git-secrets")) return true;
   return false;
 }
 
@@ -154,6 +158,12 @@ function scanAddedLines() {
     "log",
     "--all",
     "--full-history",
+    // Without this, `git log -p` silently shows no diff at all for merge
+    // commits, so a secret introduced only via a merge's conflict
+    // resolution would never be scanned. `first-parent` diffs each merge
+    // against its mainline parent only (what the merge actually changed),
+    // avoiding the much noisier N-parents-per-merge output of plain `-m`.
+    "--diff-merges=first-parent",
     "--no-color",
     "-p",
     "-U0",

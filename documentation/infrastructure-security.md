@@ -50,9 +50,16 @@ every request and threaded through to Next.js via the *request* headers
 (`content-security-policy` set on `requestHeaders` before
 `NextResponse.next()`), which is how Next.js signs its own streaming inline
 scripts with that nonce — this is what makes "no inline scripts" achievable
-without `'unsafe-inline'` in `script-src`. One consequence: because the
-policy (and the nonce inside it) is generated fresh per request, pages render
-per-request rather than being fully static/cached at the CSP layer.
+without `'unsafe-inline'` in `script-src`. This only works for routes Next.js
+actually renders per-request — Next only signs inline scripts with a nonce
+at render time, so a statically prerendered route (the default whenever
+nothing else forces dynamic rendering) would ship build-time HTML with no
+nonce on its inline bootstrap scripts, which the browser's CSP would then
+block, breaking hydration entirely. `app/layout.tsx` sets
+`export const dynamic = "force-dynamic"` at the root specifically to
+guarantee every route gets a real per-request render (and thus a valid
+nonce) — this is a requirement of the nonce-based CSP design, not an
+automatic consequence of it.
 
 Full directive table (`isDev: false`, i.e. production):
 

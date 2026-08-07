@@ -4,6 +4,70 @@ Implements `.pipeline/spec.md` in full. No OPEN QUESTIONS blocked the pipeline
 (both items in the spec's OPEN QUESTIONS section are post-merge human-action
 checklist items, recorded in the new documentation file per the spec).
 
+## Fix pass — resolving the BLOCK verdict in `.pipeline/review.md`
+
+The branch was also rebased onto current `main` (via merge commit) to pick up
+issues #74–#77, which had merged after this branch diverged and were making
+the PR show as `CONFLICTING`.
+
+- **`app/layout.tsx`** — added `export const dynamic = "force-dynamic";`.
+  This is the fix for BLOCKER 1: nothing previously forced dynamic rendering,
+  so Next statically prerendered `/`, `/dashboard`, `/documents`,
+  `/notifications`, `/conflicts`, `/_not-found` at build time, shipping HTML
+  with no nonce on inline bootstrap scripts while the CSP header carried a
+  different, per-request nonce — the browser blocked every inline script and
+  the app never hydrated. Forcing dynamic rendering at the root cascades to
+  every route group, guaranteeing a real per-request render (and thus a valid
+  nonce) everywhere the CSP middleware applies. Verified empirically (not
+  just re-read): `bun run build` afterward shows `.next/prerender-manifest.json`
+  contains only `/apple-icon` and `/manifest.webmanifest` (binary/JSON
+  responses, no inline scripts, unaffected either way); a `bun run start`
+  response for `/` returns the same nonce in `content-security-policy` as on
+  all 19 inline `<script nonce="...">` tags in the served HTML.
+- **`documentation/infrastructure-security.md`** — corrected BLOCKER 2: the
+  §3 CSP section no longer claims per-request rendering was already an
+  automatic consequence of the nonce design; it now states that
+  `app/layout.tsx`'s `force-dynamic` export is what guarantees it, and why
+  that's required (Next only signs inline scripts with a nonce at render
+  time). Re-checked `middleware.ts`'s own comment for the same false
+  premise — it doesn't assert one; only the doc needed correcting.
+- **`scripts/check-git-secrets.mjs`** — three non-blocking fixes:
+  1. `isAllowedPath`'s `path.includes("check-git-secrets")` bypass is now
+     scoped to `tests/` paths only (`/(^|\/)tests\//.test(path) &&
+     path.includes(...)`), matching the spec's actual "any test file whose
+     path contains check-git-secrets" wording instead of exempting any path
+     anywhere in history containing that fragment.
+  2. The `VALUE_ALLOWLIST` comment no longer claims whole-string match
+     semantics; it now accurately describes the (intentional) substring
+     match `isAllowedValue` performs.
+  3. `scanAddedLines()`'s `git log` invocation now passes
+     `--diff-merges=first-parent`, so a secret introduced only via a merge
+     commit's conflict resolution is no longer invisible to the scan (plain
+     `git log -p` silently omits merge-commit diffs). Re-verified
+     `bun run check:git-secrets` still exits 0 clean against this repo's
+     real history with the wider coverage.
+- **`README.md` non-blocking finding — investigated, no change needed.** The
+  review asked to restore a 2-space continuation-line indent under the
+  `check:service-role` bullet. Verified in isolation
+  (`bunx prettier` on a standalone file reproducing the exact pattern) that
+  Prettier's own canonical formatting for this markdown list-continuation
+  line strips that indent — restoring it would fail `prettier --check` and
+  get stripped again on the next format pass. The originally-shipped version
+  was already Prettier-correct; this was a false positive in the review, not
+  an accidental reformat.
+- **Recreated the two test files** `tests/unit/middleware.test.ts` and
+  `tests/unit/scripts/check-git-secrets.test.ts` never made it into the PR
+  (written by the Testing stage but never `git add`ed before that worktree
+  was cleaned up — confirmed unrecoverable via `git fsck --dangling`).
+  - `tests/unit/middleware.test.ts` was reclaimed in the meantime by #76
+    (rate-limiting tests) merging first, so the CSP-specific coverage now
+    lives in a new file, **`tests/unit/middleware-csp.test.ts`** (5 tests,
+    same scenarios `.pipeline/test-results.md` originally described).
+  - **`tests/unit/scripts/check-git-secrets.test.ts`** (8 tests): the
+    original 6 scratch-repo scenarios, plus 2 new cases covering this fix
+    pass's two `check-git-secrets.mjs` behavior changes (narrowed path
+    bypass; substring-allowlist suppression still works as documented).
+
 ## Files changed
 
 - **`lib/security/csp.ts`** (new) — pure, dependency-free, edge-safe module:

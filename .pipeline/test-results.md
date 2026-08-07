@@ -1,6 +1,53 @@
 # Test Results — Issue #78: [Sprint 4] Run infrastructure security pass (HTTPS, CSP, secret scan)
 
-## Verdict: ALL PASS
+## Fix-pass verdict: ALL PASS (BLOCK from `.pipeline/review.md` resolved)
+
+Re-verified end-to-end after the fix pass described in `.pipeline/changes.md`
+(root-layout `force-dynamic`, `check-git-secrets.mjs` fixes, recreated test
+files, branch rebased onto current `main`):
+
+| Check | Command | Result |
+|---|---|---|
+| Typecheck | `bun run typecheck` | PASS |
+| Lint | `bun run lint` | PASS (pre-existing unrelated warning in generated `coverage/`) |
+| Unit tests | `bun run test` | PASS — **109 suites, 1315 tests** |
+| Format (touched files) | `bunx prettier --check` on every file this fix pass touched | PASS |
+| Git-history secret scan | `bun run check:git-secrets` | PASS — exit 0, clean, with widened merge-commit coverage |
+| Production build | `bun run build` (synthetic Clerk keys) | PASS — `.next/prerender-manifest.json` now lists only `/apple-icon` and `/manifest.webmanifest` (no HTML routes) |
+| Live hydration check | `bun run start` + `curl` on `/` | PASS — response `content-security-policy` nonce matches all 19 inline `<script nonce="...">` tags in the served HTML; this is the exact route/mechanism BLOCKER 1 reported broken |
+
+`/dashboard`, `/documents`, `/notifications`, `/conflicts` could not be
+curled all the way to a hydrated page in this sandbox — Clerk's
+`auth.protect()` needs a real dev-browser JWT handshake that synthetic keys
+can't complete, so these return a 404 rewrite with no CSP header at all
+(pre-existing sandbox limitation, same one the original test-results.md
+below already flagged for `bun run test:e2e`; unrelated to and unaffected by
+this fix). What *is* directly verified for all of them: none appear in
+`.next/prerender-manifest.json` anymore, meaning Next now renders them
+per-request through the same code path proven correct on `/`.
+
+### New/changed test coverage
+
+- **`tests/unit/middleware-csp.test.ts`** (new, 5 tests) — the CSP-specific
+  coverage originally described below under `tests/unit/middleware.test.ts`.
+  Renamed because `tests/unit/middleware.test.ts` was independently claimed
+  by #76's rate-limiting tests, which merged into `main` first (confirmed via
+  `git log -- tests/unit/middleware.test.ts`). Same 5 scenarios, unmodified
+  in substance: public route gets the header without `auth.protect()`;
+  protected route calls `auth.protect()` once and still gets the header; the
+  request-header nonce (spied via `NextResponse.next`) matches the response
+  header nonce; two requests get two different nonces; prod CSP excludes
+  `'unsafe-eval'`/`ws:` and includes `upgrade-insecure-requests`. 5/5 passed.
+- **`tests/unit/scripts/check-git-secrets.test.ts`** (new, 8 tests) — the
+  original 6 scenarios described below, plus 2 new cases added for this fix
+  pass: a path containing `check-git-secrets` outside `tests/` is still
+  scanned (proves the narrowed path bypass), and a value containing an
+  allowlist substring like `example` mid-string is still suppressed (locks
+  in the documented substring-match behavior). 8/8 passed.
+
+---
+
+## Original verdict: ALL PASS
 
 Independently re-ran every verification `.pipeline/changes.md` claimed, from a
 clean `node_modules` (this worktree had none checked out — ran `bun install`
