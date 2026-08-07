@@ -246,7 +246,7 @@ export default function InviteResponse({ token }: { token: string }) {
     return (
       <main className={styles.container}>
         <h1>{unavailableMessageOverride ?? UNAVAILABLE_MESSAGES[unavailableReason]}</h1>
-        <a className={styles.appLink} href="/dashboard">
+        <a className={styles.appLink} href={appLink}>
           Go to the app
         </a>
       </main>
