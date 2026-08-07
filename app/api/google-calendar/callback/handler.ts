@@ -34,6 +34,10 @@ export async function callback(req: NextRequest, lookup?: UserLookup): Promise<R
   try {
     const ctx = await requireAuth(req, lookup);
 
+    // Object.fromEntries resolves a duplicate query param last-wins, vs. the
+    // previous searchParams.get() calls here which were first-wins. Google's
+    // OAuth redirect never sends duplicates for these params, so this is an
+    // accepted, no-impact behavior delta from adopting schema validation.
     const parsedQuery = googleCalendarCallbackQuerySchema.safeParse(
       Object.fromEntries(req.nextUrl.searchParams),
     );

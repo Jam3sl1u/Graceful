@@ -161,7 +161,7 @@ touched — see "Known deliberate gap" below.
 | `app/api/service-weeks/[id]/setlist/route.ts` | GET, POST | — | — | raw `id`, no schema (OUT OF SCOPE) |
 | `app/api/service-weeks/route.ts` | GET, POST | POST: `createServiceWeekSchema` | — | — |
 | `app/api/setlists/[id]/publish/route.ts` | POST | — | — | raw `id`, no schema (OUT OF SCOPE) |
-| `app/api/setlists/[id]/route.ts` | GET, PUT (reorder) | PUT: `reorderSetlistSchema` | — | raw `id`, no schema (OUT OF SCOPE) |
+| `app/api/setlists/[id]/route.ts` | GET, PUT (reorder) | PUT: `reorderSetlistSchema` (`songs` bounded `.min(1).max(50)`) | — | raw `id`, no schema (OUT OF SCOPE) |
 | `app/api/setlists/[id]/songs/[songId]/route.ts` | DELETE | — | — | raw `id`/`songId`, no schema (OUT OF SCOPE) |
 | `app/api/setlists/[id]/songs/route.ts` | POST | `addSetlistSongSchema` | — | raw `id`, no schema (OUT OF SCOPE) |
 | `app/api/setlists/[id]/unlock/route.ts` | POST | — | — | raw `id`, no schema (OUT OF SCOPE) |
