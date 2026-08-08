@@ -1,192 +1,147 @@
-# Review — Issue #78: [Sprint 4] Infrastructure security pass (HTTPS, CSP, secret scan)
+# Review — Issue #79: [Sprint 4] Conduct manual OWASP Top 10 review
 
-VERDICT: SHIP (fix pass applied — see below; original BLOCK review preserved beneath)
+VERDICT: NEEDS WORK
 
-## Fix-pass resolution
+## Summary
 
-Every item below was addressed and independently re-verified; see
-`.pipeline/changes.md`'s "Fix pass" section and `.pipeline/test-results.md`'s
-matching section for the full detail. Summary:
+The primary deliverable is genuinely good. I independently spot-checked the
+review document's load-bearing claims against the actual source rather than
+trusting its prose, and every one I checked held up (details below). The gate
+script, its tests, and the three wiring edits all match the spec. The tests are
+real subprocess tests with real fixtures and real exit-code assertions — not
+superficial.
 
-- **BLOCKER 1 (nonce CSP breaks prerendered routes) — fixed and verified.**
-  `app/layout.tsx` now forces dynamic rendering site-wide
-  (`export const dynamic = "force-dynamic"`), which is the exact fix this
-  review suggested. Re-ran the same empirical check this review used to find
-  the bug: `bun run build` → `.next/prerender-manifest.json` no longer lists
-  any HTML route; `bun run start` + `curl /` shows the response
-  `content-security-policy` nonce matching all 19 inline
-  `<script nonce="...">` tags in the served HTML. `/dashboard` and the other
-  three authenticated routes are confirmed out of the prerender manifest
-  (same fix, same mechanism as `/`) but couldn't be curled to a fully
-  hydrated page in this sandbox — Clerk's `auth.protect()` needs a real
-  dev-browser JWT handshake unavailable with synthetic keys, a pre-existing
-  environment limitation unrelated to this fix (that response carries no CSP
-  header at all, so there's no nonce mismatch to break).
-- **BLOCKER 2 (false "renders per-request" premise) — fixed.**
-  `documentation/infrastructure-security.md`'s §3 now states the real
-  mechanism: the nonce only works for routes Next renders per-request, which
-  is why `app/layout.tsx` explicitly forces that. `middleware.ts`'s own
-  comment was re-checked and doesn't assert the false premise — only the doc
-  needed correcting.
-- **Non-blocking 1 (untracked test files)** — fixed. Both recreated and
-  committed. `tests/unit/middleware.test.ts` was reclaimed by #76's
-  rate-limiting tests (merged first), so the CSP coverage now lives in
-  `tests/unit/middleware-csp.test.ts` (5 tests). `tests/unit/scripts/check-git-secrets.test.ts`
-  recreated with 8 tests (original 6 + 2 new, covering this fix pass's own
-  script changes).
-- **Non-blocking 2 (README de-indent)** — investigated, **not a real bug**.
-  Verified in isolation that Prettier's own canonical formatting for this
-  markdown list-continuation line strips the indent regardless; restoring it
-  would fail `prettier --check`. The originally-shipped version was already
-  correct. No change made.
-- **Non-blocking 3 (allowlist comment inaccurate)** — fixed. Comment
-  corrected to describe the actual (intentional) substring-match behavior
-  instead of claiming whole-match semantics.
-- **Non-blocking 4 (path bypass broader than spec)** — fixed. Scoped to
-  `tests/` paths only, matching the spec's "any test file whose path
-  contains check-git-secrets" wording.
-- **Non-blocking 5 (merge commits not scanned)** — fixed beyond what was
-  asked (the original review only asked this be documented as a known
-  limitation): `scanAddedLines()` now passes `--diff-merges=first-parent`,
-  so merge-commit diffs are actually scanned. Re-verified
-  `bun run check:git-secrets` still exits 0 clean against real history.
+Three things must be fixed before a human sees this PR. None is a security
+regression; two are integrity problems with the deliverable itself (a diff a
+human cannot read, and a gate that fails open), and one is lost work.
 
-Additionally, the branch itself was stale (forked before #74–#77 merged,
-`gh pr view` showed `CONFLICTING`/`DIRTY`) and has been synced with current
-`main`; `git diff main --stat` now shows only this issue's own files.
+## What I verified independently (all confirmed)
 
-Full test suite: 109 suites / 1315 tests, all passing. Typecheck, lint,
-format (touched files), and the git-secret scan are all clean.
+- A01-1's "28 handler.ts modules": `find app/api -name handler.ts | wc -l` = 28,
+  and all 28 match `requireAuth|requireRole`. Zero unprotected handlers. Claim exact.
+- A02-5 / A07-5: `app/api/cron/invitation-reminders/route.ts:25` really does
+  compare the bearer header with `!==`. Not fabricated.
+- A02-5's mitigation claim: `resolveTier` really does map
+  `/api/cron/invitation-reminders` to `sms`, and `sms` really is
+  `{ limit: 5, windowMs: 60_000 }` (`lib/api/rate-limit.ts:40,73`).
+- A02-3: `SIGNED_URL_EXPIRY_SECONDS = 30 * 60`, passed to both signers.
+- A05-7: `poweredByHeader` is genuinely absent from `next.config.ts`.
+- A07-3: `const store = new Map(...)` at `lib/api/rate-limit.ts:123`. Confirmed.
+- A07-4: the `x-forwarded-for` trust-boundary comment really is in the source.
+- A03-1 / A03-4: re-ran both greps; zero matches each.
+- Wiring diffs (`package.json`, `.github/workflows/ci.yml`, `README.md`) match
+  the spec's required edits in placement and style.
+- The doc, the script, and the coder's test file are all Prettier-clean.
 
----
+## Must fix
 
-## Original review (BLOCK) — preserved for context
+### 1. `scripts/check-owasp-review.mjs` contains two raw NUL bytes, so git treats the file as binary
 
-The diff matches the spec almost line for line, and every test in the pipeline is
-green — but the CSP as shipped **breaks the six statically prerendered routes in
-production**. This was verified empirically against this worktree's own
-production build, not inferred.
+Confirmed firsthand, not just taken from `.pipeline/test-results.md`:
 
----
+- `git show HEAD:scripts/check-owasp-review.mjs | od -c` shows two 0x00 bytes
+  inside the `PLACEHOLDER` string literal on line 30.
+- `git diff main...HEAD --stat` reports
+  `scripts/check-owasp-review.mjs | Bin 0 -> 6359 bytes`.
 
-## BLOCKER 1 — Nonce-based CSP blocks all inline scripts on prerendered routes
+Line 30 is committed with literal 0x00 bytes rather than escape sequences.
+Behavior is unaffected, but the consequence is that the **only new executable
+file in this PR — the script that gates the Phase 1 launch — renders as an
+unreadable binary blob in `git diff`, `git show`, and GitHub's PR diff view.**
+A human reviewer will never see its 189 lines. That defeats the point of
+shipping a reviewable gate.
 
-**Where:** `middleware.ts` + `lib/security/csp.ts` (interaction with Next's full
-route cache), documented incorrectly in `documentation/infrastructure-security.md:53-55`.
+Fix: replace each of the two raw NUL bytes in that string literal with the
+six-character JavaScript escape sequence `\u0000` (backslash, u, 0, 0, 0, 0),
+so line 30 reads:
 
-**Evidence (reproduced live, `next start` on the build in `.next/`):**
+    const PLACEHOLDER = "\u0000ESCAPED_PIPE\u0000";
 
-`GET /` (public, in `prerender-manifest.json`):
+This is behavior-identical — the runtime string is unchanged, so the sentinel
+keeps its collision resistance — but the source file becomes plain ASCII.
+Re-verify afterwards that
+`git diff main...HEAD -- scripts/check-owasp-review.mjs` renders as a normal
+unified diff.
 
-```
-x-nextjs-cache: HIT
-x-nextjs-prerender: 1
-content-security-policy: ... script-src 'self' 'nonce-ZnyOrs6hRXU0rnC+rl+RTQ==' ... (no 'unsafe-inline')
-```
+### 2. The gate fails open when a category section has more than one findings table
 
-and the body it served:
+`findFindingsTable()` (`scripts/check-owasp-review.mjs:52-75`) returns on the
+**first** table whose header first cell is `ID` and ignores every later one in
+the same section. I demonstrated the fail-open with a fixture containing, inside
+the A01 section, a clean first table followed by a second table holding
+`| A01-9 | Critical | Open | RCE in prod | ... |`. Result:
 
-```
-<script>(self.__next_f=self.__next_f||[]).push([0])</script>
-<script>self.__next_f.push([1,"0:{\"P\":null,...
-```
+    OK: OWASP review complete — 5 findings, 0 blocking.   exit=0
 
-— 8 inline `<script>` tags, **zero `nonce` attributes** (the RSC payload even
-carries `"nonce":""` for ClerkProvider). Compare `GET /sign-in` (dynamically
-rendered), which is correct:
+A `Critical` + `Open` finding sits in the document and the launch gate reports
+zero blocking. For a gate whose entire job is to fail closed, silently skipping
+rows is the wrong default — and it is a plausible future edit (someone splits a
+category into "resolved" and "open" tables). The spec's parsing note says "Only
+parse **tables** whose header row's first cell is exactly `ID`" (plural), so this
+is also a spec deviation, not just a judgment call.
 
-```
-<script nonce="DpU+fmZEjH9CB6g9VNGY0A==">
-```
+Fix in `scripts/check-owasp-review.mjs`: collect **all** ID-headed tables within
+a section and validate the union of their data rows (or, on the stricter
+reading, treat "more than one ID table in a category section" as its own
+violation). Add a test to `tests/unit/scripts/check-owasp-review.test.ts` for
+the fixture above — a second table with a `Critical`/`Open` row must exit 1.
 
-**Why:** Next reads the nonce out of the *request* `content-security-policy`
-header at **render** time (`node_modules/next/dist/server/app-render/app-render.js:108-119`).
-Statically prerendered routes are rendered at build time, when no such header
-exists, and are then served from the full route cache with a fresh per-request
-nonce in the response header that matches nothing in the HTML. With no
-`'unsafe-inline'` in `script-src`, the browser blocks every one of those inline
-scripts, `self.__next_f` never populates, and the App Router never hydrates.
+### 3. The testing stage's work is uncommitted and will be lost
 
-**Affected routes** (from `.next/prerender-manifest.json`): `/`, `/dashboard`,
-`/documents`, `/notifications`, `/conflicts`, `/_not-found` — i.e. the landing
-page and the four main authenticated pages. On Vercel this is the same or worse
-(CDN-served prerendered HTML + middleware-generated nonce).
+`git status --short` shows `.pipeline/test-results.md` modified and
+`tests/unit/scripts/check-owasp-review-tester-supplement.test.ts` untracked.
+The 8 supplemental tests pass (I ran `bun run test tests/unit/scripts/`:
+3 suites, 25 tests green) but neither the tests nor the report is in the commit.
+Commit both.
 
-**Fix (coder's call, but it must be verified end-to-end, not by unit test):**
-- Simplest: opt the app out of static prerendering while a nonce CSP is in play
-  (e.g. `export const dynamic = "force-dynamic"` in `app/layout.tsx`), then
-  confirm `bun run build` reports no statically prerendered app routes and that
-  a `next start` response for `/` shows `<script nonce="...">` matching the
-  response header.
-- Alternative: keep static prerendering and stop using a per-request nonce
-  (hash-based / `'strict-dynamic'`) — significantly more fragile; only take this
-  if you verify it against the built output.
-- Do **not** "fix" this by adding `'unsafe-inline'` to `script-src` — that
-  violates the issue's acceptance criteria.
+Also: that supplement file is **not** Prettier-clean — it takes `format:check`
+from 96 pre-existing failures to 97. CI does not run `format:check`, so this
+will not break the build, but it is a new failure attributable to this branch,
+and `.pipeline/test-results.md`'s "none of the files this issue touched appear
+in the failing list" becomes inaccurate once that file is committed. Run
+`bunx prettier --write` on it before committing.
 
-**Regression coverage to add:** a check that actually inspects served HTML (or a
-build-time assertion that no app route is statically prerendered). The current
-`tests/unit/middleware.test.ts` only asserts on the header string, which is why
-5/5 green tests missed a total production breakage.
+## Should fix (document accuracy — this doc is a security record)
 
-## BLOCKER 2 — Documentation asserts the false premise
+### 4. A02-4 overstates token entropy
 
-`documentation/infrastructure-security.md:53-55` states "because the policy (and
-the nonce inside it) is generated fresh per request, pages render per-request
-rather than being fully static/cached at the CSP layer." That is not true today —
-`x-nextjs-cache: HIT` / `x-nextjs-prerender: 1` on `/` proves it. The comment
-block in `middleware.ts:33-36` ("this is what makes 'no inline scripts'
-achievable without 'unsafe-inline'") is likewise only true for dynamically
-rendered routes. Both must be corrected as part of the fix, since this wrong
-assumption is what let the bug through.
+The doc says the invitation `response_token` has "**256 bits of randomness**".
+It is two `crypto.randomUUID()` v4 values concatenated
+(`app/api/invitations/handler.ts:55`). UUIDv4 fixes 6 bits for version+variant,
+so this is **244 bits of entropy** in a 256-bit (64-hex-char) representation.
+Still far beyond adequate — but a security review document should not round
+entropy up. Change to "244 bits of entropy (two UUIDv4s, 122 bits each) in a
+64-hex-char column".
 
----
+### 5. A02-4 omits expiry, which the spec explicitly asked it to assess
 
-## Non-blocking issues (fix while you're in here)
+The spec named "entropy, expiry, single-use" for the response-token row. The doc
+covers entropy and single-use but says nothing about expiry. Expiry does exist —
+`invitations.response_deadline`, with `accept_invitation`/`deny_invitation`
+raising `EXPIRED` and `get_invitation_by_token` computing an `expired` status —
+but every check is guarded by `response_deadline IS NOT NULL`
+(`20260712000002_get_invitation_by_token_rpc.sql:63`) and the column is
+nullable. An invitation created with a NULL deadline carries a bearer token that
+never expires. Add a sentence to A02-4 covering the expiry mechanism and this
+NULL case (Info/Low is a fine severity — do not inflate it).
 
-1. **Tester's new test files are untracked.** `tests/unit/middleware.test.ts` and
-   `tests/unit/scripts/check-git-secrets.test.ts` are not committed
-   (`git status` shows `??`). They will not land in the PR as-is. Commit them.
-2. **`README.md` unintended reformat.** The change de-indented an unrelated
-   continuation line:
-   ```
-   -  check:service-role`) and re-verified in the Sprint 4 security audit (#79).
-   +check:service-role`) and re-verified in the Sprint 4 security audit (#79).
-   ```
-   Renders the same (lazy continuation) but the spec said "nothing else in
-   README.md changes". Restore the two-space indent.
-3. **`scripts/check-git-secrets.mjs:109` — allowlist comment is inaccurate.**
-   The comment claims a value "would still need to match the *whole* allowlist
-   regex to be suppressed"; `VALUE_ALLOWLIST` entries are applied with
-   `regex.test(matched)`, i.e. substring matching. A real secret containing
-   `example`/`xxxx` as a substring would be silently suppressed. Either anchor
-   the allowlist regexes or correct the comment.
-4. **`scripts/check-git-secrets.mjs:105` — path bypass is broader than spec.**
-   The spec asked for "any *test file* whose path contains `check-git-secrets`";
-   the implementation exempts *any* path containing that fragment, which is a
-   trivially nameable scanner bypass. Narrow it (e.g. require a `tests/` prefix).
-5. **Merge commits are not scanned.** `git log --all -p` emits no diff for merge
-   commits, so a secret introduced in a conflict resolution is invisible to the
-   added-line scan. Acceptable as a known limitation, but it should be stated in
-   `documentation/infrastructure-security.md` rather than left implicit under the
-   "scans the *entire* history" claim in the script header.
+## Not blocking, noted for the record
 
-## What is correct and verified
+- The gate's policy is unenforceable by construction: whoever writes the doc
+  chooses each finding's `Severity` and `Status`, so `check:owasp` proves the
+  document is internally consistent, not that the review was honest. The spec is
+  aware of this ("do not downgrade a severity to make the check pass"). Nothing
+  to fix; the human sign-off in #83 is the real control.
+- The "no application-code changes" policy was honored — the diff touches only
+  `documentation/`, `scripts/`, `tests/`, `package.json`,
+  `.github/workflows/ci.yml`, `README.md`. Nothing under `app/**`, `lib/**`,
+  `schemas/**`, `supabase/**`. Confirmed.
+- `format:check`'s 96 pre-existing failures are genuinely pre-existing and out
+  of scope for this issue.
 
-- HSTS: live response carries `Strict-Transport-Security: max-age=63072000;
-  includeSubDomains; preload` on `/`; `next.config.ts` shape is valid (build
-  succeeds).
-- `lib/security/csp.ts` matches the spec's directive table exactly (order,
-  tokens, `isDev` gating, `clerkOrigin: null` handling); verified against the
-  live header, which correctly resolved `https://clean-mayfly-62.clerk.accounts.dev`
-  from the publishable key.
-- `scripts/check-git-secrets.mjs`: re-ran the tester's scratch-repo suite —
-  fake `sk_live_` key, committed `.env` (even when later deleted), `.env.example`
-  not flagged, shallow clone refused, non-git dir refused. Redaction never leaks
-  the matched value. Exits 0 on this repo's real history. The two extra
-  `VALUE_ALLOWLIST` entries are genuinely Jest fixtures.
-- `.github/workflows/ci.yml` (`git-secret-scan` with `fetch-depth: 0`) and
-  `.github/dependabot.yml` match the spec; no existing CI job touched.
-- `bun run typecheck`, `bun run lint`, and the 24 security-related unit tests
-  pass; every file this issue touches is Prettier-clean (repo-wide
-  `format:check` drift is pre-existing and correctly left alone).
+## Re-review scope
+
+Items 1, 2, and 3 are required. Items 4 and 5 are one-line documentation edits
+and should ride along. After the fix, re-run `bun run check:owasp`,
+`bun run test`, and confirm
+`git diff main...HEAD -- scripts/check-owasp-review.mjs` renders as text.
