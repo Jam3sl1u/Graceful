@@ -14,8 +14,15 @@ import type { UserRole } from "@/types/domain";
 
 const mockAuth = auth as unknown as jest.Mock;
 
-const DEFAULT_USER_ID = "user-1";
-const DEFAULT_CHURCH_GROUP_ID = "group-1";
+// Promoted to exports (issue #80) so registry assertions and the harness
+// cannot drift apart — makeLookup still uses these as its defaults.
+export const DEFAULT_USER_ID = "user-1";
+export const DEFAULT_CHURCH_GROUP_ID = "group-1";
+
+/** The "victim" tenant. Must never appear in any handler's DB interaction
+ *  when the caller's AuthContext belongs to DEFAULT_CHURCH_GROUP_ID. */
+export const VICTIM_CHURCH_GROUP_ID = "group-victim-2";
+export const VICTIM_USER_ID = "user-victim-2";
 
 // Injectable lookup returning a fixed AuthContext for the given role.
 // Mirrors the makeLookup() duplicated in the existing handler tests.
@@ -27,6 +34,28 @@ export function makeLookup(role: UserRole, overrides?: Partial<AuthContext>): Us
     ...overrides,
   };
   return async () => ctx;
+}
+
+/** Models an expired/absent Supabase template JWT: the Clerk session resolves
+ *  but the DB-backed lookup yields no AuthContext -> requireAuth throws 401. */
+export function makeNullLookup(): UserLookup {
+  return async () => null;
+}
+
+/** NextRequest double covering the three things handlers read: query params
+ *  (nextUrl.searchParams / nextUrl.pathname), a JSON body, and headers. */
+export function makeApiReq(opts?: {
+  query?: Record<string, string>;
+  body?: unknown;
+  headers?: Record<string, string>;
+}): NextRequest {
+  const searchParams = new URLSearchParams(opts?.query ?? {});
+  return {
+    nextUrl: { searchParams, pathname: "/api/test" },
+    json: jest.fn().mockResolvedValue(opts?.body),
+    headers: new Headers(opts?.headers ?? {}),
+    method: "GET",
+  } as unknown as NextRequest;
 }
 
 // Configure the module-mocked auth() (from "@clerk/nextjs/server") as a

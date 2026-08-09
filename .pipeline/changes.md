@@ -1,233 +1,195 @@
-# Changes — Issue #78: [Sprint 4] Run infrastructure security pass (HTTPS, CSP, secret scan)
+# Changes — Issue #80: Full auth-bypass & RLS-bypass test suite (all Phase 1 tables)
 
-Implements `.pipeline/spec.md` in full. No OPEN QUESTIONS blocked the pipeline
-(both items in the spec's OPEN QUESTIONS section are post-merge human-action
-checklist items, recorded in the new documentation file per the spec).
-
-## Fix pass — resolving the BLOCK verdict in `.pipeline/review.md`
-
-The branch was also rebased onto current `main` (via merge commit) to pick up
-issues #74–#77, which had merged after this branch diverged and were making
-the PR show as `CONFLICTING`.
-
-- **`app/layout.tsx`** — added `export const dynamic = "force-dynamic";`.
-  This is the fix for BLOCKER 1: nothing previously forced dynamic rendering,
-  so Next statically prerendered `/`, `/dashboard`, `/documents`,
-  `/notifications`, `/conflicts`, `/_not-found` at build time, shipping HTML
-  with no nonce on inline bootstrap scripts while the CSP header carried a
-  different, per-request nonce — the browser blocked every inline script and
-  the app never hydrated. Forcing dynamic rendering at the root cascades to
-  every route group, guaranteeing a real per-request render (and thus a valid
-  nonce) everywhere the CSP middleware applies. Verified empirically (not
-  just re-read): `bun run build` afterward shows `.next/prerender-manifest.json`
-  contains only `/apple-icon` and `/manifest.webmanifest` (binary/JSON
-  responses, no inline scripts, unaffected either way); a `bun run start`
-  response for `/` returns the same nonce in `content-security-policy` as on
-  all 19 inline `<script nonce="...">` tags in the served HTML.
-- **`documentation/infrastructure-security.md`** — corrected BLOCKER 2: the
-  §3 CSP section no longer claims per-request rendering was already an
-  automatic consequence of the nonce design; it now states that
-  `app/layout.tsx`'s `force-dynamic` export is what guarantees it, and why
-  that's required (Next only signs inline scripts with a nonce at render
-  time). Re-checked `middleware.ts`'s own comment for the same false
-  premise — it doesn't assert one; only the doc needed correcting.
-- **`scripts/check-git-secrets.mjs`** — three non-blocking fixes:
-  1. `isAllowedPath`'s `path.includes("check-git-secrets")` bypass is now
-     scoped to `tests/` paths only (`/(^|\/)tests\//.test(path) &&
-     path.includes(...)`), matching the spec's actual "any test file whose
-     path contains check-git-secrets" wording instead of exempting any path
-     anywhere in history containing that fragment.
-  2. The `VALUE_ALLOWLIST` comment no longer claims whole-string match
-     semantics; it now accurately describes the (intentional) substring
-     match `isAllowedValue` performs.
-  3. `scanAddedLines()`'s `git log` invocation now passes
-     `--diff-merges=first-parent`, so a secret introduced only via a merge
-     commit's conflict resolution is no longer invisible to the scan (plain
-     `git log -p` silently omits merge-commit diffs). Re-verified
-     `bun run check:git-secrets` still exits 0 clean against this repo's
-     real history with the wider coverage.
-- **`README.md` non-blocking finding — investigated, no change needed.** The
-  review asked to restore a 2-space continuation-line indent under the
-  `check:service-role` bullet. Verified in isolation
-  (`bunx prettier` on a standalone file reproducing the exact pattern) that
-  Prettier's own canonical formatting for this markdown list-continuation
-  line strips that indent — restoring it would fail `prettier --check` and
-  get stripped again on the next format pass. The originally-shipped version
-  was already Prettier-correct; this was a false positive in the review, not
-  an accidental reformat.
-- **Recreated the two test files** `tests/unit/middleware.test.ts` and
-  `tests/unit/scripts/check-git-secrets.test.ts` never made it into the PR
-  (written by the Testing stage but never `git add`ed before that worktree
-  was cleaned up — confirmed unrecoverable via `git fsck --dangling`).
-  - `tests/unit/middleware.test.ts` was reclaimed in the meantime by #76
-    (rate-limiting tests) merging first, so the CSP-specific coverage now
-    lives in a new file, **`tests/unit/middleware-csp.test.ts`** (5 tests,
-    same scenarios `.pipeline/test-results.md` originally described).
-  - **`tests/unit/scripts/check-git-secrets.test.ts`** (8 tests): the
-    original 6 scratch-repo scenarios, plus 2 new cases covering this fix
-    pass's two `check-git-secrets.mjs` behavior changes (narrowed path
-    bypass; substring-allowlist suppression still works as documented).
+Test-only change (per spec Assumption 3): nothing under `app/`, `lib/`,
+`schemas/`, `middleware.ts`, or `supabase/` was touched.
 
 ## Files changed
 
-- **`lib/security/csp.ts`** (new) — pure, dependency-free, edge-safe module:
-  - `clerkFrontendApiOrigin(publishableKey)` — derives `https://<host>` from a
-    `pk_test_`/`pk_live_` Clerk key by base64-decoding the payload up to the
-    first `$`; returns `null` for any invalid/undefined/garbage input.
-  - `generateNonce()` — 16 random bytes via `crypto.getRandomValues`,
-    base64-encoded via `btoa`.
-  - `buildContentSecurityPolicy({ nonce, clerkOrigin, isDev })` — builds the
-    single-line CSP header value per the directive table in the spec
-    (`script-src`/`connect-src` include the Clerk origin only when non-null;
-    `'unsafe-eval'`/`ws:` only when `isDev`; `upgrade-insecure-requests`
-    omitted when `isDev`).
+- `tests/support/api-auth.ts` (MODIFY) — promoted `DEFAULT_USER_ID` /
+  `DEFAULT_CHURCH_GROUP_ID` to exports; added `VICTIM_CHURCH_GROUP_ID` /
+  `VICTIM_USER_ID` constants, `makeNullLookup()` (models an expired/absent
+  Supabase-template JWT), and `makeApiReq()` (generic `NextRequest` double
+  covering query params, JSON body, headers).
+- `tests/support/recording-supabase.ts` (CREATE) — generic Supabase client
+  double (`Proxy`-based) that records every table/rpc/argument string that
+  reaches it, used to sweep ~60 handlers without per-handler chain mocks.
+  Self-tested at the top of `auth-bypass-matrix.test.ts`.
+- `tests/support/admin-route-registry.ts` (CREATE) — single source of truth
+  for the AC-1 sweep: every exported handler that takes a `UserLookup`
+  (`ADMIN_ROUTE_REGISTRY`), with `allowedRoles`, `scope`, and an `invoke()`
+  that addresses another tenant's resources. Also carries three optional,
+  per-entry, documented escape hatches discovered while making the sweep
+  green against real handler behavior — see "Registry exceptions" below.
+- `tests/unit/app/api/auth-bypass-matrix.test.ts` (CREATE, AC-1) —
+  `describe.each(ADMIN_ROUTE_REGISTRY)` sweep: no-token (401), two
+  expired-token variants (401), insufficient-role (403) for every
+  disallowed role, and the cross-tenant-admin case (tenant scope must come
+  from `ctx`, never the request). Plus explicit coverage for the
+  non-registry routes (`claimGuestInvitation`, `PUT /api/church-group`,
+  `POST /api/church-group/join`, `GET /api/cron/invitation-reminders`).
+- `tests/unit/schemas/input-validation-injection.test.ts` (CREATE, AC-3) —
+  Part A: every free-text string field of every exported Zod object schema
+  in `schemas/*.ts`, swept against a SQLi/XSS/null-byte/Unicode payload
+  corpus, asserting reject-or-verbatim-survival plus oversized/empty
+  rejection and enum-field rejection. Part B: extends
+  `escapePostgrestFilterValue`'s existing test corpus. Part C: behavioral
+  test of `createGuestInvitation`'s `escapeLikePattern` use.
+- `tests/unit/middleware-rate-limit-matrix.test.ts` (CREATE, AC-4) — sweeps
+  the `auth`, `sms`, `invite`, and `write` tiers (see spec Assumption 1 for
+  why not a job-submission tier) across 8 representative routes, plus four
+  budget-isolation cases including the pipeline-contract-required failure
+  case (exhausting one identifier's budget must not affect another's).
+- `tests/integration/rls/jwt.ts` (MODIFY) — `TestClaims` gained
+  `expiresInSeconds` (negative → already-expired token, also back-dates
+  `iat`) and `signingSecret` (forged-signature tests). `mintJwt`'s existing
+  behavior is byte-identical when both are omitted.
+- `tests/integration/rls/client.ts` (MODIFY) — added `getAnonClient()`, an
+  anon-key client with no `Authorization` header.
+- `tests/integration/rls/tables/phase1-token-bypass.test.ts` (CREATE, AC-2)
+  — `PHASE1_TABLES` (19 tables). Block A (coverage pin) runs unconditionally
+  without RLS env vars: asserts the list has exactly 19 entries and that
+  every one is referenced in `cross-tenant-bypass.test.ts`. Blocks B/C/D
+  (each `it.each(PHASE1_TABLES)`, gated behind the existing RLS skip guard):
+  unauthenticated caller, expired Church-A JWT, wrong-signature JWT — all
+  must be blocked on every table. Block E: three named trust-boundary
+  characterization tests (not a sweep) — see SECURITY FINDINGS.
 
-- **`middleware.ts`** (modified) — `isPublicRoute`, the `clerkMiddleware`
-  wrapper, the auth behavior, and the exported `config` matcher are
-  unchanged. Added: generate a nonce + CSP per request, stamp the CSP onto
-  the *request* headers before `NextResponse.next()` (so Next.js can sign its
-  own streaming inline scripts with the nonce), then set the same CSP on the
-  *response* headers. Comment explains the redirect-short-circuit edge case
-  (an `auth.protect()` redirect carries no CSP header — acceptable, empty
-  body). No `x-nonce` header added (no app code reads it — would be unused
-  scope creep).
+## Registry exceptions (tests/support/admin-route-registry.ts)
 
-- **`next.config.ts`** (modified) — added `async headers()` returning one
-  entry: `source: "/:path*"` with
-  `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`.
-  `reactStrictMode`, `outputFileTracingRoot`, `eslint.dirs` untouched. CSP is
-  deliberately NOT here (must be per-request/nonce-based, middleware-only).
+While wiring the sweep against real handler behavior, three classes of
+handler turned out not to fit the generic sweep's implicit assumptions.
+Each is called out with a `RouteEntry` field and an inline comment at the
+specific entry (not applied blanket) — the negative "no victim id ever
+leaks" assertion always still runs for every entry; only inapplicable
+positive assertions are skipped, each with a stated, verified reason:
 
-- **`scripts/check-git-secrets.mjs`** (new) — git-history secret scanner,
-  following `check-service-role.mjs`'s exit-code convention and
-  `check-workflows.mjs`'s `execFileSync` usage (node builtins only, no `bun
-  install` needed):
-  1. Fails if not inside a git work tree.
-  2. Fails (with an explanatory message) if the repo is a shallow clone —
-     `git rev-parse --is-shallow-repository`.
-  3. Added-line scan over `git log --all --full-history -p -U0` output,
-     matching `PATTERNS` (Clerk secret keys, Resend API keys, Google OAuth
-     client secrets, AWS/R2 access key IDs, PEM private key blocks, JWTs, and
-     assigned secret env vars from the 20 secret-bearing names in
-     `.env.example`).
-  4. Committed-`.env*`-file scan via `git log --diff-filter=A --name-only`,
-     flagging any added `.env`/`.env.*` path except `.env.example`.
-  5. Findings print to stderr as `<sha> <path> - <patternName>:
-     <redacted>` and exit 1; a clean scan prints `OK: ...` and exits 0.
-     Redaction is always `<first 4 chars>…(len=<n>)` — the matched secret
-     itself is never printed.
-  - Two allowlists, each entry carrying a `reason`: `VALUE_ALLOWLIST`
-    (matched-text regexes) and `PATH_ALLOWLIST` (the script's own path, plus
-    any path containing `check-git-secrets` for that script's own test
-    fixtures — nothing broader; `.pipeline/**` and `documentation/**` stay in
-    scope).
-  - **Deliberate deviation from the `check-service-role.mjs` `REPO_ROOT`
-    pattern:** this script does NOT hardcode `cwd` to its own location.
-    Instead it lets `git` auto-discover the repository from the process's
-    actual working directory. This is what makes the "exits 1 against a
-    scratch git repo with a fake key" test case in the spec's verification
-    section actually work — hardcoding `cwd` to this repo's root would make
-    the script always scan *this* repo regardless of where/against what it's
-    invoked, which would make that test case impossible to satisfy without
-    copying the script into the scratch repo first.
-  - Added `"check:git-secrets": "node scripts/check-git-secrets.mjs"` to
-    `package.json` scripts.
+- `touchesSupabase: false` — `adminOnlyExample` and `google-calendar/connect`
+  never call `getSupabaseClient`/`getAnonSupabaseClient` on any path
+  (verified by reading the handler source), so there is no tenant-scoped DB
+  call to inspect and no stale-JWT re-check to break.
+- `authFailureIsRedirect: true` — `google-calendar/callback` always responds
+  with an HTTP redirect, never JSON, on any failure (its own file-header
+  comment says so explicitly); the sweep asserts a 3xx redirect instead of a
+  401 JSON body for that entry's auth-failure cases.
+- `ownScopeAssertion: false` — `getAuditLog`, `deleteMember`, and
+  `acceptInvitation` scope entirely via RLS and/or a SECURITY DEFINER RPC
+  that derives identity from the JWT server-side, with no literal
+  `ctx.churchGroupId`/`ctx.userId` argument in the call for the positive
+  "own scope id present" check to find. See SECURITY FINDINGS below.
+- `GET /api/availability?user_id=<other>` also gets `ownScopeAssertion: false`
+  — not a defense-in-depth gap, see SECURITY FINDINGS item 2.
 
-- **`.github/workflows/ci.yml`** (modified) — added a new top-level
-  `git-secret-scan` job (checkout with `fetch-depth: 0`, `setup-bun`, `bun
-  run check:git-secrets`, no `bun install` step). Every existing job,
-  including `check-secrets` (Actions-secret availability — unrelated,
-  untouched), is unchanged.
+These exceptions were only added after every one of the 60 registry entries
+was run and each failure traced back to actual handler source, not assumed.
 
-- **`.github/dependabot.yml`** (new) — weekly `bun` (root manifest) and
-  `github-actions` update checks, each capped at 5 open PRs. Header comment
-  notes this repo uses Bun exclusively per `AGENTS.md`.
+## SECURITY FINDINGS
 
-- **`documentation/infrastructure-security.md`** (new) — follows
-  `documentation/staging-environment.md`'s house style. Sections: purpose &
-  scope (cross-references #76/#77/#79 as out of scope), HTTPS enforcement
-  (+ operator checklist), CSP (full directive table, nonce rationale, dev-only
-  relaxations, pre-launch checklist), git-history secret scan (how to run,
-  allowlist policy, **the actual scan run recorded**: date 2026-08-06, commit
-  `43050470ea60ca3637c4abaf02a843aa2321e728` — repo HEAD immediately prior to
-  this issue's own commit — result `OK: no secrets found in git history.`),
-  and Dependabot (+ post-merge verification checklist item).
+### 1. Some admin routes rely solely on RLS/RPC-derived identity, with no app-layer defense-in-depth filter
 
-- **`README.md`** (modified) — added the `check:git-secrets` bullet to the
-  Scripts list and a line under "Environments" linking to the new doc.
-  Nothing else changed.
+`getAuditLog` (`GET /api/church-group/audit-log`), `deleteMember`
+(`DELETE /api/church-group/members/:id`, via the `remove_church_group_member`
+RPC), and `acceptInvitation` (`POST /api/invitations/:id/accept`, via the
+`accept_invitation` RPC) never pass `ctx.churchGroupId` or `ctx.userId` as a
+literal query/RPC argument — tenant/user scoping for these three is enforced
+entirely by RLS reading the caller's JWT (`auth_church_group_id()`) or by a
+SECURITY DEFINER RPC that reads `auth.uid()`/the JWT `sub` claim internally.
+This is architecturally sound (identity can't be spoofed by an app-layer bug
+passing a caller-supplied id) and is exactly the trust boundary Block E below
+pins — but unlike sibling routes such as `denyInvitation` (which explicitly
+`.eq("church_group_id", ctx.churchGroupId).eq("user_id", ctx.userId)`
+*before* mutating, as a second layer beyond RLS), these three routes have no
+redundant application-layer check. Not a fix-now bug (RLS is confirmed
+enforcing the boundary by `tests/integration/rls/tables/cross-tenant-bypass.test.ts`
+and this issue's own `phase1-token-bypass.test.ts`), but worth #79's
+attention as a defense-in-depth gap: if RLS on `audit_logs`, `users`, or
+`invitations` were ever misconfigured or bypassed (e.g. a future code path
+that reaches for the service-role client by mistake), these three routes
+have no second layer to catch it.
 
-- **`tests/unit/lib/security/csp.test.ts`** (new) — coder-authored unit
-  tests for all three exported functions, covering every "Behaviors the
-  tester should be able to verify" bullet in the spec: valid/invalid
-  `pk_test_`/`pk_live_` keys, nonce uniqueness/byte-length, `isDev: false`
-  vs `isDev: true` directive differences, `clerkOrigin: null` well-formedness,
-  and directive ordering/no-trailing-semicolon.
+### 2. `GET /api/availability?user_id=` intentionally has no literal `ctx.userId` scope on the cross-user path
 
-- **`.pipeline/spec.md`** (staged) — this is the planning stage's own output
-  for this pipeline run (was already present, uncommitted, in the working
-  tree when this coding stage started); staged here so it lands in the same
-  commit as the implementation it specifies, rather than being lost. The
-  previously-committed `.pipeline/spec.md` on this branch was stale content
-  left over from issue #66.
+Not a vulnerability — documented for completeness. When an admin/leader
+supplies `?user_id=<other>`, the handler substitutes that id for
+`ctx.userId` entirely (that's the endpoint's purpose: letting a leader look
+up a specific teammate's availability). Cross-group isolation is enforced
+by RLS via the caller's own JWT, not by an explicit `church_group_id`
+filter in this handler — consistent with `tests/integration/rls`.
 
-## Verification performed (all passed)
+### 3. `escapeLikePattern` is defense-in-depth that the schema layer already makes unreachable for `%`/`\`
 
-- `bun run check:git-secrets` — exits 0 against this repo's real history.
-  Two `VALUE_ALLOWLIST` entries were added beyond the spec's minimum seed set
-  to suppress two categories of obvious false positive found on the first
-  run, both from this repo's own Jest test fixtures (not real secrets):
-  - `/"test-[a-z0-9-]+"/i` — reason: "Jest test-double value for a secret env
-    var (e.g. CRON_SECRET/PINGRAM_API_KEY fixtures like
-    `"test-cron-secret"`), not a real credential." Matched
-    `tests/unit/app/api/cron-invitation-reminders-route*.test.ts`,
-    `tests/unit/e2e-support/env.test.ts` (all `"test-cron-secret"`) and a
-    prior version of `tests/unit/lib/pingram/client.test.ts`
-    (`"test-api-key"`).
-  - `/"client-(id|secret)(-\d+)?"/i` — reason: "Jest test-double value for
-    GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET fixtures (e.g.
-    `"client-secret-456"`), not a real credential." Matched
-    `tests/unit/lib/google-calendar/{oauth,sync,sync-tester-supplement}.test.ts`.
-  Both were manually confirmed by reading the actual fixture source (`git
-  show <sha>:<path>`) before allowlisting — neither is a real credential.
-  Also independently exercised: exits 1 (redacted output, not the secret)
-  against a scratch repo with a fake `sk_live_...` key committed; exits 1
-  against a scratch repo with a committed `.env` file; exits 1 (with the
-  shallow-clone message) against a `--depth 1` clone.
-- `bun run typecheck`, `bun run lint`, `bun run test` (1064 tests, 83 suites,
-  including the 13 new CSP tests) — all pass.
-- `bun run format:check` — **fails repo-wide, but pre-existing and out of
-  scope for this issue**: 79 files fail Prettier on this branch, none of
-  them touched by this change (confirmed by running `prettier --check` on
-  only the 10 files this issue adds/modifies — all pass — and by
-  `git stash`-ing this issue's diff and re-running `format:check` against
-  unmodified `origin/main`, which fails on 80 pre-existing files, i.e. the
-  same drift minus the one file — `README.md` — this issue happens to touch
-  and which was reformatted as a side effect of editing it). Not fixed here
-  per AGENTS.md's no-scope-creep rule; every file this issue actually
-  changed is individually Prettier-clean.
-- `bun run build` — succeeds when Clerk env vars are present (confirms the
-  `next.config.ts` `headers()` shape is valid). Note: `bun run build` fails
-  in this sandbox both before and after this change (`Missing publishableKey`
-  on `/documents` prerender) because no `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
-  is set in this environment — verified pre-existing via `git stash` (fails
-  identically on unmodified `origin/main`). Re-ran with a synthetic
-  `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`/`CLERK_SECRET_KEY` set and the build
-  succeeded end-to-end, producing all 37 routes plus a compiled Middleware
-  bundle.
+`POST /api/invitations/guest`'s `.ilike("email", ...)` lookup uses a
+module-private `escapeLikePattern` (`app/api/invitations/handler.ts:285`).
+Zod's `.email()` format check in `createGuestInvitationSchema` rejects any
+local-part containing `%` or `\` before the handler body ever runs, so those
+two characters never reach `escapeLikePattern` through this endpoint today
+— only `_` does (proven correct in `input-validation-injection.test.ts`).
+This is real, if incidental, defense-in-depth: `escapeLikePattern` itself
+still correctly escapes all three characters (verified directly), so the
+route is safe either way, but the schema is the layer actually carrying the
+weight for `%`/`\`.
 
-## What the tester should focus on
+### 4. Block E — trust-boundary characterization (`phase1-token-bypass.test.ts`)
 
-- The CSP directive string itself (order, exact tokens, no double spaces,
-  dev vs. prod differences) — `tests/unit/lib/security/csp.test.ts` covers
-  this but an independent read of `lib/security/csp.ts` against the spec's
-  directive table is worthwhile.
-- `middleware.ts`'s request-header nonce plumbing — this can't be unit
-  tested in isolation the way `csp.ts` can; worth a manual/integration check
-  that a real request gets a `content-security-policy` response header.
-- `scripts/check-git-secrets.mjs`'s shallow-clone detection and the
-  cwd-discovery behavior (no hardcoded `REPO_ROOT`) — independently verify
-  the three scratch-repo scenarios named in the spec's verification section
-  (fake key present, shallow clone, committed `.env` file).
-- The two `VALUE_ALLOWLIST` additions above — confirm independently that the
-  matched fixture values really are fake/test-only, not real credentials.
+Per the migration's own design (`public.auth_church_group_id()` /
+`public.auth_user_role()`, `supabase/migrations/20260704000001_rls_policies.sql:29-53`),
+a validly-signed JWT's `church_group_id`/`role` claims are read *before* the
+DB fallback (`COALESCE`). All three characterization tests confirm the
+documented behavior, not a bug:
+
+- A Church-A member's JWT carrying a forged `church_group_id` claim
+  pointing at Church B is treated as scoped to Church B — the claim wins
+  over the DB row for that `clerk_id`.
+- A Church-A member's JWT carrying a forged `appRole: "admin"` claim is
+  treated as an admin for RLS purposes (e.g. can read the admin-only
+  `audit_logs` table) — the claim wins over the DB `role` column.
+- A JWT whose `church_group_id` claim is present but not a valid UUID
+  **errors** (the `::uuid` cast throws before `COALESCE` can fall back to
+  the DB value) rather than silently granting DB-derived scope — this is
+  the safe failure mode.
+
+**The entire path's security rests on only Clerk being able to mint these
+claims in production.** If a future change ever lets JWT custom claims be
+influenced by anything other than the trusted Clerk issuer (e.g. a
+client-settable value, a misconfigured JWT template, or a second issuer),
+this fast path becomes a direct tenant/role-escalation bypass. #79 should
+treat this as the accurate picture of the current trust boundary, not
+something to "fix" by itself.
+
+(Block E, like blocks B–D, only ever runs against a live Supabase instance
+and is skipped in a plain `bun run test` run, per spec Assumption 2 — it was
+not executed in this environment; see Verification below.)
+
+## Verification
+
+- `bun run lint` — pass, no errors or warnings.
+- `bun run typecheck` — pass, no errors.
+- `bun run test` — pass: **112 suites, 2535 tests, 0 failures.**
+- `bun run test:rls` — pass: 1 suite (this issue's coverage-pin block A, 2
+  tests) ran; 11 suites (294 tests) skipped — `SUPABASE_TEST_URL` /
+  `SUPABASE_TEST_ANON_KEY` / `SUPABASE_TEST_SERVICE_ROLE_KEY` /
+  `SUPABASE_JWT_SECRET` are unset in this environment, so blocks B–E of
+  `phase1-token-bypass.test.ts` (and all of `cross-tenant-bypass.test.ts`)
+  did not execute here, per spec Assumption 2. They should be run against a
+  live local Supabase instance before this is treated as verified beyond
+  the mechanical coverage pin.
+
+## What the Tester should focus on
+
+1. Re-run `bun run test` cold to confirm the full 2535-test count and zero
+   failures independently.
+2. Spot-check a few `ADMIN_ROUTE_REGISTRY` entries against their real
+   handler source (especially the ones with `ownScopeAssertion: false` /
+   `touchesSupabase: false` / `authFailureIsRedirect: true`) to confirm the
+   documented reasoning is accurate, not a rationalization for a weakened
+   test — this is the area most likely to hide a real gap if wrong.
+3. If a local Supabase instance is available, run `bun run test:rls` with
+   the required env vars set and confirm blocks B–E of
+   `phase1-token-bypass.test.ts` pass for real (this run only executed the
+   coverage pin, block A).
+4. Confirm no file under `app/`, `lib/`, `schemas/`, `middleware.ts`, or
+   `supabase/` was touched: `git diff origin/main...HEAD --stat`.
+5. Run `bun run test` and independently verify the schema sweep
+   (`input-validation-injection.test.ts`) actually enumerates every string
+   field with a `.max()`/`.trim()` in `schemas/*.ts` — this file was hand-
+   built by reading each schema, not generated, so it's the one most prone
+   to a silently-missing field.
