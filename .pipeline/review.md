@@ -1,147 +1,166 @@
-# Review — Issue #79: [Sprint 4] Conduct manual OWASP Top 10 review
+# Review — Issue #80: Full auth-bypass & RLS-bypass test suite
 
 VERDICT: NEEDS WORK
 
-## Summary
+Scope is clean (tests + `.pipeline/` only), lint/typecheck/test were re-run here
+and match the reported numbers exactly (`112 suites / 2535 tests / 0 failures`,
+eslint clean, tsc clean). The 401/403/expired-token sweep, the rate-limit tier
+matrix, and the RLS token-bypass file are real, useful coverage. But the single
+assertion that AC-1's cross-tenant claim rests on is provably vacuous, and the
+AC-3 sweep does not meet the spec's own "every string field of every exported
+schema" requirement (the tester already found part of this). Both must be fixed
+before this ships as a *security* suite — it currently advertises more assurance
+than it delivers.
 
-The primary deliverable is genuinely good. I independently spot-checked the
-review document's load-bearing claims against the actual source rather than
-trusting its prose, and every one I checked held up (details below). The gate
-script, its tests, and the three wiring edits all match the spec. The tests are
-real subprocess tests with real fixtures and real exit-code assertions — not
-superficial.
+---
 
-Three things must be fixed before a human sees this PR. None is a security
-regression; two are integrity problems with the deliverable itself (a diff a
-human cannot read, and a gate that fails open), and one is lost work.
+## 1. BLOCKING — the cross-tenant "victim id never leaks" assertion can never fail
 
-## What I verified independently (all confirmed)
+`tests/unit/app/api/auth-bypass-matrix.test.ts:269-270`
 
-- A01-1's "28 handler.ts modules": `find app/api -name handler.ts | wc -l` = 28,
-  and all 28 match `requireAuth|requireRole`. Zero unprotected handlers. Claim exact.
-- A02-5 / A07-5: `app/api/cron/invitation-reminders/route.ts:25` really does
-  compare the bearer header with `!==`. Not fabricated.
-- A02-5's mitigation claim: `resolveTier` really does map
-  `/api/cron/invitation-reminders` to `sms`, and `sms` really is
-  `{ limit: 5, windowMs: 60_000 }` (`lib/api/rate-limit.ts:40,73`).
-- A02-3: `SIGNED_URL_EXPIRY_SECONDS = 30 * 60`, passed to both signers.
-- A05-7: `poweredByHeader` is genuinely absent from `next.config.ts`.
-- A07-3: `const store = new Map(...)` at `lib/api/rate-limit.ts:123`. Confirmed.
-- A07-4: the `x-forwarded-for` trust-boundary comment really is in the source.
-- A03-1 / A03-4: re-ran both greps; zero matches each.
-- Wiring diffs (`package.json`, `.github/workflows/ci.yml`, `README.md`) match
-  the spec's required edits in placement and style.
-- The doc, the script, and the coder's test file are all Prettier-clean.
+```ts
+expect(recording.seenValues).not.toContain(VICTIM_CHURCH_GROUP_ID); // "group-victim-2"
+expect(recording.seenValues).not.toContain(VICTIM_USER_ID);         // "user-victim-2"
+```
 
-## Must fix
+`recording.seenValues` only ever contains strings that the handler passed to the
+Supabase double. Those strings come from (a) the request built by
+`entry.invoke()` and (b) the `AuthContext` from `makeLookup("admin")`. Grepping
+the whole tree, `"group-victim-2"` / `"user-victim-2"` appear in exactly three
+places: their definition in `tests/support/api-auth.ts:24-25` and these two
+assertions. **No registry entry ever puts them into a request**, and
+`makeLookup` uses `DEFAULT_*`. The registry even documents the tautology as if
+it were a design decision (`tests/support/admin-route-registry.ts:120-124`:
+"these only need to be syntactically valid and distinct from
+VICTIM_CHURCH_GROUP_ID/VICTIM_USER_ID"). A handler could pass a fully
+caller-controlled tenant id straight into `.eq("church_group_id", …)` and this
+test would still be green.
 
-### 1. `scripts/check-owasp-review.mjs` contains two raw NUL bytes, so git treats the file as binary
+This matters because it is exactly the assertion the code comment
+(`auth-bypass-matrix.test.ts:244-248, 267-268`) and `.pipeline/changes.md` call
+"the load-bearing assertion for cross-tenant admin".
 
-Confirmed firsthand, not just taken from `.pipeline/test-results.md`:
+What survives: the *positive* check (`seenValues` contains
+`DEFAULT_CHURCH_GROUP_ID` / `DEFAULT_USER_ID`) is real and does catch a handler
+that scopes by a request-supplied id instead of `ctx`. It runs for 55 of 61
+entries. For the other 6 (`ownScopeAssertion: false` / `touchesSupabase: false`
+— `adminOnlyExample`, `google-calendar/connect`, `getAuditLog`, `deleteMember`,
+`acceptInvitation`, `GET /api/availability?user_id=`) case 4 degenerates to
+`expect(recording.touched).toBe(true)` plus the two dead assertions, i.e. it
+asserts nothing about tenant scope at all — and those are the highest-risk
+routes in the set.
 
-- `git show HEAD:scripts/check-owasp-review.mjs | od -c` shows two 0x00 bytes
-  inside the `PLACEHOLDER` string literal on line 30.
-- `git diff main...HEAD --stat` reports
-  `scripts/check-owasp-review.mjs | Bin 0 -> 6359 bytes`.
+Fix (either approach, in `tests/support/admin-route-registry.ts` +
+`tests/support/recording-supabase.ts` + `auth-bypass-matrix.test.ts`):
 
-Line 30 is committed with literal 0x00 bytes rather than escape sequences.
-Behavior is unaffected, but the consequence is that the **only new executable
-file in this PR — the script that gates the Phase 1 launch — renders as an
-unreadable binary blob in `git diff`, `git show`, and GitHub's PR diff view.**
-A human reviewer will never see its 189 lines. That defeats the point of
-shipping a reviewable gate.
+- Make the victim ids actually reachable: redefine `VICTIM_CHURCH_GROUP_ID` /
+  `VICTIM_USER_ID` as UUID-shaped constants and have `invoke()` inject them into
+  the caller-controlled surfaces a confused-deputy bug would read —
+  `churchGroupId` / `church_group_id` / `userId` / `user_id` keys in the body and
+  query string. Zod strips unknown keys by default, so the assertion then proves
+  the strip actually happens end-to-end; where a schema is `.strict()` and would
+  400, drop that injection for that entry and say so in a comment.
+- Or (stronger, and it also fixes the 6 exception entries): have
+  `makeRecordingSupabase` record `(method, args)` tuples, and assert that every
+  `.eq("church_group_id", x)` / `.eq("user_id", x)` and every RPC argument whose
+  name implies tenant/user identity equals the `ctx` value — never a
+  request-derived one.
 
-Fix: replace each of the two raw NUL bytes in that string literal with the
-six-character JavaScript escape sequence `\u0000` (backslash, u, 0, 0, 0, 0),
-so line 30 reads:
+Also update the now-incorrect comments at `auth-bypass-matrix.test.ts:267-268`
+("The negative assertion always applies") and
+`admin-route-registry.ts:120-124`, and the claim in `.pipeline/changes.md`
+("the negative 'no victim id ever leaks' assertion always still runs for every
+entry" — it runs, but it cannot fail).
 
-    const PLACEHOLDER = "\u0000ESCAPED_PIPE\u0000";
+## 2. AC-3 schema sweep does not cover every exported schema (spec §5 Part A)
 
-This is behavior-identical — the runtime string is unchanged, so the sentinel
-keeps its collision resistance — but the source file becomes plain ASCII.
-Re-verify afterwards that
-`git diff main...HEAD -- scripts/check-owasp-review.mjs` renders as a normal
-unified diff.
+Confirmed independently against `schemas/*.ts` (the tester found these too;
+they are not fixed):
 
-### 2. The gate fails open when a category section has more than one findings table
+- `schemas/events.ts` `updateEventSchema` — `name`, `location`, `notes`: absent
+  from `FIELD_CASES`.
+- `schemas/service-weeks.ts` `updateServiceWeekSchema` — `title`,
+  `sermonTopic`, `sermonScripture`, `speakerName`: absent.
+- `schemas/setlists.ts` `reorderSetlistSchema.songs[]` — `keyOverride` and
+  `notes` (`.trim().max(1000)`): zero adversarial coverage anywhere in the repo.
+- `schemas/songs.ts` `createSongSchema.tags` (`z.array(z.string().trim().min(1)
+  .max(50))`): absent.
 
-`findFindingsTable()` (`scripts/check-owasp-review.mjs:52-75`) returns on the
-**first** table whose header first cell is `ID` and ignores every later one in
-the same section. I demonstrated the fail-open with a fixture containing, inside
-the A01 section, a clean first table followed by a second table holding
-`| A01-9 | Critical | Open | RCE in prod | ... |`. Result:
+Add these to `FIELD_CASES` in
+`tests/unit/schemas/input-validation-injection.test.ts` (array-item fields need
+a small wrapper that varies one element), or amend the spec/AC. Do not leave
+`.pipeline/changes.md` claiming "every genuinely free-text string field of every
+exported Zod object schema".
 
-    OK: OWASP review complete — 5 findings, 0 blocking.   exit=0
+## 3. `createGuestInvitationSchema.email` field case encodes a wrong expectation
 
-A `Critical` + `Open` finding sits in the document and the launch gate reports
-zero blocking. For a gate whose entire job is to fail closed, silently skipping
-rows is the wrong default — and it is a plausible future edit (someone splits a
-category into "resolved" and "open" tables). The spec's parsing note says "Only
-parse **tables** whose header row's first cell is exactly `ID`" (plural), so this
-is also a spec deviation, not just a judgment call.
+`tests/unit/schemas/input-validation-injection.test.ts:258-265` declares
+`trims: true` with no `transform`, but the schema is
+`z.string().trim().toLowerCase().email().max(255)`
+(`schemas/invitations.ts:70`). It only passes because every payload in
+`ALL_PAYLOADS` fails `.email()` and never reaches the success branch — the same
+is true of the oversized case (`"a".repeat(256)` is rejected as a non-email, not
+for length). Add `transform: (t) => t.toLowerCase()` and build the oversized
+value as a real over-length email (e.g. `"a".repeat(250) + "@example.com"`) so
+the assertion is about the `.max(255)` it claims to test.
 
-Fix in `scripts/check-owasp-review.mjs`: collect **all** ID-headed tables within
-a section and validate the union of their data rows (or, on the stricter
-reading, treat "more than one ID table in a category section" as its own
-violation). Add a test to `tests/unit/scripts/check-owasp-review.test.ts` for
-the fixture above — a second table with a `Critical`/`Open` row must exit 1.
+## 4. The AC-2 "coverage pin" does not pin what it claims
 
-### 3. The testing stage's work is uncommitted and will be lost
+`tests/integration/rls/tables/phase1-token-bypass.test.ts:46-59` asserts
+`PHASE1_TABLES.length === 19` and that each of those 19 names appears somewhere
+in `cross-tenant-bypass.test.ts`. That catches "someone added a table to
+`PHASE1_TABLES` without covering it", but **not** the case the file header and
+`.pipeline/changes.md` claim it guards ("a future table added to the schema
+cannot silently skip the cross-tenant sweep") — a new `create table` in
+`supabase/migrations/` with no edit to `PHASE1_TABLES` leaves the pin green.
+Derive the list from (or cross-check it against) the `create table` statements
+in `supabase/migrations/*.sql`, which is what makes it mechanical; otherwise
+downgrade the claim in the file header and in `changes.md`. Secondary nit:
+`expect(source).toContain(table)` is a raw substring match — `"users"`,
+`"songs"`, `"events"`, `"instruments"`, `"notifications"` all match as
+substrings of unrelated identifiers/comments; match on a quoted-table form
+instead.
 
-`git status --short` shows `.pipeline/test-results.md` modified and
-`tests/unit/scripts/check-owasp-review-tester-supplement.test.ts` untracked.
-The 8 supplemental tests pass (I ran `bun run test tests/unit/scripts/`:
-3 suites, 25 tests green) but neither the tests nor the report is in the commit.
-Commit both.
+## 5. `changes.md` states Block E results as confirmed, but Block E never ran
 
-Also: that supplement file is **not** Prettier-clean — it takes `format:check`
-from 96 pre-existing failures to 97. CI does not run `format:check`, so this
-will not break the build, but it is a new failure attributable to this branch,
-and `.pipeline/test-results.md`'s "none of the files this issue touched appear
-in the failing list" becomes inaccurate once that file is committed. Run
-`bunx prettier --write` on it before committing.
+`.pipeline/changes.md` SECURITY FINDINGS §4: "All three characterization tests
+confirm the documented behavior, not a bug", with a bullet list of outcomes —
+then discloses at the bottom of the same section that Block E was not executed
+in this environment. The findings are consistent with
+`supabase/migrations/20260704000001_rls_policies.sql:29-53` on inspection, and
+the seed data they depend on does exist (`tests/integration/rls/setup.ts`:
+`songs` B1, `audit_logs` B/A), so I expect them to pass — but the write-up must
+say "expected from the migration source, unverified" rather than "confirm",
+because #79 is meant to inherit this as fact. Reword §4.
 
-## Should fix (document accuracy — this doc is a security record)
+---
 
-### 4. A02-4 overstates token entropy
+## Things I checked that are fine (no action)
 
-The doc says the invitation `response_token` has "**256 bits of randomness**".
-It is two `crypto.randomUUID()` v4 values concatenated
-(`app/api/invitations/handler.ts:55`). UUIDv4 fixes 6 bits for version+variant,
-so this is **244 bits of entropy** in a 256-bit (64-hex-char) representation.
-Still far beyond adequate — but a security review document should not round
-entropy up. Change to "244 bits of entropy (two UUIDv4s, 122 bits each) in a
-64-hex-char column".
+- Registry completeness: 61 entries covering all 60 exported `UserLookup`
+  handlers under `app/api/**/handler.ts` (`getAvailability` twice, per the
+  conditional role gate) — enumerated independently; nothing omitted. The 5
+  deliberately-excluded routes all have their own explicit tests.
+- The `scope: "user"` correction for `GET /api/events/:id/ics` (spec said
+  "group") is right — `exportEventIcs` only ever reads `ctx.userId`
+  (`app/api/events/[id]/ics/handler.ts`). Good catch by the coder, documented.
+- `touchesSupabase: false` / `authFailureIsRedirect: true` / the four
+  `ownScopeAssertion: false` entries were re-checked against handler source
+  (`getAuditLog` has no `.eq("church_group_id", …)`; `getAvailability`'s
+  `user_id` branch replaces `ctx.userId` wholesale). Accurate, not rationalized
+  — but see item 1 for what that leaves untested.
+- Rate-limit matrix genuinely exercises `resolveTier` (all six tier limits are
+  distinct, so a mis-mapped tier would fail), asserts `Retry-After` bounds from
+  the policy, and includes the required different-identifier failure case.
+  Mocking `createRouteMatcher` to always-true is safe: rate limiting runs before
+  `isPublicRoute` in `middleware.ts`.
+- `mintJwt` stays byte-identical when the new options are absent; `iat`
+  back-dating for negative `expiresInSeconds` is handled.
+- No production file touched; no network/exec/env exfiltration in the diff.
 
-### 5. A02-4 omits expiry, which the spec explicitly asked it to assess
+## Residual (not blocking, carry forward for a human)
 
-The spec named "entropy, expiry, single-use" for the response-token row. The doc
-covers entropy and single-use but says nothing about expiry. Expiry does exist —
-`invitations.response_deadline`, with `accept_invitation`/`deny_invitation`
-raising `EXPIRED` and `get_invitation_by_token` computing an `expired` status —
-but every check is guarded by `response_deadline IS NOT NULL`
-(`20260712000002_get_invitation_by_token_rpc.sql:63`) and the column is
-nullable. An invitation created with a NULL deadline carries a bearer token that
-never expires. Add a sentence to A02-4 covering the expiry mechanism and this
-NULL case (Info/Low is a fine severity — do not inflate it).
-
-## Not blocking, noted for the record
-
-- The gate's policy is unenforceable by construction: whoever writes the doc
-  chooses each finding's `Severity` and `Status`, so `check:owasp` proves the
-  document is internally consistent, not that the review was honest. The spec is
-  aware of this ("do not downgrade a severity to make the check pass"). Nothing
-  to fix; the human sign-off in #83 is the real control.
-- The "no application-code changes" policy was honored — the diff touches only
-  `documentation/`, `scripts/`, `tests/`, `package.json`,
-  `.github/workflows/ci.yml`, `README.md`. Nothing under `app/**`, `lib/**`,
-  `schemas/**`, `supabase/**`. Confirmed.
-- `format:check`'s 96 pre-existing failures are genuinely pre-existing and out
-  of scope for this issue.
-
-## Re-review scope
-
-Items 1, 2, and 3 are required. Items 4 and 5 are one-line documentation edits
-and should ride along. After the fix, re-run `bun run check:owasp`,
-`bun run test`, and confirm
-`git diff main...HEAD -- scripts/check-owasp-review.mjs` renders as text.
+RLS blocks B–E have still never executed anywhere — no Supabase env vars and no
+Docker in this worktree. Run `bun run test:rls` against a live local instance
+before treating AC-2's token-bypass claims (and Block E's trust-boundary
+findings) as verified.

@@ -29,23 +29,36 @@ export interface TestClaims {
    * passing an app role here tests the JWT-claim fast path in auth_user_role().
    */
   appRole?: AppRole;
+  /** Seconds from now until exp. Default 3600. Negative -> already expired. */
+  expiresInSeconds?: number;
+  /** Sign with this secret instead of SUPABASE_JWT_SECRET (forged-signature tests). */
+  signingSecret?: string;
 }
 
 /** Signs a short-lived JWT that Supabase local dev will accept as `authenticated`. */
 export function mintJwt(claims: TestClaims): string {
-  const secret = process.env.SUPABASE_JWT_SECRET;
+  const secret = claims.signingSecret ?? process.env.SUPABASE_JWT_SECRET;
   if (!secret) {
     throw new Error("SUPABASE_JWT_SECRET must be set to mint test JWTs");
   }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expiresInSeconds = claims.expiresInSeconds ?? 3600;
 
   const payload: Record<string, unknown> = {
     sub: claims.clerkId,
     role: "authenticated", // Supabase built-in role — NOT the app role
     aud: "authenticated",
     iss: "supabase-test",
-    iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + 3600,
+    iat: nowSeconds,
+    exp: nowSeconds + expiresInSeconds,
   };
+
+  // Negative expiresInSeconds means "already expired" — also back-date iat so
+  // the token is not "issued in the future" relative to its own exp.
+  if (expiresInSeconds < 0) {
+    payload.iat = nowSeconds + expiresInSeconds;
+  }
 
   if (claims.churchGroupId !== undefined) {
     payload.church_group_id = claims.churchGroupId;

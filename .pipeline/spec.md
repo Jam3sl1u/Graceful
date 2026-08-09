@@ -1,405 +1,635 @@
-# Spec — Issue #79: [Sprint 4] Conduct manual OWASP Top 10 review
+# Spec — Issue #80: Full auth-bypass & RLS-bypass test suite (all Phase 1 tables)
 
 ## OPEN QUESTIONS
 
-**None blocking — do not stop the pipeline.**
+None blocking. Three planner decisions are recorded below as **Assumptions**;
+they are resolved, not open.
 
-Two items resolved by inspection rather than by asking a human (recorded here so
-downstream stages don't re-raise them):
+**Assumptions**
 
-1. **`npm audit` → `bun audit`.** The issue's AC says `npm audit --audit-level=high`.
-   Per `AGENTS.md`, translate to `bun audit --audit-level=high` and proceed. This is
-   already wired into CI (`.github/workflows/ci.yml`, `checks` job, line 30).
-2. **`pip-audit`.** The AC scopes it "if any Python tooling exists". Verified: the
-   repo contains **zero** `.py` files and no `requirements*.txt`, `pyproject.toml`,
-   `Pipfile`, or `setup.py` anywhere. `pip-audit` is therefore **N/A** and must be
-   documented as N/A with that evidence — not run, not skipped silently.
+1. **"Job-submission-style endpoints" (AC-4).** Phase 1 has no audio-pipeline /
+   job-submission endpoint (the issue says so itself under Out of Scope). The
+   closest real analogues in `lib/api/rate-limit.ts` are the `invite` tier
+   (`POST /api/invitations`, a roster-sized burst submission) and the `write`
+   tier (generic mutating submissions). AC-4 is implemented against the
+   `auth`, `sms`, `invite`, and `write` tiers.
+2. **RLS integration tests skip without env vars.** `tests/integration/rls/*`
+   already self-skips when `SUPABASE_TEST_URL` / `SUPABASE_JWT_SECRET` are
+   unset (see `tests/integration/rls/setup.ts`). New integration tests follow
+   that same precedent — they will skip in a plain `bun run test` run. Do not
+   change that.
+3. **This issue adds tests only.** Do NOT modify anything under `app/`, `lib/`,
+   `schemas/`, `middleware.ts`, or `supabase/`. If a test written to this spec
+   goes red, that is a real finding: leave it red and write it up under a
+   `## SECURITY FINDINGS` heading in `.pipeline/changes.md`. Never weaken an
+   assertion or patch production code to make it green.
 
-One item needs a human *action* (not a decision) and must not block implementation:
-the launch-gate check added here is a mechanical guard; a human still performs the
-final Phase 1 launch sign-off (issue #83). Record it as an operator checklist item
-in the new doc.
+---
 
-## Goal
+## Current state (verified — do not re-derive)
 
-Produce the documented manual OWASP Top 10 (2021) review that PRD §26.3
-(`documentation/prd/graceful_requirements_v10.md`, "OWASP Top 10 checklist" row;
-cited as §16.3 in the issue) requires before Phase 1 launch, covering **A01, A02,
-A03, A05, A07**, plus a mechanical gate so an unresolved high-severity finding
-blocks the launch rather than living only as prose.
+- **AC-2 is already largely satisfied.** `tests/integration/rls/tables/cross-tenant-bypass.test.ts`
+  already sweeps a Church A persona (memberA, plus adminA on role-gated tables)
+  against Church B rows across SELECT/INSERT/UPDATE/DELETE for all **19** Phase 1
+  tables. **No table has been added since** — every `create table` in
+  `supabase/migrations/` predates it; migrations after `20260704000001` add only
+  columns and RPCs. The remaining AC-2 work is (a) a mechanical *coverage pin* so
+  a future table cannot be added without coverage, and (b) the token-level bypass
+  vectors that suite does not cover (anon, expired, wrong-signature JWTs).
+- **AC-1 is only partially satisfied.** `tests/unit/app/api/auth-matrix.test.ts`
+  (#32) covers 5 Sprint-1 handlers out of ~60 exported handlers, and only the
+  unauth/member/admin cases — never "expired token" or "admin of another church
+  group".
+- **AC-3 is only partially satisfied.** `tests/unit/app/api/songs-search-injection-tester-supplement.test.ts`
+  covers PostgREST-filter breakout for `GET /api/songs?q=` only.
+- **AC-4 is only partially satisfied.** `tests/unit/middleware.test.ts` covers
+  the `sms` tier via one deny route; no coverage of `auth`, `invite`, or `write`.
 
-This issue is a **review + documentation** issue. Do **not** refactor, do not
-re-do the work of #76 (rate limiting), #77 (input validation), or #78
-(infra security). See "Code changes" below for the one narrow exception.
+Shared harness that already exists and must be reused, not reinvented:
+`tests/support/api-auth.ts`, `tests/integration/rls/{jwt,client,helpers,setup}.ts`.
 
-## Current state (verified by reading the code — do not re-derive, but do re-verify claims you cite)
+---
 
-- `documentation/infrastructure-security.md` exists (#78) and explicitly lists
-  "The broader OWASP security review (#79)" as out of its scope.
-- #76 shipped `lib/api/rate-limit.ts` + wiring in `middleware.ts`.
-- #77 shipped `lib/api/postgrest.ts` (`escapePostgrestFilterValue`), `schemas/**`
-  Zod max-length caps, and param/query validation; tester-supplement tests for it
-  live under `tests/unit/**/*-tester-supplement.test.ts`.
-- Existing repeatable guard scripts: `scripts/check-service-role.mjs`,
-  `scripts/check-git-secrets.mjs`, `scripts/check-workflows.mjs`, each exposed as a
-  `check:*` script in `package.json` and (for the first two indirectly / the latter
-  two) run in CI.
-- There is **no** existing OWASP review document.
+## Files
 
-## Files to create
+| Action | Path |
+| ------ | ---- |
+| MODIFY | `tests/support/api-auth.ts` |
+| CREATE | `tests/support/recording-supabase.ts` |
+| CREATE | `tests/support/admin-route-registry.ts` |
+| CREATE | `tests/unit/app/api/auth-bypass-matrix.test.ts` |
+| CREATE | `tests/unit/schemas/input-validation-injection.test.ts` |
+| CREATE | `tests/unit/middleware-rate-limit-matrix.test.ts` |
+| MODIFY | `tests/integration/rls/jwt.ts` |
+| MODIFY | `tests/integration/rls/client.ts` |
+| CREATE | `tests/integration/rls/tables/phase1-token-bypass.test.ts` |
 
-### 1. `documentation/owasp-top-10-review.md` (primary deliverable)
+---
 
-Follow the tone, structure, and level of detail of
-`documentation/infrastructure-security.md` — numbered top-level sections, tables,
-explicit "why this is safe" reasoning, and checklists for the human operator.
+## 1. `tests/support/api-auth.ts` (MODIFY)
 
-**Required section headings, verbatim** (the parser in item 2 depends on the five
-category headings, so the `A0N` prefix and the `## ` level are load-bearing):
+Keep every existing export unchanged. Add:
 
-```
-# OWASP Top 10 (2021) Manual Review — Phase 1 Pre-Launch
+```ts
+export const DEFAULT_USER_ID = "user-1";
+export const DEFAULT_CHURCH_GROUP_ID = "group-1";
 
-## 1. Scope, method, and launch-gate policy
-## 2. Dependency scans
-## 3. A01:2021 — Broken Access Control
-## 4. A02:2021 — Cryptographic Failures
-## 5. A03:2021 — Injection
-## 6. A05:2021 — Security Misconfiguration
-## 7. A07:2021 — Identification and Authentication Failures
-## 8. Open findings summary
-## 9. Re-run checklist
-```
+/** The "victim" tenant. Must never appear in any handler's DB interaction
+ *  when the caller's AuthContext belongs to DEFAULT_CHURCH_GROUP_ID. */
+export const VICTIM_CHURCH_GROUP_ID = "group-victim-2";
+export const VICTIM_USER_ID = "user-victim-2";
 
-**Section 1** must state: which OWASP categories are in scope and that A04/A06/A08/
-A09/A10 are out of scope for this issue (per the AC's named list); that third-party
-penetration testing is explicitly out of scope; the commit SHA reviewed and the
-date; and the **launch-gate policy** — a finding with severity `Critical` or `High`
-that is not `Resolved`, or any finding at any severity still `Open`, blocks the
-Phase 1 launch (issue #83), not merely this PR, and is enforced by
-`bun run check:owasp`.
+/** Models an expired/absent Supabase template JWT: the Clerk session resolves
+ *  but the DB-backed lookup yields no AuthContext -> requireAuth throws 401. */
+export function makeNullLookup(): UserLookup;
 
-**Section 2** must record, in a table, the actual runs:
-
-| Scan | Command | Date | Commit | Result |
-| ---- | ------- | ---- | ------ | ------ |
-
-- Row 1: `bun audit --audit-level=high` — **actually run it** and paste the real
-  outcome and exit code. Do not fabricate. Note it also runs per-PR in CI.
-- Row 2: `pip-audit` — `N/A`, with the evidence from OPEN QUESTIONS item 2.
-
-If `bun audit --audit-level=high` reports any high-severity advisory, record it as
-an **A05 finding with severity `High`**. Do not attempt a dependency upgrade in this
-issue — the gate failing is the correct outcome and the pipeline should surface it.
-
-**Sections 3–7** each use exactly this sub-structure:
-
-```
-### Scope reviewed
-### Method
-### Findings
-### Conclusion
+/** NextRequest double covering the three things handlers read. */
+export function makeApiReq(opts?: {
+  query?: Record<string, string>;
+  body?: unknown;
+  headers?: Record<string, string>;
+}): NextRequest;
 ```
 
-- **Scope reviewed** — a bullet list of the concrete files/dirs inspected
-  (absolute-in-repo paths, e.g. `lib/api/auth.ts`, `supabase/migrations/*rls*.sql`).
-- **Method** — how it was checked (code read, existing test suite consulted, grep,
-  etc.), naming the test files relied on.
-- **Findings** — a GitHub-flavored markdown table with **exactly these columns, in
-  this order** (the parser depends on it):
+`makeApiReq` must return an object with `nextUrl: { searchParams: URLSearchParams,
+pathname: "/api/test" }`, `json: jest.fn().mockResolvedValue(opts?.body)`,
+`headers: new Headers(opts?.headers ?? {})`, and `method: "GET"`. When `body` is
+omitted, `json()` resolves `undefined` (the existing `makeJsonReq(undefined)`
+malformed-body convention).
 
-  | ID | Severity | Status | Summary | Evidence | Resolution |
-  | -- | -------- | ------ | ------- | -------- | ---------- |
+`makeLookup` already accepts `overrides?: Partial<AuthContext>` — use that for
+the foreign-group persona; do not add a second lookup factory.
 
-  - `ID` — `A01-1`, `A01-2`, … prefixed with the section's category.
-  - `Severity` — one of `Critical`, `High`, `Medium`, `Low`, `Info`.
-  - `Status` — one of `Resolved`, `Accepted`, `Deferred`, `Open`.
-  - `Evidence` — the file path(s)/line(s) or test file that substantiate it.
-  - **A category with no issues must still emit exactly one row**: ID `A0N-0`,
-    Severity `Info`, Status `Resolved`, with `Summary` = "No issues found" and
-    `Resolution` explaining *why* — this satisfies the AC's "even 'no issues found,
-    here's why'". Empty tables are a parser failure.
-- **Conclusion** — one short paragraph.
+The two constants `DEFAULT_USER_ID` / `DEFAULT_CHURCH_GROUP_ID` are currently
+module-private; promote them to exports and keep `makeLookup` using them, so
+registry assertions and the harness cannot drift apart.
 
-**Section 8** — a single consolidated table (same six columns) listing every
-non-`Resolved` finding across all five categories, or the literal line
-`No open findings.` when there are none.
+---
 
-**Section 9** — operator checklist (`- [ ]` items) for re-running this review before
-each subsequent phase launch: re-run `bun audit --audit-level=high`, re-run
-`bun run check:owasp`, re-check any `Deferred` findings, and confirm the human
-Phase 1 launch sign-off (#83).
+## 2. `tests/support/recording-supabase.ts` (CREATE)
 
-#### Candidate items the review MUST explicitly address
+A generic Supabase client double that records every interaction, so one
+data-driven sweep can cover ~60 handlers with different query-chain shapes.
 
-Each of the following must appear in the relevant category — either dismissed in
-the Conclusion/`A0N-0` row with reasoning, or recorded as its own finding row. This
-list is the *floor*, not the ceiling; it is derived from an actual read of the repo.
-Verify each claim yourself before writing it down.
+```ts
+export type RecordingSupabase = {
+  /** Pass this as the getSupabaseClient mock's return value. */
+  client: unknown;
+  /** Table names passed to .from(). */
+  tables: string[];
+  /** Function names passed to .rpc(). */
+  rpcs: string[];
+  /** Every string that reached the client as (or inside) an argument. */
+  seenValues: string[];
+  /** True once .from() or .rpc() has been called at least once. */
+  touched: boolean;
+};
 
-**A01 — Broken Access Control**
-- `requireAuth` / `requireRole` (`lib/api/auth.ts`) and that every non-public
-  `app/api/**` route or handler goes through them.
-- `middleware.ts` `isPublicRoute` matcher — justify each entry that is public.
-- RLS policies (`supabase/migrations/20260704000001_rls_policies.sql`,
-  `20260704000002_church_groups_rls.sql`, `20260703000001_users_self_read_rls.sql`)
-  and the `tests/integration/rls/**` suite, especially
-  `tables/cross-tenant-bypass.test.ts` and `tables/role-gated.test.ts`.
-- `SECURITY DEFINER` RPCs (accept/deny invitation, church-group join/create, audit
-  log write, member removal, invitation reminders, guest invitation flow) — these
-  bypass RLS by design; confirm each performs its own authorization.
-- Guest-role scoping: `lib/invitations/guest-access.ts`.
-- IDOR on `[id]` route params — whether handlers scope by `church_group_id` or rely
-  on RLS to do it.
-- `scripts/check-service-role.mjs` guard + `lib/supabase/client.ts`
-  (anon key only; `getAnonSupabaseClient` used only on the no-session paths).
-- `app/api/_examples/admin-only/**` — an example route that ships to production.
-- `tests/unit/app/api/auth-matrix.test.ts` as the existing 401/403 matrix evidence.
-
-**A02 — Cryptographic Failures**
-- `lib/google-calendar/token-crypto.ts` — AES-256-GCM, random 12-byte IV, auth tag
-  verified on decrypt, 32-byte key length enforced.
-- HSTS header in `next.config.ts`; Vercel's HTTP→HTTPS redirect (per
-  `documentation/infrastructure-security.md` §2).
-- R2 presigned URL expiry (`lib/r2/client.ts`, `SIGNED_URL_EXPIRY_SECONDS`).
-- Invitation `response_token` generation/lookup
-  (`supabase/migrations/20260712000002_get_invitation_by_token_rpc.sql`, the
-  `respond/[token]` route) — entropy, expiry, single-use.
-- `app/api/cron/invitation-reminders/route.ts` line 25: the `CRON_SECRET` bearer is
-  compared with `!==`, i.e. **not** constant-time. Assess and record explicitly.
-- Secrets handling: `.env.example` holds placeholders only;
-  `scripts/check-git-secrets.mjs` scans full history.
-- PRD §25.6's "chat messages encrypted at rest" is Phase 2 — note as out of scope.
-
-**A03 — Injection**
-- No raw SQL or template-string SQL built from user input anywhere in `app/` or
-  `lib/` (all DB access goes through the Supabase PostgREST client or `.rpc()` with
-  bound params) — state how you verified this (grep terms used).
-- `escapePostgrestFilterValue` (`lib/api/postgrest.ts`) and its call site in the
-  songs search handler; `tests/unit/app/api/songs-search-injection-tester-supplement.test.ts`.
-- Zod coverage of bodies/query/params across `schemas/**`, including the max-length
-  caps added by #77.
-- XSS: React auto-escaping plus a grep for `dangerouslySetInnerHTML` (report the
-  result of the grep).
-- iCal injection / CRLF field escaping in `lib/ical/generate.ts`.
-- SMS/email template construction (`lib/scheduling/reminder.ts`,
-  `lib/resend/client.ts`, `lib/pingram/client.ts`).
-- Open-redirect / `state` handling in `lib/google-calendar/oauth.ts` and
-  `app/api/google-calendar/callback/**`.
-
-**A05 — Security Misconfiguration**
-- CSP directives (`lib/security/csp.ts`, applied in `middleware.ts`) and the HSTS
-  header — cross-reference `documentation/infrastructure-security.md` §3 rather than
-  restating the whole directive table.
-- Error responses do not leak internals: `lib/api/errors.ts`, `lib/api/response.ts`
-  (generic `"Internal error"` / `ErrorCode.INTERNAL`).
-- Publicly reachable 501 stub routes: all four `app/api/webhooks/*/route.ts` and the
-  four `app/api/notifications/**` stubs return `notImplemented(...)` and touch
-  nothing.
-- `app/api/_examples/**` shipping in the production bundle.
-- Dependency posture: `.github/dependabot.yml`, `bun audit` in CI, the
-  `overrides` block in `package.json`.
-- `next.config.ts` — note that `poweredByHeader` is not disabled (Next emits
-  `X-Powered-By` by default). Assess and record.
-- `.env.example` contains placeholders only; no default/committed credentials.
-
-**A07 — Identification and Authentication Failures**
-- Clerk owns password policy, session management, and MFA (`@clerk/nextjs`);
-  `middleware.ts` calls `auth.protect()` on every non-public route.
-- Rate limiting (`lib/api/rate-limit.ts`): the `auth` tier and which paths map to it
-  via `resolveTier`; the 429 + `Retry-After` shape.
-- The store is **in-memory and per-instance** (`lib/api/rate-limit.ts` lines 26–33,
-  123) — on serverless this is not a global count. Assess its anti-brute-force
-  value and record.
-- `getRequestIdentifier`'s documented trust assumption about `x-forwarded-for`.
-- `CRON_SECRET` bearer auth on `app/api/cron/invitation-reminders/route.ts`.
-- `lib/api/webhook-verify.ts`: all four verifiers throw "not implemented"; the
-  routes that would call them are 501 stubs, so no unsigned payload is processed
-  today. Record the pre-launch condition for #5/#58/#59 (PRD §25.7 requires
-  signature verification before those webhooks go live).
-- Invitation/guest token flows as an alternate authentication path
-  (`app/api/invitations/respond/[token]/route.ts`,
-  `app/api/invitations/guest/claim/route.ts`).
-
-### 2. `scripts/check-owasp-review.mjs` (mechanical launch gate — satisfies AC4)
-
-Copy the shape of `scripts/check-service-role.mjs`: `#!/usr/bin/env node`, ESM,
-`node:fs`/`node:path`/`node:url` only, no dependencies, header comment naming the
-issue and PRD section, `console.error` per violation, `process.exit(1)` on any
-violation, a single `OK: …` line and `process.exit(0)` when clean.
-
-Interface:
-
-```
-node scripts/check-owasp-review.mjs [pathToReviewDoc]
+export function makeRecordingSupabase(result?: {
+  data?: unknown;
+  error?: unknown;
+  count?: number | null;
+}): RecordingSupabase;
 ```
 
-- `pathToReviewDoc` is optional; it exists so the Jest test can point the script at
-  fixture files. Default:
-  `<repo root>/documentation/owasp-top-10-review.md`, resolved from the script's own
-  location via `fileURLToPath(import.meta.url)` exactly like `check-service-role.mjs`
-  computes `REPO_ROOT`.
+Implementation requirements:
 
-Constants to export-by-convention (module-level `const`s; the script is not
-imported, so no `export` is required):
+- `client` is a `Proxy`. Any property access that is not a reserved name returns
+  a recording function which (a) pushes every argument's strings into
+  `seenValues`, and (b) returns the same proxy so chains of arbitrary depth work.
+- Argument flattening: for a `string` push it; for an array push each string
+  element; for a plain object push each string **value** (keys are ignored);
+  recurse at most 2 levels deep; ignore everything else.
+- The proxy is thenable: `then` must resolve to `result`, defaulting to
+  `{ data: [], error: null, count: 0 }`. This is what makes
+  `await supabase.from(t).select(...).eq(...)` destructure correctly.
+- `from(table)` additionally pushes `table` to `tables` and sets `touched = true`.
+- `rpc(name, args)` additionally pushes `name` to `rpcs`, sets `touched = true`,
+  and flattens `args` into `seenValues`.
+- Reserved names that must NOT be turned into recorders (they are probed by
+  `await`, Jest, and `expect`): `then`, `catch`, `finally`, `constructor`,
+  `toJSON`, `nodeType`, `$$typeof`, `asymmetricMatch`, `Symbol.toStringTag`,
+  `Symbol.iterator`, `Symbol.asyncIterator`, and any other `symbol` key.
+  Return `undefined` for those (except `then`, handled above).
+- `touched` must be readable after the call — expose it via a getter on the
+  returned object, not a captured-by-value boolean.
 
-```js
-const REQUIRED_CATEGORIES = ["A01", "A02", "A03", "A05", "A07"];
-const SEVERITIES = ["Critical", "High", "Medium", "Low", "Info"];
-const STATUSES = ["Resolved", "Accepted", "Deferred", "Open"];
-const BLOCKING_SEVERITIES = ["Critical", "High"];
+Because it is itself non-obvious infrastructure, add a small self-test
+`describe` block for `makeRecordingSupabase` at the top of
+`tests/unit/app/api/auth-bypass-matrix.test.ts`: a chained
+`await client.from("songs").select("id").eq("church_group_id", "g1")` records
+`tables === ["songs"]`, `seenValues` containing `"g1"`, and destructures to
+`{ data: [], error: null }`.
+
+---
+
+## 3. `tests/support/admin-route-registry.ts` (CREATE)
+
+The single source of truth for the sweep. Non-test module under `tests/`
+(precedent: `tests/support/api-auth.ts`).
+
+```ts
+import type { UserLookup } from "@/lib/api/auth";
+import type { UserRole } from "@/types/domain";
+
+export type RouteEntry = {
+  /** Stable label used in test names, e.g. "PATCH /api/church-group/members/:id/role". */
+  name: string;
+  /** Roles that pass requireRole. null = authenticated, no role gate. */
+  allowedRoles: UserRole[] | null;
+  /** What the handler must scope its DB access by. */
+  scope: "group" | "user";
+  /** Invokes the handler with the given lookup. */
+  invoke: (lookup: UserLookup) => Promise<Response>;
+  /** Optional result override handed to makeRecordingSupabase(). */
+  result?: { data?: unknown; error?: unknown; count?: number | null };
+};
+
+export const ADMIN_ROUTE_REGISTRY: RouteEntry[];
 ```
 
-Behavior — exit 1 with a specific message for each of these:
+`invoke` builds its own request via `makeApiReq(...)` and passes a valid-shaped
+body/params so the handler gets past its own Zod validation. Path params and
+body ids must address **the victim tenant** — use fixed UUID constants
+(e.g. victim service week `"22222222-2222-2222-2222-222222222222"`).
 
-1. The review doc does not exist or is empty.
-2. Any of `REQUIRED_CATEGORIES` has no `## ` heading whose text contains
-   `A01:2021` … `A07:2021` (match on the `A0N:2021` token, not the full title).
-3. A required category section contains no findings table, or its table has zero
-   data rows (header + separator only).
-4. A findings table has an unexpected column count (must be 6 cells per data row
-   after splitting on unescaped `|` and trimming the leading/trailing empties).
-5. A row's `Severity` is not in `SEVERITIES`, or `Status` is not in `STATUSES`
-   (case-sensitive — catches typos).
-6. A row's `ID` does not start with the enclosing section's category prefix
-   (e.g. an `A02-3` row inside the A01 section).
-7. **The gate:** any row with `Severity` in `BLOCKING_SEVERITIES` and
-   `Status !== "Resolved"`, or any row with `Status === "Open"` at any severity.
-   The error message must name the finding ID, severity, status, and summary.
+### Registry contents (complete — every exported handler)
 
-Clean output message: `OK: OWASP review complete — N findings, 0 blocking.`
+`allowedRoles` below is authoritative; it is the `requireRole(...)` argument in
+each handler. `A = admin`, `L = set_leader`, `M = member`, `G = guest`.
 
-Parsing notes:
-- Section boundaries: a section runs from its `## ` heading to the next `## `
-  heading (or EOF). `### ` sub-headings do **not** end a section.
-- Only parse tables whose header row's first cell is exactly `ID` — this makes the
-  scan-results table in section 2 and any other table invisible to the parser.
-- Section 8's consolidated table lives outside the five category sections, so it is
-  not parsed (avoids double-counting the same finding).
+| Module | Export | Extra params | allowedRoles | scope |
+| --- | --- | --- | --- | --- |
+| `app/api/_examples/admin-only/handler` | `adminOnlyExample` | — | A | group |
+| `app/api/availability/handler` | `getAvailability` | — | null | user |
+| `app/api/availability/handler` | `getAvailability` with `?user_id=<victim>` | — | A,L | user |
+| `app/api/availability/handler` | `setAvailability` | — | null | user |
+| `app/api/availability/handler` | `deleteAvailability` | `date` | null | user |
+| `app/api/availability/team/handler` | `getTeamAvailability` | — | A,L | group |
+| `app/api/church-group/audit-log/handler` | `getAuditLog` | — | A | group |
+| `app/api/church-group/members/handler` | `getChurchGroupMembers` | — | A,L,M | group |
+| `app/api/church-group/members/[id]/handler` | `deleteMember` | `targetUserId` | A | group |
+| `app/api/church-group/members/[id]/role/handler` | `patchMemberRole` | `targetUserId` | A | group |
+| `app/api/conflicts/handler` | `getOpenConflicts` | — | A,L | group |
+| `app/api/conflicts/handler` | `resolveConflict` | `id` | A,L | group |
+| `app/api/events/handler` | `listEvents` | — | null | group |
+| `app/api/events/handler` | `createEvent` | — | A,L | group |
+| `app/api/events/[id]/handler` | `updateEvent` | `id` | A,L | group |
+| `app/api/events/[id]/handler` | `deleteEvent` | `id` | A,L | group |
+| `app/api/events/[id]/attendees/handler` | `assignAttendee` | `eventId` | A,L | group |
+| `app/api/events/[id]/attendees/handler` | `removeAttendee` | `eventId`,`userId` | A,L | group |
+| `app/api/events/[id]/ics/handler` | `exportEventIcs` | `id` | null | group |
+| `app/api/events/ics/handler` | `exportEventsIcs` | — | null | user |
+| `app/api/google-calendar/callback/handler` | `callback` | — | null | user |
+| `app/api/google-calendar/connect/handler` | `connect` | — | null | user |
+| `app/api/google-calendar/disconnect/handler` | `disconnect` | — | null | user |
+| `app/api/instruments/handler` | `listInstruments` | — | null | group |
+| `app/api/instruments/handler` | `addInstrument` | — | A | group |
+| `app/api/instruments/handler` | `submitCustomInstrument` | — | null | group |
+| `app/api/instruments/handler` | `promoteInstrument` | `id` | A | group |
+| `app/api/instruments/handler` | `deleteInstrument` | `id` | A | group |
+| `app/api/invitations/handler` | `listInvitations` | — | A,L | group |
+| `app/api/invitations/handler` | `createInvitation` | — | A,L | group |
+| `app/api/invitations/handler` | `createGuestInvitation` | — | A,L | group |
+| `app/api/invitations/handler` | `withdrawInvitation` | `id` | A,L | group |
+| `app/api/invitations/handler` | `denyInvitation` | `id` | null | group |
+| `app/api/invitations/handler` | `acceptInvitation` | `id` | null | group |
+| `app/api/notifications/preferences/handler` | `getNotificationPreferences` | — | null | user |
+| `app/api/notifications/preferences/handler` | `updateNotificationPreferences` | — | null | user |
+| `app/api/profile/handler` | `getProfile` | — | null | user |
+| `app/api/profile/handler` | `updateProfile` | — | null | user |
+| `app/api/service-weeks/handler` | `listServiceWeeks` | — | null | group |
+| `app/api/service-weeks/handler` | `createServiceWeek` | — | A,L | group |
+| `app/api/service-weeks/[id]/handler` | `getServiceWeek` | `id` | null | group |
+| `app/api/service-weeks/[id]/handler` | `updateServiceWeek` | `id` | A,L | group |
+| `app/api/service-weeks/[id]/handler` | `deleteServiceWeek` | `id` | A | group |
+| `app/api/service-weeks/[id]/handler` | `cancelServiceWeek` | `id` | A | group |
+| `app/api/service-weeks/[id]/handler` | `reactivateServiceWeek` | `id` | A | group |
+| `app/api/service-weeks/[id]/member-view/handler` | `getMemberWeekView` | `id` | A,L,M,G | group |
+| `app/api/service-weeks/[id]/setlist/handler` | `getSetlist` | `id` | null | group |
+| `app/api/service-weeks/[id]/setlist/handler` | `createSetlist` | `id` | A,L | group |
+| `app/api/service-weeks/overview/handler` | `getServiceWeeksOverview` | — | A,L | group |
+| `app/api/setlists/[id]/handler` | `getSetlistWithSongs` | `id` | A,L | group |
+| `app/api/setlists/[id]/handler` | `reorderSetlist` | `id` | A,L | group |
+| `app/api/setlists/[id]/handler` | `addSetlistSong` | `id` | A,L | group |
+| `app/api/setlists/[id]/handler` | `publishSetlist` | `id` | A,L | group |
+| `app/api/setlists/[id]/handler` | `unlockSetlist` | `id` | A,L | group |
+| `app/api/setlists/[id]/handler` | `removeSetlistSong` | `id`,`songId` | A,L | group |
+| `app/api/songs/handler` | `listSongs` | — | A,L,M | group |
+| `app/api/songs/handler` | `createSong` | — | A,L | group |
+| `app/api/songs/[id]/documents/handler` | `createUploadUrl` | `songId` | A,L | group |
+| `app/api/songs/[id]/documents/handler` | `registerDocument` | `songId` | A,L | group |
+| `app/api/songs/[id]/documents/handler` | `listDocuments` | `songId` | A,L,M | group |
+| `app/api/songs/[id]/documents/handler` | `deleteDocument` | `songId`,`docId` | A,L | group |
 
-### 3. `tests/unit/scripts/check-owasp-review.test.ts`
+Exact parameter order for the multi-arg handlers (verified against source):
+`removeAttendee(req, eventId, userId, lookup?)`,
+`removeSetlistSong(req, setlistId, songId, lookup?)`,
+`deleteDocument(req, songId, docId, lookup?)`,
+`deleteAvailability(req, date, lookup?)`.
 
-Copy the integration-style pattern of `tests/unit/scripts/check-git-secrets.test.ts`:
-resolve `SCRIPT_PATH` with `path.resolve(__dirname, "../../../scripts/check-owasp-review.mjs")`,
-run it with `spawnSync("node", [SCRIPT_PATH, fixturePath], { encoding: "utf8" })`,
-write fixtures into `fs.mkdtempSync(path.join(os.tmpdir(), "check-owasp-review-"))`,
-and clean them up in `afterEach`.
+**Deliberately excluded from the registry** (each gets its own explicitly-named
+test in the same file — see §4, "Non-registry routes"):
 
-Required cases (at minimum):
-- A minimal well-formed doc with all five categories, each with a single
-  `A0N-0 | Info | Resolved` row → exit 0, stdout contains `OK:`.
-- The real `documentation/owasp-top-10-review.md` (no path arg, default resolution)
-  → exit 0.
-- A doc missing the A05 section → exit 1, stderr names `A05`.
-- A `High` + `Deferred` row → exit 1, stderr names the finding ID.
-- A `Low` + `Open` row → exit 1 (Open blocks at any severity).
-- A row with `Severity` = `high` (wrong case) → exit 1.
-- A category section whose findings table has zero data rows → exit 1.
-- A nonexistent doc path → exit 1.
+- `getInvitationByToken(token)` — public token route, takes no `lookup`.
+- `claimGuestInvitation(req)` — session-only, takes no `lookup`.
+- `app/api/church-group/route.ts` `PUT`, `app/api/church-group/join/route.ts`
+  `POST` — deliberately bypass `requireAuth` (caller has no `users` row yet);
+  they gate on `auth()` + Supabase-template JWT directly.
+- `app/api/cron/invitation-reminders/route.ts` `GET` — `CRON_SECRET` bearer, not
+  a Clerk session.
+- `app/api/webhooks/**` and the `notImplemented` stubs
+  (`app/api/notifications/{route,[id]/read,mark-all-read,unread-count}`,
+  `GET /api/church-group`) — no auth surface to bypass.
 
-## Files to modify
+---
 
-### 4. `package.json`
+## 4. `tests/unit/app/api/auth-bypass-matrix.test.ts` (CREATE) — AC-1
 
-Add to `scripts`, immediately after `"check:git-secrets"` (keep the existing
-`check:*` grouping and ordering style):
+Follow the file layout of `tests/unit/app/api/auth-matrix.test.ts`: `jest.mock`
+calls at the very top, then imports.
 
-```json
-"check:owasp": "node scripts/check-owasp-review.mjs"
+```ts
+jest.mock("@clerk/nextjs/server", () => ({ auth: jest.fn(), currentUser: jest.fn() }));
+jest.mock("@/lib/supabase/client", () => ({
+  getSupabaseClient: jest.fn(),
+  getAnonSupabaseClient: jest.fn(),
+}));
 ```
 
-### 5. `.github/workflows/ci.yml`
+Also `jest.mock` every side-effecting external client the registry's handler
+modules pull in at import time, so importing ~19 handler modules in one file
+cannot fail on missing env: `@/lib/r2/client`, `@/lib/pingram/client`,
+`@/lib/resend/client`, `@/lib/upstash/qstash`, `@/lib/upstash/redis`,
+`@/lib/spotify/client`, `@/lib/google-calendar/oauth`,
+`@/lib/google-calendar/sync`, `@/lib/google-calendar/token-crypto`. If a module
+still needs an env var at import time, set it in the test file (do not drop the
+registry entry).
 
-In the `checks` job, add one step after the existing
-`- run: bun run check:workflows` step (line 26):
+`describe.each(ADMIN_ROUTE_REGISTRY)` with these cases per entry:
 
-```yaml
-      - run: bun run check:owasp
+1. **No token** — `mockClerkAnonymous()`; invoke with a `jest.fn()` lookup.
+   Assert: `status === 401`, `body.code === "UNAUTHENTICATED"`, the lookup was
+   never called, and `getSupabaseClient` was never called.
+2. **Expired token** — two variants:
+   - `mockClerkAuthed()` + `makeNullLookup()` (Clerk session resolves, the
+     Supabase-template JWT is gone/expired so the DB lookup yields nothing).
+   - `mockClerkAuthed(null)` + `makeLookup("admin")` (session present,
+     `getToken` resolves `null`).
+   Both assert `status === 401` and `body.code === "UNAUTHENTICATED"`. The
+   first also asserts `getSupabaseClient` was never called.
+3. **Valid token, insufficient role** — skip when `allowedRoles` is `null`.
+   For each role in `["member", "guest"]` that is NOT in `allowedRoles`:
+   `mockClerkAuthed()` + `makeLookup(role)`. Assert `status === 403`,
+   `body.code === "FORBIDDEN"`, and `getSupabaseClient` was never called.
+4. **Valid admin token from a different church group** — `mockClerkAuthed()` +
+   `makeLookup("admin")` (which yields `DEFAULT_USER_ID` /
+   `DEFAULT_CHURCH_GROUP_ID`), with `getSupabaseClient` returning
+   `makeRecordingSupabase(entry.result).client`. The request built by `invoke`
+   addresses **the victim tenant's** resources. Assert:
+   - `recording.touched === true` — the handler actually reached the DB layer
+     (otherwise the assertion below is vacuous).
+   - `recording.seenValues` does **not** contain `VICTIM_CHURCH_GROUP_ID` and
+     does **not** contain `VICTIM_USER_ID`.
+   - `recording.seenValues` **does** contain `DEFAULT_CHURCH_GROUP_ID` when
+     `scope === "group"`, or `DEFAULT_USER_ID` when `scope === "user"`.
+
+   This is the load-bearing assertion for cross-tenant admin: the app layer
+   cannot 403 a foreign admin (they are a legitimate admin *of their own*
+   group), so the security property under test is that the handler derives its
+   tenant scope solely from the server-side `AuthContext` and never from
+   caller-supplied ids. Put exactly that reasoning in a comment above the case.
+
+`beforeEach` must `mockReset()` both mocks, mirroring `auth-matrix.test.ts`.
+
+**Non-registry routes** — same file, separate `describe` blocks:
+
+- `claimGuestInvitation`: `mockClerkAnonymous()` -> 401 `UNAUTHENTICATED`;
+  `mockClerkAuthed(null)` -> 401 `UNAUTHENTICATED`.
+- `PUT /api/church-group` and `POST /api/church-group/join` (import the route
+  modules directly): `mockClerkAnonymous()` -> 401 `UNAUTHENTICATED`;
+  `mockClerkAuthed(null)` -> 401 `UNAUTHENTICATED`. Mock `currentUser` to
+  resolve `null`.
+- `GET /api/cron/invitation-reminders`: no `authorization` header -> 401;
+  `Bearer wrong` -> 401; `CRON_SECRET` unset -> 500. Set/restore
+  `process.env.CRON_SECRET` around these.
+
+---
+
+## 5. `tests/unit/schemas/input-validation-injection.test.ts` (CREATE) — AC-3
+
+Directory precedent: `tests/unit/schemas/events.test.ts`.
+
+Define the payload corpus once. **Never paste a raw non-printable, bidi, or
+astral character into the source file** — a literal NUL byte makes the file
+binary to git and grep. Build them with `String.fromCharCode` /
+`String.fromCodePoint`:
+
+```ts
+const NUL  = String.fromCharCode(0x0000);      // null byte
+const RTL  = String.fromCharCode(0x202e);      // right-to-left override
+const BOM  = String.fromCharCode(0xfeff);      // byte-order mark
+const IDSP = String.fromCharCode(0x3000);      // ideographic space
+const LONE = String.fromCharCode(0xd800);      // lone surrogate
+const ACUTE = String.fromCharCode(0x0301);     // combining acute accent
+const ASTRAL = String.fromCodePoint(0x1d518);  // astral-plane letter
+
+const SQLI = [
+  "'; DROP TABLE users; --",
+  "' OR '1'='1",
+  "1; SELECT pg_sleep(10)--",
+  '" OR ""="',
+  "admin'--",
+];
+
+const XSS = [
+  "<script>alert(1)</script>",
+  "javascript:alert(1)",
+  "<img src=x onerror=alert(1)>",
+  '"><svg/onload=alert(1)>',
+  "&lt;script&gt;alert(1)&lt;/script&gt;",
+];
+
+// Null bytes: leading, embedded, trailing.
+const NULL_BYTES = [NUL + "lead", "ok" + NUL + "injected", "trail" + NUL];
+
+const UNICODE = [
+  RTL + "gnp.exe",
+  ASTRAL + ASTRAL,
+  "e" + ACUTE,   // combining form
+  "é",      // precomposed form: same glyph, different bytes
+  BOM + "bom",
+  IDSP,
+  LONE,
+];
+
+const ALL_PAYLOADS = [...SQLI, ...XSS, ...NULL_BYTES, ...UNICODE];
 ```
 
-Do not touch any other job.
+**Part A — schema sweep.** Build a table of `{ label, schema, field, max, trims,
+baseValid }` for every string field of every exported Zod object schema in
+`schemas/*.ts`. Read each schema file and enumerate the fields and their `.max(n)`
+values — do not guess. `baseValid` is a minimal valid object for that schema so
+only the field under test varies.
 
-### 6. `README.md`
+For each `(field, payload)` in `ALL_PAYLOADS` assert **exactly one** of:
 
-Under `## Environments`, after the existing
-`documentation/infrastructure-security.md` paragraph (lines 11–12), add a matching
-two-line paragraph linking
-[`documentation/owasp-top-10-review.md`](documentation/owasp-top-10-review.md)
-described as the Phase 1 pre-launch OWASP Top 10 manual review. Match the existing
-sentence style exactly.
+- `safeParse` fails, **or**
+- `safeParse` succeeds and the parsed field equals `payload.trim()` when the
+  field declares `.trim()`, else equals `payload` — i.e. the value survives
+  byte-for-byte and is therefore handed to a parameterized query, never
+  partially "sanitized" into a different-but-still-dangerous string.
 
-## Code changes
+Express that as a single assertion helper (`expectRejectedOrVerbatim`) so the
+failure message names the schema, field, and payload.
 
-**Default: none.** This is a review issue. The only permitted application-code
-change is a *minimal* fix for a finding the review rates `Critical` or `High`, and
-only when the fix is small and self-contained. In that case:
+Assert failure (never success) for:
 
-- Make the fix, add/extend the matching unit test, and record the finding as
-  `Resolved` with the fix described in the `Resolution` column and the changed file
-  named in `Evidence`.
-- If a `Critical`/`High` finding cannot be fixed small and self-contained, record it
-  as `Open`, let `bun run check:owasp` fail, and say so plainly in
-  `.pipeline/changes.md`. A failing gate is the correct, intended outcome — do not
-  downgrade a severity or flip a status to make the check pass.
-- Medium/Low findings are recorded as `Accepted` (with reasoning) or `Deferred`
-  (naming the follow-up work); do **not** fix them in this PR.
+- **Oversized**: `"a".repeat(max + 1)` for every field with a `.max(n)`.
+- **Empty / whitespace-only** on every field with `.min(1)` after `.trim()`.
+
+Also assert the enum-typed fields (e.g. `vocalCapability` in `schemas/profile.ts`,
+`role` in `schemas/role.ts`, and `default_key` membership via `isValidSongKey`
+in `schemas/songs.ts`) reject every payload in `ALL_PAYLOADS`.
+
+**Part B — filter-escaping.** Direct unit tests on `escapePostgrestFilterValue`
+from `@/lib/api/postgrest`, over `ALL_PAYLOADS` plus the reserved characters
+`,` `(` `)` `.` `"` `\`:
+
+- Round-trip: reversing the escaping (`\\` then `\"`) recovers the input exactly.
+- The escaped result contains no `"` that is not preceded by a `\`.
+
+`tests/unit/lib/api/postgrest.test.ts` already exists — extend the corpus here;
+do not duplicate its existing cases.
+
+**Part C — handler-level escaping** (the only two places user input is
+interpolated into a PostgREST filter string):
+
+- `GET /api/songs?q=` — already covered by
+  `tests/unit/app/api/songs-search-injection-tester-supplement.test.ts`. Do not
+  duplicate; reference it in a comment.
+- `POST /api/invitations/guest` (`createGuestInvitation`) — the
+  `.ilike("email", ...)` lookup uses a module-private `escapeLikePattern`
+  (`app/api/invitations/handler.ts:285`). Test it behaviorally: drive the
+  handler with an email containing `%`, `_`, and `\`, capture the argument
+  passed to `.ilike`, and assert each of those three characters is
+  backslash-escaped in it. Mirror the mock style of
+  `songs-search-injection-tester-supplement.test.ts`.
+
+---
+
+## 6. `tests/unit/middleware-rate-limit-matrix.test.ts` (CREATE) — AC-4
+
+Copy the mocking/harness preamble verbatim from `tests/unit/middleware.test.ts`
+(`jest.mock("@clerk/nextjs/server", ...)`, the `MiddlewareHandler` recast,
+`makeReq`, `makeAuthFn`, `beforeEach(resetRateLimitStore)`).
+
+For each tier/route pair below, assert: the first `RATE_LIMIT_POLICIES[tier].limit`
+requests are not 429; the very next one is `429` with
+`body.code === "RATE_LIMITED"` and a `Retry-After` header that is an integer
+`>= 1` and `<= RATE_LIMIT_POLICIES[tier].windowMs / 1000`.
+
+| Tier | Route under test |
+| --- | --- |
+| `auth` | `POST /api/church-group/join` |
+| `auth` | `GET /api/invitations/respond/<token>` |
+| `auth` | `POST /api/invitations/<uuid>/accept` |
+| `sms` | `POST /api/invitations/<uuid>/deny` |
+| `sms` | `POST /api/setlists/<uuid>/publish` |
+| `sms` | `GET /api/cron/invitation-reminders` |
+| `invite` | `POST /api/invitations` |
+| `write` | `PUT /api/profile` |
+
+Plus these isolation cases:
+
+- Tiers are bucketed independently: exhausting `sms` for one identifier leaves
+  that same identifier's `auth` budget intact.
+- Two different `x-forwarded-for` first hops get independent budgets.
+- A signed-in caller (`userId` non-null) and an anonymous caller from the same
+  IP get independent budgets.
+- **Failure case (required by the pipeline contract):** exhausting a tier for
+  one identifier must NOT 429 a different identifier — assert the second
+  identifier's very next request is not 429.
+
+Use a distinct `x-forwarded-for` per test so tests cannot cross-contaminate even
+if `resetRateLimitStore` ordering changes. Derive every loop bound from
+`RATE_LIMIT_POLICIES[tier].limit`, never a hardcoded number.
+
+---
+
+## 7. `tests/integration/rls/jwt.ts` (MODIFY)
+
+Keep `mintJwt`'s existing behavior byte-identical when the new options are
+absent. Extend `TestClaims`:
+
+```ts
+export interface TestClaims {
+  clerkId: string;
+  churchGroupId?: string;
+  appRole?: AppRole;
+  /** Seconds from now until exp. Default 3600. Negative -> already expired. */
+  expiresInSeconds?: number;
+  /** Sign with this secret instead of SUPABASE_JWT_SECRET (forged-signature tests). */
+  signingSecret?: string;
+}
+```
+
+`exp` becomes `Math.floor(Date.now() / 1000) + (claims.expiresInSeconds ?? 3600)`.
+When `expiresInSeconds` is negative, also set `iat` to that same past second so
+the token is not "issued in the future". `signingSecret` replaces the
+`SUPABASE_JWT_SECRET` lookup; the "secret missing" throw still applies when
+neither is available.
+
+## 8. `tests/integration/rls/client.ts` (MODIFY)
+
+Add alongside the existing exports (do not change `getUserClient`):
+
+```ts
+/** Anon-key client with NO Authorization header — the unauthenticated caller. */
+export function getAnonClient(): SupabaseClient<any>;
+```
+
+## 9. `tests/integration/rls/tables/phase1-token-bypass.test.ts` (CREATE) — AC-2
+
+Same skip-gate and `beforeAll` seeding preamble as
+`tests/integration/rls/tables/cross-tenant-bypass.test.ts` (copy it).
+
+Define the canonical table list at the top of the file:
+
+```ts
+export const PHASE1_TABLES = [
+  "church_groups", "users", "member_profiles", "instruments",
+  "member_instruments", "service_weeks", "setlists", "setlist_songs",
+  "events", "invitations", "event_attendees", "conflicts", "songs",
+  "song_documents", "availability", "notification_preferences",
+  "notifications", "google_calendar_tokens", "audit_logs",
+] as const; // 19 tables — matches supabase/migrations/20260704000001_rls_policies.sql
+```
+
+Blocks:
+
+**A. Coverage pin.** Put this in a plain `describe` that runs even when the RLS
+env vars are absent. Read
+`tests/integration/rls/tables/cross-tenant-bypass.test.ts` from disk with
+`fs.readFileSync` (resolve via
+`path.resolve(__dirname, "./cross-tenant-bypass.test.ts")`) and assert every
+name in `PHASE1_TABLES` appears in it. Also assert
+`PHASE1_TABLES.length === 19`. This is the mechanical guarantee that AC-2's
+"every table" claim stays true when a table is added later.
+
+**B. Unauthenticated caller (`getAnonClient()`), per table** — `SELECT id` must
+return zero rows or an error. Use `assertSelectBlocked` from `../helpers`.
+
+**C. Expired Church A JWT, per table** — `getUserClient({ clerkId: IDS.clerkIds.memberA,
+expiresInSeconds: -60 })`; `SELECT id` must return zero rows or an error.
+
+**D. Wrong-signature JWT, per table** — `getUserClient({ clerkId: IDS.clerkIds.adminA,
+signingSecret: "not-the-real-secret-not-the-real-secret" })`; `SELECT id` must
+return zero rows or an error.
+
+Drive B/C/D with `it.each(PHASE1_TABLES)` so adding a table to the list
+automatically adds coverage.
+
+**E. Trust-boundary characterization (3 tests, NOT a sweep).**
+`public.auth_church_group_id()` (`supabase/migrations/20260704000001_rls_policies.sql:29-38`)
+and `public.auth_user_role()` (lines 42-53) read the `church_group_id` / `role`
+JWT claims *first*, falling back to the DB only when the claim is absent — so a
+JWT signed by the trusted issuer with a forged claim is authoritative. Pin that
+behavior explicitly so #79 (OWASP review) inherits an accurate picture:
+
+- Church A member JWT carrying `churchGroupId: IDS.churches.B` — assert what it
+  can read from `songs`.
+- Church A member JWT carrying `appRole: "admin"` — assert whether it can read
+  `audit_logs` (an admin-only table).
+- A JWT whose `church_group_id` claim is not a valid uuid must error, not
+  silently fall through to the DB value.
+
+Name these tests so the trust assumption is unmistakable (e.g.
+`"church_group_id JWT claim overrides the DB value (trusted-issuer assumption)"`),
+and add a file-header comment stating that the security of this path rests
+entirely on only Clerk being able to mint these claims. **Record the outcome of
+block E in `.pipeline/changes.md` under `## SECURITY FINDINGS`.** Do not change
+any migration.
+
+---
 
 ## Edge cases the implementation must handle
 
-1. `bun audit --audit-level=high` returning a non-zero exit or advisories — record
-   truthfully, escalate to an A05 `High` finding, do not upgrade dependencies here.
-2. `pip-audit` — must be recorded as N/A **with evidence**, never silently omitted.
-3. A category with genuinely no issues still needs the `A0N-0 / Info / Resolved`
-   row; the parser rejects an empty table.
-4. Markdown table cells must not contain a raw `|` (escape as `\|`) — pipes inside
-   a `Summary`/`Evidence` cell would break both rendering and the parser.
-5. The parser must not be confused by the section-2 scan table, the section-8
-   consolidated table, or the doc's own prose mentioning `A01:2021` outside a
-   heading.
-6. `### ` sub-headings must not terminate a `## ` section during parsing.
-7. Severity/Status matching is case-sensitive; a lowercase value is a violation, not
-   a silent pass.
-8. The default doc path must resolve from the script's own location, not `cwd`, so
-   the check works from any directory and inside a worktree.
-9. `prettier --check .` covers markdown — the new doc and any tables must be
-   Prettier-clean (`bun run format:check` must pass).
-10. The new script lives under `scripts/`, which is **not** in `next.config.ts`'s
-    `eslint.dirs` list; `bun run lint` still runs `eslint .` at the repo root, so
-    keep the file lint-clean in the same style as the other `scripts/*.mjs`.
+1. Importing ~19 handler modules into one test file — module-level env
+   requirements must be mocked/stubbed, not worked around by dropping entries.
+2. `getAvailability` is gated **conditionally** (`requireRole` only fires when
+   `?user_id=` differs from `ctx.userId`) — it appears twice in the registry,
+   once with and once without the query param.
+3. Handlers that bail early on falsy `data` (`.single()` / `.maybeSingle()`)
+   may never reach a later group-scoped query. If `recording.touched` or the
+   "own group id present" assertion fails for such an entry, set `entry.result`
+   to a shape that lets the handler proceed — do not delete the assertion.
+4. `denyInvitation` / `acceptInvitation` accept a token path *or* a session
+   path; their registry entries must exercise the session path (no token in the
+   body/query) so `requireAuth` is actually reached.
+5. `expectRejectedOrVerbatim` must treat a documented schema `.transform()`
+   (e.g. `schemas/profile.ts` maps empty/whitespace `bio` to `null`) as a
+   transform, not a sanitization failure — allow `null` for that specific field
+   when the input trims to empty.
+6. Rate-limit tests share one module-level store — `resetRateLimitStore()` in
+   `beforeEach` plus a unique IP per test.
+7. The lone surrogate can throw when round-tripped through
+   `JSON.stringify`/`JSON.parse`. Keep it in the schema sweep (Zod handles it)
+   and out of any test that serializes.
+8. The RLS files must remain skip-safe: no top-level code that requires
+   `SUPABASE_TEST_URL`, except block A which must run unconditionally.
+9. No source file may contain a raw NUL / bidi / astral character — always
+   construct them with `String.fromCharCode` / `String.fromCodePoint`.
 
-## Patterns to follow (name the file, copy the style)
+---
 
-| What | Copy from |
-| ---- | --------- |
-| Documentation structure, tone, checklists, "run recorded for this issue" table | `documentation/infrastructure-security.md` |
-| Guard-script structure, exit codes, `OK:` output, `REPO_ROOT` resolution | `scripts/check-service-role.mjs` |
-| Subprocess-based test for a `scripts/*.mjs` guard, tmpdir fixtures, cleanup | `tests/unit/scripts/check-git-secrets.test.ts` |
-| `check:*` script naming in `package.json` | existing `check:service-role` / `check:workflows` / `check:git-secrets` |
-| CI step placement/format | `.github/workflows/ci.yml`, `checks` job |
-| Doc link paragraph | `README.md` `## Environments` section |
+## Verification
 
-## Verification before finishing
+Run and report in `.pipeline/changes.md`:
 
-Run all of these and report the results in `.pipeline/changes.md`:
+- `bun run lint`
+- `bun run typecheck`
+- `bun run test`
+- `bun run test:rls` (will skip without Supabase env vars — say so explicitly)
 
-```
-bun run lint
-bun run typecheck
-bun run test
-bun run format:check
-bun run check:owasp
-bun audit --audit-level=high
-```
-
-## Out of scope (do not do)
-
-- Third-party penetration testing (explicitly excluded by the issue).
-- Re-doing #76 / #77 / #78 work, or tuning rate-limit numbers, Zod schemas, or CSP
-  directives.
-- Implementing the webhook signature verifiers (`lib/api/webhook-verify.ts`) — those
-  belong to #5 / #58 / #59.
-- Dependency upgrades.
-- OWASP categories A04, A06, A08, A09, A10 (the AC names five; note the exclusion in
-  section 1, do not review them).
-- Any change to `.github/workflows/invitation-reminders-cron.yml`, `supabase/**`, or
-  existing route handlers (subject to the narrow "Code changes" exception above).
+Do not use npm/yarn/pnpm/npx.
