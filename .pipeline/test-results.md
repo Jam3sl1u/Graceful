@@ -1,223 +1,164 @@
-# Test Results — Issue #78: [Sprint 4] Run infrastructure security pass (HTTPS, CSP, secret scan)
+# Test Results — Issue #80: Full auth-bypass & RLS-bypass test suite
 
-## Fix-pass verdict: ALL PASS (BLOCK from `.pipeline/review.md` resolved)
+## Verdict: PASS (with one non-blocking coverage gap noted below)
 
-Re-verified end-to-end after the fix pass described in `.pipeline/changes.md`
-(root-layout `force-dynamic`, `check-git-secrets.mjs` fixes, recreated test
-files, branch rebased onto current `main`):
+All commands were re-run independently and cold in this worktree
+(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-80`). All
+claims in `.pipeline/changes.md` were spot-checked against actual handler
+and migration source, not just trusted.
 
-| Check | Command | Result |
-|---|---|---|
-| Typecheck | `bun run typecheck` | PASS |
-| Lint | `bun run lint` | PASS (pre-existing unrelated warning in generated `coverage/`) |
-| Unit tests | `bun run test` | PASS — **109 suites, 1315 tests** |
-| Format (touched files) | `bunx prettier --check` on every file this fix pass touched | PASS |
-| Git-history secret scan | `bun run check:git-secrets` | PASS — exit 0, clean, with widened merge-commit coverage |
-| Production build | `bun run build` (synthetic Clerk keys) | PASS — `.next/prerender-manifest.json` now lists only `/apple-icon` and `/manifest.webmanifest` (no HTML routes) |
-| Live hydration check | `bun run start` + `curl` on `/` | PASS — response `content-security-policy` nonce matches all 19 inline `<script nonce="...">` tags in the served HTML; this is the exact route/mechanism BLOCKER 1 reported broken |
+## Commands re-run
 
-`/dashboard`, `/documents`, `/notifications`, `/conflicts` could not be
-curled all the way to a hydrated page in this sandbox — Clerk's
-`auth.protect()` needs a real dev-browser JWT handshake that synthetic keys
-can't complete, so these return a 404 rewrite with no CSP header at all
-(pre-existing sandbox limitation, same one the original test-results.md
-below already flagged for `bun run test:e2e`; unrelated to and unaffected by
-this fix). What *is* directly verified for all of them: none appear in
-`.next/prerender-manifest.json` anymore, meaning Next now renders them
-per-request through the same code path proven correct on `/`.
+- `bun run lint` — **PASS**, no errors/warnings (`eslint .`).
+- `bun run typecheck` — **PASS**, no errors (`tsc --noEmit`).
+- `bun run test` — **PASS**: `112 suites, 2535 tests, 0 failures.` Matches
+  the coder's claimed count exactly, run cold.
+- `bun run test:rls` — **PASS**: `1 suite passed (2 tests), 11 suites
+  skipped (294 tests)`. Confirmed no `SUPABASE_TEST_URL` /
+  `SUPABASE_TEST_ANON_KEY` / `SUPABASE_TEST_SERVICE_ROLE_KEY` /
+  `SUPABASE_JWT_SECRET` are set in this environment (`env | grep -i
+  supabase` empty), and no local Supabase/Docker instance is reachable
+  (`docker ps` fails — no daemon). Blocks B–E of
+  `tests/integration/rls/tables/phase1-token-bypass.test.ts` and all of
+  `cross-tenant-bypass.test.ts` did **not** execute here, matching spec
+  Assumption 2 and the coder's own disclosure. This remains unverified
+  beyond the mechanical coverage pin (block A) in this environment — flag
+  for the Reviewer/human to run against a live local Supabase instance
+  before treating AC-2's token-bypass claims as fully verified.
+- New test files run in isolation for a closer look:
+  `auth-bypass-matrix.test.ts` + `input-validation-injection.test.ts` +
+  `middleware-rate-limit-matrix.test.ts` → **PASS**, 1220 tests, 3 suites.
+- `phase1-token-bypass.test.ts` run directly against
+  `jest.config.integration.js` → **PASS**: 2 passed (coverage pin), 60
+  skipped (blocks B–D across 19 tables × 3, plus block E's 3), consistent
+  with the skip-gate design.
 
-### New/changed test coverage
+## Scope check
 
-- **`tests/unit/middleware-csp.test.ts`** (new, 5 tests) — the CSP-specific
-  coverage originally described below under `tests/unit/middleware.test.ts`.
-  Renamed because `tests/unit/middleware.test.ts` was independently claimed
-  by #76's rate-limiting tests, which merged into `main` first (confirmed via
-  `git log -- tests/unit/middleware.test.ts`). Same 5 scenarios, unmodified
-  in substance: public route gets the header without `auth.protect()`;
-  protected route calls `auth.protect()` once and still gets the header; the
-  request-header nonce (spied via `NextResponse.next`) matches the response
-  header nonce; two requests get two different nonces; prod CSP excludes
-  `'unsafe-eval'`/`ws:` and includes `upgrade-insecure-requests`. 5/5 passed.
-- **`tests/unit/scripts/check-git-secrets.test.ts`** (new, 8 tests) — the
-  original 6 scenarios described below, plus 2 new cases added for this fix
-  pass: a path containing `check-git-secrets` outside `tests/` is still
-  scanned (proves the narrowed path bypass), and a value containing an
-  allowlist substring like `example` mid-string is still suppressed (locks
-  in the documented substring-match behavior). 8/8 passed.
+- `git diff origin/main...HEAD --stat` confirms **no file under `app/`,
+  `lib/`, `schemas/`, `middleware.ts`, or `supabase/` was touched** — only
+  files under `tests/` (plus `.pipeline/*`). Matches spec Assumption 3.
 
----
+## Independent verification of claims (not just trusted)
 
-## Original verdict: ALL PASS
+1. **AC-2 coverage-pin table count.** Cross-checked `PHASE1_TABLES` (19
+   entries) against every `create table` / `CREATE TABLE` statement across
+   `supabase/migrations/*.sql` (case-insensitive grep, since one migration
+   uses uppercase DDL that a naive lowercase-only grep misses). Result: 19
+   distinct tables, exact match. Also confirmed all 19 names literally
+   appear in `cross-tenant-bypass.test.ts` (grepped each individually,
+   5–8 occurrences each — not a coincidental substring match).
 
-Independently re-ran every verification `.pipeline/changes.md` claimed, from a
-clean `node_modules` (this worktree had none checked out — ran `bun install`
-first), and added two new test files covering the two seams the spec/changes.md
-flagged as not yet independently exercised: `middleware.ts`'s request/response
-CSP-header plumbing, and `scripts/check-git-secrets.mjs`'s exit-code behavior
-against disposable scratch git repos.
+2. **`ADMIN_ROUTE_REGISTRY` escape-hatch entries — read the real handler
+   source for every one, not just the registry's comments:**
+   - `adminOnlyExample`, `google-calendar/connect` (`touchesSupabase:
+     false`): confirmed via grep — neither calls
+     `getSupabaseClient`/`getAnonSupabaseClient` anywhere in their files.
+   - `google-calendar/callback` (`authFailureIsRedirect: true`): confirmed
+     — every failure path in the handler goes through a blanket
+     `redirectError()`/`try`/`catch`, never a JSON response.
+   - `getAuditLog` (`ownScopeAssertion: false`): confirmed — its only
+     `.from("audit_logs")...` query has no `.eq("church_group_id", ...)`;
+     scoping is delegated entirely to RLS, as the registry comment claims.
+   - `deleteMember` (`ownScopeAssertion: false`): confirmed — the RPC call
+     is `supabase.rpc("remove_church_group_member", { p_target_user_id:
+     targetUserId })`, no `church_group_id` argument.
+   - `acceptInvitation` (`ownScopeAssertion: false`): confirmed — the RPC
+     call is `supabase.rpc("accept_invitation", { p_invitation_id,
+     p_response_token })`, no `church_group_id`/`userId` argument.
+   - `GET /api/availability?user_id=<other>` (`ownScopeAssertion: false`):
+     confirmed — the handler's `targetUserId = user_id` branch fully
+     replaces `ctx.userId`; the query only ever filters by
+     `targetUserId`, never a combined own-scope filter.
 
-## New test files added by this stage
+   All six spot-checked exceptions are accurate descriptions of real
+   handler behavior, not weakened assertions dressed up with a
+   rationalization.
 
-### `tests/unit/middleware.test.ts` (new, 5 tests)
+3. **No hidden skips.** Grepped all four new/changed test files for
+   `.skip`/`xdescribe`/`xit`/`it.todo` — the only hit is the intentional
+   `describe.skip` RLS env-var gate in `phase1-token-bypass.test.ts`
+   (`const describeRls = skip ? describe.skip : describe;`), which is the
+   documented, spec-required behavior (Assumption 2), not a smuggled-in
+   skip.
 
-`middleware.ts` wraps its handler in `clerkMiddleware`, so it can't be
-exercised the way a pure module can. Mocked `@clerk/nextjs/server` down to an
-identity function for `clerkMiddleware` only (`clerkMiddleware: (handler) =>
-handler`), keeping the real `createRouteMatcher` (pure route matching against
-`req.nextUrl.pathname`, no external calls), so the actual handler body in
-`middleware.ts` runs against a real `NextRequest`.
+4. **Mutation sanity check attempted, then reverted.** I temporarily
+   widened `createSongSchema.title`'s `.max(200)` to `.max(200000)` in
+   `schemas/songs.ts` to confirm the Part A oversized-input assertion
+   would actually catch a real regression (not a vacuous pass). The
+   harness's own auto-mode classifier blocked the follow-up `bun run test`
+   invocation specifically because it detected an uncommitted change to a
+   file this issue is scoped to leave untouched (`schemas/`) — a good
+   guardrail. I reverted the edit immediately
+   (`git diff schemas/songs.ts` now empty, `git status` clean) and did not
+   obtain a live before/after diff of the sweep failing. This is a gap in
+   *my own* verification depth, not a defect in the suite; the direct
+   source-level spot checks in item 2 above still substantiate that the
+   registry's assertions are load-bearing.
 
-- **Happy path**: a public route (`/sign-in`) gets a
-  `content-security-policy` response header containing `default-src 'self'`,
-  a `script-src 'self' 'nonce-...'` token, and `frame-ancestors 'none'`,
-  without `auth.protect()` being called.
-- **Edge case (spec-named auth interaction)**: a non-public route
-  (`/dashboard`) calls `auth.protect()` exactly once and still returns a
-  response carrying the CSP header.
-- **Edge case (the plumbing changes.md specifically flagged as worth
-  checking)**: spied on `NextResponse.next` to confirm the *same* nonce that
-  ends up in the response header is also stamped onto the *request* headers
-  object passed to `NextResponse.next({ request: { headers } })` — this is
-  the mechanism the spec relies on for Next to sign its own inline scripts.
-- **Edge case**: two consecutive requests get two different CSP strings
-  (nonce uniqueness carried through the full handler, not just
-  `generateNonce()` in isolation).
-- **Edge case (dev/prod branching)**: with `NODE_ENV=production`, the
-  response CSP contains neither `'unsafe-eval'` nor `ws:`, and does contain
-  `upgrade-insecure-requests`.
+## Finding: Part A schema sweep does not enumerate every exported schema's string fields
 
-Result: **5/5 passed**.
+Spec §5 Part A says: "Build a table of `{ label, schema, field, max, trims,
+baseValid }` for every string field of every exported Zod object schema in
+`schemas/*.ts`." Reading every file under `schemas/*.ts` directly and
+diffing against `FIELD_CASES` in
+`tests/unit/schemas/input-validation-injection.test.ts`, four
+gaps remain:
 
-### `tests/unit/scripts/check-git-secrets.test.ts` (new, 6 tests)
+- `schemas/events.ts` → `updateEventSchema` (`name`, `location`, `notes`)
+  is exported but never appears in `FIELD_CASES` — only its sibling
+  `createEventSchema` is swept. (`updateEventSchema` does have separate,
+  pre-existing max-length-only tests in `tests/unit/schemas/events.test.ts`
+  and `events-notes-max-tester-supplement.test.ts`, but neither runs the
+  SQLi/XSS/null-byte/Unicode `ALL_PAYLOADS` corpus against it.)
+- `schemas/service-weeks.ts` → `updateServiceWeekSchema` (`title`,
+  `sermonTopic`, `sermonScripture`, `speakerName`) — same situation:
+  exported, has identical field validators to
+  `createServiceWeekSchema`, but not in `FIELD_CASES`. Pre-existing
+  max-length-only tests exist in `tests/unit/schemas/service-weeks.test.ts`,
+  again without the adversarial corpus.
+- `schemas/setlists.ts` → `reorderSetlistSchema`'s array-item `notes`
+  field (`.trim().max(1000)`) is not tested anywhere in the repo — not in
+  this new sweep, not in any pre-existing test file I could find
+  (`grep -rn "reorderSetlistSchema" tests/`).
+- `schemas/songs.ts` → `createSongSchema.tags` (`z.array(z.string().trim()
+  .min(1).max(50))`) — the array-of-strings field is entirely absent from
+  the sweep.
 
-Integration-style test (real `git`/`node` subprocesses against disposable
-scratch repos under `os.tmpdir()`, cleaned up per-test) — the behavior under
-test (git history semantics, shallow-clone detection, exit codes) is only
-meaningfully verified end-to-end, matching the spec's own named verification
-scenarios.
+None of these caused an actual production bug in this run — the `update*`
+schemas literally copy-paste the same `.trim().min().max()` chain as their
+`create*` counterparts, so the risk of an undetected divergence is low
+today — but `reorderSetlistSchema.notes` and `createSongSchema.tags` have
+**zero** adversarial-payload coverage anywhere in the repo, which is a real
+gap relative to the "every string field of every exported Zod object
+schema" claim in `.pipeline/changes.md`'s own "What the Tester should focus
+on" item 5 (which specifically asked for this check, correctly anticipating
+it as the most fragile part of the suite).
 
-- **Happy path**: a clean scratch repo (one commit, no secrets) → exit 0,
-  stdout contains `OK:`.
-- **Failure case (spec-named)**: a scratch repo with a commit containing a
-  fake `sk_live_...` key → exit 1, stderr names the `Clerk secret key`
-  pattern, stderr does **not** contain the raw fake secret anywhere, and the
-  redaction format matches `sk_l…(len=<n>)` exactly as the script's `redact()`
-  function specifies.
-- **Edge case**: a committed `.env` file, even after being deleted in a later
-  commit, still triggers a `Committed .env file` finding (history scan, not
-  working-tree scan) → exit 1.
-- **Edge case**: a committed `.env.example` file is correctly *not* flagged →
-  exit 0.
-- **Edge case (spec-named)**: a shallow clone (`git clone --depth 1`) of a
-  2-commit repo → exit 1 with a stderr message containing "shallow",
-  regardless of whether the shallow history itself contains a secret — i.e.
-  the shallow-clone guard fires before/instead of reporting a false "clean".
-- **Failure case**: running the script outside any git working tree → exit 1
-  with a "git working tree" error message.
+This does not change any test's pass/fail status — everything that exists
+passes — but it is a completeness gap the Reviewer should weigh: AC-3
+("free-text validation, all Phase 1 handlers") is not fully satisfied by
+this suite for these four fields/schemas.
 
-Result: **6/6 passed**.
+## Overall assessment for the Reviewer
 
-## Independent re-verification of the Coding stage's claims
-
-All run fresh in this worktree
-(`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-78`), after `bun
-install` (node_modules was absent at the start of this stage):
-
-| Check | Command | Result |
-|---|---|---|
-| Typecheck | `bun run typecheck` | PASS — no errors |
-| Lint | `bun run lint` | PASS — no errors/warnings |
-| Unit tests (baseline, before this stage's new files) | `bun run test` | PASS — **83 suites, 1064 tests** — matches changes.md's claimed count exactly |
-| Unit tests (after this stage's 2 new test files) | `bun run test` | PASS — **85 suites, 1075 tests** (1064 + 5 middleware + 6 check-git-secrets, no regressions) |
-| Format check (repo-wide) | `bun run format:check` | FAILS — but confirmed pre-existing: same 79-file drift changes.md described, none of which are files this issue touches or the 2 files this stage added (`prettier --check` on the new test files individually passes) |
-| Format check (new test files only) | `bunx prettier --check tests/unit/middleware.test.ts tests/unit/scripts/check-git-secrets.test.ts` | PASS |
-| Git-history secret scan | `bun run check:git-secrets` | PASS — exit 0, `OK: no secrets found in git history.` against this repo's real history |
-| Production build | `bun run build` (with synthetic `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`/`CLERK_SECRET_KEY` set, since none are configured in this sandbox) | PASS — exit 0, all 37 routes + Middleware bundle produced, confirming `next.config.ts`'s `headers()` shape is valid Next.js config |
-
-## Manual review against the spec (spot-checked, not just trusted changes.md)
-
-- **`lib/security/csp.ts`**: directive order, tokens, and dev/prod branching
-  in `buildContentSecurityPolicy` match the spec's directive table exactly
-  (verified by reading the source against the table line by line, plus the
-  coder's own `tests/unit/lib/security/csp.test.ts`, which independently
-  looks correct and complete — re-ran it as part of the full suite above).
-  `clerkFrontendApiOrigin`'s prefix-strip / `atob` / `$`-split / host-regex
-  sequence matches the spec's five bullet points exactly.
-- **`middleware.ts`**: `isPublicRoute`, the `clerkMiddleware` wrapper, the
-  `auth.protect()` gate, and the exported `config` matcher are byte-for-byte
-  unchanged from what the spec said to preserve. The nonce/CSP addition
-  matches the spec's 5-step description; the redirect-short-circuit comment
-  is present and accurate. No stray `x-nonce` header (confirmed by grep).
-- **`next.config.ts`**: single `headers()` entry, exact HSTS value from the
-  spec (`max-age=63072000; includeSubDomains; preload`), `source: "/:path*"`.
-  No CSP here (correctly deferred to middleware). `reactStrictMode`,
-  `outputFileTracingRoot`, `eslint.dirs` untouched (confirmed via diff-free
-  read).
-- **`scripts/check-git-secrets.mjs`**: all 7 `PATTERNS` entries match the
-  spec's regexes verbatim, including the 20-name `SECRET_ENV_VAR_NAMES` list.
-  Both allowlists carry a `reason` per entry as required. `PATH_ALLOWLIST` is
-  narrowly scoped to the script's own path plus `check-git-secrets`-fragment
-  paths — confirmed `.pipeline/**` and `documentation/**` are NOT allowlisted
-  (grepped `PATH_ALLOWLIST`/`isAllowedPath`, only the two entries described in
-  changes.md exist). Redaction format matches spec exactly (`<first 4
-  chars>…(len=<n>)`) — confirmed with a live scratch-repo run above. The
-  deliberate no-hardcoded-`cwd` deviation from `check-service-role.mjs` is
-  real and is exactly what makes the scratch-repo test cases in this stage's
-  new test file work.
-- **`.github/workflows/ci.yml`**: new `git-secret-scan` job matches the
-  spec's YAML verbatim (`fetch-depth: 0`, `setup-bun@v2` at `1.2.x`, no `bun
-  install` step, `bun run check:git-secrets`). Every other job
-  (`checks`, `check-secrets`, `rls-integration`, `e2e`) is untouched —
-  confirmed by reading the full file (reproduced above).
-- **`.github/dependabot.yml`**: matches the spec's YAML verbatim, header
-  comment present.
-- **`README.md`**: both additions (Scripts bullet, Environments link) present
-  and match the spec's requested wording/placement; nothing else changed.
-- **`documentation/infrastructure-security.md`**: read in full — covers all
-  five spec sections (purpose/scope, HTTPS, CSP, git-history scan, Dependabot)
-  with the operator checklists as `- [ ]` items, and records the actual scan
-  run (date, commit SHA, `OK:` result) as required. The recorded commit SHA
-  (`43050470ea60ca3637c4abaf02a843aa2321e728`) is the repo HEAD immediately
-  prior to this issue's own commits, consistent with changes.md's explanation.
-- Confirmed the two `VALUE_ALLOWLIST` additions beyond the spec's seed set
-  (`"test-..."` and `"client-(id|secret)..."` regexes) by reading the actual
-  matched fixture files via `git show` — both are genuinely Jest test-double
-  strings (`"test-cron-secret"`, `"test-api-key"`, `"client-secret-456"`),
-  not real credentials. No overly broad allowlist entries found.
-
-## Not independently exercised (environment limitation, not a gap in the diff)
-
-- The two OPEN QUESTION items (Vercel's actual HTTP→HTTPS redirect behavior
-  on a deployed URL; Dependabot actually running on GitHub) are explicitly
-  post-merge human-action items per the spec and were not — and could not be
-  — exercised from this sandbox.
-- `bun run test:e2e` was not re-run: no `STAGING_APP_URL`/Clerk/E2E secrets
-  are configured in this sandbox (same limitation prior pipeline runs in this
-  repo have hit), and this issue's scope doesn't touch any E2E-covered flow.
-  Not required by this issue's spec.
-- A live end-to-end HTTP round-trip against a running `next dev`/`next start`
-  server (to see the `content-security-policy`/`Strict-Transport-Security`
-  headers on an actual HTTP response, as opposed to the in-process handler
-  test added above) was not performed — this repo's E2E harness needs real
-  Clerk credentials to boot the app (`clerkMiddleware` throws without a
-  publishable/secret key pair), which are not present in this sandbox. The
-  `tests/unit/middleware.test.ts` added by this stage exercises the same
-  handler code path in-process instead, which is the closest substitute
-  available without those credentials.
-
-## Failure case coverage summary (per AGENTS.md's Testing-stage requirement)
-
-- `clerkFrontendApiOrigin` invalid-input failure cases: covered by the
-  coder's `tests/unit/lib/security/csp.test.ts` (undefined, empty string,
-  non-`pk_` string, garbage base64, invalid decoded host) — re-verified
-  green.
-- `check-git-secrets.mjs` failure cases: fake-secret-in-history, shallow
-  clone, and non-git-directory all covered by this stage's new test file
-  above, each independently confirmed to exit 1 with the expected message.
-- `middleware.ts`: no distinct failure-mode branch exists in this handler
-  beyond the auth redirect (which the spec explicitly says is out of scope
-  to test — "that redirect response carries no CSP header... state it in a
-  comment so it doesn't read as a bug" — not a code path the tester needs to
-  assert on).
-
-No product bugs found. No failing tests. Ready for Review.
+- Every command the coder claimed to have run was independently re-run and
+  matches exactly (lint clean, typecheck clean, 2535/2535 tests, RLS
+  skip-behavior as documented).
+- No scope creep: diff is entirely under `tests/` + `.pipeline/`.
+- Six of the registry's "escape hatch" entries (the highest-risk part of
+  this suite, per the coder's own recommendation) were traced against real
+  handler/RPC source and found accurate, not rationalized.
+- The AC-2 table-coverage-pin count (19) was independently re-derived from
+  the migrations, not just trusted.
+- One genuine, non-blocking completeness gap found in the AC-3 schema
+  sweep (see above) — four string fields across two schemas plus one
+  array-of-strings field are not exercised against the adversarial payload
+  corpus. Recommend the Reviewer decide whether this needs a follow-up
+  patch to `FIELD_CASES` or can ship as a documented residual gap (similar
+  in spirit to the SECURITY FINDINGS already recorded in
+  `.pipeline/changes.md`).
+- RLS blocks B–E remain unexecuted in any environment so far (no live
+  Supabase available here either) — carried forward as an open
+  verification item for whoever has DB access before this is fully
+  trusted end-to-end.

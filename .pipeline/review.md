@@ -1,192 +1,166 @@
-# Review — Issue #78: [Sprint 4] Infrastructure security pass (HTTPS, CSP, secret scan)
+# Review — Issue #80: Full auth-bypass & RLS-bypass test suite
 
-VERDICT: SHIP (fix pass applied — see below; original BLOCK review preserved beneath)
+VERDICT: NEEDS WORK
 
-## Fix-pass resolution
-
-Every item below was addressed and independently re-verified; see
-`.pipeline/changes.md`'s "Fix pass" section and `.pipeline/test-results.md`'s
-matching section for the full detail. Summary:
-
-- **BLOCKER 1 (nonce CSP breaks prerendered routes) — fixed and verified.**
-  `app/layout.tsx` now forces dynamic rendering site-wide
-  (`export const dynamic = "force-dynamic"`), which is the exact fix this
-  review suggested. Re-ran the same empirical check this review used to find
-  the bug: `bun run build` → `.next/prerender-manifest.json` no longer lists
-  any HTML route; `bun run start` + `curl /` shows the response
-  `content-security-policy` nonce matching all 19 inline
-  `<script nonce="...">` tags in the served HTML. `/dashboard` and the other
-  three authenticated routes are confirmed out of the prerender manifest
-  (same fix, same mechanism as `/`) but couldn't be curled to a fully
-  hydrated page in this sandbox — Clerk's `auth.protect()` needs a real
-  dev-browser JWT handshake unavailable with synthetic keys, a pre-existing
-  environment limitation unrelated to this fix (that response carries no CSP
-  header at all, so there's no nonce mismatch to break).
-- **BLOCKER 2 (false "renders per-request" premise) — fixed.**
-  `documentation/infrastructure-security.md`'s §3 now states the real
-  mechanism: the nonce only works for routes Next renders per-request, which
-  is why `app/layout.tsx` explicitly forces that. `middleware.ts`'s own
-  comment was re-checked and doesn't assert the false premise — only the doc
-  needed correcting.
-- **Non-blocking 1 (untracked test files)** — fixed. Both recreated and
-  committed. `tests/unit/middleware.test.ts` was reclaimed by #76's
-  rate-limiting tests (merged first), so the CSP coverage now lives in
-  `tests/unit/middleware-csp.test.ts` (5 tests). `tests/unit/scripts/check-git-secrets.test.ts`
-  recreated with 8 tests (original 6 + 2 new, covering this fix pass's own
-  script changes).
-- **Non-blocking 2 (README de-indent)** — investigated, **not a real bug**.
-  Verified in isolation that Prettier's own canonical formatting for this
-  markdown list-continuation line strips the indent regardless; restoring it
-  would fail `prettier --check`. The originally-shipped version was already
-  correct. No change made.
-- **Non-blocking 3 (allowlist comment inaccurate)** — fixed. Comment
-  corrected to describe the actual (intentional) substring-match behavior
-  instead of claiming whole-match semantics.
-- **Non-blocking 4 (path bypass broader than spec)** — fixed. Scoped to
-  `tests/` paths only, matching the spec's "any test file whose path
-  contains check-git-secrets" wording.
-- **Non-blocking 5 (merge commits not scanned)** — fixed beyond what was
-  asked (the original review only asked this be documented as a known
-  limitation): `scanAddedLines()` now passes `--diff-merges=first-parent`,
-  so merge-commit diffs are actually scanned. Re-verified
-  `bun run check:git-secrets` still exits 0 clean against real history.
-
-Additionally, the branch itself was stale (forked before #74–#77 merged,
-`gh pr view` showed `CONFLICTING`/`DIRTY`) and has been synced with current
-`main`; `git diff main --stat` now shows only this issue's own files.
-
-Full test suite: 109 suites / 1315 tests, all passing. Typecheck, lint,
-format (touched files), and the git-secret scan are all clean.
+Scope is clean (tests + `.pipeline/` only), lint/typecheck/test were re-run here
+and match the reported numbers exactly (`112 suites / 2535 tests / 0 failures`,
+eslint clean, tsc clean). The 401/403/expired-token sweep, the rate-limit tier
+matrix, and the RLS token-bypass file are real, useful coverage. But the single
+assertion that AC-1's cross-tenant claim rests on is provably vacuous, and the
+AC-3 sweep does not meet the spec's own "every string field of every exported
+schema" requirement (the tester already found part of this). Both must be fixed
+before this ships as a *security* suite — it currently advertises more assurance
+than it delivers.
 
 ---
 
-## Original review (BLOCK) — preserved for context
+## 1. BLOCKING — the cross-tenant "victim id never leaks" assertion can never fail
 
-The diff matches the spec almost line for line, and every test in the pipeline is
-green — but the CSP as shipped **breaks the six statically prerendered routes in
-production**. This was verified empirically against this worktree's own
-production build, not inferred.
+`tests/unit/app/api/auth-bypass-matrix.test.ts:269-270`
+
+```ts
+expect(recording.seenValues).not.toContain(VICTIM_CHURCH_GROUP_ID); // "group-victim-2"
+expect(recording.seenValues).not.toContain(VICTIM_USER_ID);         // "user-victim-2"
+```
+
+`recording.seenValues` only ever contains strings that the handler passed to the
+Supabase double. Those strings come from (a) the request built by
+`entry.invoke()` and (b) the `AuthContext` from `makeLookup("admin")`. Grepping
+the whole tree, `"group-victim-2"` / `"user-victim-2"` appear in exactly three
+places: their definition in `tests/support/api-auth.ts:24-25` and these two
+assertions. **No registry entry ever puts them into a request**, and
+`makeLookup` uses `DEFAULT_*`. The registry even documents the tautology as if
+it were a design decision (`tests/support/admin-route-registry.ts:120-124`:
+"these only need to be syntactically valid and distinct from
+VICTIM_CHURCH_GROUP_ID/VICTIM_USER_ID"). A handler could pass a fully
+caller-controlled tenant id straight into `.eq("church_group_id", …)` and this
+test would still be green.
+
+This matters because it is exactly the assertion the code comment
+(`auth-bypass-matrix.test.ts:244-248, 267-268`) and `.pipeline/changes.md` call
+"the load-bearing assertion for cross-tenant admin".
+
+What survives: the *positive* check (`seenValues` contains
+`DEFAULT_CHURCH_GROUP_ID` / `DEFAULT_USER_ID`) is real and does catch a handler
+that scopes by a request-supplied id instead of `ctx`. It runs for 55 of 61
+entries. For the other 6 (`ownScopeAssertion: false` / `touchesSupabase: false`
+— `adminOnlyExample`, `google-calendar/connect`, `getAuditLog`, `deleteMember`,
+`acceptInvitation`, `GET /api/availability?user_id=`) case 4 degenerates to
+`expect(recording.touched).toBe(true)` plus the two dead assertions, i.e. it
+asserts nothing about tenant scope at all — and those are the highest-risk
+routes in the set.
+
+Fix (either approach, in `tests/support/admin-route-registry.ts` +
+`tests/support/recording-supabase.ts` + `auth-bypass-matrix.test.ts`):
+
+- Make the victim ids actually reachable: redefine `VICTIM_CHURCH_GROUP_ID` /
+  `VICTIM_USER_ID` as UUID-shaped constants and have `invoke()` inject them into
+  the caller-controlled surfaces a confused-deputy bug would read —
+  `churchGroupId` / `church_group_id` / `userId` / `user_id` keys in the body and
+  query string. Zod strips unknown keys by default, so the assertion then proves
+  the strip actually happens end-to-end; where a schema is `.strict()` and would
+  400, drop that injection for that entry and say so in a comment.
+- Or (stronger, and it also fixes the 6 exception entries): have
+  `makeRecordingSupabase` record `(method, args)` tuples, and assert that every
+  `.eq("church_group_id", x)` / `.eq("user_id", x)` and every RPC argument whose
+  name implies tenant/user identity equals the `ctx` value — never a
+  request-derived one.
+
+Also update the now-incorrect comments at `auth-bypass-matrix.test.ts:267-268`
+("The negative assertion always applies") and
+`admin-route-registry.ts:120-124`, and the claim in `.pipeline/changes.md`
+("the negative 'no victim id ever leaks' assertion always still runs for every
+entry" — it runs, but it cannot fail).
+
+## 2. AC-3 schema sweep does not cover every exported schema (spec §5 Part A)
+
+Confirmed independently against `schemas/*.ts` (the tester found these too;
+they are not fixed):
+
+- `schemas/events.ts` `updateEventSchema` — `name`, `location`, `notes`: absent
+  from `FIELD_CASES`.
+- `schemas/service-weeks.ts` `updateServiceWeekSchema` — `title`,
+  `sermonTopic`, `sermonScripture`, `speakerName`: absent.
+- `schemas/setlists.ts` `reorderSetlistSchema.songs[]` — `keyOverride` and
+  `notes` (`.trim().max(1000)`): zero adversarial coverage anywhere in the repo.
+- `schemas/songs.ts` `createSongSchema.tags` (`z.array(z.string().trim().min(1)
+  .max(50))`): absent.
+
+Add these to `FIELD_CASES` in
+`tests/unit/schemas/input-validation-injection.test.ts` (array-item fields need
+a small wrapper that varies one element), or amend the spec/AC. Do not leave
+`.pipeline/changes.md` claiming "every genuinely free-text string field of every
+exported Zod object schema".
+
+## 3. `createGuestInvitationSchema.email` field case encodes a wrong expectation
+
+`tests/unit/schemas/input-validation-injection.test.ts:258-265` declares
+`trims: true` with no `transform`, but the schema is
+`z.string().trim().toLowerCase().email().max(255)`
+(`schemas/invitations.ts:70`). It only passes because every payload in
+`ALL_PAYLOADS` fails `.email()` and never reaches the success branch — the same
+is true of the oversized case (`"a".repeat(256)` is rejected as a non-email, not
+for length). Add `transform: (t) => t.toLowerCase()` and build the oversized
+value as a real over-length email (e.g. `"a".repeat(250) + "@example.com"`) so
+the assertion is about the `.max(255)` it claims to test.
+
+## 4. The AC-2 "coverage pin" does not pin what it claims
+
+`tests/integration/rls/tables/phase1-token-bypass.test.ts:46-59` asserts
+`PHASE1_TABLES.length === 19` and that each of those 19 names appears somewhere
+in `cross-tenant-bypass.test.ts`. That catches "someone added a table to
+`PHASE1_TABLES` without covering it", but **not** the case the file header and
+`.pipeline/changes.md` claim it guards ("a future table added to the schema
+cannot silently skip the cross-tenant sweep") — a new `create table` in
+`supabase/migrations/` with no edit to `PHASE1_TABLES` leaves the pin green.
+Derive the list from (or cross-check it against) the `create table` statements
+in `supabase/migrations/*.sql`, which is what makes it mechanical; otherwise
+downgrade the claim in the file header and in `changes.md`. Secondary nit:
+`expect(source).toContain(table)` is a raw substring match — `"users"`,
+`"songs"`, `"events"`, `"instruments"`, `"notifications"` all match as
+substrings of unrelated identifiers/comments; match on a quoted-table form
+instead.
+
+## 5. `changes.md` states Block E results as confirmed, but Block E never ran
+
+`.pipeline/changes.md` SECURITY FINDINGS §4: "All three characterization tests
+confirm the documented behavior, not a bug", with a bullet list of outcomes —
+then discloses at the bottom of the same section that Block E was not executed
+in this environment. The findings are consistent with
+`supabase/migrations/20260704000001_rls_policies.sql:29-53` on inspection, and
+the seed data they depend on does exist (`tests/integration/rls/setup.ts`:
+`songs` B1, `audit_logs` B/A), so I expect them to pass — but the write-up must
+say "expected from the migration source, unverified" rather than "confirm",
+because #79 is meant to inherit this as fact. Reword §4.
 
 ---
 
-## BLOCKER 1 — Nonce-based CSP blocks all inline scripts on prerendered routes
+## Things I checked that are fine (no action)
 
-**Where:** `middleware.ts` + `lib/security/csp.ts` (interaction with Next's full
-route cache), documented incorrectly in `documentation/infrastructure-security.md:53-55`.
+- Registry completeness: 61 entries covering all 60 exported `UserLookup`
+  handlers under `app/api/**/handler.ts` (`getAvailability` twice, per the
+  conditional role gate) — enumerated independently; nothing omitted. The 5
+  deliberately-excluded routes all have their own explicit tests.
+- The `scope: "user"` correction for `GET /api/events/:id/ics` (spec said
+  "group") is right — `exportEventIcs` only ever reads `ctx.userId`
+  (`app/api/events/[id]/ics/handler.ts`). Good catch by the coder, documented.
+- `touchesSupabase: false` / `authFailureIsRedirect: true` / the four
+  `ownScopeAssertion: false` entries were re-checked against handler source
+  (`getAuditLog` has no `.eq("church_group_id", …)`; `getAvailability`'s
+  `user_id` branch replaces `ctx.userId` wholesale). Accurate, not rationalized
+  — but see item 1 for what that leaves untested.
+- Rate-limit matrix genuinely exercises `resolveTier` (all six tier limits are
+  distinct, so a mis-mapped tier would fail), asserts `Retry-After` bounds from
+  the policy, and includes the required different-identifier failure case.
+  Mocking `createRouteMatcher` to always-true is safe: rate limiting runs before
+  `isPublicRoute` in `middleware.ts`.
+- `mintJwt` stays byte-identical when the new options are absent; `iat`
+  back-dating for negative `expiresInSeconds` is handled.
+- No production file touched; no network/exec/env exfiltration in the diff.
 
-**Evidence (reproduced live, `next start` on the build in `.next/`):**
+## Residual (not blocking, carry forward for a human)
 
-`GET /` (public, in `prerender-manifest.json`):
-
-```
-x-nextjs-cache: HIT
-x-nextjs-prerender: 1
-content-security-policy: ... script-src 'self' 'nonce-ZnyOrs6hRXU0rnC+rl+RTQ==' ... (no 'unsafe-inline')
-```
-
-and the body it served:
-
-```
-<script>(self.__next_f=self.__next_f||[]).push([0])</script>
-<script>self.__next_f.push([1,"0:{\"P\":null,...
-```
-
-— 8 inline `<script>` tags, **zero `nonce` attributes** (the RSC payload even
-carries `"nonce":""` for ClerkProvider). Compare `GET /sign-in` (dynamically
-rendered), which is correct:
-
-```
-<script nonce="DpU+fmZEjH9CB6g9VNGY0A==">
-```
-
-**Why:** Next reads the nonce out of the *request* `content-security-policy`
-header at **render** time (`node_modules/next/dist/server/app-render/app-render.js:108-119`).
-Statically prerendered routes are rendered at build time, when no such header
-exists, and are then served from the full route cache with a fresh per-request
-nonce in the response header that matches nothing in the HTML. With no
-`'unsafe-inline'` in `script-src`, the browser blocks every one of those inline
-scripts, `self.__next_f` never populates, and the App Router never hydrates.
-
-**Affected routes** (from `.next/prerender-manifest.json`): `/`, `/dashboard`,
-`/documents`, `/notifications`, `/conflicts`, `/_not-found` — i.e. the landing
-page and the four main authenticated pages. On Vercel this is the same or worse
-(CDN-served prerendered HTML + middleware-generated nonce).
-
-**Fix (coder's call, but it must be verified end-to-end, not by unit test):**
-- Simplest: opt the app out of static prerendering while a nonce CSP is in play
-  (e.g. `export const dynamic = "force-dynamic"` in `app/layout.tsx`), then
-  confirm `bun run build` reports no statically prerendered app routes and that
-  a `next start` response for `/` shows `<script nonce="...">` matching the
-  response header.
-- Alternative: keep static prerendering and stop using a per-request nonce
-  (hash-based / `'strict-dynamic'`) — significantly more fragile; only take this
-  if you verify it against the built output.
-- Do **not** "fix" this by adding `'unsafe-inline'` to `script-src` — that
-  violates the issue's acceptance criteria.
-
-**Regression coverage to add:** a check that actually inspects served HTML (or a
-build-time assertion that no app route is statically prerendered). The current
-`tests/unit/middleware.test.ts` only asserts on the header string, which is why
-5/5 green tests missed a total production breakage.
-
-## BLOCKER 2 — Documentation asserts the false premise
-
-`documentation/infrastructure-security.md:53-55` states "because the policy (and
-the nonce inside it) is generated fresh per request, pages render per-request
-rather than being fully static/cached at the CSP layer." That is not true today —
-`x-nextjs-cache: HIT` / `x-nextjs-prerender: 1` on `/` proves it. The comment
-block in `middleware.ts:33-36` ("this is what makes 'no inline scripts'
-achievable without 'unsafe-inline'") is likewise only true for dynamically
-rendered routes. Both must be corrected as part of the fix, since this wrong
-assumption is what let the bug through.
-
----
-
-## Non-blocking issues (fix while you're in here)
-
-1. **Tester's new test files are untracked.** `tests/unit/middleware.test.ts` and
-   `tests/unit/scripts/check-git-secrets.test.ts` are not committed
-   (`git status` shows `??`). They will not land in the PR as-is. Commit them.
-2. **`README.md` unintended reformat.** The change de-indented an unrelated
-   continuation line:
-   ```
-   -  check:service-role`) and re-verified in the Sprint 4 security audit (#79).
-   +check:service-role`) and re-verified in the Sprint 4 security audit (#79).
-   ```
-   Renders the same (lazy continuation) but the spec said "nothing else in
-   README.md changes". Restore the two-space indent.
-3. **`scripts/check-git-secrets.mjs:109` — allowlist comment is inaccurate.**
-   The comment claims a value "would still need to match the *whole* allowlist
-   regex to be suppressed"; `VALUE_ALLOWLIST` entries are applied with
-   `regex.test(matched)`, i.e. substring matching. A real secret containing
-   `example`/`xxxx` as a substring would be silently suppressed. Either anchor
-   the allowlist regexes or correct the comment.
-4. **`scripts/check-git-secrets.mjs:105` — path bypass is broader than spec.**
-   The spec asked for "any *test file* whose path contains `check-git-secrets`";
-   the implementation exempts *any* path containing that fragment, which is a
-   trivially nameable scanner bypass. Narrow it (e.g. require a `tests/` prefix).
-5. **Merge commits are not scanned.** `git log --all -p` emits no diff for merge
-   commits, so a secret introduced in a conflict resolution is invisible to the
-   added-line scan. Acceptable as a known limitation, but it should be stated in
-   `documentation/infrastructure-security.md` rather than left implicit under the
-   "scans the *entire* history" claim in the script header.
-
-## What is correct and verified
-
-- HSTS: live response carries `Strict-Transport-Security: max-age=63072000;
-  includeSubDomains; preload` on `/`; `next.config.ts` shape is valid (build
-  succeeds).
-- `lib/security/csp.ts` matches the spec's directive table exactly (order,
-  tokens, `isDev` gating, `clerkOrigin: null` handling); verified against the
-  live header, which correctly resolved `https://clean-mayfly-62.clerk.accounts.dev`
-  from the publishable key.
-- `scripts/check-git-secrets.mjs`: re-ran the tester's scratch-repo suite —
-  fake `sk_live_` key, committed `.env` (even when later deleted), `.env.example`
-  not flagged, shallow clone refused, non-git dir refused. Redaction never leaks
-  the matched value. Exits 0 on this repo's real history. The two extra
-  `VALUE_ALLOWLIST` entries are genuinely Jest fixtures.
-- `.github/workflows/ci.yml` (`git-secret-scan` with `fetch-depth: 0`) and
-  `.github/dependabot.yml` match the spec; no existing CI job touched.
-- `bun run typecheck`, `bun run lint`, and the 24 security-related unit tests
-  pass; every file this issue touches is Prettier-clean (repo-wide
-  `format:check` drift is pre-existing and correctly left alone).
+RLS blocks B–E have still never executed anywhere — no Supabase env vars and no
+Docker in this worktree. Run `bun run test:rls` against a live local instance
+before treating AC-2's token-bypass claims (and Block E's trust-boundary
+findings) as verified.
