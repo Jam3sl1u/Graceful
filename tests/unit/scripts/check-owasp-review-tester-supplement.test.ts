@@ -34,12 +34,7 @@ afterEach(() => {
   scratchDirs = [];
 });
 
-function categorySection(
-  code: string,
-  title: string,
-  tableRows: string,
-  extra = "",
-): string {
+function categorySection(code: string, title: string, tableRows: string, extra = ""): string {
   return `## ${code}:2021 — ${title}
 
 ### Scope reviewed

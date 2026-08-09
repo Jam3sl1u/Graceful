@@ -153,4 +153,26 @@ describe("check-owasp-review.mjs", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("not found");
   });
+
+  it("exits 1 (fails closed) when a category section has a second ID-headed findings table, even if it hides a Critical + Open row", () => {
+    const doc = minimalDoc().replace(
+      "| A01-0 | Info | Resolved | No issues found | n/a | Reviewed, nothing to report. |\n",
+      `| A01-0 | Info | Resolved | No issues found | n/a | Reviewed, nothing to report. |
+
+### More Findings
+
+| ID | Severity | Status | Summary | Evidence | Resolution |
+| -- | -------- | ------ | ------- | -------- | ---------- |
+| A01-9 | Critical | Open | RCE in prod | some/file.ts | Not yet triaged. |
+`,
+    );
+    const fixturePath = writeFixture(doc);
+
+    const result = runCheck([fixturePath]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("A01");
+    expect(result.stderr).toContain("expected exactly 1");
+    expect(result.stdout).not.toContain("OK:");
+  });
 });
