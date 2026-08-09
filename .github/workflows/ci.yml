@@ -25,6 +25,8 @@ jobs:
 
       - run: bun run check:workflows
 
+      - run: bun run check:owasp
+
       - run: bun run test:coverage
 
       - run: bun audit --audit-level=high

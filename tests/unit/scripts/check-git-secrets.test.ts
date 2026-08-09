@@ -161,4 +161,35 @@ describe("check-git-secrets.mjs", () => {
 
     expect(result.status).toBe(0);
   });
+
+  it('does not flag the "the-real-secret" test-double value for CRON_SECRET', () => {
+    const repo = makeScratchDir();
+    initRepo(repo);
+    commitFile(
+      repo,
+      "auth-bypass.test.ts",
+      'process.env.CRON_SECRET = "the-real-secret";\n',
+      "add auth-bypass fixture",
+    );
+
+    const result = runScanner(repo);
+
+    expect(result.status).toBe(0);
+  });
+
+  it("does not flag restoring a secret env var from an ORIGINAL_ saved variable", () => {
+    const repo = makeScratchDir();
+    initRepo(repo);
+    commitFile(
+      repo,
+      "auth-bypass.test.ts",
+      "const ORIGINAL_CRON_SECRET = process.env.CRON_SECRET;\n" +
+        "process.env.CRON_SECRET = ORIGINAL_CRON_SECRET;\n",
+      "add save/restore fixture",
+    );
+
+    const result = runScanner(repo);
+
+    expect(result.status).toBe(0);
+  });
 });

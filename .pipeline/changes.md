@@ -1,233 +1,145 @@
-# Changes — Issue #78: [Sprint 4] Run infrastructure security pass (HTTPS, CSP, secret scan)
+# Changes — Issue #79: [Sprint 4] Conduct manual OWASP Top 10 review
 
-Implements `.pipeline/spec.md` in full. No OPEN QUESTIONS blocked the pipeline
-(both items in the spec's OPEN QUESTIONS section are post-merge human-action
-checklist items, recorded in the new documentation file per the spec).
+## Summary
 
-## Fix pass — resolving the BLOCK verdict in `.pipeline/review.md`
+Implemented exactly what `.pipeline/spec.md` specified: the manual OWASP Top
+10 (2021) review document (A01, A02, A03, A05, A07), a mechanical launch-gate
+script that parses it, a test suite for that script, and the three small
+wiring changes (`package.json`, CI, `README.md`). This is a docs +
+tooling-only issue — no application/business-logic code was touched, per the
+spec's "Code changes: none (default)" policy, because no finding rated
+`Critical` or `High` was found.
 
-The branch was also rebased onto current `main` (via merge commit) to pick up
-issues #74–#77, which had merged after this branch diverged and were making
-the PR show as `CONFLICTING`.
+## Files added
 
-- **`app/layout.tsx`** — added `export const dynamic = "force-dynamic";`.
-  This is the fix for BLOCKER 1: nothing previously forced dynamic rendering,
-  so Next statically prerendered `/`, `/dashboard`, `/documents`,
-  `/notifications`, `/conflicts`, `/_not-found` at build time, shipping HTML
-  with no nonce on inline bootstrap scripts while the CSP header carried a
-  different, per-request nonce — the browser blocked every inline script and
-  the app never hydrated. Forcing dynamic rendering at the root cascades to
-  every route group, guaranteeing a real per-request render (and thus a valid
-  nonce) everywhere the CSP middleware applies. Verified empirically (not
-  just re-read): `bun run build` afterward shows `.next/prerender-manifest.json`
-  contains only `/apple-icon` and `/manifest.webmanifest` (binary/JSON
-  responses, no inline scripts, unaffected either way); a `bun run start`
-  response for `/` returns the same nonce in `content-security-policy` as on
-  all 19 inline `<script nonce="...">` tags in the served HTML.
-- **`documentation/infrastructure-security.md`** — corrected BLOCKER 2: the
-  §3 CSP section no longer claims per-request rendering was already an
-  automatic consequence of the nonce design; it now states that
-  `app/layout.tsx`'s `force-dynamic` export is what guarantees it, and why
-  that's required (Next only signs inline scripts with a nonce at render
-  time). Re-checked `middleware.ts`'s own comment for the same false
-  premise — it doesn't assert one; only the doc needed correcting.
-- **`scripts/check-git-secrets.mjs`** — three non-blocking fixes:
-  1. `isAllowedPath`'s `path.includes("check-git-secrets")` bypass is now
-     scoped to `tests/` paths only (`/(^|\/)tests\//.test(path) &&
-     path.includes(...)`), matching the spec's actual "any test file whose
-     path contains check-git-secrets" wording instead of exempting any path
-     anywhere in history containing that fragment.
-  2. The `VALUE_ALLOWLIST` comment no longer claims whole-string match
-     semantics; it now accurately describes the (intentional) substring
-     match `isAllowedValue` performs.
-  3. `scanAddedLines()`'s `git log` invocation now passes
-     `--diff-merges=first-parent`, so a secret introduced only via a merge
-     commit's conflict resolution is no longer invisible to the scan (plain
-     `git log -p` silently omits merge-commit diffs). Re-verified
-     `bun run check:git-secrets` still exits 0 clean against this repo's
-     real history with the wider coverage.
-- **`README.md` non-blocking finding — investigated, no change needed.** The
-  review asked to restore a 2-space continuation-line indent under the
-  `check:service-role` bullet. Verified in isolation
-  (`bunx prettier` on a standalone file reproducing the exact pattern) that
-  Prettier's own canonical formatting for this markdown list-continuation
-  line strips that indent — restoring it would fail `prettier --check` and
-  get stripped again on the next format pass. The originally-shipped version
-  was already Prettier-correct; this was a false positive in the review, not
-  an accidental reformat.
-- **Recreated the two test files** `tests/unit/middleware.test.ts` and
-  `tests/unit/scripts/check-git-secrets.test.ts` never made it into the PR
-  (written by the Testing stage but never `git add`ed before that worktree
-  was cleaned up — confirmed unrecoverable via `git fsck --dangling`).
-  - `tests/unit/middleware.test.ts` was reclaimed in the meantime by #76
-    (rate-limiting tests) merging first, so the CSP-specific coverage now
-    lives in a new file, **`tests/unit/middleware-csp.test.ts`** (5 tests,
-    same scenarios `.pipeline/test-results.md` originally described).
-  - **`tests/unit/scripts/check-git-secrets.test.ts`** (8 tests): the
-    original 6 scratch-repo scenarios, plus 2 new cases covering this fix
-    pass's two `check-git-secrets.mjs` behavior changes (narrowed path
-    bypass; substring-allowlist suppression still works as documented).
+- **`documentation/owasp-top-10-review.md`** — the primary deliverable. Nine
+  required sections (verbatim headings per spec), covering:
+  - Section 1: scope (A01/A02/A03/A05/A07 in scope; A04/A06/A08/A09/A10 and
+    pen-testing explicitly out of scope), commit SHA (`3af534affcd5ee9487ab5e3475528dac21ffd982`)
+    and date reviewed, and the launch-gate policy (enforced by `bun run
+    check:owasp`).
+  - Section 2: the actual `bun audit --audit-level=high` run (clean, exit 0)
+    and `pip-audit` recorded `N/A` with evidence (zero `.py` files /
+    `requirements*.txt` / `pyproject.toml` / `Pipfile` / `setup.py` anywhere
+    in the repo, verified by `find`).
+  - Sections 3–7: one category each, every candidate item named in the spec
+    addressed as its own findings-table row (36 total rows across the five
+    categories — none `Critical`/`High`-and-not-`Resolved`, none `Open`).
+  - Section 8: consolidated non-`Resolved` findings (6 rows: two `Low`/`Accepted`,
+    four `Medium`/`Low` `Deferred`).
+  - Section 9: operator re-run checklist, including the human Phase 1
+    launch sign-off (#83) as an explicit checklist item.
 
-## Files changed
+  **Six open (non-`Resolved`) findings recorded**, all `Low`/`Medium` and
+  intentionally not fixed in this review-only issue (per its "Code changes"
+  scope — only `Critical`/`High` may be fixed here, and none were found):
+  - `A01-7`/`A05-5`: `app/api/_examples/admin-only/**` ships in the
+    production API surface (`Accepted` — still auth-gated, no sensitive
+    data; recommended cleanup, not fixed).
+  - `A02-5`/`A07-5`: the cron route's `CRON_SECRET` bearer check
+    (`app/api/cron/invitation-reminders/route.ts:25`) uses `!==` instead of
+    a constant-time comparison (`Deferred` — recommend `crypto.timingSafeEqual`
+    as a follow-up).
+  - `A05-7`: `next.config.ts` doesn't set `poweredByHeader: false`
+    (`Deferred` — trivial follow-up).
+  - `A07-3`: the rate-limit store (`lib/api/rate-limit.ts`) is an in-memory
+    `Map`, not distributed across serverless instances, even though
+    `@upstash/redis`/`@upstash/qstash` are already repo dependencies
+    (`Deferred` — recommend migrating the store as a follow-up).
 
-- **`lib/security/csp.ts`** (new) — pure, dependency-free, edge-safe module:
-  - `clerkFrontendApiOrigin(publishableKey)` — derives `https://<host>` from a
-    `pk_test_`/`pk_live_` Clerk key by base64-decoding the payload up to the
-    first `$`; returns `null` for any invalid/undefined/garbage input.
-  - `generateNonce()` — 16 random bytes via `crypto.getRandomValues`,
-    base64-encoded via `btoa`.
-  - `buildContentSecurityPolicy({ nonce, clerkOrigin, isDev })` — builds the
-    single-line CSP header value per the directive table in the spec
-    (`script-src`/`connect-src` include the Clerk origin only when non-null;
-    `'unsafe-eval'`/`ws:` only when `isDev`; `upgrade-insecure-requests`
-    omitted when `isDev`).
+  None of these block `bun run check:owasp` — the gate only fires on
+  `Critical`/`High`-and-not-`Resolved` or any `Open` finding, and there are
+  none of either.
 
-- **`middleware.ts`** (modified) — `isPublicRoute`, the `clerkMiddleware`
-  wrapper, the auth behavior, and the exported `config` matcher are
-  unchanged. Added: generate a nonce + CSP per request, stamp the CSP onto
-  the *request* headers before `NextResponse.next()` (so Next.js can sign its
-  own streaming inline scripts with the nonce), then set the same CSP on the
-  *response* headers. Comment explains the redirect-short-circuit edge case
-  (an `auth.protect()` redirect carries no CSP header — acceptable, empty
-  body). No `x-nonce` header added (no app code reads it — would be unused
-  scope creep).
+- **`scripts/check-owasp-review.mjs`** — the launch-gate script (AC4). Copies
+  the shape of `scripts/check-service-role.mjs` (`#!/usr/bin/env node`, ESM,
+  `node:fs`/`node:path`/`node:url` only, `REPO_ROOT`/default-doc-path
+  resolution via `fileURLToPath(import.meta.url)`, not `cwd`). Parses the
+  five required category sections (bounded by `## ` headings; `### `
+  sub-headings do not end a section), finds the findings table whose header
+  row's first cell is exactly `"ID"` (so the Section 2 scan table and
+  Section 8's consolidated table are invisible to it), and fails with a
+  specific message for each of the 7 violation classes named in the spec
+  (missing doc, missing category, missing/empty table, wrong column count,
+  invalid `Severity`/`Status`, ID-prefix mismatch, and the blocking-finding
+  gate itself). Prints `OK: OWASP review complete — N findings, 0 blocking.`
+  on success. `node scripts/check-owasp-review.mjs [pathToReviewDoc]` — the
+  optional arg is what the Jest test uses to point at fixture files.
 
-- **`next.config.ts`** (modified) — added `async headers()` returning one
-  entry: `source: "/:path*"` with
-  `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`.
-  `reactStrictMode`, `outputFileTracingRoot`, `eslint.dirs` untouched. CSP is
-  deliberately NOT here (must be per-request/nonce-based, middleware-only).
+- **`tests/unit/scripts/check-owasp-review.test.ts`** — subprocess-based
+  tests copying `tests/unit/scripts/check-git-secrets.test.ts`'s pattern
+  (`spawnSync`, `fs.mkdtempSync(os.tmpdir())` fixtures, cleanup in
+  `afterEach`). Covers every case the spec named as a minimum: a minimal
+  well-formed doc (exit 0), the real doc via default path resolution (exit
+  0), a doc missing the A05 section (exit 1, stderr names A05), a
+  `High`+`Deferred` row (exit 1, names the finding ID), a `Low`+`Open` row
+  (exit 1 — Open blocks at any severity), a lowercase `"high"` Severity
+  (exit 1), a category whose table has zero data rows (exit 1), and a
+  nonexistent doc path (exit 1).
 
-- **`scripts/check-git-secrets.mjs`** (new) — git-history secret scanner,
-  following `check-service-role.mjs`'s exit-code convention and
-  `check-workflows.mjs`'s `execFileSync` usage (node builtins only, no `bun
-  install` needed):
-  1. Fails if not inside a git work tree.
-  2. Fails (with an explanatory message) if the repo is a shallow clone —
-     `git rev-parse --is-shallow-repository`.
-  3. Added-line scan over `git log --all --full-history -p -U0` output,
-     matching `PATTERNS` (Clerk secret keys, Resend API keys, Google OAuth
-     client secrets, AWS/R2 access key IDs, PEM private key blocks, JWTs, and
-     assigned secret env vars from the 20 secret-bearing names in
-     `.env.example`).
-  4. Committed-`.env*`-file scan via `git log --diff-filter=A --name-only`,
-     flagging any added `.env`/`.env.*` path except `.env.example`.
-  5. Findings print to stderr as `<sha> <path> - <patternName>:
-     <redacted>` and exit 1; a clean scan prints `OK: ...` and exits 0.
-     Redaction is always `<first 4 chars>…(len=<n>)` — the matched secret
-     itself is never printed.
-  - Two allowlists, each entry carrying a `reason`: `VALUE_ALLOWLIST`
-    (matched-text regexes) and `PATH_ALLOWLIST` (the script's own path, plus
-    any path containing `check-git-secrets` for that script's own test
-    fixtures — nothing broader; `.pipeline/**` and `documentation/**` stay in
-    scope).
-  - **Deliberate deviation from the `check-service-role.mjs` `REPO_ROOT`
-    pattern:** this script does NOT hardcode `cwd` to its own location.
-    Instead it lets `git` auto-discover the repository from the process's
-    actual working directory. This is what makes the "exits 1 against a
-    scratch git repo with a fake key" test case in the spec's verification
-    section actually work — hardcoding `cwd` to this repo's root would make
-    the script always scan *this* repo regardless of where/against what it's
-    invoked, which would make that test case impossible to satisfy without
-    copying the script into the scratch repo first.
-  - Added `"check:git-secrets": "node scripts/check-git-secrets.mjs"` to
-    `package.json` scripts.
+## Files modified
 
-- **`.github/workflows/ci.yml`** (modified) — added a new top-level
-  `git-secret-scan` job (checkout with `fetch-depth: 0`, `setup-bun`, `bun
-  run check:git-secrets`, no `bun install` step). Every existing job,
-  including `check-secrets` (Actions-secret availability — unrelated,
-  untouched), is unchanged.
+- **`package.json`** — added `"check:owasp": "node scripts/check-owasp-review.mjs"`
+  immediately after `"check:git-secrets"`.
+- **`.github/workflows/ci.yml`** — added `- run: bun run check:owasp` in the
+  `checks` job, immediately after the existing `- run: bun run
+  check:workflows` step. No other job touched.
+- **`README.md`** — added a two-line paragraph under `## Environments`,
+  immediately after the existing `infrastructure-security.md` paragraph,
+  linking `documentation/owasp-top-10-review.md`, matching the existing
+  sentence style.
 
-- **`.github/dependabot.yml`** (new) — weekly `bun` (root manifest) and
-  `github-actions` update checks, each capped at 5 open PRs. Header comment
-  notes this repo uses Bun exclusively per `AGENTS.md`.
+## Verification run (all from a clean state, in this worktree)
 
-- **`documentation/infrastructure-security.md`** (new) — follows
-  `documentation/staging-environment.md`'s house style. Sections: purpose &
-  scope (cross-references #76/#77/#79 as out of scope), HTTPS enforcement
-  (+ operator checklist), CSP (full directive table, nonce rationale, dev-only
-  relaxations, pre-launch checklist), git-history secret scan (how to run,
-  allowlist policy, **the actual scan run recorded**: date 2026-08-06, commit
-  `43050470ea60ca3637c4abaf02a843aa2321e728` — repo HEAD immediately prior to
-  this issue's own commit — result `OK: no secrets found in git history.`),
-  and Dependabot (+ post-merge verification checklist item).
+```
+bun run lint          -> clean (no output/errors)
+bun run typecheck     -> clean (no output/errors)
+bun run test          -> 110 suites / 1324 tests passed (includes the new
+                          tests/unit/scripts/check-owasp-review.test.ts)
+bun run format:check  -> FAILS, but pre-existing and unrelated to this issue:
+                          96 files fail, identical count/file-list whether or
+                          not this issue's changes are stashed (verified by
+                          `git stash -u` + re-running). None of the 6 files
+                          this issue touched/added appear in that list — the
+                          new doc and script are themselves Prettier-clean.
+bun run check:owasp   -> OK: OWASP review complete — 36 findings, 0 blocking.
+bun run check:workflows -> OK: 1 workflow script(s) checked — syntax valid,
+                          all agent() calls pinned. (sanity-check that the
+                          CI edit didn't break this unrelated guard)
+bun audit --audit-level=high -> No vulnerabilities found (exit 0)
+```
 
-- **`README.md`** (modified) — added the `check:git-secrets` bullet to the
-  Scripts list and a line under "Environments" linking to the new doc.
-  Nothing else changed.
+## What the Tester should focus on
 
-- **`tests/unit/lib/security/csp.test.ts`** (new) — coder-authored unit
-  tests for all three exported functions, covering every "Behaviors the
-  tester should be able to verify" bullet in the spec: valid/invalid
-  `pk_test_`/`pk_live_` keys, nonce uniqueness/byte-length, `isDev: false`
-  vs `isDev: true` directive differences, `clerkOrigin: null` well-formedness,
-  and directive ordering/no-trailing-semicolon.
-
-- **`.pipeline/spec.md`** (staged) — this is the planning stage's own output
-  for this pipeline run (was already present, uncommitted, in the working
-  tree when this coding stage started); staged here so it lands in the same
-  commit as the implementation it specifies, rather than being lost. The
-  previously-committed `.pipeline/spec.md` on this branch was stale content
-  left over from issue #66.
-
-## Verification performed (all passed)
-
-- `bun run check:git-secrets` — exits 0 against this repo's real history.
-  Two `VALUE_ALLOWLIST` entries were added beyond the spec's minimum seed set
-  to suppress two categories of obvious false positive found on the first
-  run, both from this repo's own Jest test fixtures (not real secrets):
-  - `/"test-[a-z0-9-]+"/i` — reason: "Jest test-double value for a secret env
-    var (e.g. CRON_SECRET/PINGRAM_API_KEY fixtures like
-    `"test-cron-secret"`), not a real credential." Matched
-    `tests/unit/app/api/cron-invitation-reminders-route*.test.ts`,
-    `tests/unit/e2e-support/env.test.ts` (all `"test-cron-secret"`) and a
-    prior version of `tests/unit/lib/pingram/client.test.ts`
-    (`"test-api-key"`).
-  - `/"client-(id|secret)(-\d+)?"/i` — reason: "Jest test-double value for
-    GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET fixtures (e.g.
-    `"client-secret-456"`), not a real credential." Matched
-    `tests/unit/lib/google-calendar/{oauth,sync,sync-tester-supplement}.test.ts`.
-  Both were manually confirmed by reading the actual fixture source (`git
-  show <sha>:<path>`) before allowlisting — neither is a real credential.
-  Also independently exercised: exits 1 (redacted output, not the secret)
-  against a scratch repo with a fake `sk_live_...` key committed; exits 1
-  against a scratch repo with a committed `.env` file; exits 1 (with the
-  shallow-clone message) against a `--depth 1` clone.
-- `bun run typecheck`, `bun run lint`, `bun run test` (1064 tests, 83 suites,
-  including the 13 new CSP tests) — all pass.
-- `bun run format:check` — **fails repo-wide, but pre-existing and out of
-  scope for this issue**: 79 files fail Prettier on this branch, none of
-  them touched by this change (confirmed by running `prettier --check` on
-  only the 10 files this issue adds/modifies — all pass — and by
-  `git stash`-ing this issue's diff and re-running `format:check` against
-  unmodified `origin/main`, which fails on 80 pre-existing files, i.e. the
-  same drift minus the one file — `README.md` — this issue happens to touch
-  and which was reformatted as a side effect of editing it). Not fixed here
-  per AGENTS.md's no-scope-creep rule; every file this issue actually
-  changed is individually Prettier-clean.
-- `bun run build` — succeeds when Clerk env vars are present (confirms the
-  `next.config.ts` `headers()` shape is valid). Note: `bun run build` fails
-  in this sandbox both before and after this change (`Missing publishableKey`
-  on `/documents` prerender) because no `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`
-  is set in this environment — verified pre-existing via `git stash` (fails
-  identically on unmodified `origin/main`). Re-ran with a synthetic
-  `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`/`CLERK_SECRET_KEY` set and the build
-  succeeded end-to-end, producing all 37 routes plus a compiled Middleware
-  bundle.
-
-## What the tester should focus on
-
-- The CSP directive string itself (order, exact tokens, no double spaces,
-  dev vs. prod differences) — `tests/unit/lib/security/csp.test.ts` covers
-  this but an independent read of `lib/security/csp.ts` against the spec's
-  directive table is worthwhile.
-- `middleware.ts`'s request-header nonce plumbing — this can't be unit
-  tested in isolation the way `csp.ts` can; worth a manual/integration check
-  that a real request gets a `content-security-policy` response header.
-- `scripts/check-git-secrets.mjs`'s shallow-clone detection and the
-  cwd-discovery behavior (no hardcoded `REPO_ROOT`) — independently verify
-  the three scratch-repo scenarios named in the spec's verification section
-  (fake key present, shallow clone, committed `.env` file).
-- The two `VALUE_ALLOWLIST` additions above — confirm independently that the
-  matched fixture values really are fake/test-only, not real credentials.
+1. **`scripts/check-owasp-review.mjs`'s parsing correctness** is the highest-risk
+   surface — it's hand-written markdown/table parsing, not a library. Worth
+   independently verifying:
+   - `### ` sub-headings genuinely don't terminate a `## ` section (the doc's
+     own category sections rely on this — each has `### Scope reviewed` /
+     `### Method` / `### Findings` / `### Conclusion` sub-headings).
+   - The Section 2 scan-results table and Section 8 consolidated table are
+     correctly *not* double-counted (Section 2's header starts with `Scan`,
+     Section 8 lives outside the five category section boundaries entirely).
+   - A row's `Summary`/`Evidence`/`Resolution` cells in the real doc contain
+     backticks, parentheses, and em dashes but no literal unescaped `|` —
+     worth a final grep (`grep -n '[^\\]|' documentation/owasp-top-10-review.md`
+     inside table rows, being careful of the table delimiters themselves)
+     to confirm none slipped in during drafting.
+2. **The real doc parses clean today** (`bun run check:owasp` exits 0 with 36
+   findings) — worth confirming this stays true after any Prettier
+   reformatting of the table (table cell reflow shouldn't change parsed
+   content, but it's worth one more run post-format).
+3. **`bun audit` and the `pip-audit` N/A claim** were both actually run/verified
+   for this PR (not fabricated) — the Tester should independently re-run
+   `bun audit --audit-level=high` and the `find` commands for Python tooling
+   to confirm the same clean/N/A result rather than trusting the doc's prose.
+4. **The `format:check` pre-existing failure** (96 files, none touched by this
+   issue) — confirm independently via `git stash` that it predates this
+   branch, so it isn't mistaken for a regression introduced here.
+5. **No application/business-logic code changed** — the diff should be
+   entirely `documentation/**`, `scripts/check-owasp-review.mjs`,
+   `tests/unit/scripts/check-owasp-review.test.ts`, `package.json`,
+   `.github/workflows/ci.yml`, and `README.md`. Nothing under `app/**`,
+   `lib/**`, `schemas/**`, `supabase/**`, or existing tests should differ
+   from `origin/main` (other than `.pipeline/spec.md`, which the Planning
+   stage wrote before this stage started).
