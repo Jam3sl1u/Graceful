@@ -60,8 +60,10 @@ While wiring the sweep against real handler behavior, three classes of
 handler turned out not to fit the generic sweep's implicit assumptions.
 Each is called out with a `RouteEntry` field and an inline comment at the
 specific entry (not applied blanket) — the negative "no victim id ever
-leaks" assertion always still runs for every entry; only inapplicable
-positive assertions are skipped, each with a stated, verified reason:
+leaks" assertion always still runs for every entry that touches Supabase,
+and is a live, reachable check (see "Reviewer fix-up" below for why); only
+inapplicable positive assertions are skipped, each with a stated, verified
+reason:
 
 - `touchesSupabase: false` — `adminOnlyExample` and `google-calendar/connect`
   never call `getSupabaseClient`/`getAnonSupabaseClient` on any path
@@ -133,8 +135,11 @@ weight for `%`/`\`.
 Per the migration's own design (`public.auth_church_group_id()` /
 `public.auth_user_role()`, `supabase/migrations/20260704000001_rls_policies.sql:29-53`),
 a validly-signed JWT's `church_group_id`/`role` claims are read *before* the
-DB fallback (`COALESCE`). All three characterization tests confirm the
-documented behavior, not a bug:
+DB fallback (`COALESCE`). All three characterization tests are **expected
+from the migration source on inspection, but unverified** — Block E has not
+executed in this environment (see Verification below), so treat the
+following as the documented design, not a confirmed test result, until it's
+run against a live Supabase instance:
 
 - A Church-A member's JWT carrying a forged `church_group_id` claim
   pointing at Church B is treated as scoped to Church B — the claim wins
@@ -159,19 +164,77 @@ something to "fix" by itself.
 and is skipped in a plain `bun run test` run, per spec Assumption 2 — it was
 not executed in this environment; see Verification below.)
 
+## Reviewer fix-up (`.pipeline/review.md` NEEDS WORK — addressed)
+
+Test-only follow-up fixing all five findings from the first review pass; no
+file under `app/`, `lib/`, `schemas/`, `middleware.ts`, or `supabase/` was
+touched in this pass either.
+
+1. **BLOCKING — the cross-tenant negative assertion was vacuous.**
+   `VICTIM_CHURCH_GROUP_ID`/`VICTIM_USER_ID` (`tests/support/api-auth.ts`)
+   are now real UUID-shaped constants, and `makeApiReq` unconditionally
+   merges them into every request's query string — and, when a body object
+   is already present, the body too — under
+   `churchGroupId`/`church_group_id`/`userId`/`user_id` keys (explicit
+   call-site values always win, so legitimate fields like `assignAttendee`'s
+   `userId: R2` attendee target are untouched). No schema declares those
+   keys and none use `.strict()`, so every real handler silently strips
+   them; the negative "no victim id ever leaks" assertion in
+   `auth-bypass-matrix.test.ts` case 4 is now a live, reachable check for
+   every entry that touches Supabase, including 3 of the 6
+   previously-flagged highest-risk entries (`getAuditLog`, `deleteMember`,
+   `acceptInvitation`) that have no literal `.eq()` scope call. One entry —
+   plain `GET /api/availability` — opts out of the `userId`/`user_id` probe
+   keys via a new `excludeProbeKeys` option, because
+   `getAvailabilityQuerySchema.user_id` is presence-sensitive (any value
+   switches the handler into the cross-user admin-lookup branch), so
+   injecting one would have silently changed which code path that entry
+   exercises rather than testing it.
+2. **AC-3 schema sweep gaps.** Added the missing `FIELD_CASES` entries in
+   `input-validation-injection.test.ts`: `updateEventSchema.{name,location,
+   notes}`, `updateServiceWeekSchema.{title,sermonTopic,sermonScripture,
+   speakerName}`, `reorderSetlistSchema.songs[0].{keyOverride,notes}`, and
+   `createSongSchema.tags[0]`. The last two needed new optional
+   `buildInput`/`readValue` overrides on `FieldCase` since the field lives
+   inside an array, not at the payload's top level.
+3. **`createGuestInvitationSchema.email` field case tested the wrong thing.**
+   Added `transform: (t) => t.toLowerCase()` (the schema lowercases) and a
+   new `oversizedValue` override (`"a".repeat(250) + "@example.com"`) so the
+   oversized-rejection case is actually driven by `.max(255)` instead of
+   `.email()` rejecting a bare repeated-character string first.
+4. **AC-2 coverage pin didn't pin what it claimed.** Added a new assertion
+   in `phase1-token-bypass.test.ts` block A that parses every `create table`
+   statement out of `supabase/migrations/*.sql` and asserts the resulting
+   set is exactly `PHASE1_TABLES` — this is the actual "a future table can't
+   silently skip the sweep" guarantee the file header claims. Also fixed the
+   existing `cross-tenant-bypass.test.ts` reference check, which used a raw
+   `toContain` substring match (e.g. `"songs"` is a substring of the
+   unrelated `"setlist_songs"` literal) — replaced with a quoted-match regex.
+5. **Block E summary overclaimed "confirmed."** Reworded SECURITY FINDINGS
+   §4 above to say "expected from the migration source on inspection, but
+   unverified" rather than "confirm," since Block E has still never executed
+   in this environment (see Verification).
+
 ## Verification
 
-- `bun run lint` — pass, no errors or warnings.
+Re-run after the reviewer fix-up above:
+
+- `bun run lint` — pass, no errors (one pre-existing warning in the
+  generated `coverage/` directory, unrelated to this change).
 - `bun run typecheck` — pass, no errors.
-- `bun run test` — pass: **112 suites, 2535 tests, 0 failures.**
-- `bun run test:rls` — pass: 1 suite (this issue's coverage-pin block A, 2
-  tests) ran; 11 suites (294 tests) skipped — `SUPABASE_TEST_URL` /
-  `SUPABASE_TEST_ANON_KEY` / `SUPABASE_TEST_SERVICE_ROLE_KEY` /
-  `SUPABASE_JWT_SECRET` are unset in this environment, so blocks B–E of
-  `phase1-token-bypass.test.ts` (and all of `cross-tenant-bypass.test.ts`)
-  did not execute here, per spec Assumption 2. They should be run against a
-  live local Supabase instance before this is treated as verified beyond
-  the mechanical coverage pin.
+- `bun run test` — pass: **112 suites, 2754 tests, 0 failures** (up from
+  2535 — the new AC-3 FIELD_CASES account for the difference).
+- `bun run test:rls` — pass: 1 suite (this issue's coverage-pin block A, now
+  3 tests — the new migration cross-check added one) ran; 11 suites (294
+  tests) skipped — `SUPABASE_TEST_URL` / `SUPABASE_TEST_ANON_KEY` /
+  `SUPABASE_TEST_SERVICE_ROLE_KEY` / `SUPABASE_JWT_SECRET` are unset in this
+  environment, so blocks B–E of `phase1-token-bypass.test.ts` (and all of
+  `cross-tenant-bypass.test.ts`) did not execute here, per spec Assumption
+  2. They should be run against a live local Supabase instance before this
+  is treated as verified beyond the mechanical coverage pin.
+- `git diff origin/main...HEAD --stat` — confirmed still confined to
+  `tests/` and `.pipeline/`; no `app/`, `lib/`, `schemas/`, `middleware.ts`,
+  or `supabase/` file touched.
 
 ## What the Tester should focus on
 

@@ -2,6 +2,14 @@
 
 ## Verdict: PASS (with one non-blocking coverage gap noted below)
 
+**Superseded in part — see "Reviewer fix-up follow-up" at the bottom.** This
+report predates `.pipeline/review.md`'s NEEDS WORK verdict and the
+subsequent fix-up pass; the coverage gap this report flagged (below) and the
+review's separate BLOCKING finding have both since been addressed. The
+original findings are left as written for the record; do not read this
+file's numbers as current — see the follow-up section for the re-verified
+counts.
+
 All commands were re-run independently and cold in this worktree
 (`/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-80`). All
 claims in `.pipeline/changes.md` were spot-checked against actual handler
@@ -140,6 +148,12 @@ passes — but it is a completeness gap the Reviewer should weigh: AC-3
 ("free-text validation, all Phase 1 handlers") is not fully satisfied by
 this suite for these four fields/schemas.
 
+**Addressed in the reviewer fix-up** (see `.pipeline/changes.md` "Reviewer
+fix-up" section): all four gaps now have `FIELD_CASES` entries, including
+`reorderSetlistSchema.notes` and `createSongSchema.tags`, which needed a new
+`buildInput`/`readValue` override on `FieldCase` since those fields live
+inside an array.
+
 ## Overall assessment for the Reviewer
 
 - Every command the coder claimed to have run was independently re-run and
@@ -162,3 +176,29 @@ this suite for these four fields/schemas.
   Supabase available here either) — carried forward as an open
   verification item for whoever has DB access before this is fully
   trusted end-to-end.
+
+## Reviewer fix-up follow-up (re-verified)
+
+`.pipeline/review.md` additionally found a **BLOCKING** issue this tester
+pass did not catch: the cross-tenant "victim id never leaks" assertion in
+`auth-bypass-matrix.test.ts` case 4 could never fail, because
+`VICTIM_CHURCH_GROUP_ID`/`VICTIM_USER_ID` were never actually injected into
+any request. Fixed by having `makeApiReq` (`tests/support/api-auth.ts`)
+unconditionally inject both constants into every request's query string
+(and body, when a body object is present) under
+`churchGroupId`/`church_group_id`/`userId`/`user_id` keys — see
+`.pipeline/changes.md` "Reviewer fix-up" for the full description, including
+the one documented exception (`GET /api/availability`'s plain entry).
+Combined with the AC-3 gap fix above and the AC-2 coverage-pin
+strengthening (migration cross-check), re-ran cold:
+
+- `bun run lint` — PASS (0 errors; 1 pre-existing warning in generated
+  `coverage/`, unrelated).
+- `bun run typecheck` — PASS, 0 errors.
+- `bun run test` — PASS: **112 suites, 2754 tests, 0 failures** (was
+  2535 — the new AC-3 FIELD_CASES account for the increase).
+- `bun run test:rls` — PASS: 1 suite / 3 tests (coverage pin, block A —
+  was 2 tests; the migration cross-check added one), 11 suites / 294 tests
+  skipped (no live Supabase env vars, unchanged).
+- `git diff origin/main...HEAD --stat` — still confined to `tests/` +
+  `.pipeline/`.

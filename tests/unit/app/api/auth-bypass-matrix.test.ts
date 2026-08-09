@@ -264,8 +264,14 @@ describe.each(ADMIN_ROUTE_REGISTRY)("$name", (entry) => {
     }
 
     expect(recording.touched).toBe(true);
-    // The negative assertion always applies, regardless of ownScopeAssertion:
-    // a victim-tenant id must never reach the DB layer.
+    // The negative assertion always applies, regardless of ownScopeAssertion.
+    // makeApiReq (tests/support/api-auth.ts) injects VICTIM_CHURCH_GROUP_ID /
+    // VICTIM_USER_ID into every request's query string (and body, when a
+    // body object is present) under churchGroupId/church_group_id/userId/
+    // user_id keys — so this is a live check for every entry that reaches
+    // the DB layer, not just a check against strings no request ever
+    // contains: a handler that echoed a caller-supplied scope id into the DB
+    // layer would fail here.
     expect(recording.seenValues).not.toContain(VICTIM_CHURCH_GROUP_ID);
     expect(recording.seenValues).not.toContain(VICTIM_USER_ID);
 

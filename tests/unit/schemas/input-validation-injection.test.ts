@@ -10,7 +10,7 @@
 
 import { escapePostgrestFilterValue } from "@/lib/api/postgrest";
 import { createChurchGroupSchema, joinChurchGroupSchema } from "@/schemas/church-group";
-import { createEventSchema } from "@/schemas/events";
+import { createEventSchema, updateEventSchema } from "@/schemas/events";
 import { googleCalendarCallbackQuerySchema } from "@/schemas/google-calendar";
 import { createInstrumentSchema } from "@/schemas/instruments";
 import {
@@ -20,8 +20,8 @@ import {
 } from "@/schemas/invitations";
 import { updateProfileSchema, VOCAL_CAPABILITY_VALUES } from "@/schemas/profile";
 import { updateRoleSchema, USER_ROLE_VALUES } from "@/schemas/role";
-import { createServiceWeekSchema } from "@/schemas/service-weeks";
-import { addSetlistSongSchema } from "@/schemas/setlists";
+import { createServiceWeekSchema, updateServiceWeekSchema } from "@/schemas/service-weeks";
+import { addSetlistSongSchema, reorderSetlistSchema } from "@/schemas/setlists";
 import { uploadUrlSchema, registerDocumentSchema } from "@/schemas/song-documents";
 import { createSongSchema, songSearchQuerySchema, isValidSongKey } from "@/schemas/songs";
 import {
@@ -92,6 +92,18 @@ type FieldCase = {
   min1?: boolean;
   transform?: (trimmed: string) => string;
   emptyBecomesNull?: boolean;
+  /** Overrides the default `{ ...baseValid(), [field]: payload }` input —
+   *  needed when `field` lives inside a nested/array structure (e.g.
+   *  "songs[0].keyOverride", "tags[0]") that plain object-spread can't reach. */
+  buildInput?: (payload: string) => Record<string, unknown>;
+  /** Overrides the default `data[field]` read of the parsed result — paired
+   *  with buildInput for nested/array fields. */
+  readValue?: (data: Record<string, unknown>) => unknown;
+  /** Overrides the default `"a".repeat(max + 1)` oversized payload — needed
+   *  when a field has an upstream format check (e.g. `.email()`) that would
+   *  reject a bare repeated-character string before `.max()` is ever
+   *  reached, making the oversized test pass for the wrong reason. */
+  oversizedValue?: string;
 };
 
 const FIELD_CASES: FieldCase[] = [
@@ -188,6 +200,36 @@ const FIELD_CASES: FieldCase[] = [
     trims: true,
     min1: true,
   },
+  // schemas/events.ts updateEventSchema — all fields optional (refine
+  // requires at least one present); baseValid supplies `name` alone so
+  // testing location/notes still satisfies that refine.
+  {
+    label: "updateEventSchema",
+    schema: updateEventSchema,
+    field: "name",
+    baseValid: () => ({ name: "Test" }),
+    max: 100,
+    trims: true,
+    min1: true,
+  },
+  {
+    label: "updateEventSchema",
+    schema: updateEventSchema,
+    field: "location",
+    baseValid: () => ({ name: "Test" }),
+    max: 200,
+    trims: true,
+    min1: true,
+  },
+  {
+    label: "updateEventSchema",
+    schema: updateEventSchema,
+    field: "notes",
+    baseValid: () => ({ name: "Test" }),
+    max: 2000,
+    trims: true,
+    min1: true,
+  },
   // schemas/google-calendar.ts — provider-supplied opaque strings, bounded
   // by length only (no .trim()).
   {
@@ -262,6 +304,14 @@ const FIELD_CASES: FieldCase[] = [
     baseValid: () => ({ serviceWeekId: R1, email: "guest@example.com" }),
     max: 255,
     trims: true,
+    // .trim().toLowerCase().email().max(255) — the parsed value is
+    // lowercased, not just trimmed.
+    transform: (trimmed) => trimmed.toLowerCase(),
+    // "a".repeat(256) fails .email() before .max() is ever reached (no "@"),
+    // so the generic oversized case would pass for the wrong reason. Use a
+    // syntactically valid but over-length email so rejection is actually
+    // driven by .max(255).
+    oversizedValue: "a".repeat(250) + "@example.com",
   },
   {
     label: "denyInvitationSchema",
@@ -343,6 +393,44 @@ const FIELD_CASES: FieldCase[] = [
     trims: true,
     min1: true,
   },
+  // schemas/service-weeks.ts updateServiceWeekSchema — all fields optional
+  // (refine requires at least one present).
+  {
+    label: "updateServiceWeekSchema",
+    schema: updateServiceWeekSchema,
+    field: "title",
+    baseValid: () => ({ title: "T" }),
+    max: 100,
+    trims: true,
+    min1: true,
+  },
+  {
+    label: "updateServiceWeekSchema",
+    schema: updateServiceWeekSchema,
+    field: "sermonTopic",
+    baseValid: () => ({ title: "T" }),
+    max: 200,
+    trims: true,
+    min1: true,
+  },
+  {
+    label: "updateServiceWeekSchema",
+    schema: updateServiceWeekSchema,
+    field: "sermonScripture",
+    baseValid: () => ({ title: "T" }),
+    max: 200,
+    trims: true,
+    min1: true,
+  },
+  {
+    label: "updateServiceWeekSchema",
+    schema: updateServiceWeekSchema,
+    field: "speakerName",
+    baseValid: () => ({ title: "T" }),
+    max: 100,
+    trims: true,
+    min1: true,
+  },
   // schemas/setlists.ts
   {
     label: "addSetlistSongSchema",
@@ -352,6 +440,30 @@ const FIELD_CASES: FieldCase[] = [
     max: 5,
     trims: true,
     min1: true,
+  },
+  // reorderSetlistSchema.songs[0].{keyOverride,notes} — nested inside an
+  // array item, so buildInput/readValue override the default top-level
+  // field access.
+  {
+    label: "reorderSetlistSchema",
+    schema: reorderSetlistSchema,
+    field: "songs[0].keyOverride",
+    baseValid: () => ({ songs: [{ songId: R2 }] }),
+    max: 5,
+    trims: true,
+    min1: true,
+    buildInput: (payload) => ({ songs: [{ songId: R2, keyOverride: payload }] }),
+    readValue: (data) => (data.songs as Record<string, unknown>[] | undefined)?.[0]?.keyOverride,
+  },
+  {
+    label: "reorderSetlistSchema",
+    schema: reorderSetlistSchema,
+    field: "songs[0].notes",
+    baseValid: () => ({ songs: [{ songId: R2 }] }),
+    max: 1000,
+    trims: true,
+    buildInput: (payload) => ({ songs: [{ songId: R2, notes: payload }] }),
+    readValue: (data) => (data.songs as Record<string, unknown>[] | undefined)?.[0]?.notes,
   },
   // schemas/song-documents.ts
   {
@@ -414,6 +526,19 @@ const FIELD_CASES: FieldCase[] = [
     trims: true,
     min1: true,
   },
+  // tags[0] — array of strings, so buildInput/readValue override the
+  // default top-level field access.
+  {
+    label: "createSongSchema",
+    schema: createSongSchema,
+    field: "tags[0]",
+    baseValid: () => ({ title: "Song" }),
+    max: 50,
+    trims: true,
+    min1: true,
+    buildInput: (payload) => ({ title: "Song", tags: [payload] }),
+    readValue: (data) => (data.tags as unknown[] | undefined)?.[0],
+  },
   {
     label: "songSearchQuerySchema",
     schema: songSearchQuerySchema,
@@ -464,8 +589,16 @@ const FIELD_CASES: FieldCase[] = [
 
 // Named assertion helper so a failure message identifies the schema, field,
 // and payload — not just a bare toBe() mismatch.
+function buildInput(fc: FieldCase, payload: string): Record<string, unknown> {
+  return fc.buildInput ? fc.buildInput(payload) : { ...fc.baseValid(), [fc.field]: payload };
+}
+
+function readValue(fc: FieldCase, data: Record<string, unknown>): unknown {
+  return fc.readValue ? fc.readValue(data) : data[fc.field];
+}
+
 function expectRejectedOrVerbatim(fc: FieldCase, payload: string): void {
-  const input = { ...fc.baseValid(), [fc.field]: payload };
+  const input = buildInput(fc, payload);
   const result = fc.schema.safeParse(input);
 
   if (!result.success || result.data === undefined) {
@@ -473,23 +606,24 @@ function expectRejectedOrVerbatim(fc: FieldCase, payload: string): void {
   }
 
   const data = result.data;
+  const actual = readValue(fc, data);
   const trimmed = fc.trims ? payload.trim() : payload;
 
   if (fc.emptyBecomesNull && trimmed.length === 0) {
-    if (data[fc.field] !== null) {
+    if (actual !== null) {
       throw new Error(
         `[${fc.label}.${fc.field}] payload ${JSON.stringify(payload)} trimmed to empty but did not ` +
-          `become null (documented transform) — got ${JSON.stringify(data[fc.field])}`,
+          `become null (documented transform) — got ${JSON.stringify(actual)}`,
       );
     }
     return;
   }
 
   const expected = fc.transform ? fc.transform(trimmed) : trimmed;
-  if (data[fc.field] !== expected) {
+  if (actual !== expected) {
     throw new Error(
       `[${fc.label}.${fc.field}] payload ${JSON.stringify(payload)} succeeded but was not preserved ` +
-        `verbatim — expected ${JSON.stringify(expected)}, got ${JSON.stringify(data[fc.field])}`,
+        `verbatim — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
     );
   }
 }
@@ -504,14 +638,15 @@ describe("schema injection sweep (Part A) — safeParse fails, or the value surv
       if (fc.max !== undefined) {
         const max = fc.max;
         it(`rejects oversized input (> ${max} chars)`, () => {
-          const input = { ...fc.baseValid(), [fc.field]: "a".repeat(max + 1) };
+          const oversized = fc.oversizedValue ?? "a".repeat(max + 1);
+          const input = buildInput(fc, oversized);
           expect(fc.schema.safeParse(input).success).toBe(false);
         });
       }
 
       if (fc.trims && fc.min1) {
         it("rejects empty/whitespace-only input", () => {
-          const input = { ...fc.baseValid(), [fc.field]: "   " };
+          const input = buildInput(fc, "   ");
           expect(fc.schema.safeParse(input).success).toBe(false);
         });
       }

@@ -53,8 +53,35 @@ describe("PHASE1_TABLES coverage pin (runs without RLS env vars)", () => {
     const source = fs.readFileSync(crossTenantPath, "utf8");
 
     for (const table of PHASE1_TABLES) {
-      expect(source).toContain(table);
+      // Quoted-match, not a raw substring: `toContain("songs")` would also
+      // match inside the unrelated literal "setlist_songs", silently
+      // passing even if "songs" itself were never referenced.
+      const quoted = new RegExp(`["'\`]${table}["'\`]`);
+      expect(quoted.test(source)).toBe(true);
     }
+  });
+
+  // The check above only catches "a table was added to PHASE1_TABLES without
+  // being covered" — it says nothing about a table that was added to the
+  // schema but never added to PHASE1_TABLES in the first place, which is
+  // the actual claim made by this file's header and .pipeline/changes.md
+  // ("a future table added to the schema cannot silently skip the
+  // cross-tenant sweep"). Deriving the list mechanically from the
+  // migrations themselves is what makes that true.
+  it("PHASE1_TABLES exactly matches every table created in supabase/migrations/*.sql", () => {
+    const migrationsDir = path.resolve(__dirname, "../../../../supabase/migrations");
+    const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith(".sql") && !f.endsWith(".down.sql"));
+
+    const createTableRe = /create\s+table(?:\s+if\s+not\s+exists)?\s+(?:public\.)?"?(\w+)"?/gi;
+    const migrationTables = new Set<string>();
+    for (const file of files) {
+      const source = fs.readFileSync(path.join(migrationsDir, file), "utf8");
+      for (const match of source.matchAll(createTableRe)) {
+        if (match[1]) migrationTables.add(match[1].toLowerCase());
+      }
+    }
+
+    expect([...migrationTables].sort()).toEqual([...PHASE1_TABLES].sort());
   });
 });
 

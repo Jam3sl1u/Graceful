@@ -117,11 +117,14 @@ export type RouteEntry = {
   ownScopeAssertion?: boolean;
 };
 
-// Fixed UUIDs standing in for "some other tenant's resource" — the recording
-// client doesn't know or enforce tenant ownership, so these only need to be
-// syntactically valid and distinct from VICTIM_CHURCH_GROUP_ID/VICTIM_USER_ID
-// (tests/support/api-auth.ts), which are the two values case 4 actually
-// asserts on.
+// Fixed UUIDs standing in for "some other tenant's resource" (a setlist id,
+// an attendee id, etc.) — the recording client doesn't know or enforce
+// tenant ownership, so these only need to be syntactically valid and
+// distinct from VICTIM_CHURCH_GROUP_ID/VICTIM_USER_ID. They are separate
+// from the tenant-scope probe: makeApiReq (tests/support/api-auth.ts)
+// independently injects the VICTIM_* values into every request's query
+// string/body under churchGroupId/church_group_id/userId/user_id keys,
+// which is what case 4's negative assertion actually checks against.
 const R1 = "22222222-2222-2222-2222-222222222222";
 const R2 = "33333333-3333-3333-3333-333333333333";
 
@@ -146,7 +149,13 @@ export const ADMIN_ROUTE_REGISTRY: RouteEntry[] = [
     name: "GET /api/availability",
     allowedRoles: null,
     scope: "user",
-    invoke: (lookup) => getAvailability(makeApiReq(), lookup),
+    // Excludes the userId/user_id probe keys: getAvailabilityQuerySchema's
+    // `user_id` is presence-sensitive (any value, including the injected
+    // probe's, switches the handler into the cross-user admin-lookup branch
+    // — see app/api/availability/handler.ts), so injecting one here would
+    // silently turn this "own availability" case into a duplicate of the
+    // "?user_id=<other>" entry below instead of testing what it's meant to.
+    invoke: (lookup) => getAvailability(makeApiReq({ excludeProbeKeys: ["userId", "user_id"] }), lookup),
   },
   {
     name: "GET /api/availability?user_id=<other>",
