@@ -1,0 +1,197 @@
+#!/usr/bin/env node
+// Launch gate for issue #79 (PRD §26.3, "OWASP Top 10 checklist"; cited as
+// §16.3 in the issue): parses documentation/owasp-top-10-review.md's
+// per-category findings tables and fails if any required category is
+// missing, malformed, or contains a finding that blocks the Phase 1 launch
+// (issue #83) — a Critical/High finding that isn't Resolved, or any finding
+// at any severity still Open.
+//
+// Usage: node scripts/check-owasp-review.mjs [pathToReviewDoc]
+//   (exit 0 = clean, exit 1 = violation; pathToReviewDoc defaults to
+//   documentation/owasp-top-10-review.md, resolved from this script's own
+//   location, not cwd)
+
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const DEFAULT_DOC_PATH = join(REPO_ROOT, "documentation", "owasp-top-10-review.md");
+
+const REQUIRED_CATEGORIES = ["A01", "A02", "A03", "A05", "A07"];
+const SEVERITIES = ["Critical", "High", "Medium", "Low", "Info"];
+const STATUSES = ["Resolved", "Accepted", "Deferred", "Open"];
+const BLOCKING_SEVERITIES = ["Critical", "High"];
+
+// Splits a markdown table row into trimmed cells, honoring `\|` as an
+// escaped literal pipe (not a column separator) and dropping the empty
+// leading/trailing cells produced by a row's outer `|` delimiters.
+function splitRow(line) {
+  const PLACEHOLDER = "\u0000ESCAPED_PIPE\u0000";
+  const withPlaceholders = line.replace(/\\\|/g, PLACEHOLDER);
+  const cells = withPlaceholders.split("|").map((cell) => cell.trim().split(PLACEHOLDER).join("|"));
+
+  if (cells.length > 0 && cells[0] === "") cells.shift();
+  if (cells.length > 0 && cells[cells.length - 1] === "") cells.pop();
+
+  return cells;
+}
+
+function isTableRow(line) {
+  return line.trim().startsWith("|");
+}
+
+function isSeparatorRow(line) {
+  return /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$/.test(line.trim());
+}
+
+// Finds every contiguous markdown table block within `sectionLines` whose
+// header row's first cell is exactly "ID" (per the parsing notes, this is
+// what makes the section-2 scan table and any other stray table invisible to
+// this parser). Returns an array of { dataRows } — a section is expected to
+// have exactly one; the caller treats zero or more than one as a violation.
+function findFindingsTables(sectionLines) {
+  const tables = [];
+  let i = 0;
+  while (i < sectionLines.length) {
+    if (!isTableRow(sectionLines[i])) {
+      i += 1;
+      continue;
+    }
+
+    const blockStart = i;
+    let j = i;
+    while (j < sectionLines.length && isTableRow(sectionLines[j])) j += 1;
+    const block = sectionLines.slice(blockStart, j);
+    i = j;
+
+    if (block.length >= 2 && isSeparatorRow(block[1])) {
+      const headerCells = splitRow(block[0]);
+      if (headerCells[0] === "ID") {
+        tables.push({ dataRows: block.slice(2) });
+      }
+    }
+  }
+
+  return tables;
+}
+
+function main() {
+  const docPath = process.argv[2] ? resolve(process.argv[2]) : DEFAULT_DOC_PATH;
+
+  if (!existsSync(docPath)) {
+    console.error(`ERROR: OWASP review doc not found at ${docPath}`);
+    process.exit(1);
+  }
+
+  const content = readFileSync(docPath, "utf8");
+  if (content.trim().length === 0) {
+    console.error(`ERROR: OWASP review doc at ${docPath} is empty`);
+    process.exit(1);
+  }
+
+  const lines = content.split("\n");
+
+  // Level-2 (`## `) headings only — `### ` sub-headings must not be treated
+  // as section boundaries.
+  const headings = [];
+  lines.forEach((line, index) => {
+    if (/^## /.test(line)) {
+      headings.push({ index, text: line.slice(3).trim() });
+    }
+  });
+
+  const violations = [];
+  let totalFindings = 0;
+
+  for (const category of REQUIRED_CATEGORIES) {
+    const token = `${category}:2021`;
+    const headingPos = headings.findIndex((h) => h.text.includes(token));
+
+    if (headingPos === -1) {
+      violations.push(
+        `Missing required category section for ${category}: no "## " heading contains "${token}"`,
+      );
+      continue;
+    }
+
+    const sectionStart = headings[headingPos].index + 1;
+    const sectionEnd =
+      headingPos + 1 < headings.length ? headings[headingPos + 1].index : lines.length;
+    const sectionLines = lines.slice(sectionStart, sectionEnd);
+
+    const tables = findFindingsTables(sectionLines);
+    if (tables.length === 0) {
+      violations.push(
+        `Category ${category}: no findings table found (a table with a header row whose first cell is "ID" is required)`,
+      );
+      continue;
+    }
+    if (tables.length > 1) {
+      violations.push(
+        `Category ${category}: found ${tables.length} ID-headed findings tables in this section, expected exactly 1`,
+      );
+      continue;
+    }
+    const table = tables[0];
+
+    const dataRows = table.dataRows.filter((row) => row.trim().length > 0);
+    if (dataRows.length === 0) {
+      violations.push(
+        `Category ${category}: findings table has zero data rows (header + separator only) — a "no issues found" row is required even when the category is clean`,
+      );
+      continue;
+    }
+
+    for (const rawRow of dataRows) {
+      const cells = splitRow(rawRow);
+      if (cells.length !== 6) {
+        violations.push(
+          `Category ${category}: row "${rawRow.trim()}" has ${cells.length} column(s), expected exactly 6 (ID | Severity | Status | Summary | Evidence | Resolution)`,
+        );
+        continue;
+      }
+
+      const [id, severity, status, summary] = cells;
+      totalFindings += 1;
+
+      if (!id.startsWith(`${category}-`)) {
+        violations.push(
+          `Category ${category}: finding ID "${id}" does not start with the section's category prefix "${category}-"`,
+        );
+      }
+
+      if (!SEVERITIES.includes(severity)) {
+        violations.push(
+          `Category ${category}, finding ${id}: invalid Severity "${severity}" (must be one of ${SEVERITIES.join(", ")}, case-sensitive)`,
+        );
+      }
+
+      if (!STATUSES.includes(status)) {
+        violations.push(
+          `Category ${category}, finding ${id}: invalid Status "${status}" (must be one of ${STATUSES.join(", ")}, case-sensitive)`,
+        );
+      }
+
+      const isBlocking =
+        (BLOCKING_SEVERITIES.includes(severity) && status !== "Resolved") || status === "Open";
+      if (isBlocking) {
+        violations.push(
+          `BLOCKING: finding ${id} (severity: ${severity}, status: ${status}) — ${summary}`,
+        );
+      }
+    }
+  }
+
+  if (violations.length > 0) {
+    for (const violation of violations) {
+      console.error(violation);
+    }
+    process.exit(1);
+  }
+
+  console.log(`OK: OWASP review complete — ${totalFindings} findings, 0 blocking.`);
+  process.exit(0);
+}
+
+main();

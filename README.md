@@ -11,6 +11,9 @@ for how the staging environment is configured and verified.
 See [`documentation/infrastructure-security.md`](documentation/infrastructure-security.md)
 for the HTTPS/CSP/secret-scan security baseline.
 
+See [`documentation/owasp-top-10-review.md`](documentation/owasp-top-10-review.md)
+for the Phase 1 pre-launch OWASP Top 10 manual review.
+
 ## Prerequisites
 
 Requires [Bun](https://bun.sh) (CI pins `1.2.x` via `oven-sh/setup-bun`).
