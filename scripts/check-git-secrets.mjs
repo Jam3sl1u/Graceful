@@ -87,6 +87,21 @@ const VALUE_ALLOWLIST = [
       "Jest test-double value for GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET fixtures " +
       '(e.g. "client-secret-456"), not a real credential',
   },
+  {
+    regex: /"the-real-secret"/,
+    reason:
+      'Jest test-double value in auth-bypass-matrix.test.ts — named "the-real-secret" ' +
+      "purely to contrast with the no-token/wrong-token cases in the same describe block, " +
+      "not an actual credential",
+  },
+  {
+    regex: /[=:]\s*ORIGINAL_[A-Z0-9_]+$/,
+    reason:
+      "RHS is a variable reference (e.g. `CRON_SECRET = ORIGINAL_CRON_SECRET`) restoring a " +
+      "saved env var at test teardown, not a literal secret value — the pattern can't tell " +
+      "an identifier from a secret shape, so this is allowlisted on the ORIGINAL_ naming " +
+      "convention used for save/restore fixtures",
+  },
 ];
 
 // Exact paths (or path fragments, for generated test fixtures) skipped
