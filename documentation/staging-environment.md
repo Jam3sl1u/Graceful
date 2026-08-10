@@ -227,3 +227,23 @@ Human setup steps:
       staging environment (verified via a Vercel deployment log entry).
 - [ ] This document exists at `documentation/staging-environment.md` and is
       linked from `README.md`.
+
+## 9. Load / performance testing (issue #81)
+
+The Phase 1 pre-launch load/performance test pass (PRD §14.1) runs a Bun +
+TypeScript harness (`tests/load/`, `bun run test:load`) against this staging
+environment — see
+[`documentation/performance-testing.md`](performance-testing.md) for the
+harness design, prerequisites, running instructions, known limitations, and
+the results table issue #83's production deploy gate reads.
+
+| Var | Required | Meaning |
+| --- | --- | --- |
+| `LOAD_TEST_BASE_URL` | yes (falls back to `STAGING_APP_URL`) | Staging base URL |
+| `LOAD_TEST_ADMIN_TOKENS` | yes | Comma-separated Clerk session JWTs for admin-persona user(s) |
+| `LOAD_TEST_MEMBER_TOKENS` | yes | Comma-separated Clerk session JWTs for member-persona user(s) |
+| `LOAD_TEST_SONG_ID` | no | Song uuid with ≥1 attached document; the signed-URL scenario is `skipped` when absent |
+
+These are local/operator-run env vars for a manual pass, not GitHub Actions
+secrets — `test:load` is not wired into `.github/workflows/ci.yml` (see
+`documentation/performance-testing.md` §3 for why).
