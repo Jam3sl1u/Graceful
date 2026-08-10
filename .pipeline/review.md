@@ -1,166 +1,154 @@
-# Review — Issue #80: Full auth-bypass & RLS-bypass test suite
+# Review — Issue #81: Run performance/load test pass against staging
 
 VERDICT: NEEDS WORK
 
-Scope is clean (tests + `.pipeline/` only), lint/typecheck/test were re-run here
-and match the reported numbers exactly (`112 suites / 2535 tests / 0 failures`,
-eslint clean, tsc clean). The 401/403/expired-token sweep, the rate-limit tier
-matrix, and the RLS token-bypass file are real, useful coverage. But the single
-assertion that AC-1's cross-tenant claim rests on is provably vacuous, and the
-AC-3 sweep does not meet the spec's own "every string field of every exported
-schema" requirement (the tester already found part of this). Both must be fixed
-before this ships as a *security* suite — it currently advertises more assurance
-than it delivers.
+Reviewed: `.pipeline/spec.md`, `.pipeline/changes.md`, `.pipeline/test-results.md`,
+`git diff main...HEAD`, plus every file under `tests/load/**` and
+`tests/unit/load/**` read in full. Independently re-ran `bun run typecheck`
+(clean), `bun run lint` (clean), `bun run test` (120 suites / 2839 tests, all
+green), `bun run check:git-secrets` (clean), `bunx prettier --check` on this
+change's files (clean), and the CLI end-to-end against a local mock staging
+server that mimics the real `read` 240/60s limiter and the real 429 body/header
+shape.
 
----
+The code matches the spec closely, the scope discipline is good (no `app/**`,
+`lib/**`, `middleware.ts`, `schemas/**`, `supabase/**`, or `ci.yml` changes), the
+token-never-logged requirement holds, and the `blocked` (not faked) handling of
+AC2 is exactly right. The unit tests are mostly meaningful rather than
+superficial. But an actual end-to-end run of the `api` scenario — the one code
+path nobody in the pipeline exercised, because it needs 70s of wall clock —
+shows the headline AC1 number this harness produces is not the number AC1 asks
+for. Green tests, wrong behavior. That has to be fixed before a human runs this
+pass and pastes the result into the table that gates #83.
 
-## 1. BLOCKING — the cross-tenant "victim id never leaks" assertion can never fail
+## Must fix
 
-`tests/unit/app/api/auth-bypass-matrix.test.ts:269-270`
+### 1. `/api/health` dominates the overall AC1 p95 (measurement is invalid)
 
-```ts
-expect(recording.seenValues).not.toContain(VICTIM_CHURCH_GROUP_ID); // "group-victim-2"
-expect(recording.seenValues).not.toContain(VICTIM_USER_ID);         // "user-victim-2"
+`tests/load/scenarios.ts` `runApiLoad` → `runLoadAgainstEndpoints` concatenates
+every endpoint's samples into `overallSamples` and evaluates that pooled set
+against `PERF_TARGETS.api`. But `/api/health` is explicitly exempt from rate
+limiting (`lib/api/rate-limit.ts` `resolveTier`: `if (path === "/api/health")
+return null`), while all 11 other endpoints fall in the `read` tier and stop
+producing `ok` samples after ~240 responses per token bucket. So health keeps
+emitting samples for the full 60s and everything else stops within the first
+second.
+
+Measured, running `--scenario api` against a mock with the real limiter policy:
+
+```
+GET /api/health:            ok=171585   rateLimited=0
+GET /api/profile:           ok=58       rateLimited=171546
+GET /api/songs:             ok=71       rateLimited=171507
+... (9 more, all ok=64..122)
 ```
 
-`recording.seenValues` only ever contains strings that the handler passed to the
-Supabase double. Those strings come from (a) the request built by
-`entry.invoke()` and (b) the `AuthContext` from `makeLookup("admin")`. Grepping
-the whole tree, `"group-victim-2"` / `"user-victim-2"` appear in exactly three
-places: their definition in `tests/support/api-auth.ts:24-25` and these two
-assertions. **No registry entry ever puts them into a request**, and
-`makeLookup` uses `DEFAULT_*`. The registry even documents the tautology as if
-it were a design decision (`tests/support/admin-route-registry.ts:120-124`:
-"these only need to be syntactically valid and distinct from
-VICTIM_CHURCH_GROUP_ID/VICTIM_USER_ID"). A handler could pass a fully
-caller-controlled tenant id straight into `.eq("church_group_id", …)` and this
-test would still be green.
+>99% of the pooled sample set is `/api/health` — an unauthenticated,
+no-database, no-rate-limit endpoint. The reported "API response time p95 @ 100
+concurrent users" is therefore essentially the health endpoint's p95, and it
+will look excellent no matter how slow the real API is. #83's deploy gate reads
+that number.
 
-This matters because it is exactly the assertion the code comment
-(`auth-bypass-matrix.test.ts:244-248, 267-268`) and `.pipeline/changes.md` call
-"the load-bearing assertion for cross-tenant admin".
+Fix in `tests/load/scenarios.ts` (and reflect it in
+`documentation/performance-testing.md` §2/§6): exclude `persona: "none"` /
+`/api/health` entries from `overallSamples`, or evaluate AC1 against the worst
+per-endpoint p95 rather than a pooled set that is weighted by how often each
+endpoint happened to be allowed through. Keep `/api/health` in the preflight
+warm-up and in `perEndpoint` reporting if you want it — just not in the number
+that decides pass/fail.
 
-What survives: the *positive* check (`seenValues` contains
-`DEFAULT_CHURCH_GROUP_ID` / `DEFAULT_USER_ID`) is real and does catch a handler
-that scopes by a request-supplied id instead of `ctx`. It runs for 55 of 61
-entries. For the other 6 (`ownScopeAssertion: false` / `touchesSupabase: false`
-— `adminOnlyExample`, `google-calendar/connect`, `getAuditLog`, `deleteMember`,
-`acceptInvitation`, `GET /api/availability?user_id=`) case 4 degenerates to
-`expect(recording.touched).toBe(true)` plus the two dead assertions, i.e. it
-asserts nothing about tenant scope at all — and those are the highest-risk
-routes in the set.
+### 2. No pacing or 429 backoff: the run self-invalidates and floods the target
 
-Fix (either approach, in `tests/support/admin-route-registry.ts` +
-`tests/support/recording-supabase.ts` + `auth-bypass-matrix.test.ts`):
+`runConcurrent` gives each of the 100 workers a tight `while (now() < deadline)`
+loop with no think-time and no reaction to a 429. Two consequences, both
+observed in the mock run above:
 
-- Make the victim ids actually reachable: redefine `VICTIM_CHURCH_GROUP_ID` /
-  `VICTIM_USER_ID` as UUID-shaped constants and have `invoke()` inject them into
-  the caller-controlled surfaces a confused-deputy bug would read —
-  `churchGroupId` / `church_group_id` / `userId` / `user_id` keys in the body and
-  query string. Zod strips unknown keys by default, so the assertion then proves
-  the strip actually happens end-to-end; where a schema is `.strict()` and would
-  400, drop that injection for that entry and say so in a comment.
-- Or (stronger, and it also fixes the 6 exception entries): have
-  `makeRecordingSupabase` record `(method, args)` tuples, and assert that every
-  `.eq("church_group_id", x)` / `.eq("user_id", x)` and every RPC argument whose
-  name implies tenant/user identity equals the `ctx` value — never a
-  request-derived one.
+- **Volume.** ~2.06M requests in 60s against a local mock; against staging over
+  a real RTT it is still tens of thousands, of which ~99% are 429s that
+  contribute nothing to any measurement. That is gratuitous load/cost on the
+  staging deployment and a plausible trigger for platform-level abuse
+  protection, which would then corrupt the run.
+- **Self-invalidation.** Under that self-inflicted saturation the transport
+  started dropping connections; `timedRequest` classified those as `error`, and
+  the run came back `[FAIL] non-429 error rate 14.3% exceeds max 1.0%` with a
+  4ms p95. `evaluateThreshold` (`tests/load/stats.ts:79`) invalidates the run on
+  error rate before it ever looks at latency, so as written the harness has a
+  real chance of never being able to report `pass` for AC1 — the deliverable
+  this issue exists to produce.
 
-Also update the now-incorrect comments at `auth-bypass-matrix.test.ts:267-268`
-("The negative assertion always applies") and
-`admin-route-registry.ts:120-124`, and the claim in `.pipeline/changes.md`
-("the negative 'no victim id ever leaks' assertion always still runs for every
-entry" — it runs, but it cannot fail).
+Fix: have the worker loop honor `Retry-After` (sleep, or stop that worker for
+the remainder of the window) once it sees a 429, and/or add a per-iteration
+think-time to `LOAD_PROFILE` so "100 concurrent users" means 100 users rather
+than 100 spin loops. Either change also makes the §6 "shared rate-limit bucket"
+limitation honest instead of merely disclosed.
 
-## 2. AC-3 schema sweep does not cover every exported schema (spec §5 Part A)
+### 3. The testing stage's work is not committed
 
-Confirmed independently against `schemas/*.ts` (the tester found these too;
-they are not fixed):
+`git status` on this branch:
 
-- `schemas/events.ts` `updateEventSchema` — `name`, `location`, `notes`: absent
-  from `FIELD_CASES`.
-- `schemas/service-weeks.ts` `updateServiceWeekSchema` — `title`,
-  `sermonTopic`, `sermonScripture`, `speakerName`: absent.
-- `schemas/setlists.ts` `reorderSetlistSchema.songs[]` — `keyOverride` and
-  `notes` (`.trim().max(1000)`): zero adversarial coverage anywhere in the repo.
-- `schemas/songs.ts` `createSongSchema.tags` (`z.array(z.string().trim().min(1)
-  .max(50))`): absent.
+```
+ M .pipeline/test-results.md
+?? tests/unit/load/env.test.ts
+?? tests/unit/load/scenarios.test.ts
+```
 
-Add these to `FIELD_CASES` in
-`tests/unit/schemas/input-validation-injection.test.ts` (array-item fields need
-a small wrapper that varies one element), or amend the spec/AC. Do not leave
-`.pipeline/changes.md` claiming "every genuinely free-text string field of every
-exported Zod object schema".
+Commit `f5ead67` contains only the coding stage. If this branch is pushed as-is,
+the PR ships without the two test files the testing stage added (22 of the 2839
+green tests) and without `test-results.md`. Commit them before opening/updating
+the PR.
 
-## 3. `createGuestInvitationSchema.email` field case encodes a wrong expectation
+## Should fix
 
-`tests/unit/schemas/input-validation-injection.test.ts:258-265` declares
-`trims: true` with no `transform`, but the schema is
-`z.string().trim().toLowerCase().email().max(255)`
-(`schemas/invitations.ts:70`). It only passes because every payload in
-`ALL_PAYLOADS` fails `.email()` and never reaches the success branch — the same
-is true of the oversized case (`"a".repeat(256)` is rejected as a non-email, not
-for length). Add `transform: (t) => t.toLowerCase()` and build the oversized
-value as a real over-length email (e.g. `"a".repeat(250) + "@example.com"`) so
-the assertion is about the `.max(255)` it claims to test.
+4. **Results table cannot actually be pasted.** `renderMarkdown`
+   (`tests/load/report.ts:46`) emits `| Target | Threshold | Measured (p95) |
+   Status | Notes |`, but `documentation/performance-testing.md` §7's table is
+   `| ... | Status | Date / commit |` and instructs the operator to "paste the
+   resulting table here in place of the placeholder rows". The columns don't
+   line up. Pick one shape (the spec itself is inconsistent between §3.6 and
+   §6.7 — §7 losing the date/commit provenance is the worse option, so prefer
+   adding a date/commit column to `renderMarkdown`).
 
-## 4. The AC-2 "coverage pin" does not pin what it claims
+5. **`preflight` runs for `--scenario notifications`.** `tests/load/run.ts:115`
+   always preflights all 12 endpoints, so a scenario whose entire contract is
+   "makes no network calls" still fires 13 requests and can exit `2` on a
+   connectivity problem that is irrelevant to it. Skip preflight when the
+   selected scenario set needs no network.
 
-`tests/integration/rls/tables/phase1-token-bypass.test.ts:46-59` asserts
-`PHASE1_TABLES.length === 19` and that each of those 19 names appears somewhere
-in `cross-tenant-bypass.test.ts`. That catches "someone added a table to
-`PHASE1_TABLES` without covering it", but **not** the case the file header and
-`.pipeline/changes.md` claim it guards ("a future table added to the schema
-cannot silently skip the cross-tenant sweep") — a new `create table` in
-`supabase/migrations/` with no edit to `PHASE1_TABLES` leaves the pin green.
-Derive the list from (or cross-check it against) the `create table` statements
-in `supabase/migrations/*.sql`, which is what makes it mechanical; otherwise
-downgrade the claim in the file header and in `changes.md`. Secondary nit:
-`expect(source).toContain(table)` is a raw substring match — `"users"`,
-`"songs"`, `"events"`, `"instruments"`, `"notifications"` all match as
-substrings of unrelated identifiers/comments; match on a quoted-table form
-instead.
+6. **`STAGING_APP_URL` fallback turns "unconfigured" into exit 2.**
+   `tests/load/env.ts:54,60` counts the `STAGING_APP_URL` fallback toward
+   `anySet`, so an operator or script with `STAGING_APP_URL` exported (it is a
+   documented staging var) but no `LOAD_TEST_*` vars gets `partial` + exit `2`
+   instead of the documented skip + exit `0` (spec §4 item 7). Consider only
+   counting the `LOAD_TEST_*` vars toward `anySet`.
 
-## 5. `changes.md` states Block E results as confirmed, but Block E never ran
+7. **Two superficial unit tests** in `tests/unit/load/http.test.ts`:
+   - "never exceeds the concurrency ceiling" asserts only `maxInFlight <= 5`; a
+     fully serial implementation passes it. Also assert `maxInFlight === 5`.
+   - "stops issuing new iterations once the injected clock passes the duration
+     deadline" asserts only `calls.length > 0`. The injected clock makes this
+     fully deterministic (3 calls) — assert the exact count, otherwise the test
+     proves nothing about the deadline.
 
-`.pipeline/changes.md` SECURITY FINDINGS §4: "All three characterization tests
-confirm the documented behavior, not a bug", with a bullet list of outcomes —
-then discloses at the bottom of the same section that Block E was not executed
-in this environment. The findings are consistent with
-`supabase/migrations/20260704000001_rls_policies.sql:29-53` on inspection, and
-the seed data they depend on does exist (`tests/integration/rls/setup.ts`:
-`songs` B1, `audit_logs` B/A), so I expect them to pass — but the write-up must
-say "expected from the migration source, unverified" rather than "confirm",
-because #79 is meant to inherit this as fact. Reword §4.
+## Noted, no change required
 
----
-
-## Things I checked that are fine (no action)
-
-- Registry completeness: 61 entries covering all 60 exported `UserLookup`
-  handlers under `app/api/**/handler.ts` (`getAvailability` twice, per the
-  conditional role gate) — enumerated independently; nothing omitted. The 5
-  deliberately-excluded routes all have their own explicit tests.
-- The `scope: "user"` correction for `GET /api/events/:id/ics` (spec said
-  "group") is right — `exportEventIcs` only ever reads `ctx.userId`
-  (`app/api/events/[id]/ics/handler.ts`). Good catch by the coder, documented.
-- `touchesSupabase: false` / `authFailureIsRedirect: true` / the four
-  `ownScopeAssertion: false` entries were re-checked against handler source
-  (`getAuditLog` has no `.eq("church_group_id", …)`; `getAvailability`'s
-  `user_id` branch replaces `ctx.userId` wholesale). Accurate, not rationalized
-  — but see item 1 for what that leaves untested.
-- Rate-limit matrix genuinely exercises `resolveTier` (all six tier limits are
-  distinct, so a mis-mapped tier would fail), asserts `Retry-After` bounds from
-  the policy, and includes the required different-identifier failure case.
-  Mocking `createRouteMatcher` to always-true is safe: rate limiting runs before
-  `isPublicRoute` in `middleware.ts`.
-- `mintJwt` stays byte-identical when the new options are absent; `iat`
-  back-dating for negative `expiresInSeconds` is handled.
-- No production file touched; no network/exec/env exfiltration in the diff.
-
-## Residual (not blocking, carry forward for a human)
-
-RLS blocks B–E have still never executed anywhere — no Supabase env vars and no
-Docker in this worktree. Run `bun run test:rls` against a live local instance
-before treating AC-2's token-bypass claims (and Block E's trust-boundary
-findings) as verified.
+- `lastApiLoadRateLimitedTotal` (module-level handoff between `runApiLoad` and
+  `runRateLimitProbe`, `tests/load/scenarios.ts:119`) is an acceptable reading
+  of a spec that pinned both signatures. Verified it degrades cleanly to
+  "not run this session" when the probe runs standalone.
+- Bun+TS instead of k6 is a reasonable reading of "k6 (or similar)", and the
+  rationale is documented in `documentation/performance-testing.md` §3.
+- `EXPECTED_RATE_LIMIT_POLICIES` matches `lib/api/rate-limit.ts`'s
+  `RATE_LIMIT_POLICIES`, and the sync test enforces it. The 429 assertions in
+  `runRateLimitProbe` match what `rateLimitResponse` actually emits
+  (`code: ErrorCode.RATE_LIMITED`, `Retry-After` integer >= 1) — verified
+  against the source, not just the diff.
+- Token hygiene holds: no token reaches stdout, the markdown report, or any
+  error string; `hostOnly` strips userinfo and query. Confirmed by reading the
+  code and by the mock CLI runs.
+- AC2 handled as `blocked` with no fabricated number and no network calls —
+  exactly right, and the exit-code-3 consequence is correctly wired.
+- Unverifiable here, flag for the operator's first real run: the harness assumes
+  the API accepts `Authorization: Bearer <clerk session jwt>`. If Clerk on
+  staging is cookie-only for these routes, preflight will fail with a wall of
+  `HTTP 401` and exit `2`. The doc's "re-mint the token" guidance would be
+  misleading in that case.
