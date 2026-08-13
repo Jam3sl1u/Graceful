@@ -25,6 +25,18 @@ describe("readEnv", () => {
     }
   });
 
+  it("returns unconfigured (not partial) when only STAGING_APP_URL is set (regression: issue #81 review SHOULD FIX)", () => {
+    // STAGING_APP_URL is a general-purpose var set in most environments for
+    // reasons unrelated to load testing; its mere presence must not turn an
+    // otherwise-unconfigured harness into exit code 2 (partial) instead of
+    // the documented exit code 0 (unconfigured, skip).
+    const result = readEnv({
+      STAGING_APP_URL: "https://staging.example.com",
+    } as unknown as NodeJS.ProcessEnv);
+
+    expect(result.kind).toBe("unconfigured");
+  });
+
   it("falls back to STAGING_APP_URL when LOAD_TEST_BASE_URL is unset", () => {
     const result = readEnv({
       STAGING_APP_URL: "https://staging.example.com",

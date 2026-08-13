@@ -70,6 +70,7 @@ export type ConcurrentOptions = {
   rampUpMs?: number;
   durationMs?: number; // exactly one of durationMs / iterationsPerWorker
   iterationsPerWorker?: number;
+  thinkTimeMs?: number; // pacing delay between a worker's iterations (duration mode only)
   now?: () => number; // injectable for tests; defaults to performance.now
   sleep?: (ms: number) => Promise<void>; // injectable for tests
 };
@@ -79,13 +80,15 @@ export type ConcurrentOptions = {
  * each of `concurrency` workers runs its own sequential loop, so no more
  * than one request per worker (and therefore never more than `concurrency`
  * total) is ever in flight at once. Ramp-up staggers worker start times
- * evenly across `rampUpMs`.
+ * evenly across `rampUpMs`. `thinkTimeMs` (duration mode only) paces each
+ * worker with a fixed delay between iterations, so `concurrency` in-flight
+ * requests doesn't also mean an unbounded steady-state request rate.
  */
 export async function runConcurrent<T>(
   task: (workerIndex: number, iteration: number) => Promise<T>,
   options: ConcurrentOptions,
 ): Promise<T[]> {
-  const { concurrency, rampUpMs = 0, durationMs, iterationsPerWorker } = options;
+  const { concurrency, rampUpMs = 0, durationMs, iterationsPerWorker, thinkTimeMs = 0 } = options;
   const now = options.now ?? (() => performance.now());
   const sleep =
     options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -111,6 +114,9 @@ export async function runConcurrent<T>(
         const result = await task(workerIndex, iteration);
         results.push(result);
         iteration += 1;
+        if (thinkTimeMs > 0) {
+          await sleep(thinkTimeMs);
+        }
       }
     } else {
       const total = iterationsPerWorker ?? 0;

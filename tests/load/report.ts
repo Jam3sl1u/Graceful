@@ -33,22 +33,26 @@ function escapeCell(value: string): string {
 }
 
 /**
- * `| Target | Threshold | Measured (p95) | Status | Notes |` — paste-ready
- * into documentation/performance-testing.md §7.
+ * `| Target | Threshold | Measured (p95) | Status | Notes | Date / commit |`
+ * — paste-ready into documentation/performance-testing.md §7. `meta.commit`
+ * is the harness's own local checkout (see run.ts's resolveCommit) — a
+ * provenance marker for which version of tests/load/** produced the row,
+ * not necessarily the commit deployed to the staging server being measured.
  */
 export function renderMarkdown(
   results: readonly ScenarioResult[],
-  meta: { baseUrl: string; startedAt: string },
+  meta: { baseUrl: string; startedAt: string; commit: string },
 ): string {
   const lines: string[] = [];
   lines.push(`Load test run — ${hostOnly(meta.baseUrl)} — ${meta.startedAt}`);
   lines.push("");
-  lines.push("| Target | Threshold | Measured (p95) | Status | Notes |");
-  lines.push("| --- | --- | --- | --- | --- |");
+  lines.push("| Target | Threshold | Measured (p95) | Status | Notes | Date / commit |");
+  lines.push("| --- | --- | --- | --- | --- | --- |");
 
+  const dateAndCommit = `${escapeCell(meta.startedAt)} / ${escapeCell(meta.commit)}`;
   for (const result of results) {
     lines.push(
-      `| ${escapeCell(result.label)} | ${escapeCell(result.targetLabel)} | ${escapeCell(result.measured)} | ${statusCell(result.status)} | ${escapeCell(result.detail)} |`,
+      `| ${escapeCell(result.label)} | ${escapeCell(result.targetLabel)} | ${escapeCell(result.measured)} | ${statusCell(result.status)} | ${escapeCell(result.detail)} | ${dateAndCommit} |`,
     );
   }
 

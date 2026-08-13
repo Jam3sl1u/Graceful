@@ -128,6 +128,21 @@ Exit codes:
 
 ## 6. Known limitations
 
+- **`GET /api/health` is excluded from the AC1 p95.** It's unauthenticated
+  and exempt from rate limiting (`resolveTier`, `lib/api/rate-limit.ts`), so
+  its latency and error-rate profile isn't representative of the
+  authenticated API under load. It's still driven every run (round-robin
+  with the other 11 endpoints) and still reported individually in the
+  per-endpoint breakdown the CLI prints, but its samples/ok/rate-limited/
+  error counts are excluded from `runApiLoad`'s pooled totals — the numbers
+  that decide AC1 pass/fail and populate the `Measured (p95)` / `Notes`
+  cells below.
+- **Virtual users are paced, not saturating.** Each worker sleeps
+  `LOAD_PROFILE.thinkTimeMs` (500ms) between iterations, so "100 concurrent
+  users" means 100 workers each issuing roughly one request every
+  ~500ms+RTT, not 100 tight loops firing as fast as the network allows. This
+  keeps the harness from self-flooding (and self-inflicting a spurious
+  error-rate failure) — see `tests/load/http.ts`'s `runConcurrent`.
 - **Shared rate-limit bucket.** The limiter keys per Clerk user id
   (`getRequestIdentifier`, `lib/api/rate-limit.ts:101`), and staging seeds
   exactly two Clerk test users. 100 virtual users driven by one or two
@@ -157,13 +172,13 @@ Exit codes:
 Fill in this table when you run the pass. #83 (production deploy gate) reads
 this table; a `Not run` or `Blocked` row means the pass is **not** complete.
 
-| Target | Threshold | Measured (p95) | Status | Date / commit |
-| --- | --- | --- | --- | --- |
-| API response time | p95 < 500ms @ 100 concurrent users | — | Not run | — |
-| Signed URL generation | p95 < 200ms | — | Not run | — |
-| SMS delivery | p95 < 30s @ 50 simultaneous sends | — | Blocked | — |
-| Email delivery | p95 < 60s @ 50 simultaneous sends | — | Blocked | — |
-| Rate limiting (AC4) | ≥1 429 w/ valid `Retry-After` + `code=RATE_LIMITED` | — | Not run | — |
+| Target | Threshold | Measured (p95) | Status | Notes | Date / commit |
+| --- | --- | --- | --- | --- | --- |
+| API response time | p95 < 500ms @ 100 concurrent users | — | Not run | — | — |
+| Signed URL generation | p95 < 200ms | — | Not run | — | — |
+| SMS delivery | p95 < 30s @ 50 simultaneous sends | — | Blocked | — | — |
+| Email delivery | p95 < 60s @ 50 simultaneous sends | — | Blocked | — | — |
+| Rate limiting (AC4) | ≥1 429 w/ valid `Retry-After` + `code=RATE_LIMITED` | — | Not run | — | — |
 
 Run `bun run test:load --markdown` and paste the resulting table here in
 place of the placeholder rows above.

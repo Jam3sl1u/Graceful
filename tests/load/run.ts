@@ -10,6 +10,8 @@
  * the exit-code table and required env vars.
  */
 
+import { spawnSync } from "node:child_process";
+
 import { readEnv } from "./env";
 import {
   preflight,
@@ -34,6 +36,28 @@ const SCENARIO_ORDER: readonly SingleScenario[] = [
 
 function isSingleScenario(value: string): value is SingleScenario {
   return (SCENARIO_ORDER as readonly string[]).includes(value);
+}
+
+/**
+ * Short SHA of the harness's own local checkout — i.e. which version of
+ * tests/load/** produced this row, not which commit is deployed to the
+ * staging server being measured (those routinely differ; the operator's
+ * checkout may also be ahead of or behind what's actually deployed). A
+ * `-dirty` suffix flags an uncommitted working tree, since that SHA alone
+ * would otherwise overstate how reproducible the run is.
+ */
+function resolveCommit(): string {
+  try {
+    const shaResult = spawnSync("git", ["rev-parse", "--short", "HEAD"], { encoding: "utf8" });
+    const sha = shaResult.stdout?.trim() ?? "";
+    if (sha.length === 0) return "unknown";
+
+    const statusResult = spawnSync("git", ["status", "--porcelain"], { encoding: "utf8" });
+    const isDirty = (statusResult.stdout?.trim() ?? "").length > 0;
+    return isDirty ? `${sha}-dirty` : sha;
+  } catch {
+    return "unknown";
+  }
 }
 
 function parseArgs(argv: readonly string[]): { scenario: ScenarioName; markdown: boolean } {
@@ -112,14 +136,22 @@ async function main(): Promise<void> {
     `Running load test against ${config.baseUrl} (run against staging, not local dev)...`,
   );
 
-  const preflightResult = await preflight(config);
-  if (!preflightResult.ok) {
-    console.error("Preflight failed:");
-    for (const failure of preflightResult.failures) {
-      console.error(`  - ${failure}`);
+  // The notifications scenario makes zero network calls (runNotificationLatency
+  // always returns blocked), so warming up/probing the API endpoints ahead of
+  // it wastes 13 requests for no benefit. Only skip when it's the sole
+  // scenario being run — inside `--scenario all`, the other 3 scenarios still
+  // need the warm-up and notifications runs last anyway.
+  const needsPreflight = scenario !== "notifications";
+  if (needsPreflight) {
+    const preflightResult = await preflight(config);
+    if (!preflightResult.ok) {
+      console.error("Preflight failed:");
+      for (const failure of preflightResult.failures) {
+        console.error(`  - ${failure}`);
+      }
+      process.exit(2);
+      return;
     }
-    process.exit(2);
-    return;
   }
 
   const toRun: readonly SingleScenario[] = scenario === "all" ? SCENARIO_ORDER : [scenario];
@@ -136,7 +168,9 @@ async function main(): Promise<void> {
   printSummary(results);
 
   if (markdown) {
-    console.log(renderMarkdown(results, { baseUrl: config.baseUrl, startedAt }));
+    console.log(
+      renderMarkdown(results, { baseUrl: config.baseUrl, startedAt, commit: resolveCommit() }),
+    );
   }
 
   process.exit(resolveExitCode(results));

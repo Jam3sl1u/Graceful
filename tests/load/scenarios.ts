@@ -19,6 +19,23 @@ import {
 } from "./targets";
 import type { LoadTestConfig } from "./env";
 
+// See the rateLimited branch in runLoadAgainstEndpoints's task below for why
+// this is capped rather than honoring the server's full Retry-After.
+const RATE_LIMIT_BACKOFF_CAP_MS = 2000;
+
+/**
+ * Backoff duration (ms) for a rate-limited outcome: the server's
+ * `Retry-After` (seconds, floored to 1 if it parses as <=0), capped at
+ * `RATE_LIMIT_BACKOFF_CAP_MS`. A missing or non-numeric `retryAfter` (e.g.
+ * an HTTP-date form, or absent) falls back to the cap outright.
+ */
+export function resolveBackoffMs(retryAfter: string | null): number {
+  const parsedRetryAfter = retryAfter ? Number(retryAfter) : NaN;
+  return Number.isFinite(parsedRetryAfter)
+    ? Math.min(Math.max(1, parsedRetryAfter) * 1000, RATE_LIMIT_BACKOFF_CAP_MS)
+    : RATE_LIMIT_BACKOFF_CAP_MS;
+}
+
 export type ScenarioStatus = "pass" | "fail" | "skipped" | "blocked";
 
 export type ScenarioResult = {
@@ -118,7 +135,7 @@ export async function preflight(
 // avoids widening either function's spec'd signature.
 let lastApiLoadRateLimitedTotal: number | null = null;
 
-type EndpointAggregate = {
+export type EndpointAggregate = {
   name: string;
   samples: number[];
   ok: number;
@@ -126,6 +143,66 @@ type EndpointAggregate = {
   errors: number;
   unauthorized: number;
 };
+
+/**
+ * Pools per-endpoint aggregates into the overall sample set used for the
+ * AC1 p95/error-rate evaluation. `persona: "none"` endpoints (currently only
+ * `GET /api/health`) are exempt from rate limiting and unauthenticated
+ * (`resolveTier`, `lib/api/rate-limit.ts`), so their sample volume and error
+ * rate are not representative of the authenticated API under load and must
+ * not be pooled into the AC1 measurement — every endpoint is still reported
+ * individually in `perEndpoint` regardless of persona.
+ */
+export function poolAggregates(
+  endpoints: readonly { name: string; persona: Persona }[],
+  aggregates: ReadonlyMap<number, EndpointAggregate>,
+): {
+  overallSamples: number[];
+  totalOk: number;
+  totalRateLimited: number;
+  totalErrors: number;
+  perEndpoint: {
+    name: string;
+    summary: LatencySummary | null;
+    ok: number;
+    rateLimited: number;
+    errors: number;
+  }[];
+} {
+  const overallSamples: number[] = [];
+  let totalOk = 0;
+  let totalRateLimited = 0;
+  let totalErrors = 0;
+  const perEndpoint: {
+    name: string;
+    summary: LatencySummary | null;
+    ok: number;
+    rateLimited: number;
+    errors: number;
+  }[] = [];
+
+  endpoints.forEach((endpoint, index) => {
+    const bucket = aggregates.get(index);
+    if (!bucket) return;
+
+    perEndpoint.push({
+      name: bucket.name,
+      summary: summarize(bucket.samples),
+      ok: bucket.ok,
+      rateLimited: bucket.rateLimited,
+      errors: bucket.errors,
+    });
+
+    if (endpoint.persona === "none") return;
+
+    overallSamples.push(...bucket.samples);
+    totalOk += bucket.ok;
+    totalRateLimited += bucket.rateLimited;
+    totalErrors += bucket.errors;
+  });
+
+  return { overallSamples, totalOk, totalRateLimited, totalErrors, perEndpoint };
+}
 
 async function runLoadAgainstEndpoints(
   config: LoadTestConfig,
@@ -180,6 +257,17 @@ async function runLoadAgainstEndpoints(
         bucket.samples.push(outcome.durationMs);
       } else if (outcome.classification === "rateLimited") {
         bucket.rateLimited += 1;
+        // Back off before the next iteration so a throttled worker doesn't
+        // immediately re-hammer the limiter — but capped, unlike
+        // preflightOne's one-shot retry above: the server's own Retry-After
+        // can be up to the full rate-limit window (documentation/performance-testing.md
+        // §6 "Shared rate-limit bucket" — a small shared token pool hits this
+        // routinely), and LOAD_PROFILE.durationSeconds is a fixed wall-clock
+        // budget for the whole run. Honoring the full Retry-After here would
+        // let one throttled worker stall the run for tens of seconds past
+        // its own deadline; a short, bounded backoff still eases pressure
+        // without breaking that contract.
+        await new Promise((resolve) => setTimeout(resolve, resolveBackoffMs(outcome.retryAfter)));
       } else if (outcome.classification === "unauthorized") {
         bucket.unauthorized += 1;
         unauthorizedSeen = true;
@@ -191,36 +279,14 @@ async function runLoadAgainstEndpoints(
       concurrency: LOAD_PROFILE.concurrentUsers,
       rampUpMs: LOAD_PROFILE.rampUpSeconds * 1000,
       durationMs: LOAD_PROFILE.durationSeconds * 1000,
+      thinkTimeMs: LOAD_PROFILE.thinkTimeMs,
     },
   );
 
-  const overallSamples: number[] = [];
-  let totalOk = 0;
-  let totalRateLimited = 0;
-  let totalErrors = 0;
-  const perEndpoint: {
-    name: string;
-    summary: LatencySummary | null;
-    ok: number;
-    rateLimited: number;
-    errors: number;
-  }[] = [];
-
-  endpoints.forEach((_endpoint, index) => {
-    const bucket = aggregates.get(index);
-    if (!bucket) return;
-    overallSamples.push(...bucket.samples);
-    totalOk += bucket.ok;
-    totalRateLimited += bucket.rateLimited;
-    totalErrors += bucket.errors;
-    perEndpoint.push({
-      name: bucket.name,
-      summary: summarize(bucket.samples),
-      ok: bucket.ok,
-      rateLimited: bucket.rateLimited,
-      errors: bucket.errors,
-    });
-  });
+  const { overallSamples, totalOk, totalRateLimited, totalErrors, perEndpoint } = poolAggregates(
+    endpoints,
+    aggregates,
+  );
 
   return { overallSamples, totalOk, totalRateLimited, totalErrors, unauthorizedSeen, perEndpoint };
 }
@@ -236,6 +302,7 @@ async function runLoadAgainstEndpoints(
 export async function runApiLoad(config: LoadTestConfig): Promise<ScenarioResult> {
   const target = PERF_TARGETS.api;
   const targetLabel = `p95 < ${target.thresholdMs}ms`;
+  const authenticatedEndpointCount = API_ENDPOINTS.filter((e) => e.persona !== "none").length;
 
   const { overallSamples, totalOk, totalRateLimited, totalErrors, unauthorizedSeen, perEndpoint } =
     await runLoadAgainstEndpoints(
@@ -273,7 +340,7 @@ export async function runApiLoad(config: LoadTestConfig): Promise<ScenarioResult
     measured: measuredLabel(result.p95),
     detail:
       result.status === "pass"
-        ? `${totalOk} ok, ${totalRateLimited} rate-limited, ${totalErrors} errors across ${API_ENDPOINTS.length} endpoints`
+        ? `${totalOk} ok, ${totalRateLimited} rate-limited, ${totalErrors} errors across ${authenticatedEndpointCount} authenticated endpoints (GET /api/health excluded from AC1 pooling — see perEndpoint)`
         : result.reason,
     perEndpoint,
   };

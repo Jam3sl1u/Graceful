@@ -1,157 +1,132 @@
-# Test Results — Issue #81: Run performance/load test pass against staging
+# Test results — Issue #81 fix pass (review NEEDS WORK → this pass)
 
-**Overall: PASS.** All coder-claimed checks reproduced independently, plus
-new tests added for two gaps in the coder's own coverage (`tests/load/env.ts`
-had zero unit tests, and `tests/load/scenarios.ts` had none at all beyond a
-real `bun run test:load` smoke pass). Everything is green.
+**Overall: PASS.** All 7 findings from `.pipeline/review.md`'s NEEDS WORK
+verdict (3 MUST FIX, 4 SHOULD FIX) were independently re-verified after the
+fix pass described in `.pipeline/changes.md`.
 
-## What was independently re-run
+## Automated checks
 
 | Check | Result |
 | --- | --- |
 | `bun run typecheck` | Clean |
-| `bun run lint` | Clean |
-| `bun run format:check` (grep'd for `tests/load\|tests/unit/load`) | No output — no formatting issues in this change's files (repo-wide pre-existing ~100-file format:check failure, confirmed unrelated, unchanged) |
-| `bun run test` (full suite) | **120 suites / 2839 tests, all green** (was 118/2817 before my 2 new files; +2 suites, +22 tests) |
+| `bun run lint` | Clean (1 pre-existing warning in generated `coverage/lcov-report/`, unrelated to this change) |
+| `bun run test` | 120 suites / 2850 tests, all green (2839 original baseline + 6 from this fix pass + 5 from the independent-review addendum below) |
+| `bun run format:check` | Clean for every file this fix pass touched; the ~100 other repo-wide warnings confirmed pre-existing on this branch via `git stash` (identical warning set before and after this fix pass's changes) |
 | `bun run check:git-secrets` | Clean |
-| `bun run check:workflows` | Clean (unaffected by this change, as expected) |
-| `bunx jest --listTests \| grep -i load` | Confirms only `tests/unit/load/*.test.ts` (now 6 files) are Jest-visible; `tests/load/**` itself is not picked up, matching spec §2/§7 |
-| `bun run tests/load/run.ts` with no env vars | `SKIPPED: load harness not configured...`, exit `0` |
+| `bun run check:workflows` | N/A — no `.claude/workflows/**` file touched |
 
-## New tests added (this stage)
+## New regression tests (verifying the fix, not just re-running old coverage)
 
-### `tests/unit/load/env.test.ts` (new — no test file existed for `env.ts`)
+- `tests/unit/load/scenarios.test.ts` — `poolAggregates`: confirms a
+  `persona: "none"` bucket (e.g. `/api/health`) is excluded from pooled
+  totals but still reported per-endpoint (MUST FIX #1's exact regression
+  case), and that normal all-authenticated pooling is unaffected.
+- `tests/unit/load/http.test.ts` — `thinkTimeMs`: confirms `sleep` is called
+  with the configured pacing delay between iterations, and never called when
+  omitted (MUST FIX #2).
+- `tests/unit/load/http.test.ts` — the two previously weak assertions now
+  pin exact values (`maxInFlight` is `toBe(5)`, not `toBeLessThanOrEqual(5)`;
+  the deadline test's `calls` array is pinned to the observed deterministic
+  `[0, 1, 0, 1]` sequence rather than just `toBeGreaterThan(0)`) (SHOULD FIX
+  #7).
+- `tests/unit/load/env.test.ts` — only `STAGING_APP_URL` set (no
+  `LOAD_TEST_*` vars) → `unconfigured`, not `partial` (SHOULD FIX #6).
+- `tests/unit/load/report.test.ts` — `renderMarkdown` now requires and
+  renders a `commit` field in the 6-column table (SHOULD FIX #4).
 
-Spec's file table (§2) doesn't list an `env.test.ts`, but `readEnv` is pure,
-security-sensitive (token handling / never-echo requirement), and drives the
-CLI's exit-0/exit-2 branch — worth independent coverage. 10 tests:
-happy-path `configured` (multi-token, trailing-slash-stripped base URL,
-`STAGING_APP_URL` fallback, whitespace/empty-token trimming), `unconfigured`
-when nothing is set, `partial` when some-but-not-all vars are set (incl. the
-edge case of an env carrying *only* the optional `LOAD_TEST_SONG_ID`, and a
-token-list-of-only-commas collapsing to empty ⇒ `partial`), and a check that
-a real-looking token value never appears in the `partial` state's `missing`
-list. All pass.
+## Manual end-to-end verification (real network path, not unit-testable per spec §2)
 
-### `tests/unit/load/scenarios.test.ts` (new — this module had no unit test file at all)
+Ran against local mock HTTP servers reproducing the real 240/60s read-tier
+rate limiter shape (`lib/api/rate-limit.ts`'s `resolveTier`/
+`checkRateLimit`) — no real staging credentials exist in this environment,
+consistent with the original coding/testing stages' documented constraint.
 
-Mocks `global.fetch` to independently verify the parts of `scenarios.ts` that
-don't depend on `LOAD_PROFILE`'s real 60s-duration/10s-ramp-up load path
-(see "Known limitation" below for why the load path itself isn't unit-tested
-here — this matches, and confirms as reasonable, the coder's own rationale
-for excluding this file from spec §2's test list). 12 tests covering:
+1. **Happy path — `--scenario api --markdown` against a mock with the
+   documented small shared-token-pool scenario (4 tokens, 100 workers):**
+   `PASS`, measured p95 21ms, `1653 ok, 2005 rate-limited, 0 errors across 12
+   endpoints`, exit 0.
+   - Verified `totalOk` (1653) equals the exact sum of the 11 *authenticated*
+     endpoints' individual `ok` counts (health's 332 `ok` samples correctly
+     excluded from pooling) — direct confirmation MUST FIX #1 is fixed.
+   - Verified 0 non-429 errors despite 2005 rate-limited responses (heavy
+     429 volume is expected/documented under a small shared token pool,
+     §6) — direct confirmation MUST FIX #2's self-inflicted-flood is fixed;
+     total request volume (~3,700 over ~70s) is roughly 3 orders of
+     magnitude below the review's reported 2.06M/60s.
+   - Verified the `--markdown` output is the new 6-column
+     `Target | Threshold | Measured (p95) | Status | Notes | Date / commit`
+     shape with a populated commit cell (SHOULD FIX #4).
+2. **Failure case — `--scenario api` against a mock injecting a ~5% non-429
+   error rate on authenticated endpoints (no rate limiting simulated, to
+   isolate the error-rate path):** `FAIL`, `non-429 error rate 4.8% exceeds
+   max 1.0%`, exit 1. Confirms the fix pass didn't accidentally make the
+   harness unable to report FAIL when a real >1% error rate exists — the
+   original review's MUST FIX #2 concern was specifically that the harness
+   might become *structurally unable to ever pass*; this checks the
+   complementary risk (unable to ever fail) wasn't introduced by the pacing
+   fix. Health's endpoint again correctly shows 0 errors and is excluded
+   from the reported rate.
+3. **`STAGING_APP_URL`-only environment** (`env -i` with only
+   `STAGING_APP_URL` set, no `LOAD_TEST_*` vars): prints `SKIPPED: load
+   harness not configured`, exit 0 — was exit 2 before the fix (SHOULD FIX
+   #6).
+4. **`--scenario notifications` against a deliberately unreachable base
+   URL:** returns the expected `blocked` result, exit 3 — proves preflight
+   was skipped (an unreachable URL would otherwise produce a preflight
+   failure, exit 2) (SHOULD FIX #5).
 
-- `preflight`: happy path (all 2xx), a named failure entry for a non-2xx
-  endpoint (`"GET /api/instruments: HTTP 500"`), the single-retry-after-429
-  path (verified via a real ~1s wait, not mocked away), and that the
-  signed-URL endpoint is/isn't probed depending on `songId`.
-- `runNotificationLatency`: always `blocked`, **zero** `fetch` calls (spec
-  OPEN QUESTION 1's "never fabricate a number" contract), detail names both
-  stub client files.
-- `runSignedUrlLoad`: `skipped` with zero `fetch` calls when `songId` is
-  null (edge case explicitly named in spec §4 item 9).
-- `runRateLimitProbe`: happy-path pass (all-429/valid-`Retry-After`/
-  `RATE_LIMITED` responses, confirms the short-circuit exactly at
-  `policy.limit` calls, not `limit + 20`), a failure case (never 429s), plus
-  two more failure cases (invalid `Retry-After`, wrong error `code`), and a
-  check that a token value never leaks into `result.detail`/`result.measured`.
+## Issue found and fixed during this stage's own verification
 
-All 12 pass. **One bug was caught and fixed in my own test, not the
-implementation**: my first draft used `jest.fn().mockResolvedValue(response)`
-for scenarios that call `fetch` many times in a loop (`runRateLimitProbe` up
-to 240+ times); since a `Response` body can only be read once, every call
-after the first got a `""` body on `.text()`, which made `errorCode` parse to
-`null` and the probe's `code === "RATE_LIMITED"` check fail spuriously.
-Switched to `jest.fn(async () => jsonResponse(...))` so each call gets a
-fresh `Response` instance — this is a Jest-mock/`fetch`-body-stream gotcha,
-not a defect in `tests/load/scenarios.ts` itself (confirmed via a standalone
-Bun script hitting `runRateLimitProbe` directly with a real per-call
-`Response`, which passed before the test fix too).
+While manually verifying MUST FIX #2's happy path (item 1 above), the first
+run of the harness against the small-token-pool mock **did not complete
+within a 150s window** (nearly double the ~70s the fixed `durationSeconds`
++ `rampUpSeconds` design implies). Root cause: the Retry-After-aware backoff
+added for MUST FIX #2 honored the mock's full reported `Retry-After`, which
+— like the real limiter under a small shared token pool — can be up to the
+entire 60s rate-limit window early in that window. A worker rate-limited
+near the start of its loop would sleep for most of a minute before checking
+the deadline again, stalling `runConcurrent`'s `Promise.all` well past the
+run's own fixed-duration contract. Fixed by capping the backoff at
+`RATE_LIMIT_BACKOFF_CAP_MS = 2000`ms in `tests/load/scenarios.ts` (see
+`.pipeline/changes.md` for detail); re-verified afterward (item 1 above)
+completes in the expected ~70s window. This is called out explicitly for the
+Reviewer since it's a design refinement made during this stage, not
+something the original plan anticipated.
 
-## Manual smoke verification against a local mock HTTP server
+## Addendum — independent re-review round
 
-No real staging credentials exist in this environment (by design, per spec
-§7 — "do not attempt a real staging run"), so, like the coder, I exercised
-the live CLI/scenario code paths against a throwaway `Bun.serve` mock
-(`/private/tmp/.../scratchpad/mock-server.ts`, not part of the repo,
-discarded after use):
+An independent `reviewer` subagent (fresh context, own typecheck/lint/test/
+git-secrets/prettier runs, own reading of every touched file — see
+`.pipeline/review.md`) confirmed all 3 MUST FIX and 4 SHOULD FIX findings
+genuinely fixed, including mutation-testing the two strengthened
+`http.test.ts` assertions itself (serial `runConcurrent` kills the new
+`toBe(5)`; a removed deadline check kills the new
+`toEqual([0, 1, 0, 1])` — neither would have been caught by the original weak
+assertions). It found and this stage fixed 5 new issues introduced by the
+original fix-pass round — see `.pipeline/changes.md`'s "Addendum" section for
+the detail on each:
 
-- **Partial env** (`LOAD_TEST_BASE_URL` only) → lists the two missing vars,
-  exit `2`. Matches.
-- **Invalid `--scenario bogus`** → `Invalid --scenario value: bogus`, exit
-  `2`. Matches.
-- **Preflight failure** (mock returns 500 for `/api/instruments`) →
-  `Preflight failed:\n  - GET /api/instruments: HTTP 500`, exit `2`, no hang.
-  Matches spec §4 item 7 / §5.
-- **`--scenario rate-limit`** against a mock that lets 2 requests through
-  then 429s everything → `[PASS] Rate limit probe`, exit `0`, and the
-  `--markdown` table's base-URL cell is host-only (`127.0.0.1:8934`) with no
-  token anywhere in stdout. Matches.
-- **`--scenario rate-limit`** against a mock that never 429s → `[FAIL]`,
-  reason `no 429 observed`, exit `1`. Matches.
-- **`--scenario notifications`** → `[BLOCKED]`, zero-network, exit `3`.
-  Matches.
-- **`--scenario signed-url`** with no `LOAD_TEST_SONG_ID` → `[SKIPPED]`,
-  exit `3`. Matches.
+1. `runApiLoad`'s detail string said "12 endpoints" when only 11 feed the
+   pooled AC1 totals post-fix — now dynamically computed and reworded.
+2. `documentation/performance-testing.md` §6 didn't disclose the health
+   exclusion or the new pacing behavior — two new bullets added.
+3. The `Date / commit` column's commit is the harness's local checkout, not
+   the staging deployment's — now documented explicitly and suffixed
+   `-dirty` when the working tree has uncommitted changes.
+4. The rate-limit backoff had no test coverage — extracted to a pure
+   `resolveBackoffMs` with 5 new unit tests.
+5. The `poolAggregates` test's excluded fixture only exercised
+   samples/ok — extended to nonzero `rateLimited`/`errors` too, so a
+   regression leaking those into the pooled totals would be caught.
 
-## Spec cross-checks (source-of-truth verification, not just reading the diff)
+Re-verified after all 5 fixes: full suite (120 suites / 2850 tests),
+typecheck, lint, `check:git-secrets`, and `prettier --check` on every touched
+file all clean; the local-mock manual check was re-run and confirmed both
+the corrected "11 authenticated endpoints" wording and the `-dirty` commit
+suffix render correctly in real output.
 
-- All 12 `API_ENDPOINTS` paths resolve to real, non-`notImplemented` `GET`
-  handlers under `app/api/**` — confirmed by `find` + `grep` against the
-  actual route/handler files, not just trusting `changes.md`.
-- The four `admin`-persona endpoints (`/api/conflicts`,
-  `/api/service-weeks/overview`, `/api/church-group/audit-log`,
-  `/api/instruments`) each call `requireRole(ctx, ["admin", ...])` in their
-  handler — confirmed by `grep`, so `persona: "admin"` is correct for all
-  four.
-- `EXPECTED_RATE_LIMIT_POLICIES` in `tests/load/targets.ts` textually matches
-  `RATE_LIMIT_POLICIES` in `lib/api/rate-limit.ts` (also asserted by
-  `tests/unit/load/targets.test.ts`'s `toEqual` check, which passes).
-- `runNotificationLatency`'s cited blockers all check out: `sendSms`
-  (`lib/pingram/client.ts:5`) and `sendEmail` (`lib/resend/client.ts:4`) are
-  throwing stubs; both webhook routes call `notImplemented(...)`; the
-  `notifications` table (migration `20260702000005_cluster_5_partial.sql`)
-  has no dispatch/delivery timestamp columns near the cited line.
-- `documentation/performance-testing.md` contains all 8 required §6 sections,
-  the exact §5 exit-code table, and the §6 known-limitations bullets
-  verbatim as spec'd; `README.md` and `documentation/staging-environment.md`
-  §9 additions match spec §2 exactly, with no other section renumbered.
+## What the Reviewer should focus on
 
-## Known limitation (not a defect — confirms the coder's own scoping)
-
-`runApiLoad` and `runSignedUrlLoad` call `runConcurrent` with the real,
-hardcoded `LOAD_PROFILE` (100 concurrency / 60s duration / 10s ramp-up) and
-never pass `now`/`sleep` overrides, so even with a fully mocked `fetch` a
-direct unit test of either function would take 70+ seconds of real
-wall-clock time per test. This is why I did not attempt to unit-test them
-directly (mirroring the coder's own documented rationale for leaving
-`scenarios.ts` out of spec §2's test list) — `runApiLoad`/`runSignedUrlLoad`'s
-actual load-generation behavior is only exercised by a real
-`bun run test:load` pass, which requires staging credentials this
-environment doesn't have. This is a pre-existing scope boundary from the
-spec, not something this stage is flagging as a gap to fix.
-
-## Items the Reviewer should specifically weigh in on
-
-These are carried over from `.pipeline/changes.md`'s own "what the Tester
-should focus on" list — I confirmed the logic behaves as documented, but the
-underlying *design choices* are worth a second, independent judgment call:
-
-1. `lastApiLoadRateLimitedTotal`'s module-level-variable hand-off between
-   `runApiLoad` and `runRateLimitProbe` (confirmed working via manual CLI
-   smoke test — `runRateLimitProbe` run alone correctly reports "not run
-   this session"; the non-zero-count path via a real `runApiLoad` call
-   wasn't exercised here since that requires the real 60s+10s load path
-   above).
-2. Whether a Bun+TS hand-rolled harness (vs. k6) is an acceptable reading of
-   the AC's "k6 (or similar)" — this is a judgment call the spec already made
-   as a non-blocking decision, not a code-behavior question testing can
-   settle.
-
-## Files touched by this stage
-
-- Added `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-81/tests/unit/load/env.test.ts`
-- Added `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-81/tests/unit/load/scenarios.test.ts`
-- No other files modified. No application code (`app/**`, `lib/**`,
-  `middleware.ts`, `schemas/**`, `supabase/**`) touched, consistent with
-  spec scope.
+All items from the independent review's own list have been addressed above.
+Nothing outstanding is being carried forward to human review beyond the
+normal expectation of eyes on the diff before merge.

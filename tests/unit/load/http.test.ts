@@ -137,7 +137,14 @@ describe("runConcurrent", () => {
       { concurrency: 5, iterationsPerWorker: 4 },
     );
 
-    expect(maxInFlight).toBeLessThanOrEqual(5);
+    // Exactly 5, not merely "at most 5": with concurrency 5 and no ramp-up
+    // stagger, all 5 workers' first iteration increments inFlight
+    // synchronously (Array.from invokes each async worker callback
+    // synchronously up to its first await) before any 1ms setTimeout can
+    // fire, so reaching 5 is deterministic. A regression to a serial (or
+    // otherwise under-concurrent) implementation would still satisfy
+    // `toBeLessThanOrEqual(5)` but fails this.
+    expect(maxInFlight).toBe(5);
   });
 
   it("runs exactly concurrency * iterationsPerWorker tasks when iterationsPerWorker is set", async () => {
@@ -164,10 +171,14 @@ describe("runConcurrent", () => {
       { concurrency: 2, durationMs: 25, now: clock, sleep: async () => {} },
     );
 
-    // Each worker's loop checks now() < deadline before each iteration;
-    // with a shared clock advancing 10ms per call, this terminates quickly
-    // and deterministically rather than depending on real wall-clock time.
-    expect(calls.length).toBeGreaterThan(0);
+    // Each worker's loop checks now() < deadline before each iteration; with
+    // a shared clock advancing 10ms per call, this terminates quickly and
+    // deterministically rather than depending on real wall-clock time.
+    // worker0 sees deadline=25 (computed when now=0); worker1 starts after
+    // worker0's first call already advanced the clock to 10, so it sees
+    // deadline=35. Pinning the exact interleaving (not just "ran at least
+    // once") catches regressions to the termination/interleaving logic.
+    expect(calls).toEqual([0, 1, 0, 1]);
   });
 
   it("throws when both durationMs and iterationsPerWorker are provided", async () => {
@@ -198,5 +209,44 @@ describe("runConcurrent", () => {
     // 3 workers, rampUpMs 100 => stagger = 100 / (3 - 1) = 50ms; worker 0
     // does not sleep (delay 0), so only 2 sleep calls are recorded.
     expect(sleepCalls.sort((a, b) => a - b)).toEqual([50, 100]);
+  });
+
+  it("paces iterations with thinkTimeMs via the injected sleep, in duration mode", async () => {
+    let now = 0;
+    const clock = () => now;
+    const sleepCalls: number[] = [];
+    const sleep = async (ms: number) => {
+      sleepCalls.push(ms);
+    };
+    const calls: number[] = [];
+
+    await runConcurrent(
+      async (workerIndex) => {
+        calls.push(workerIndex);
+        now += 1;
+      },
+      { concurrency: 1, durationMs: 3, thinkTimeMs: 10, now: clock, sleep },
+    );
+
+    expect(calls.length).toBeGreaterThan(0);
+    expect(sleepCalls).toEqual(calls.map(() => 10));
+  });
+
+  it("never sleeps for think-time when thinkTimeMs is omitted", async () => {
+    let now = 0;
+    const clock = () => now;
+    const sleepCalls: number[] = [];
+    const sleep = async (ms: number) => {
+      sleepCalls.push(ms);
+    };
+
+    await runConcurrent(
+      async () => {
+        now += 1;
+      },
+      { concurrency: 1, durationMs: 3, now: clock, sleep },
+    );
+
+    expect(sleepCalls).toEqual([]);
   });
 });

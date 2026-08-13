@@ -10,10 +10,13 @@
  * `bun run test:load` pass instead. See .pipeline/test-results.md.
  */
 import {
+  poolAggregates,
   preflight,
+  resolveBackoffMs,
   runNotificationLatency,
   runRateLimitProbe,
   runSignedUrlLoad,
+  type EndpointAggregate,
 } from "@/tests/load/scenarios";
 import { EXPECTED_RATE_LIMIT_POLICIES } from "@/tests/load/targets";
 import type { LoadTestConfig } from "@/tests/load/env";
@@ -35,6 +38,113 @@ function baseConfig(overrides: Partial<LoadTestConfig> = {}): LoadTestConfig {
     ...overrides,
   };
 }
+
+describe("poolAggregates", () => {
+  // Regression test for the MUST FIX finding on issue #81's review: pooling
+  // used to include persona: "none" endpoints (GET /api/health is exempt
+  // from rate limiting and unauthenticated, per resolveTier in
+  // lib/api/rate-limit.ts), which invalidated the AC1 measurement by mixing
+  // an unrepresentative sample flood into the authenticated-endpoint p95.
+  function aggregate(overrides: Partial<EndpointAggregate> = {}): EndpointAggregate {
+    return {
+      name: "GET /api/example",
+      samples: [],
+      ok: 0,
+      rateLimited: 0,
+      errors: 0,
+      unauthorized: 0,
+      ...overrides,
+    };
+  }
+
+  it("excludes persona none endpoints from the pooled totals but still reports them per-endpoint", () => {
+    const endpoints = [
+      { name: "GET /api/health", persona: "none" as const },
+      { name: "GET /api/profile", persona: "member" as const },
+    ];
+    const aggregates = new Map<number, EndpointAggregate>([
+      [
+        0,
+        aggregate({
+          name: "GET /api/health",
+          // Nonzero rateLimited/errors here too (not just ok/samples) so a
+          // regression that pooled only samples/ok, but still leaked
+          // rateLimited/errors from persona:"none" buckets into the totals
+          // that feed evaluateThreshold's error-rate gate, would be caught.
+          samples: [1, 2, 3, 4, 5],
+          ok: 5,
+          rateLimited: 9,
+          errors: 7,
+        }),
+      ],
+      [
+        1,
+        aggregate({
+          name: "GET /api/profile",
+          samples: [100, 200],
+          ok: 2,
+          rateLimited: 1,
+          errors: 1,
+        }),
+      ],
+    ]);
+
+    const result = poolAggregates(endpoints, aggregates);
+
+    expect(result.overallSamples).toEqual([100, 200]);
+    expect(result.totalOk).toBe(2);
+    expect(result.totalRateLimited).toBe(1);
+    expect(result.totalErrors).toBe(1);
+
+    expect(result.perEndpoint).toHaveLength(2);
+    expect(result.perEndpoint[0]).toMatchObject({
+      name: "GET /api/health",
+      ok: 5,
+      rateLimited: 9,
+      errors: 7,
+    });
+    expect(result.perEndpoint[1]).toMatchObject({ name: "GET /api/profile", ok: 2 });
+  });
+
+  it("pools every endpoint's samples/counters when none are persona none", () => {
+    const endpoints = [
+      { name: "GET /api/songs", persona: "member" as const },
+      { name: "GET /api/conflicts", persona: "admin" as const },
+    ];
+    const aggregates = new Map<number, EndpointAggregate>([
+      [0, aggregate({ name: "GET /api/songs", samples: [10], ok: 1 })],
+      [1, aggregate({ name: "GET /api/conflicts", samples: [20], ok: 1 })],
+    ]);
+
+    const result = poolAggregates(endpoints, aggregates);
+
+    expect(result.overallSamples).toEqual([10, 20]);
+    expect(result.totalOk).toBe(2);
+  });
+});
+
+describe("resolveBackoffMs", () => {
+  it("caps a large Retry-After (e.g. the full rate-limit window) at RATE_LIMIT_BACKOFF_CAP_MS", () => {
+    expect(resolveBackoffMs("60")).toBe(2000);
+  });
+
+  it("uses the Retry-After value in ms when it's below the cap", () => {
+    expect(resolveBackoffMs("1")).toBe(1000);
+  });
+
+  it("floors a zero or negative Retry-After to 1 second", () => {
+    expect(resolveBackoffMs("0")).toBe(1000);
+    expect(resolveBackoffMs("-5")).toBe(1000);
+  });
+
+  it("falls back to the cap when Retry-After is missing", () => {
+    expect(resolveBackoffMs(null)).toBe(2000);
+  });
+
+  it("falls back to the cap when Retry-After is non-numeric (e.g. an HTTP-date form)", () => {
+    expect(resolveBackoffMs("Wed, 21 Oct 2026 07:28:00 GMT")).toBe(2000);
+  });
+});
 
 describe("preflight", () => {
   const originalFetch = global.fetch;

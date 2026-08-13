@@ -30,6 +30,7 @@ describe("LOAD_PROFILE / NOTIFICATION_PROFILE", () => {
       rampUpSeconds: 10,
       requestTimeoutMs: 30_000,
       maxErrorRate: 0.01,
+      thinkTimeMs: 500,
     });
   });
 

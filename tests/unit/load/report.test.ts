@@ -18,10 +18,13 @@ describe("renderMarkdown", () => {
     const md = renderMarkdown([makeResult()], {
       baseUrl: "https://staging.example.com",
       startedAt: "2026-08-10T00:00:00.000Z",
+      commit: "abc1234",
     });
-    expect(md).toContain("| Target | Threshold | Measured (p95) | Status | Notes |");
     expect(md).toContain(
-      "| API load | p95 < 500ms | 412ms | Pass | 100 ok, 0 rate-limited, 0 errors |",
+      "| Target | Threshold | Measured (p95) | Status | Notes | Date / commit |",
+    );
+    expect(md).toContain(
+      "| API load | p95 < 500ms | 412ms | Pass | 100 ok, 0 rate-limited, 0 errors | 2026-08-10T00:00:00.000Z / abc1234 |",
     );
   });
 
@@ -33,7 +36,11 @@ describe("renderMarkdown", () => {
         makeResult({ id: "notifications", status: "blocked" }),
         makeResult({ id: "rate-limit", status: "skipped" }),
       ],
-      { baseUrl: "https://staging.example.com", startedAt: "2026-08-10T00:00:00.000Z" },
+      {
+        baseUrl: "https://staging.example.com",
+        startedAt: "2026-08-10T00:00:00.000Z",
+        commit: "abc1234",
+      },
     );
     expect(md).toContain("| Pass |");
     expect(md).toContain("| Fail |");
@@ -45,6 +52,7 @@ describe("renderMarkdown", () => {
     const md = renderMarkdown([makeResult()], {
       baseUrl: "https://user:pass@staging.example.com/some/path?token=abc123",
       startedAt: "2026-08-10T00:00:00.000Z",
+      commit: "abc1234",
     });
     expect(md).not.toContain("token=abc123");
     expect(md).not.toContain("user:pass");
@@ -55,8 +63,18 @@ describe("renderMarkdown", () => {
     const md = renderMarkdown([makeResult({ detail: "a | b" })], {
       baseUrl: "https://staging.example.com",
       startedAt: "2026-08-10T00:00:00.000Z",
+      commit: "abc1234",
     });
     expect(md).toContain("a \\| b");
+  });
+
+  it("includes the run's startedAt and commit in the Date / commit cell", () => {
+    const md = renderMarkdown([makeResult()], {
+      baseUrl: "https://staging.example.com",
+      startedAt: "2026-08-10T00:00:00.000Z",
+      commit: "deadbee",
+    });
+    expect(md).toContain("2026-08-10T00:00:00.000Z / deadbee");
   });
 });
 

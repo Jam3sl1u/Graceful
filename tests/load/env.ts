@@ -56,9 +56,18 @@ export function readEnv(env: NodeJS.ProcessEnv = process.env): EnvState {
   const memberTokens = splitTokens(env.LOAD_TEST_MEMBER_TOKENS);
   const songIdRaw = env.LOAD_TEST_SONG_ID?.trim() ?? "";
 
-  const anySet =
-    Boolean(baseUrlRaw) || adminTokens.length > 0 || memberTokens.length > 0 || Boolean(songIdRaw);
-  if (!anySet) {
+  // Deliberately excludes the STAGING_APP_URL fallback: that var is set for
+  // general (non-load-test) purposes in most environments, so its mere
+  // presence must not turn "nobody configured the load harness" into
+  // "partially configured" (exit 2) — only an explicit LOAD_TEST_* var
+  // counts as an attempt to configure this harness (see §5's exit-code
+  // table: unconfigured ⇒ exit 0 skip).
+  const explicitlySet =
+    Boolean(env.LOAD_TEST_BASE_URL) ||
+    adminTokens.length > 0 ||
+    memberTokens.length > 0 ||
+    Boolean(songIdRaw);
+  if (!explicitlySet) {
     return { kind: "unconfigured" };
   }
 

@@ -45,6 +45,13 @@ export const LOAD_PROFILE = {
   rampUpSeconds: 10,
   requestTimeoutMs: 30_000,
   maxErrorRate: 0.01, // >1% non-429 error responses ⇒ run invalid
+  // Pacing delay between each virtual user's iterations. Without this, 100
+  // workers loop as fast as the network allows with zero think-time, which
+  // self-floods the server (2M+ requests/60s observed against a local mock)
+  // and produces a connection-drop error rate that fails the run before p95
+  // is even meaningful. 500ms keeps concurrentUsers at the AC1-mandated 100
+  // while capping steady-state throughput to a sane ceiling.
+  thinkTimeMs: 500,
 } as const;
 
 export const NOTIFICATION_PROFILE = { simultaneousSends: 50 } as const;
