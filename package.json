@@ -22,6 +22,7 @@
     "test:coverage": "jest --coverage",
     "test:rls": "jest --config jest.config.integration.js",
     "test:e2e": "playwright test",
+    "test:load": "bun run tests/load/run.ts",
     "check:service-role": "node scripts/check-service-role.mjs",
     "check:workflows": "node scripts/check-workflows.mjs",
     "check:git-secrets": "node scripts/check-git-secrets.mjs",

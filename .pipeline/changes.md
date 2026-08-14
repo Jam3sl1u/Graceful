@@ -1,258 +1,210 @@
-# Changes — Issue #80: Full auth-bypass & RLS-bypass test suite (all Phase 1 tables)
+# Changes — Issue #81 fix pass: address review NEEDS WORK verdict
 
-Test-only change (per spec Assumption 3): nothing under `app/`, `lib/`,
-`schemas/`, `middleware.ts`, or `supabase/` was touched.
+This run addresses every finding in the prior `.pipeline/review.md` (NEEDS
+WORK: 3 MUST FIX, 4 SHOULD FIX) against the load/performance-test harness
+built for issue #81. No application code under `app/**`, `lib/**`,
+`middleware.ts`, `schemas/**`, or `supabase/**` was touched, and
+`.github/workflows/ci.yml` was not modified — same scope boundary as the
+original implementation.
 
-## Files changed
+## MUST FIX #1 — Invalid AC1 measurement (health polluting the pooled p95)
 
-- `tests/support/api-auth.ts` (MODIFY) — promoted `DEFAULT_USER_ID` /
-  `DEFAULT_CHURCH_GROUP_ID` to exports; added `VICTIM_CHURCH_GROUP_ID` /
-  `VICTIM_USER_ID` constants, `makeNullLookup()` (models an expired/absent
-  Supabase-template JWT), and `makeApiReq()` (generic `NextRequest` double
-  covering query params, JSON body, headers).
-- `tests/support/recording-supabase.ts` (CREATE) — generic Supabase client
-  double (`Proxy`-based) that records every table/rpc/argument string that
-  reaches it, used to sweep ~60 handlers without per-handler chain mocks.
-  Self-tested at the top of `auth-bypass-matrix.test.ts`.
-- `tests/support/admin-route-registry.ts` (CREATE) — single source of truth
-  for the AC-1 sweep: every exported handler that takes a `UserLookup`
-  (`ADMIN_ROUTE_REGISTRY`), with `allowedRoles`, `scope`, and an `invoke()`
-  that addresses another tenant's resources. Also carries three optional,
-  per-entry, documented escape hatches discovered while making the sweep
-  green against real handler behavior — see "Registry exceptions" below.
-- `tests/unit/app/api/auth-bypass-matrix.test.ts` (CREATE, AC-1) —
-  `describe.each(ADMIN_ROUTE_REGISTRY)` sweep: no-token (401), two
-  expired-token variants (401), insufficient-role (403) for every
-  disallowed role, and the cross-tenant-admin case (tenant scope must come
-  from `ctx`, never the request). Plus explicit coverage for the
-  non-registry routes (`claimGuestInvitation`, `PUT /api/church-group`,
-  `POST /api/church-group/join`, `GET /api/cron/invitation-reminders`).
-- `tests/unit/schemas/input-validation-injection.test.ts` (CREATE, AC-3) —
-  Part A: every free-text string field of every exported Zod object schema
-  in `schemas/*.ts`, swept against a SQLi/XSS/null-byte/Unicode payload
-  corpus, asserting reject-or-verbatim-survival plus oversized/empty
-  rejection and enum-field rejection. Part B: extends
-  `escapePostgrestFilterValue`'s existing test corpus. Part C: behavioral
-  test of `createGuestInvitation`'s `escapeLikePattern` use.
-- `tests/unit/middleware-rate-limit-matrix.test.ts` (CREATE, AC-4) — sweeps
-  the `auth`, `sms`, `invite`, and `write` tiers (see spec Assumption 1 for
-  why not a job-submission tier) across 8 representative routes, plus four
-  budget-isolation cases including the pipeline-contract-required failure
-  case (exhausting one identifier's budget must not affect another's).
-- `tests/integration/rls/jwt.ts` (MODIFY) — `TestClaims` gained
-  `expiresInSeconds` (negative → already-expired token, also back-dates
-  `iat`) and `signingSecret` (forged-signature tests). `mintJwt`'s existing
-  behavior is byte-identical when both are omitted.
-- `tests/integration/rls/client.ts` (MODIFY) — added `getAnonClient()`, an
-  anon-key client with no `Authorization` header.
-- `tests/integration/rls/tables/phase1-token-bypass.test.ts` (CREATE, AC-2)
-  — `PHASE1_TABLES` (19 tables). Block A (coverage pin) runs unconditionally
-  without RLS env vars: asserts the list has exactly 19 entries and that
-  every one is referenced in `cross-tenant-bypass.test.ts`. Blocks B/C/D
-  (each `it.each(PHASE1_TABLES)`, gated behind the existing RLS skip guard):
-  unauthenticated caller, expired Church-A JWT, wrong-signature JWT — all
-  must be blocked on every table. Block E: three named trust-boundary
-  characterization tests (not a sweep) — see SECURITY FINDINGS.
+`GET /api/health` is `persona: "none"` — unauthenticated and exempt from rate
+limiting (`resolveTier`, `lib/api/rate-limit.ts`) — so pooling its samples
+into `overallSamples` alongside the 11 authenticated endpoints produced an
+AC1 p95 that was over 99% health traffic.
 
-## Registry exceptions (tests/support/admin-route-registry.ts)
+- `tests/load/scenarios.ts` — extracted the pooling step out of
+  `runLoadAgainstEndpoints`'s inline `forEach` into a new exported pure
+  function, `poolAggregates(endpoints, aggregates)`. It now excludes any
+  endpoint with `persona === "none"` from `overallSamples` /
+  `totalOk`/`totalRateLimited`/`totalErrors`, while still including every
+  endpoint (health included) in the returned `perEndpoint` breakdown for
+  visibility.
+- `tests/unit/load/scenarios.test.ts` — new `describe("poolAggregates", ...)`
+  block: two tests, one asserting a `persona: "none"` bucket's
+  samples/counters are excluded from the pooled totals but still present in
+  `perEndpoint`, one asserting normal pooling across all-authenticated
+  endpoints is unaffected. This is the regression test that would have
+  caught the original bug — `runApiLoad`'s real network path still has no
+  unit test (by design, per spec §2), so this exercises the pooling logic in
+  isolation instead.
 
-While wiring the sweep against real handler behavior, three classes of
-handler turned out not to fit the generic sweep's implicit assumptions.
-Each is called out with a `RouteEntry` field and an inline comment at the
-specific entry (not applied blanket) — the negative "no victim id ever
-leaks" assertion always still runs for every entry that touches Supabase,
-and is a live, reachable check (see "Reviewer fix-up" below for why); only
-inapplicable positive assertions are skipped, each with a stated, verified
-reason:
+## MUST FIX #2 — No pacing/backoff (self-inflicted flood)
 
-- `touchesSupabase: false` — `adminOnlyExample` and `google-calendar/connect`
-  never call `getSupabaseClient`/`getAnonSupabaseClient` on any path
-  (verified by reading the handler source), so there is no tenant-scoped DB
-  call to inspect and no stale-JWT re-check to break.
-- `authFailureIsRedirect: true` — `google-calendar/callback` always responds
-  with an HTTP redirect, never JSON, on any failure (its own file-header
-  comment says so explicitly); the sweep asserts a 3xx redirect instead of a
-  401 JSON body for that entry's auth-failure cases.
-- `ownScopeAssertion: false` — `getAuditLog`, `deleteMember`, and
-  `acceptInvitation` scope entirely via RLS and/or a SECURITY DEFINER RPC
-  that derives identity from the JWT server-side, with no literal
-  `ctx.churchGroupId`/`ctx.userId` argument in the call for the positive
-  "own scope id present" check to find. See SECURITY FINDINGS below.
-- `GET /api/availability?user_id=<other>` also gets `ownScopeAssertion: false`
-  — not a defense-in-depth gap, see SECURITY FINDINGS item 2.
+100 workers looping with zero think-time produced ~2.06M requests in 60s
+against review's mock, and the resulting connection-drop error rate failed
+the run before p95 was even meaningful.
 
-These exceptions were only added after every one of the 60 registry entries
-was run and each failure traced back to actual handler source, not assumed.
+- `tests/load/targets.ts` — added `LOAD_PROFILE.thinkTimeMs = 500`.
+- `tests/load/http.ts` — `ConcurrentOptions` gained an optional
+  `thinkTimeMs?: number` (default `0`, so existing callers/tests are
+  unaffected). In `runConcurrent`'s duration-loop branch, after each
+  iteration the worker now `await sleep(thinkTimeMs)`s (using the
+  already-injectable `sleep`) before re-checking the deadline.
+- `tests/load/scenarios.ts` — `runLoadAgainstEndpoints`'s `runConcurrent`
+  call now passes `thinkTimeMs: LOAD_PROFILE.thinkTimeMs`. Also added
+  Retry-After-aware backoff on `rateLimited` outcomes, **capped** at
+  `RATE_LIMIT_BACKOFF_CAP_MS = 2000`ms — honoring the server's full
+  `Retry-After` (which can be up to the entire 60s rate-limit window under
+  the harness's documented small shared-token-pool scenario, §6) would let
+  one throttled worker stall the whole run for tens of seconds past its own
+  fixed-duration deadline. This cap was added after manual verification
+  against a mock rate limiter (below) showed the uncapped version hanging
+  well past the intended ~70s run time.
+- `tests/unit/load/http.test.ts` — two new tests: `sleep` is invoked with
+  `thinkTimeMs` between iterations when the option is set (using the
+  existing injected-clock/sleep pattern), and is never invoked when the
+  option is omitted.
 
-## SECURITY FINDINGS
+Net effect verified manually (see below): total request volume against a
+local mock dropped from ~2.06M/60s to ~3,700/70s, with 0 non-429 errors.
 
-### 1. Some admin routes rely solely on RLS/RPC-derived identity, with no app-layer defense-in-depth filter
+## MUST FIX #3 — Testing-stage commit gap
 
-`getAuditLog` (`GET /api/church-group/audit-log`), `deleteMember`
-(`DELETE /api/church-group/members/:id`, via the `remove_church_group_member`
-RPC), and `acceptInvitation` (`POST /api/invitations/:id/accept`, via the
-`accept_invitation` RPC) never pass `ctx.churchGroupId` or `ctx.userId` as a
-literal query/RPC argument — tenant/user scoping for these three is enforced
-entirely by RLS reading the caller's JWT (`auth_church_group_id()`) or by a
-SECURITY DEFINER RPC that reads `auth.uid()`/the JWT `sub` claim internally.
-This is architecturally sound (identity can't be spoofed by an app-layer bug
-passing a caller-supplied id) and is exactly the trust boundary Block E below
-pins — but unlike sibling routes such as `denyInvitation` (which explicitly
-`.eq("church_group_id", ctx.churchGroupId).eq("user_id", ctx.userId)`
-*before* mutating, as a second layer beyond RLS), these three routes have no
-redundant application-layer check. Not a fix-now bug (RLS is confirmed
-enforcing the boundary by `tests/integration/rls/tables/cross-tenant-bypass.test.ts`
-and this issue's own `phase1-token-bypass.test.ts`), but worth #79's
-attention as a defense-in-depth gap: if RLS on `audit_logs`, `users`, or
-`invitations` were ever misconfigured or bypassed (e.g. a future code path
-that reaches for the service-role client by mistake), these three routes
-have no second layer to catch it.
+Already resolved on this branch (commit `7b42387`). No code change; verified
+`git status --short` stays empty after this fix pass's own changes, before
+committing.
 
-### 2. `GET /api/availability?user_id=` intentionally has no literal `ctx.userId` scope on the cross-user path
+## SHOULD FIX #4 — `renderMarkdown` / doc §7 column mismatch
 
-Not a vulnerability — documented for completeness. When an admin/leader
-supplies `?user_id=<other>`, the handler substitutes that id for
-`ctx.userId` entirely (that's the endpoint's purpose: letting a leader look
-up a specific teammate's availability). Cross-group isolation is enforced
-by RLS via the caller's own JWT, not by an explicit `church_group_id`
-filter in this handler — consistent with `tests/integration/rls`.
+- `tests/load/report.ts` — `renderMarkdown`'s `meta` param gained a required
+  `commit: string`; the table now renders 6 columns:
+  `Target | Threshold | Measured (p95) | Status | Notes | Date / commit`.
+- `tests/load/run.ts` — new `resolveCommit()` (via `node:child_process`
+  `spawnSync("git", ["rev-parse", "--short", "HEAD"])`, falling back to
+  `"unknown"` on any failure) is now passed into the `renderMarkdown(...,
+  { commit })` call site.
+- `documentation/performance-testing.md` §7 — header and all 5 placeholder
+  rows updated to the same 6-column shape so the CLI's `--markdown` output
+  pastes in directly.
+- `tests/unit/load/report.test.ts` — existing tests updated for the new
+  required `commit` field; one new test asserts the `Date / commit` cell
+  content.
 
-### 3. `escapeLikePattern` is defense-in-depth that the schema layer already makes unreachable for `%`/`\`
+## SHOULD FIX #5 — Preflight firing for the zero-network `notifications` scenario
 
-`POST /api/invitations/guest`'s `.ilike("email", ...)` lookup uses a
-module-private `escapeLikePattern` (`app/api/invitations/handler.ts:285`).
-Zod's `.email()` format check in `createGuestInvitationSchema` rejects any
-local-part containing `%` or `\` before the handler body ever runs, so those
-two characters never reach `escapeLikePattern` through this endpoint today
-— only `_` does (proven correct in `input-validation-injection.test.ts`).
-This is real, if incidental, defense-in-depth: `escapeLikePattern` itself
-still correctly escapes all three characters (verified directly), so the
-route is safe either way, but the schema is the layer actually carrying the
-weight for `%`/`\`.
+- `tests/load/run.ts` — preflight is now skipped when the resolved
+  `--scenario` is exactly `notifications` (the single-scenario case;
+  `--scenario all` still runs preflight, since the other 3 scenarios need it
+  and `notifications` runs last in that mode regardless).
+- Verified manually (below) rather than via a new unit test — `run.ts` has
+  no dedicated unit test file (it's the CLI entry point; `preflight()` itself
+  is already covered in `scenarios.test.ts`), consistent with the existing
+  test layout.
 
-### 4. Block E — trust-boundary characterization (`phase1-token-bypass.test.ts`)
+## SHOULD FIX #6 — `STAGING_APP_URL`-only → wrong exit code
 
-Per the migration's own design (`public.auth_church_group_id()` /
-`public.auth_user_role()`, `supabase/migrations/20260704000001_rls_policies.sql:29-53`),
-a validly-signed JWT's `church_group_id`/`role` claims are read *before* the
-DB fallback (`COALESCE`). All three characterization tests are **expected
-from the migration source on inspection, but unverified** — Block E has not
-executed in this environment (see Verification below), so treat the
-following as the documented design, not a confirmed test result, until it's
-run against a live Supabase instance:
+- `tests/load/env.ts` — `readEnv`'s "is the harness even being configured"
+  gate (`anySet`, renamed `explicitlySet`) no longer folds in the
+  `STAGING_APP_URL` fallback — it's computed from `LOAD_TEST_*` vars only.
+  An environment where only `STAGING_APP_URL` is set (common — it's a
+  general-purpose var, not load-test-specific) now correctly resolves to
+  `{ kind: "unconfigured" }` (exit 0) instead of `{ kind: "partial" }`
+  (exit 2). `baseUrlRaw`'s `STAGING_APP_URL` fallback is unchanged for the
+  subsequent `missing`/`configured` resolution once at least one
+  `LOAD_TEST_*` var is genuinely set.
+- `tests/unit/load/env.test.ts` — new test: only `STAGING_APP_URL` set →
+  `unconfigured`.
 
-- A Church-A member's JWT carrying a forged `church_group_id` claim
-  pointing at Church B is treated as scoped to Church B — the claim wins
-  over the DB row for that `clerk_id`.
-- A Church-A member's JWT carrying a forged `appRole: "admin"` claim is
-  treated as an admin for RLS purposes (e.g. can read the admin-only
-  `audit_logs` table) — the claim wins over the DB `role` column.
-- A JWT whose `church_group_id` claim is present but not a valid UUID
-  **errors** (the `::uuid` cast throws before `COALESCE` can fall back to
-  the DB value) rather than silently granting DB-derived scope — this is
-  the safe failure mode.
+## SHOULD FIX #7 — Two weak `http.test.ts` assertions
 
-**The entire path's security rests on only Clerk being able to mint these
-claims in production.** If a future change ever lets JWT custom claims be
-influenced by anything other than the trusted Clerk issuer (e.g. a
-client-settable value, a misconfigured JWT template, or a second issuer),
-this fast path becomes a direct tenant/role-escalation bypass. #79 should
-treat this as the accurate picture of the current trust boundary, not
-something to "fix" by itself.
+- `tests/unit/load/http.test.ts`:
+  - "never exceeds the concurrency ceiling" — `toBeLessThanOrEqual(5)` →
+    `toBe(5)`. With `concurrency: 5` and no ramp-up stagger, all 5 workers'
+    first iteration increments `inFlight` synchronously before any 1ms timer
+    fires, so 5 is deterministic; this now proves real concurrency, not just
+    an upper bound.
+  - "stops issuing new iterations..." — `toBeGreaterThan(0)` → a pinned
+    `toEqual([0, 1, 0, 1])`. The exact sequence was **observed by running the
+    test** (temporarily logging the `calls` array), not hand-derived, per the
+    review's own caution about re-deriving the math; the trace is documented
+    inline in the test.
 
-(Block E, like blocks B–D, only ever runs against a live Supabase instance
-and is skipped in a plain `bun run test` run, per spec Assumption 2 — it was
-not executed in this environment; see Verification below.)
+## Addendum — independent re-review round
 
-## Reviewer fix-up (`.pipeline/review.md` NEEDS WORK — addressed)
+Before writing a final verdict, this fix pass was independently re-reviewed
+(fresh `reviewer` subagent, no access to this session's reasoning — see
+`.pipeline/review.md`). It confirmed all 7 original findings were genuinely
+fixed (not cosmetically), including running its own mutation checks on the
+two strengthened `http.test.ts` assertions, and found 5 new issues
+introduced by this fix pass itself. All 5 were fixed:
 
-Test-only follow-up fixing all five findings from the first review pass; no
-file under `app/`, `lib/`, `schemas/`, `middleware.ts`, or `supabase/` was
-touched in this pass either.
+1. **`runApiLoad`'s pass-detail string said "across 12 endpoints"** but only
+   11 (the authenticated ones) feed the pooled totals after MUST FIX #1 —
+   factually wrong in the exact artifact #83's gate reads. Now computed as
+   `API_ENDPOINTS.filter((e) => e.persona !== "none").length` and reworded to
+   "authenticated endpoints" (`tests/load/scenarios.ts`).
+2. **`documentation/performance-testing.md` §6 never disclosed either
+   behavioral change** (health exclusion from AC1 pooling, 500ms think-time
+   pacing) — added two new "Known limitations" bullets.
+3. **The new `Date / commit` column reports the harness's local checkout,
+   not the staging deployment's commit** — those routinely differ and the
+   local tree may be dirty. `resolveCommit()` (`tests/load/run.ts`) now
+   appends a `-dirty` suffix when `git status --porcelain` is non-empty, and
+   `renderMarkdown`'s doc comment (`tests/load/report.ts`) now states
+   explicitly what the commit represents.
+4. **The rate-limit backoff had zero test coverage** and used a raw
+   `setTimeout` rather than the module's own injectable pattern — extracted
+   as a pure, exported `resolveBackoffMs(retryAfter)` function with 5 new
+   unit tests (missing/non-numeric/zero-or-negative/below-cap/above-cap).
+5. **The `poolAggregates` test fixture's `persona: "none"` bucket had
+   `rateLimited: 0, errors: 0`**, so a regression that pooled only
+   `samples`/`ok` (but still leaked `rateLimited`/`errors` from excluded
+   endpoints into the totals feeding `evaluateThreshold`'s error-rate gate)
+   would have survived. Fixture now uses nonzero values for both.
 
-1. **BLOCKING — the cross-tenant negative assertion was vacuous.**
-   `VICTIM_CHURCH_GROUP_ID`/`VICTIM_USER_ID` (`tests/support/api-auth.ts`)
-   are now real UUID-shaped constants, and `makeApiReq` unconditionally
-   merges them into every request's query string — and, when a body object
-   is already present, the body too — under
-   `churchGroupId`/`church_group_id`/`userId`/`user_id` keys (explicit
-   call-site values always win, so legitimate fields like `assignAttendee`'s
-   `userId: R2` attendee target are untouched). No schema declares those
-   keys and none use `.strict()`, so every real handler silently strips
-   them; the negative "no victim id ever leaks" assertion in
-   `auth-bypass-matrix.test.ts` case 4 is now a live, reachable check for
-   every entry that touches Supabase, including 3 of the 6
-   previously-flagged highest-risk entries (`getAuditLog`, `deleteMember`,
-   `acceptInvitation`) that have no literal `.eq()` scope call. One entry —
-   plain `GET /api/availability` — opts out of the `userId`/`user_id` probe
-   keys via a new `excludeProbeKeys` option, because
-   `getAvailabilityQuerySchema.user_id` is presence-sensitive (any value
-   switches the handler into the cross-user admin-lookup branch), so
-   injecting one would have silently changed which code path that entry
-   exercises rather than testing it.
-2. **AC-3 schema sweep gaps.** Added the missing `FIELD_CASES` entries in
-   `input-validation-injection.test.ts`: `updateEventSchema.{name,location,
-   notes}`, `updateServiceWeekSchema.{title,sermonTopic,sermonScripture,
-   speakerName}`, `reorderSetlistSchema.songs[0].{keyOverride,notes}`, and
-   `createSongSchema.tags[0]`. The last two needed new optional
-   `buildInput`/`readValue` overrides on `FieldCase` since the field lives
-   inside an array, not at the payload's top level.
-3. **`createGuestInvitationSchema.email` field case tested the wrong thing.**
-   Added `transform: (t) => t.toLowerCase()` (the schema lowercases) and a
-   new `oversizedValue` override (`"a".repeat(250) + "@example.com"`) so the
-   oversized-rejection case is actually driven by `.max(255)` instead of
-   `.email()` rejecting a bare repeated-character string first.
-4. **AC-2 coverage pin didn't pin what it claimed.** Added a new assertion
-   in `phase1-token-bypass.test.ts` block A that parses every `create table`
-   statement out of `supabase/migrations/*.sql` and asserts the resulting
-   set is exactly `PHASE1_TABLES` — this is the actual "a future table can't
-   silently skip the sweep" guarantee the file header claims. Also fixed the
-   existing `cross-tenant-bypass.test.ts` reference check, which used a raw
-   `toContain` substring match (e.g. `"songs"` is a substring of the
-   unrelated `"setlist_songs"` literal) — replaced with a quoted-match regex.
-5. **Block E summary overclaimed "confirmed."** Reworded SECURITY FINDINGS
-   §4 above to say "expected from the migration source on inspection, but
-   unverified" rather than "confirm," since Block E has still never executed
-   in this environment (see Verification).
+Re-verified after these fixes: `bun run typecheck`/`lint`/`test` (120 suites
+/ 2850 tests) / `check:git-secrets` all clean; `bunx prettier --check` clean
+on every touched file; re-ran the local-mock manual check and confirmed the
+corrected detail string (`"...across 11 authenticated endpoints..."`) and
+the `-dirty` commit suffix both render correctly.
 
-## Verification
+## Verification run (original fix-pass round)
 
-Re-run after the reviewer fix-up above:
+- `bun run typecheck` — clean.
+- `bun run lint` — clean (1 pre-existing warning in generated
+  `coverage/lcov-report/`, unrelated).
+- `bun run test` — 120 suites / 2845 tests, all green (2839 baseline + 6 new
+  tests from this fix pass).
+- `bun run format:check` — this fix pass's files are clean; confirmed via
+  `git stash` that the ~100 other files it flags repo-wide are a pre-existing
+  condition on this branch, not introduced here. One file this fix pass
+  touched (`tests/unit/load/report.test.ts`) needed `prettier --write`
+  (applied, scoped to only the files this fix pass touched).
+- `bun run check:git-secrets` — clean.
+- Manual end-to-end run against a local mock server reproducing the real
+  240/60s read-tier limiter (`resolveTier`/`checkRateLimit` shape from
+  `lib/api/rate-limit.ts`), 4 shared tokens across 100 workers (deliberately
+  small, matching the documented §6 "Shared rate-limit bucket" scenario):
+  `--scenario api --markdown` → `PASS`, measured p95 21ms, `1653 ok, 2005
+  rate-limited, 0 errors across 12 endpoints`, exit 0. `totalOk` (1653)
+  verified to equal the sum of the 11 authenticated endpoints' individual
+  `ok` counts exactly (health's 332 `ok` samples correctly excluded from
+  pooling). Markdown output confirmed 6-column with a populated
+  `Date / commit` cell.
+- Manual check: `STAGING_APP_URL` set alone (no `LOAD_TEST_*` vars) → prints
+  the `SKIPPED` message, exit 0 (previously exit 2).
+- Manual check: `--scenario notifications` against a deliberately
+  **unreachable** base URL → returns the expected `blocked` result / exit 3
+  rather than a preflight failure (exit 2), proving preflight was skipped.
 
-- `bun run lint` — pass, no errors (one pre-existing warning in the
-  generated `coverage/` directory, unrelated to this change).
-- `bun run typecheck` — pass, no errors.
-- `bun run test` — pass: **112 suites, 2754 tests, 0 failures** (up from
-  2535 — the new AC-3 FIELD_CASES account for the difference).
-- `bun run test:rls` — pass: 1 suite (this issue's coverage-pin block A, now
-  3 tests — the new migration cross-check added one) ran; 11 suites (294
-  tests) skipped — `SUPABASE_TEST_URL` / `SUPABASE_TEST_ANON_KEY` /
-  `SUPABASE_TEST_SERVICE_ROLE_KEY` / `SUPABASE_JWT_SECRET` are unset in this
-  environment, so blocks B–E of `phase1-token-bypass.test.ts` (and all of
-  `cross-tenant-bypass.test.ts`) did not execute here, per spec Assumption
-  2. They should be run against a live local Supabase instance before this
-  is treated as verified beyond the mechanical coverage pin.
-- `git diff origin/main...HEAD --stat` — confirmed still confined to
-  `tests/` and `.pipeline/`; no `app/`, `lib/`, `schemas/`, `middleware.ts`,
-  or `supabase/` file touched.
+## What the Reviewer should focus on
 
-## What the Tester should focus on
-
-1. Re-run `bun run test` cold to confirm the full 2535-test count and zero
-   failures independently.
-2. Spot-check a few `ADMIN_ROUTE_REGISTRY` entries against their real
-   handler source (especially the ones with `ownScopeAssertion: false` /
-   `touchesSupabase: false` / `authFailureIsRedirect: true`) to confirm the
-   documented reasoning is accurate, not a rationalization for a weakened
-   test — this is the area most likely to hide a real gap if wrong.
-3. If a local Supabase instance is available, run `bun run test:rls` with
-   the required env vars set and confirm blocks B–E of
-   `phase1-token-bypass.test.ts` pass for real (this run only executed the
-   coverage pin, block A).
-4. Confirm no file under `app/`, `lib/`, `schemas/`, `middleware.ts`, or
-   `supabase/` was touched: `git diff origin/main...HEAD --stat`.
-5. Run `bun run test` and independently verify the schema sweep
-   (`input-validation-injection.test.ts`) actually enumerates every string
-   field with a `.max()`/`.trim()` in `schemas/*.ts` — this file was hand-
-   built by reading each schema, not generated, so it's the one most prone
-   to a silently-missing field.
+1. The `RATE_LIMIT_BACKOFF_CAP_MS = 2000` cap on rate-limited backoff — this
+   wasn't in the original review's stated fix, but was discovered as a
+   necessary consequence of adding Retry-After-aware backoff (item 4 of MUST
+   FIX #2's design) during this fix pass's own manual verification. Worth
+   confirming the reasoning (bounding backoff so the fixed-duration test
+   loop can't be stalled by one throttled worker) holds up.
+2. `poolAggregates`'s exclusion is keyed on `persona === "none"` specifically
+   (matching today's only such endpoint, `/api/health`) rather than a more
+   general "is this endpoint rate-limit-exempt" check — reasonable today
+   since persona and rate-limit-exemption happen to coincide for every
+   current `API_ENDPOINTS` entry, but worth flagging as an assumption if a
+   future rate-limit-exempt-but-authenticated endpoint is ever added.
+3. `resolveCommit()`'s `spawnSync("git", ...)` in `tests/load/run.ts` — a new
+   `node:child_process` dependency in a module whose doc comment previously
+   only disclaimed server-only/Next/Clerk/Supabase imports; confirm this is
+   an acceptable addition (it mirrors the existing pattern in
+   `scripts/check-git-secrets.mjs`).
