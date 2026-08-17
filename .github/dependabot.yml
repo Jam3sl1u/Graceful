@@ -9,6 +9,14 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
     ignore:
+      # eslint-config-next 15.5.23 (paired with our next@15.5.23) is old-style
+      # .eslintrc config loaded via @rushstack/eslint-patch, which cannot
+      # resolve module callers under ESLint 10's internals ("Cannot read
+      # config file" / "Failed to patch ESLint"). eslint-config-next only
+      # gains a compatible flat-native config in the Next.js 16 line. Remove
+      # this once eslint-config-next is upgraded alongside a Next 16 bump.
+      - dependency-name: "eslint"
+        versions: [">=10.0.0"]
       # TypeScript 7.0 (native Go-based compiler) breaks @typescript-eslint,
       # which hard-throws on any TS major >=7 with no override. Re-allow once
       # https://github.com/typescript-eslint/typescript-eslint/issues/10940
