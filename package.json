@@ -29,7 +29,7 @@
     "check:owasp": "node scripts/check-owasp-review.mjs"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1105.0",
+    "@aws-sdk/client-s3": "^3.1108.0",
     "@aws-sdk/s3-request-presigner": "^3.1105.0",
     "@clerk/nextjs": "^6.39.6",
     "@supabase/supabase-js": "^2.112.2",
