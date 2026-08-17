@@ -29,7 +29,7 @@
     "check:owasp": "node scripts/check-owasp-review.mjs"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1105.0",
+    "@aws-sdk/client-s3": "^3.1108.0",
     "@aws-sdk/s3-request-presigner": "^3.1105.0",
     "@clerk/nextjs": "^7.7.4",
     "@supabase/supabase-js": "^2.112.2",
@@ -57,7 +57,7 @@
     "@types/node": "^26.1.2",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
-    "@typescript-eslint/eslint-plugin": "^8.66.0",
+    "@typescript-eslint/eslint-plugin": "^8.67.0",
     "@typescript-eslint/parser": "^8.66.0",
     "eslint": "^9.39.5",
     "eslint-config-next": "^15.5.23",
