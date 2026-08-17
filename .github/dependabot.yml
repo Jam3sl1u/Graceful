@@ -17,6 +17,12 @@ updates:
       # this once eslint-config-next is upgraded alongside a Next 16 bump.
       - dependency-name: "eslint"
         versions: [">=10.0.0"]
+      # TypeScript 7.0 (native Go-based compiler) breaks @typescript-eslint,
+      # which hard-throws on any TS major >=7 with no override. Re-allow once
+      # https://github.com/typescript-eslint/typescript-eslint/issues/10940
+      # ships a compatible release.
+      - dependency-name: "typescript"
+        versions: [">=7.0.0"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
