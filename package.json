@@ -48,7 +48,7 @@
     "@clerk/testing": "^2.2.18",
     "@eslint/eslintrc": "^3.3.6",
     "@playwright/test": "^1.62.1",
-    "@swc/core": "^1.15.47",
+    "@swc/core": "^1.16.0",
     "@swc/jest": "^0.2.39",
     "@testing-library/jest-dom": "^6.10.0",
     "@testing-library/react": "^16.3.2",
