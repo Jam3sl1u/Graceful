@@ -31,7 +31,6 @@ export async function connect(req: NextRequest, lookup?: UserLookup): Promise<Re
 
     return ok({ authUrl });
   } catch (err) {
-    console.error("[TEMP DEBUG] /api/google-calendar/connect threw:", err);
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);
   }
