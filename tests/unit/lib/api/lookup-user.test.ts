@@ -46,7 +46,7 @@ describe("lookupUserByClerkId", () => {
 
     const result = await lookupUserByClerkId(CLERK_ID);
 
-    expect(mockGetToken).toHaveBeenCalledWith({ template: "supabase" });
+    expect(mockGetToken).toHaveBeenCalledWith();
     expect(mockGetSupabaseClient).toHaveBeenCalledWith("supabase-jwt");
     expect(chain.from).toHaveBeenCalledWith("users");
     expect(chain.select).toHaveBeenCalledWith("id, church_group_id, role");
