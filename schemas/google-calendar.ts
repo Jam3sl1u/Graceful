@@ -1,6 +1,12 @@
 import { z } from "zod";
 
-// TODO(Sprint 3 #52-53): fill in real field-level validation for the
-// google-calendar routes in PRD §22.
-export const googleCalendarSchema = z.object({});
-export type GoogleCalendarInput = z.infer<typeof googleCalendarSchema>;
+// GET /api/google-calendar/callback query params. Google sends either
+// `error` (user denied consent) or `code` + `state`. All three are opaque
+// provider-supplied strings — bound their length so a hostile redirect
+// can't push an unbounded value into exchangeCode()/the CSRF comparison.
+export const googleCalendarCallbackQuerySchema = z.object({
+  code: z.string().min(1).max(2048).optional(),
+  state: z.string().min(1).max(512).optional(),
+  error: z.string().min(1).max(200).optional(),
+});
+export type GoogleCalendarCallbackQuery = z.infer<typeof googleCalendarCallbackQuerySchema>;

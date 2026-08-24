@@ -12,6 +12,15 @@ For provisioning the Google OAuth client and Cloudflare R2 bucket that
 Sprint 3 (#58/#61/#62) depends on, see
 [`documentation/google-oauth-r2-provisioning.md`](documentation/google-oauth-r2-provisioning.md).
 
+See [`documentation/infrastructure-security.md`](documentation/infrastructure-security.md)
+for the HTTPS/CSP/secret-scan security baseline.
+
+See [`documentation/owasp-top-10-review.md`](documentation/owasp-top-10-review.md)
+for the Phase 1 pre-launch OWASP Top 10 manual review.
+
+See [`documentation/performance-testing.md`](documentation/performance-testing.md)
+for the Phase 1 pre-launch load/performance test pass against staging.
+
 ## Prerequisites
 
 Requires [Bun](https://bun.sh) (CI pins `1.2.x` via `oven-sh/setup-bun`).
@@ -37,6 +46,7 @@ Open http://localhost:3000 to view the app.
 - `bun run test:rls` — RLS integration tests (requires Supabase test env)
 - `bun run test:e2e` — Playwright E2E tests
 - `bun run check:service-role` — verify service role key not in `app/` or `lib/`
+- `bun run check:git-secrets` — scan the full git history for committed secrets
 
 ## Project Structure
 
@@ -59,4 +69,4 @@ Open http://localhost:3000 to view the app.
   only in trusted migration/seed scripts and CI secrets.
 - Reference: PRD §15.1 (§25.1 in v10 doc), §19.3.
 - Enforced by `scripts/check-service-role.mjs` (run via `bun run
-  check:service-role`) and re-verified in the Sprint 4 security audit (#79).
+check:service-role`) and re-verified in the Sprint 4 security audit (#79).

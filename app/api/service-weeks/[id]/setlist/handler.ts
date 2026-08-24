@@ -5,6 +5,7 @@ import { ok, fail } from "@/lib/api/response";
 import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
+import { guestHasWeekAccess } from "@/lib/invitations/guest-access";
 
 type SetlistsRow = Database["public"]["Tables"]["setlists"]["Row"];
 
@@ -67,19 +68,9 @@ export async function getSetlist(
     }
 
     if (ctx.role === "guest") {
-      const { data: invitation, error: invitationError } = await supabase
-        .from("invitations")
-        .select("id")
-        .eq("service_week_id", id)
-        .eq("user_id", ctx.userId)
-        .maybeSingle();
-
-      if (invitationError) {
-        return fail("Internal error", ErrorCode.INTERNAL, 500);
-      }
-      if (!invitation) {
-        return fail("Not found", ErrorCode.NOT_FOUND, 404);
-      }
+      const access = await guestHasWeekAccess(supabase, id, ctx.userId);
+      if (access.dbError) return fail("Internal error", ErrorCode.INTERNAL, 500);
+      if (!access.allowed) return fail("Not found", ErrorCode.NOT_FOUND, 404);
     }
 
     return ok({ setlist: toSetlistResponse(data) });

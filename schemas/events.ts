@@ -16,7 +16,10 @@ export const createEventSchema = z.object({
   location: z.string().trim().min(1).max(200).nullish(),
   startTime: z.string().datetime({ offset: true }),
   endTime: z.string().datetime({ offset: true }),
-  notes: z.string().trim().min(1).nullish(),
+  // events.notes is a `text` column (no DB-level cap), so this is an
+  // app-layer limit. 2000 matches the repo's existing long-free-text
+  // convention (schemas/profile.ts bio).
+  notes: z.string().trim().min(1).max(2000).nullish(),
 });
 export type CreateEventInput = z.infer<typeof createEventSchema>;
 
@@ -30,7 +33,10 @@ export const updateEventSchema = z
     location: z.string().trim().min(1).max(200).nullish(),
     startTime: z.string().datetime({ offset: true }).optional(),
     endTime: z.string().datetime({ offset: true }).optional(),
-    notes: z.string().trim().min(1).nullish(),
+    // events.notes is a `text` column (no DB-level cap), so this is an
+    // app-layer limit. 2000 matches the repo's existing long-free-text
+    // convention (schemas/profile.ts bio).
+    notes: z.string().trim().min(1).max(2000).nullish(),
   })
   .refine((v) => Object.keys(v).length > 0, "at least one field required");
 export type UpdateEventInput = z.infer<typeof updateEventSchema>;

@@ -121,6 +121,53 @@ async function loadSongResponses(
   };
 }
 
+// GET /api/setlists/:id — set_leader/admin only (this is the Set Leader
+// editing surface). Returns the setlist plus its ordered songs so the
+// builder screen has an initial read (add/remove/reorder only ever return
+// songs as a side effect otherwise). Returned for both draft and published
+// setlists — the client needs status to render the locked state.
+export async function getSetlistWithSongs(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const ctx = await requireAuth(req, lookup);
+    requireRole(ctx, ["admin", "set_leader"]);
+
+    const { getToken } = await auth();
+    const jwt = await getToken({ template: "supabase" });
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data, error } = await supabase
+      .from("setlists")
+      .select("*")
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .maybeSingle();
+
+    if (error) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if (!data) {
+      return fail("Setlist not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    const { data: songs, error: songsError } = await loadSongResponses(supabase, id);
+    if (songsError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    return ok({ setlist: toSetlistResponse(data), songs });
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
 // PUT /api/setlists/:id — set_leader/admin only. Reorders the songs already
 // in the setlist and sets per-song key overrides. Does not add/remove songs
 // (see POST/DELETE below) — the songId set in the body must exactly match
@@ -190,12 +237,17 @@ export async function reorderSetlist(
 
     for (let i = 0; i < parsed.songs.length; i++) {
       const entry = parsed.songs[i]!;
+      const update: Record<string, unknown> = {
+        position: i + 1,
+        key_override: entry.keyOverride ?? null,
+      };
+      // Only touch `notes` when the client actually sent it, so existing
+      // reorder callers (that omit notes) do NOT wipe notes.
+      if (entry.notes !== undefined) update.notes = entry.notes ?? null;
+
       const { error: updateError } = await supabase
         .from("setlist_songs")
-        .update({
-          position: i + 1,
-          key_override: entry.keyOverride ?? null,
-        } as unknown as Database["public"]["Tables"]["setlist_songs"]["Update"])
+        .update(update as unknown as Database["public"]["Tables"]["setlist_songs"]["Update"])
         .eq("setlist_id", id)
         .eq("song_id", entry.songId);
 

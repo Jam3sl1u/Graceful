@@ -377,4 +377,86 @@ describe("WeekView", () => {
       expect(within(openSlot).getByText("Open")).toBeInTheDocument();
     });
   });
+
+  describe("Invite a guest form (#72)", () => {
+    const GUEST_ID = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    const guestInvitation = {
+      id: "inv-guest-1",
+      serviceWeekId: SERVICE_WEEK_ID,
+      userId: GUEST_ID,
+      roleNote: null,
+      status: "pending",
+      responseDeadline: "2026-07-20T00:00:00Z",
+      createdAt: "2026-07-13T00:00:00Z",
+    };
+    const membersWithGuest = [...members, { id: GUEST_ID, name: "guest@example.com", role: "guest" }];
+
+    it("refreshes the directory after a successful invite, so the Guests section shows the new guest without a reload", async () => {
+      let membersCallCount = 0;
+      const fetchMock = jest.fn((url: string, init?: RequestInit) => {
+        if (url === "/api/church-group/members") {
+          membersCallCount += 1;
+          const body = membersCallCount === 1 ? members : membersWithGuest;
+          return Promise.resolve(jsonResponse(200, { data: { members: body } }));
+        }
+        if (url === "/api/invitations/guest" && init?.method === "POST") {
+          return Promise.resolve(
+            jsonResponse(201, {
+              data: { invitation: guestInvitation, isNewUser: false, accountSetupUrl: null },
+            }),
+          );
+        }
+        return mockFetchByUrl()(url);
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      render(<WeekView serviceWeekId={SERVICE_WEEK_ID} />);
+      await waitFor(() => expect(screen.getByText("Sunday Service")).toBeInTheDocument());
+      expect(screen.getByText("No guests invited for this week yet")).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText("Guest email"), {
+        target: { value: "guest@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /invite guest/i }));
+
+      await waitFor(() =>
+        expect(screen.queryByText("No guests invited for this week yet")).not.toBeInTheDocument(),
+      );
+      expect(screen.getByText("guest@example.com")).toBeInTheDocument();
+      expect(membersCallCount).toBe(2);
+    });
+
+    it("a members-refetch failure after a successful invite does not block the accountSetupUrl success feedback", async () => {
+      const setupUrl = "https://app.example/guest/token-123";
+      let membersCallCount = 0;
+      const fetchMock = jest.fn((url: string, init?: RequestInit) => {
+        if (url === "/api/church-group/members") {
+          membersCallCount += 1;
+          if (membersCallCount === 1) {
+            return Promise.resolve(jsonResponse(200, { data: { members } }));
+          }
+          return Promise.resolve(jsonResponse(500, { error: "Internal error", code: "INTERNAL" }));
+        }
+        if (url === "/api/invitations/guest" && init?.method === "POST") {
+          return Promise.resolve(
+            jsonResponse(201, {
+              data: { invitation: guestInvitation, isNewUser: true, accountSetupUrl: setupUrl },
+            }),
+          );
+        }
+        return mockFetchByUrl()(url);
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      render(<WeekView serviceWeekId={SERVICE_WEEK_ID} />);
+      await waitFor(() => expect(screen.getByText("Sunday Service")).toBeInTheDocument());
+
+      fireEvent.change(screen.getByLabelText("Guest email"), {
+        target: { value: "new-guest@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /invite guest/i }));
+
+      await waitFor(() => expect(screen.getByText(setupUrl)).toBeInTheDocument());
+    });
+  });
 });

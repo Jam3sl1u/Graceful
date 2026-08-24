@@ -36,6 +36,9 @@ const UNICODE_SONG_KEYS = [
   "B♭",
 ] as const;
 
+// Ordered ASCII key list for UI dropdowns (Setlist Builder key select, #64).
+export const SONG_KEY_OPTIONS = ASCII_SONG_KEYS;
+
 export const VALID_SONG_KEYS: ReadonlySet<string> = new Set([
   ...ASCII_SONG_KEYS,
   ...UNICODE_SONG_KEYS,

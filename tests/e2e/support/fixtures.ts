@@ -177,12 +177,65 @@ export async function seedInvitation(
   return { id, responseToken };
 }
 
+export async function seedSong(
+  svc: SupabaseClient,
+  churchGroupId: string,
+  opts?: { title?: string; artist?: string | null; defaultKey?: string | null },
+): Promise<{ id: string; title: string }> {
+  const id = crypto.randomUUID();
+  const title = opts?.title ?? `E2E Song ${crypto.randomUUID().slice(0, 8)}`;
+  const { error } = await svc.from("songs").insert({
+    id,
+    church_group_id: churchGroupId,
+    title,
+    artist: opts?.artist ?? null,
+    default_key: opts?.defaultKey ?? null,
+    created_by: FIXTURE.adminUserId,
+  });
+  if (error) throw new Error(`seedSong failed: ${error.message}`);
+  return { id, title };
+}
+
+// Seeds a users row with no Clerk identity behind it — it exists only to be
+// a notification recipient / invitation target in tests that need a second,
+// non-stable persona (e.g. a pending invitee distinct from FIXTURE.memberUserId),
+// and must never be signed in as via signInAs. A second real Clerk identity
+// isn't an option here for the same reason the admin/member fixture is
+// stable rather than minted per test (see this file's header comment):
+// `users.clerk_id` is UNIQUE, and only two real Clerk personas are
+// pre-provisioned in staging.
+export async function seedSyntheticUser(
+  svc: SupabaseClient,
+  churchGroupId: string,
+  opts?: { role?: "member" | "set_leader" | "admin"; name?: string },
+): Promise<string> {
+  const id = crypto.randomUUID();
+  const suffix = crypto.randomUUID().replace(/-/g, "");
+  const { error } = await svc.from("users").insert({
+    id,
+    clerk_id: `e2e_synthetic_${suffix}`,
+    church_group_id: churchGroupId,
+    role: opts?.role ?? "member",
+    name: opts?.name ?? "E2E Synthetic Member",
+    email: `e2e-synthetic-${suffix.slice(0, 8)}@example.invalid`,
+    phone: null,
+    sms_opted_in: false,
+    anonymized_at: null,
+  });
+  if (error) throw new Error(`seedSyntheticUser failed: ${error.message}`);
+  return id;
+}
+
 export type TeardownIds = {
   serviceWeekId?: string;
   invitationId?: string;
+  invitationIds?: string[]; // tests that seed more than one invitation
   conflictId?: string;
   notificationLinkEntityIds?: string[];
   availability?: { userId: string; date: string };
+  songIds?: string[];
+  googleTokenUserIds?: string[]; // google_calendar_tokens rows by user_id
+  userIds?: string[]; // synthetic users only, never FIXTURE ids
 };
 
 // Per-test cleanup — deletes only the variable fixtures a test created
@@ -205,7 +258,23 @@ export async function teardownFixtures(svc: SupabaseClient, ids: TeardownIds): P
   if (ids.invitationId) {
     await svc.from("invitations").delete().eq("id", ids.invitationId);
   }
+  for (const invitationId of ids.invitationIds ?? []) {
+    await svc.from("invitations").delete().eq("id", invitationId);
+  }
   if (ids.serviceWeekId) {
+    // Cascades setlists, setlist_songs, events, event_attendees, invitations.
     await svc.from("service_weeks").delete().eq("id", ids.serviceWeekId);
+  }
+  if (ids.songIds && ids.songIds.length > 0) {
+    await svc.from("songs").delete().in("id", ids.songIds);
+  }
+  if (ids.googleTokenUserIds && ids.googleTokenUserIds.length > 0) {
+    await svc.from("google_calendar_tokens").delete().in("user_id", ids.googleTokenUserIds);
+  }
+  // Must only ever receive ids from seedSyntheticUser — never
+  // FIXTURE.adminUserId / FIXTURE.memberUserId, which are the stable,
+  // idempotently-upserted fixture rows every other test depends on.
+  if (ids.userIds && ids.userIds.length > 0) {
+    await svc.from("users").delete().in("id", ids.userIds);
   }
 }
