@@ -150,7 +150,7 @@ export async function reorderSetlist(
     }
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -241,7 +241,7 @@ export async function addSetlistSong(
     }
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -339,7 +339,7 @@ export async function publishSetlist(
     requireRole(ctx, ["admin", "set_leader"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -439,7 +439,7 @@ export async function unlockSetlist(
     requireRole(ctx, ["admin", "set_leader"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -494,7 +494,7 @@ export async function removeSetlistSong(
     requireRole(ctx, ["admin", "set_leader"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

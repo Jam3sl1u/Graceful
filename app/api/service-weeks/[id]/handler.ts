@@ -20,7 +20,7 @@ export async function getServiceWeek(
     const ctx = await requireAuth(req, lookup);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -81,7 +81,7 @@ export async function updateServiceWeek(
     const parsed = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -135,7 +135,7 @@ export async function deleteServiceWeek(
     requireRole(ctx, ["admin"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -215,7 +215,7 @@ async function setServiceWeekCancelled(
     requireRole(ctx, ["admin"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

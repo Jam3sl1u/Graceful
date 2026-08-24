@@ -20,7 +20,7 @@ export type UserLookup = (clerkId: string) => Promise<AuthContext | null>;
 // Full group-scoped RLS policies are in 20260704000001_rls_policies.sql (#22).
 export async function lookupUserByClerkId(clerkId: string): Promise<AuthContext | null> {
   const { getToken } = await auth();
-  const jwt = await getToken({ template: "supabase" });
+  const jwt = await getToken();
   if (!jwt) return null;
 
   const supabase = getSupabaseClient(jwt);

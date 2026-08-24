@@ -47,7 +47,7 @@ export async function getAvailability(req: NextRequest, lookup?: UserLookup): Pr
     }
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -126,7 +126,7 @@ export async function setAvailability(req: NextRequest, lookup?: UserLookup): Pr
     }
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -213,7 +213,7 @@ export async function deleteAvailability(
     }
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
