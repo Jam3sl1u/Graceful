@@ -7,15 +7,15 @@
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import WeekView from "@/app/(app)/week/[id]/week-view";
 
-const SERVICE_WEEK_ID = "22222222-2222-2222-2222-222222222222";
-const PREV_WEEK_ID = "33333333-3333-3333-3333-333333333333";
-const NEXT_WEEK_ID = "44444444-4444-4444-4444-444444444444";
+const SERVICE_WEEK_ID = "22222222-2222-4222-8222-222222222222";
+const PREV_WEEK_ID = "33333333-3333-4333-8333-333333333333";
+const NEXT_WEEK_ID = "44444444-4444-4444-8444-444444444444";
 
-const MEMBER_OPEN = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-const MEMBER_PENDING = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-const MEMBER_CONFIRMED = "cccccccc-cccc-cccc-cccc-cccccccccccc";
-const MEMBER_DECLINED = "dddddddd-dddd-dddd-dddd-dddddddddddd";
-const MEMBER_CONFLICT = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+const MEMBER_OPEN = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const MEMBER_PENDING = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const MEMBER_CONFIRMED = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const MEMBER_DECLINED = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const MEMBER_CONFLICT = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
 function jsonResponse(status: number, body: unknown): Response {
   return {

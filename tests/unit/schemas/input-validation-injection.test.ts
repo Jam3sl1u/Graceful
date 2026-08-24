@@ -79,8 +79,8 @@ const ALL_PAYLOADS = [...SQLI, ...XSS, ...NULL_BYTES, ...UNICODE];
 // Part A — schema sweep
 // ---------------------------------------------------------------------------
 
-const R1 = "22222222-2222-2222-2222-222222222222";
-const R2 = "33333333-3333-3333-3333-333333333333";
+const R1 = "22222222-2222-4222-8222-222222222222";
+const R2 = "33333333-3333-4333-8333-333333333333";
 
 type FieldCase = {
   label: string;
@@ -766,7 +766,7 @@ function makeGuestInvitationSupabase(onIlike: (col: string, val: string) => void
     return usersChain;
   });
   const invitationsChain = makeChain({
-    data: { id: "inv-1", response_token: "tok", service_week_id: "22222222-2222-2222-2222-222222222222" },
+    data: { id: "inv-1", response_token: "tok", service_week_id: "22222222-2222-4222-8222-222222222222" },
     error: null,
   });
 
@@ -797,7 +797,7 @@ describe("createGuestInvitation — escapeLikePattern (handler-level, Part C)", 
 
     const email = "a_b@example.com";
     const res = await createGuestInvitation(
-      makeReq({ serviceWeekId: "22222222-2222-2222-2222-222222222222", email }),
+      makeReq({ serviceWeekId: "22222222-2222-4222-8222-222222222222", email }),
       makeLookup(),
     );
     expect(res.status).not.toBe(400);
@@ -815,7 +815,7 @@ describe("createGuestInvitation — escapeLikePattern (handler-level, Part C)", 
     async (email) => {
       setUpAuth();
       const res = await createGuestInvitation(
-        makeReq({ serviceWeekId: "22222222-2222-2222-2222-222222222222", email }),
+        makeReq({ serviceWeekId: "22222222-2222-4222-8222-222222222222", email }),
         makeLookup(),
       );
       expect(res.status).toBe(400);

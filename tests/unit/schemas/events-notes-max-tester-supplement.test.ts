@@ -5,7 +5,7 @@
 import { createEventSchema, updateEventSchema } from "@/schemas/events";
 
 const validCreateBody = {
-  serviceWeekId: "11111111-1111-1111-1111-111111111111",
+  serviceWeekId: "11111111-1111-4111-8111-111111111111",
   type: "rehearsal",
   name: "Full band rehearsal",
   location: "Main hall",

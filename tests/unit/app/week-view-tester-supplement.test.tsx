@@ -28,9 +28,9 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import WeekView from "@/app/(app)/week/[id]/week-view";
 
-const SERVICE_WEEK_ID = "22222222-2222-2222-2222-222222222222";
-const FIRST_WEEK_ID = "55555555-5555-5555-5555-555555555555";
-const LAST_WEEK_ID = "66666666-6666-6666-6666-666666666666";
+const SERVICE_WEEK_ID = "22222222-2222-4222-8222-222222222222";
+const FIRST_WEEK_ID = "55555555-5555-4555-8555-555555555555";
+const LAST_WEEK_ID = "66666666-6666-4666-8666-666666666666";
 
 const MEMBER_WITHDRAWN = "ffffffff-ffff-ffff-ffff-ffffffffffff";
 

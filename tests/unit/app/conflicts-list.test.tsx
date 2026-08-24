@@ -6,7 +6,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import ConflictsList from "@/app/(app)/conflicts/conflicts-list";
 
-const CONFLICT_ID = "44444444-4444-4444-4444-444444444444";
+const CONFLICT_ID = "44444444-4444-4444-8444-444444444444";
 
 function jsonResponse(status: number, body: unknown): Response {
   return {

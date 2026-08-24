@@ -125,8 +125,8 @@ export type RouteEntry = {
 // independently injects the VICTIM_* values into every request's query
 // string/body under churchGroupId/church_group_id/userId/user_id keys,
 // which is what case 4's negative assertion actually checks against.
-const R1 = "22222222-2222-2222-2222-222222222222";
-const R2 = "33333333-3333-3333-3333-333333333333";
+const R1 = "22222222-2222-4222-8222-222222222222";
+const R2 = "33333333-3333-4333-8333-333333333333";
 
 const A: UserRole[] = ["admin"];
 const AL: UserRole[] = ["admin", "set_leader"];

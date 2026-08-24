@@ -29,9 +29,9 @@ const USER_ID = "user-1";
 const CHURCH_GROUP_ID = "group-1";
 const SETLIST_ID = "setlist-1";
 
-const SONG_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"; // default_key "C"
-const SONG_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"; // default_key null
-const SONG_C = "cccccccc-cccc-cccc-cccc-cccccccccccc"; // default_key "G", used for add
+const SONG_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"; // default_key "C"
+const SONG_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"; // default_key null
+const SONG_C = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"; // default_key "G", used for add
 
 function makeLookup(role: "admin" | "set_leader" | "member" | "guest" = "admin"): UserLookup {
   const ctx: AuthContext = { userId: USER_ID, churchGroupId: CHURCH_GROUP_ID, role };

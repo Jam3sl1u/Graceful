@@ -7,8 +7,8 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import InviteResponse from "@/app/(public)/invite/[token]/invite-response";
 
 const TOKEN = "a".repeat(64);
-const INVITATION_ID = "11111111-1111-1111-1111-111111111111";
-const SERVICE_WEEK_ID = "22222222-2222-2222-2222-222222222222";
+const INVITATION_ID = "11111111-1111-4111-8111-111111111111";
+const SERVICE_WEEK_ID = "22222222-2222-4222-8222-222222222222";
 
 function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}): Response {
   return {

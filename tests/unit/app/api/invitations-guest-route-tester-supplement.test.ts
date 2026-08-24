@@ -25,7 +25,7 @@ const JWT = "supabase-jwt";
 const USER_ID = "admin-1";
 const CHURCH_GROUP_ID = "group-1";
 const OTHER_CHURCH_GROUP_ID = "group-EVIL";
-const SERVICE_WEEK_ID = "22222222-2222-2222-2222-222222222222";
+const SERVICE_WEEK_ID = "22222222-2222-4222-8222-222222222222";
 
 function makeReq(body?: unknown): NextRequest {
   return { json: jest.fn().mockResolvedValue(body) } as unknown as NextRequest;
