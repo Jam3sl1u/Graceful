@@ -1,99 +1,72 @@
-# Review — Issue #81 fix pass (review NEEDS WORK → this pass)
+# Review — Issue #142: Provision Google OAuth credentials & Cloudflare R2 bucket
 
-## Verdict: SHIP
+## VERDICT: NEEDS WORK
 
-The prior NEEDS WORK verdict's 3 MUST FIX and 4 SHOULD FIX findings are all
-genuinely fixed, verified two ways: (1) this fix pass's own re-verification
-(`.pipeline/test-results.md`), and (2) an independent `reviewer` subagent
-with no access to this session's reasoning, which read the real diff and
-code cold, ran its own typecheck/lint/test/git-secrets/prettier, and
-mutation-tested the two strengthened test assertions itself rather than
-trusting the test names. That independent pass returned NEEDS WORK against
-this branch's first-round state — it found 5 new issues the fix pass had
-itself introduced while fixing the original 7. All 5 were fixed in a second
-round, re-verified, and are reflected in the current `tests/load/**` /
-`documentation/performance-testing.md` / `.pipeline/*.md` state. This
-verdict (SHIP) reflects that second, corrected state.
+One real, well-localized factual error in the authoritative runbook, surfaced
+by a legitimate failing test. Everything else is sound. This is a one-word
+documentation fix, not a design or security problem — hence NEEDS WORK, not
+BLOCK.
 
-## Original 7 findings — final disposition
+## What I verified firsthand (not just trusting the summaries)
 
-| # | Finding | Status |
-| --- | --- | --- |
-| MUST FIX 1 | `/api/health` pooled into the AC1 p95, invalidating it | **Fixed** — `poolAggregates` (`tests/load/scenarios.ts`) excludes `persona: "none"` from pooled totals, keeps it in `perEndpoint`. Verified by extraction into a unit-testable pure function, 2 new unit tests, and a manual mock run confirming pooled `totalOk` equals the exact sum of the 11 authenticated endpoints. |
-| MUST FIX 2 | No pacing/backoff → self-inflicted flood/error rate | **Fixed** — `LOAD_PROFILE.thinkTimeMs = 500` + `runConcurrent`'s new think-time sleep + capped Retry-After backoff (`RATE_LIMIT_BACKOFF_CAP_MS = 2000`, extracted as pure `resolveBackoffMs`, 5 unit tests). Verified by a manual mock run: total volume dropped from the original review's 2.06M/60s to ~3,700/70s with 0 non-429 errors. A second manual run with an injected 5% error rate confirmed the harness still correctly reports FAIL — the fix didn't overcorrect into "always passes." |
-| MUST FIX 3 | Testing-stage work left uncommitted | Already resolved on this branch (`7b42387`) before this fix pass began; reverified `git status --short` stays clean. |
-| SHOULD FIX 4 | `renderMarkdown`/doc §7 column mismatch | **Fixed** — 6-column table (`Target \| Threshold \| Measured (p95) \| Status \| Notes \| Date / commit`) in both `report.ts` and the doc. Commit column clarified as the harness's own checkout (not the staging deployment's) with a `-dirty` suffix when uncommitted. |
-| SHOULD FIX 5 | Preflight fires for zero-network `notifications` scenario | **Fixed** — `run.ts` skips preflight when `--scenario notifications` is the sole scenario. Verified manually: an unreachable base URL with `--scenario notifications` returns the scenario's normal `blocked`/exit 3, not a preflight failure/exit 2. |
-| SHOULD FIX 6 | `STAGING_APP_URL`-only → wrong exit code | **Fixed** — `readEnv`'s configuration-attempt gate now excludes the `STAGING_APP_URL` fallback. Verified manually: `STAGING_APP_URL` alone now exits 0 with the SKIPPED message (was exit 2). |
-| SHOULD FIX 7 | Two weak `http.test.ts` assertions | **Fixed** — `toBe(5)` (was `toBeLessThanOrEqual`) and a pinned `toEqual([0, 1, 0, 1])` (was `toBeGreaterThan(0)`), the exact sequence observed by running the test rather than hand-derived. Independently mutation-tested by the reviewer subagent: a serial implementation kills the first, a broken deadline check kills the second. |
+- Ran `git diff main...HEAD` and read every changed file directly.
+- Confirmed the scope framing: this is a provisioning/ops issue whose only
+  legitimate in-repo deliverable is a human-operator runbook plus link wiring.
+  No application code was touched. Correct call.
+- Counted the real integration env vars against source, not the summaries:
+  `lib/google-calendar/oauth.ts` (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+  `GOOGLE_REDIRECT_URI`), `lib/google-calendar/token-crypto.ts`
+  (`TOKEN_ENCRYPTION_KEY`), `lib/r2/client.ts` (`R2_ACCOUNT_ID`,
+  `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT`).
+  That is exactly **nine** variables. `.env.example` also lists exactly nine.
+  There is no tenth variable anywhere in the Google Calendar / R2 integration.
+- Runbook technical accuracy checks out: OAuth scope is write-only
+  `calendar.events` only (no read scope), redirect path is exactly
+  `/api/google-calendar/callback`, `TOKEN_ENCRYPTION_KEY` is base64 / exactly
+  32 decoded bytes via `openssl rand -base64 32`, R2 bucket must be private,
+  R2 endpoint is the account-level `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`
+  shape. All match the code.
+- `.env.example` edit is comment-only; all nine placeholder lines remain
+  exactly `VAR=` (empty). No secrets anywhere in the diff. README and
+  `staging-environment.md` cross-references are minimal pointers, not
+  duplicated content.
+- The tester's new test file is meaningful, not superficial: it reads the
+  actual committed files and cross-checks them against the code and the
+  no-secrets invariant. The failing test is honest — it is not a test bug.
 
-## Issues found by the independent review round and fixed
+## Must fix (blocking the SHIP)
 
-1. `runApiLoad`'s pass-detail string said "across 12 endpoints" after MUST
-   FIX #1 made only 11 feed the pooled totals — a factual error in the exact
-   string pasted into the table issue #83's deploy gate reads. Now computed
-   dynamically and reworded to "authenticated endpoints."
-2. `documentation/performance-testing.md` §6 never disclosed either
-   behavioral change (health exclusion, pacing) to an operator reading the
-   doc. Two new bullets added.
-3. The new commit column reports the harness's local checkout, which
-   routinely differs from (and may be ahead of/behind, or dirty relative to)
-   the staging deployment actually being measured — could read as false
-   provenance. Now documented explicitly, with a `-dirty` suffix.
-4. The rate-limit backoff logic had no test coverage and didn't use the
-   module's injectable-time pattern. Extracted to a pure, exported,
-   unit-tested `resolveBackoffMs`.
-5. The `poolAggregates` regression test's excluded (`persona: "none"`)
-   fixture only had nonzero `samples`/`ok`, so a partial regression (pooling
-   samples/ok correctly but still leaking `rateLimited`/`errors` into the
-   error-rate gate) would have gone undetected. Fixture strengthened.
+1. `documentation/google-oauth-r2-provisioning.md` line 110: the sentence
+   **"The ten variables provisioned by this runbook:"** sits directly above a
+   table that lists **nine** variables. There is no tenth variable in the
+   codebase, `.env.example`, or the table. Change "ten" to "nine" (or reword
+   to drop the count). This is the single failing test and a genuine accuracy
+   defect in a document whose entire purpose is to be a followable, correct
+   operator runbook — an operator would waste time hunting for a nonexistent
+   tenth variable.
 
-## Verification (this stage, on the final state)
+## Should fix (same root miscount, for consistency)
 
-- `bun run typecheck` — clean.
-- `bun run lint` — clean (1 pre-existing warning in generated
-  `coverage/lcov-report/`, unrelated to this branch's changes).
-- `bun run test` — 120 suites / 2850 tests, all green.
-- `bunx prettier --check` on every file this fix pass touched — clean (the
-  ~100 other repo-wide warnings `bun run format:check` reports are confirmed
-  pre-existing on this branch via `git stash`, not introduced here).
-- `bun run check:git-secrets` — clean.
-- Scope: `git diff --stat` confirms nothing under `app/**`, `lib/**`,
-  `middleware.ts`, `schemas/**`, `supabase/**`, or `.github/workflows/ci.yml`
-  was touched — only `tests/load/**`, `tests/unit/load/**`,
-  `documentation/performance-testing.md`, and `.pipeline/*.md`.
-- `git status --short` — clean tree of exactly the expected modified files,
-  no untracked stragglers (MUST FIX #3's regression check).
+2. `.pipeline/spec.md` carries the same latent error at line 30 ("already has
+   all ten variables as empty placeholders") and line 117 ("a table mapping
+   each of the ten variables"). The planner introduced the miscount; the coder
+   faithfully copied it. Correct these to "nine" too so a re-run from spec does
+   not reintroduce the defect. (Spec is a handoff artifact, so this is
+   secondary to fix #1, but it is the actual source.)
 
-## Positives
+## Process note (not blocking, for the human/orchestrator)
 
-- `poolAggregates` and `resolveBackoffMs` were both extracted specifically
-  to make previously network-path-only logic unit-testable — the right
-  instinct given `tests/load/scenarios.ts`'s real load path is otherwise
-  untested by design (70s+ wall-clock cost per spec §2).
-- The backoff cap (`RATE_LIMIT_BACKOFF_CAP_MS`) was discovered by this fix
-  pass's own end-to-end verification catching a real stall, and disclosed
-  prominently in `.pipeline/test-results.md` rather than silently patched —
-  exactly the behavior wanted from a stage reporting on itself.
-- Both the PASS path (mock reproducing the real limiter) and the FAIL path
-  (mock injecting a real error rate) were manually exercised, confirming the
-  fix pass didn't overcorrect MUST FIX #2 into "the harness can never fail."
-- An independent reviewer pass was used deliberately rather than
-  self-review only, consistent with this repo's prior experience (issues
-  #64, #66) that self-review after a fix pass can miss regressions the fix
-  itself introduces — and it did find 5 real issues here, all now resolved.
-- Token hygiene holds throughout: no token value appears in stdout, the
-  markdown table, or any error string in either the original implementation
-  or this fix pass; `check:git-secrets` stays clean.
+- The tester's test file `tests/unit/documentation/
+  google-oauth-r2-provisioning-tester-supplement.test.ts` is currently
+  **untracked**, and `.pipeline/test-results.md` is **modified but
+  uncommitted**. Whoever applies fix #1 should also stage/commit the test file
+  so the failing-then-passing test travels with the change; otherwise the PR
+  would ship the doc without the test that guards it.
 
-## For the human sign-off
+## After the fix
 
-No real staging credentials exist in this environment, so AC1–AC4's actual
-measurements against staging were never taken — this was true of the
-original implementation and remains true here (by design; see
-`.pipeline/spec.md`'s Verification section). `documentation/performance-testing.md`
-§7 still has placeholder rows; an operator with real
-`LOAD_TEST_ADMIN_TOKENS`/`LOAD_TEST_MEMBER_TOKENS` needs to run
-`bun run test:load --markdown` against actual staging and paste the result
-over the placeholders before issue #83's deploy gate has a real pass to
-read.
+Once "ten" → "nine" is corrected and the suite is green (the consistency test
+is written to pass when the count is not claimed as ten, or when the table has
+the claimed number of rows), this is a clean, correctly-scoped, secret-free
+docs deliverable that satisfies the issue. Re-run `bun run test` to confirm
+78 suites / all green, then this is SHIP-able.

@@ -102,7 +102,7 @@ export async function listInvitations(req: NextRequest, lookup?: UserLookup): Pr
     const { serviceWeekId } = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -142,7 +142,7 @@ export async function createInvitation(req: NextRequest, lookup?: UserLookup): P
     const parsed = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -318,7 +318,7 @@ export async function createGuestInvitation(
     const parsed = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -541,7 +541,7 @@ export async function claimGuestInvitation(req: NextRequest): Promise<Response> 
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
 
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -667,7 +667,7 @@ export async function denyInvitation(
     const ctx = await requireAuth(req, lookup);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -771,7 +771,7 @@ export async function withdrawInvitation(
     }
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -885,7 +885,7 @@ export async function acceptInvitation(
       await requireAuth(req, lookup);
 
       const { getToken } = await auth();
-      const jwt = await getToken({ template: "supabase" });
+      const jwt = await getToken();
       if (!jwt) {
         return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
       }

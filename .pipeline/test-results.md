@@ -1,132 +1,162 @@
-# Test results — Issue #81 fix pass (review NEEDS WORK → this pass)
+# Test Results — Issue #142: Provision Google OAuth credentials & Cloudflare R2 bucket
 
-**Overall: PASS.** All 7 findings from `.pipeline/review.md`'s NEEDS WORK
-verdict (3 MUST FIX, 4 SHOULD FIX) were independently re-verified after the
-fix pass described in `.pipeline/changes.md`.
+This overwrites the stale `test-results.md` for issue #63 that was still
+sitting at this path (per AGENTS.md, `.pipeline/` files reflect only the most
+recent run).
 
-## Automated checks
+## Verdict: PASS (post-fix) — see "Post-review fix" note at bottom
 
-| Check | Result |
-| --- | --- |
-| `bun run typecheck` | Clean |
-| `bun run lint` | Clean (1 pre-existing warning in generated `coverage/lcov-report/`, unrelated to this change) |
-| `bun run test` | 120 suites / 2850 tests, all green (2839 original baseline + 6 from this fix pass + 5 from the independent-review addendum below) |
-| `bun run format:check` | Clean for every file this fix pass touched; the ~100 other repo-wide warnings confirmed pre-existing on this branch via `git stash` (identical warning set before and after this fix pass's changes) |
-| `bun run check:git-secrets` | Clean |
-| `bun run check:workflows` | N/A — no `.claude/workflows/**` file touched |
+Original Testing-stage run (below) found one failing test. The Reviewer
+confirmed it as a genuine content defect (not a test bug) and it has since
+been fixed; see the "Post-review fix" section at the end of this file for
+the corrected result. The rest of this document is preserved as originally
+written by the Testing stage.
 
-## New regression tests (verifying the fix, not just re-running old coverage)
+## Verdict: FAIL — one failing test, pipeline paused for Reviewer
 
-- `tests/unit/load/scenarios.test.ts` — `poolAggregates`: confirms a
-  `persona: "none"` bucket (e.g. `/api/health`) is excluded from pooled
-  totals but still reported per-endpoint (MUST FIX #1's exact regression
-  case), and that normal all-authenticated pooling is unaffected.
-- `tests/unit/load/http.test.ts` — `thinkTimeMs`: confirms `sleep` is called
-  with the configured pacing delay between iterations, and never called when
-  omitted (MUST FIX #2).
-- `tests/unit/load/http.test.ts` — the two previously weak assertions now
-  pin exact values (`maxInFlight` is `toBe(5)`, not `toBeLessThanOrEqual(5)`;
-  the deadline test's `calls` array is pinned to the observed deterministic
-  `[0, 1, 0, 1]` sequence rather than just `toBeGreaterThan(0)`) (SHOULD FIX
-  #7).
-- `tests/unit/load/env.test.ts` — only `STAGING_APP_URL` set (no
-  `LOAD_TEST_*` vars) → `unconfigured`, not `partial` (SHOULD FIX #6).
-- `tests/unit/load/report.test.ts` — `renderMarkdown` now requires and
-  renders a `commit` field in the 6-column table (SHOULD FIX #4).
+This issue is a docs-only deliverable (per spec.md's "Scope note" and
+changes.md — no application code was touched). New tests were added at
+`tests/unit/documentation/google-oauth-r2-provisioning-tester-supplement.test.ts`
+to independently verify the runbook's content against the actual code it
+describes (`lib/google-calendar/oauth.ts`, `lib/google-calendar/token-crypto.ts`,
+`lib/r2/client.ts`, `app/api/google-calendar/callback/route.ts`), plus the
+no-secrets / placeholder-integrity invariant the issue itself requires.
 
-## Manual end-to-end verification (real network path, not unit-testable per spec §2)
+## Standard checks (re-run independently, not trusted from changes.md)
 
-Ran against local mock HTTP servers reproducing the real 240/60s read-tier
-rate limiter shape (`lib/api/rate-limit.ts`'s `resolveTier`/
-`checkRateLimit`) — no real staging credentials exist in this environment,
-consistent with the original coding/testing stages' documented constraint.
+- `bun run lint` (eslint .) — clean, 0 errors.
+- `bun run typecheck` (tsc --noEmit) — clean, 0 errors.
+- `bun run test` (full suite, including new tests) — **78 suites total: 77
+  passed, 1 failed. 983 tests total: 982 passed, 1 failed.** Before adding
+  the new test file: 77 suites / 968 tests, all passing — matches the
+  coder's claim in changes.md for the pre-existing suite exactly.
+- `git diff origin/main...HEAD --stat` confirms only the claimed files
+  changed: `.env.example`, `README.md`,
+  `documentation/google-oauth-r2-provisioning.md` (new),
+  `documentation/staging-environment.md`, plus `.pipeline/*.md` handoff
+  files. No application code, tests, or CI workflows were touched.
+- Grepped the diff for secret-shaped strings (`AIza`, `ya29.`, `GOCSPX`,
+  `-----BEGIN`, `AKIA`, long opaque tokens) — none found. All Google
+  Calendar/R2 placeholder lines in `.env.example` remain exactly `VAR=`
+  (empty).
 
-1. **Happy path — `--scenario api --markdown` against a mock with the
-   documented small shared-token-pool scenario (4 tokens, 100 workers):**
-   `PASS`, measured p95 21ms, `1653 ok, 2005 rate-limited, 0 errors across 12
-   endpoints`, exit 0.
-   - Verified `totalOk` (1653) equals the exact sum of the 11 *authenticated*
-     endpoints' individual `ok` counts (health's 332 `ok` samples correctly
-     excluded from pooling) — direct confirmation MUST FIX #1 is fixed.
-   - Verified 0 non-429 errors despite 2005 rate-limited responses (heavy
-     429 volume is expected/documented under a small shared token pool,
-     §6) — direct confirmation MUST FIX #2's self-inflicted-flood is fixed;
-     total request volume (~3,700 over ~70s) is roughly 3 orders of
-     magnitude below the review's reported 2.06M/60s.
-   - Verified the `--markdown` output is the new 6-column
-     `Target | Threshold | Measured (p95) | Status | Notes | Date / commit`
-     shape with a populated commit cell (SHOULD FIX #4).
-2. **Failure case — `--scenario api` against a mock injecting a ~5% non-429
-   error rate on authenticated endpoints (no rate limiting simulated, to
-   isolate the error-rate path):** `FAIL`, `non-429 error rate 4.8% exceeds
-   max 1.0%`, exit 1. Confirms the fix pass didn't accidentally make the
-   harness unable to report FAIL when a real >1% error rate exists — the
-   original review's MUST FIX #2 concern was specifically that the harness
-   might become *structurally unable to ever pass*; this checks the
-   complementary risk (unable to ever fail) wasn't introduced by the pacing
-   fix. Health's endpoint again correctly shows 0 errors and is excluded
-   from the reported rate.
-3. **`STAGING_APP_URL`-only environment** (`env -i` with only
-   `STAGING_APP_URL` set, no `LOAD_TEST_*` vars): prints `SKIPPED: load
-   harness not configured`, exit 0 — was exit 2 before the fix (SHOULD FIX
-   #6).
-4. **`--scenario notifications` against a deliberately unreachable base
-   URL:** returns the expected `blocked` result, exit 3 — proves preflight
-   was skipped (an unreachable URL would otherwise produce a preflight
-   failure, exit 2) (SHOULD FIX #5).
+## New tests added (happy path / named edge cases / failure case)
 
-## Issue found and fixed during this stage's own verification
+File: `tests/unit/documentation/google-oauth-r2-provisioning-tester-supplement.test.ts`
+(15 tests, Jest, matches this repo's `tests/unit/**/*.test.ts` layout and its
+existing `-tester-supplement.test.ts` naming convention).
 
-While manually verifying MUST FIX #2's happy path (item 1 above), the first
-run of the harness against the small-token-pool mock **did not complete
-within a 150s window** (nearly double the ~70s the fixed `durationSeconds`
-+ `rampUpSeconds` design implies). Root cause: the Retry-After-aware backoff
-added for MUST FIX #2 honored the mock's full reported `Retry-After`, which
-— like the real limiter under a small shared token pool — can be up to the
-entire 60s rate-limit window early in that window. A worker rate-limited
-near the start of its loop would sleep for most of a minute before checking
-the deadline again, stalling `runConcurrent`'s `Promise.all` well past the
-run's own fixed-duration contract. Fixed by capping the backoff at
-`RATE_LIMIT_BACKOFF_CAP_MS = 2000`ms in `tests/load/scenarios.ts` (see
-`.pipeline/changes.md` for detail); re-verified afterward (item 1 above)
-completes in the expected ~70s window. This is called out explicitly for the
-Reviewer since it's a design refinement made during this stage, not
-something the original plan anticipated.
+**Happy path:**
+- Runbook exists and documents the real env vars consumed by
+  `lib/google-calendar/oauth.ts` and `lib/r2/client.ts`.
+- Runbook has a `## Verification checklist` section with `- [ ]` items.
+- README links to the runbook; `staging-environment.md` cross-references it.
 
-## Addendum — independent re-review round
+**Edge cases named in spec.md's "Edge cases / must-get-right details":**
+- OAuth scope is exactly the write-only `calendar.events` URL, matching
+  `oauth.ts`'s `CALENDAR_EVENTS_SCOPE`; any mention of `calendar.readonly`
+  only appears as a "do not use this" caution, never as a recommendation.
+- Redirect URI path is exactly `/api/google-calendar/callback` (fixed by
+  the route file).
+- `TOKEN_ENCRYPTION_KEY` documented as base64 (not hex), exactly 32 decoded
+  bytes, generated via `openssl rand -base64 32`.
+- Staging/production get distinct OAuth clients and encryption keys.
+- R2 bucket must be private / no public access; API token scoped to a
+  single bucket, not account-wide.
+- R2 endpoint is the account-level shape
+  (`https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`), no bucket in the
+  host.
+- `.env.example`'s nine Google Calendar / R2 placeholder lines remain
+  exactly `VAR=` (empty) — no real values were introduced; only comment
+  lines were added above the two blocks.
 
-An independent `reviewer` subagent (fresh context, own typecheck/lint/test/
-git-secrets/prettier runs, own reading of every touched file — see
-`.pipeline/review.md`) confirmed all 3 MUST FIX and 4 SHOULD FIX findings
-genuinely fixed, including mutation-testing the two strengthened
-`http.test.ts` assertions itself (serial `runConcurrent` kills the new
-`toBe(5)`; a removed deadline check kills the new
-`toEqual([0, 1, 0, 1])` — neither would have been caught by the original weak
-assertions). It found and this stage fixed 5 new issues introduced by the
-original fix-pass round — see `.pipeline/changes.md`'s "Addendum" section for
-the detail on each:
+**Failure case (this is the one that FAILS):**
+- A consistency check that the runbook's own claim in §6 — *"The ten
+  variables provisioned by this runbook"* — matches the number of rows
+  actually tabulated there.
 
-1. `runApiLoad`'s detail string said "12 endpoints" when only 11 feed the
-   pooled AC1 totals post-fix — now dynamically computed and reworded.
-2. `documentation/performance-testing.md` §6 didn't disclose the health
-   exclusion or the new pacing behavior — two new bullets added.
-3. The `Date / commit` column's commit is the harness's local checkout, not
-   the staging deployment's — now documented explicitly and suffixed
-   `-dirty` when the working tree has uncommitted changes.
-4. The rate-limit backoff had no test coverage — extracted to a pure
-   `resolveBackoffMs` with 5 new unit tests.
-5. The `poolAggregates` test's excluded fixture only exercised
-   samples/ok — extended to nonzero `rateLimited`/`errors` too, so a
-   regression leaking those into the pooled totals would be caught.
+## FAILING TEST — real content defect, not a test bug
 
-Re-verified after all 5 fixes: full suite (120 suites / 2850 tests),
-typecheck, lint, `check:git-secrets`, and `prettier --check` on every touched
-file all clean; the local-mock manual check was re-run and confirmed both
-the corrected "11 authenticated endpoints" wording and the `-dirty` commit
-suffix render correctly in real output.
+```
+● documentation/google-oauth-r2-provisioning.md › the 'ten variables' claim
+  in §6 matches the actual number of variables tabulated
 
-## What the Reviewer should focus on
+  expect(received).toBe(expected)
+  Expected: 10
+  Received: 9
+```
 
-All items from the independent review's own list have been addressed above.
-Nothing outstanding is being carried forward to human review beyond the
-normal expectation of eyes on the diff before merge.
+**Root cause (verified by direct inspection, not just the failing test):**
+`documentation/google-oauth-r2-provisioning.md` §6 says *"The ten variables
+provisioned by this runbook:"* immediately above a table that lists only
+**9** variables: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+`GOOGLE_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY` (4 Google Calendar vars) +
+`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+`R2_BUCKET_NAME`, `R2_ENDPOINT` (5 R2 vars) = 9. This matches the actual
+`.env.example` contents (also exactly 9 vars across the Google Calendar and
+Cloudflare R2 blocks, confirmed by direct read of `.env.example` lines
+34–50) and the env vars actually read by `lib/r2/client.ts` /
+`lib/google-calendar/oauth.ts` / `lib/google-calendar/token-crypto.ts`.
+There is no tenth variable anywhere in the codebase's Google
+Calendar/R2 integration.
+
+This traces back to `.pipeline/spec.md` itself, which independently says
+"already has all ten variables as empty placeholders" (line 30) and "a
+table mapping each of the ten variables" (line 117) — the miscount
+originated in the planning stage and was faithfully carried into the
+coding stage's runbook. It is a small but genuine factual inaccuracy in a
+document whose whole purpose is to be an authoritative, followable runbook
+for a human operator, and changes.md itself flagged "Runbook accuracy" as
+something the Tester should specifically check.
+
+Per AGENTS.md's pipeline contract ("A failing test pauses the pipeline for
+review; it is not something this stage patches around"), this is not
+something the Testing stage fixes. Flagging for the Reviewer/human: the
+runbook's "ten variables" wording in §6 (its §1 intro doesn't state a
+count, so that's unaffected) should be corrected to "nine" (or the
+sentence reworded to avoid a count), and `.pipeline/spec.md`'s two "ten
+variables" mentions carry the same latent error, worth fixing for
+consistency if this pipeline stage is ever re-run from spec.md.
+
+## Everything else: PASS
+
+All other new assertions pass (14/15), and the pre-existing 77 suites /
+968 tests are unaffected and still fully green. No secrets found anywhere
+in the diff. `.env.example` placeholder integrity holds (all nine
+Google Calendar/R2 vars still empty; only comment lines were added).
+README and `staging-environment.md` cross-references are present and
+correctly scoped (pointers only, no duplicated runbook content). Lint and
+typecheck are both clean.
+
+## Files added by this stage (Testing)
+
+- `/Users/jamesliu/Documents/Graceful/.claude/worktrees/issue-142/tests/unit/documentation/google-oauth-r2-provisioning-tester-supplement.test.ts`
+
+No implementation or documentation files were modified by this stage — the
+one failing test surfaces a pre-existing defect in the coder's
+`documentation/google-oauth-r2-provisioning.md`, it is not something this
+stage patched around. Not ready for Review sign-off until the "ten
+variables" discrepancy is resolved (either fix the wording or fix the
+table — both should say the same number).
+
+## Post-review fix
+
+Per `review.md`'s verdict (NEEDS WORK, one MUST FIX): changed
+`documentation/google-oauth-r2-provisioning.md` §6 "The ten variables
+provisioned by this runbook:" to "The nine variables provisioned by this
+runbook:" — matching the 9 rows actually tabulated. Also corrected the same
+latent miscount in `.pipeline/spec.md` (lines 30 and 117, "ten" → "nine")
+per the review's SHOULD FIX, so a future re-run from spec.md doesn't
+reintroduce it.
+
+Re-ran the full suite after the fix:
+
+```
+Test Suites: 78 passed, 78 total
+Tests:       983 passed, 983 total
+```
+
+`bun run lint` and `bun run typecheck` both clean, 0 errors. All 15 tests in
+`tests/unit/documentation/google-oauth-r2-provisioning-tester-supplement.test.ts`
+now pass, including the previously-failing "ten variables" consistency
+check. No other files changed. Ready to ship.

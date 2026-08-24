@@ -58,7 +58,7 @@ export async function listSongs(req: NextRequest, lookup?: UserLookup): Promise<
     const { q } = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -108,7 +108,7 @@ export async function createSong(req: NextRequest, lookup?: UserLookup): Promise
     }
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

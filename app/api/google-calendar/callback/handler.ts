@@ -68,7 +68,7 @@ export async function callback(req: NextRequest, lookup?: UserLookup): Promise<R
     const refreshTokenEncrypted = encryptToken(tokens.refreshToken);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return redirectError();
     }
