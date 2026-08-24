@@ -21,7 +21,7 @@ const mockToGoogleEventId = toGoogleEventId as unknown as jest.Mock;
 const JWT = "supabase-jwt";
 const USER_ID = "user-1";
 const CHURCH_GROUP_ID = "group-1";
-const WEEK_ID = "22222222-2222-2222-2222-222222222222";
+const WEEK_ID = "22222222-2222-4222-8222-222222222222";
 
 const fakeReq = {} as NextRequest;
 

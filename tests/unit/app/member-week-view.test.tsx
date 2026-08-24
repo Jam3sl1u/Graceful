@@ -8,7 +8,7 @@
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import MemberWeekView from "@/app/(app)/member-week/[id]/member-week-view";
 
-const SERVICE_WEEK_ID = "22222222-2222-2222-2222-222222222222";
+const SERVICE_WEEK_ID = "22222222-2222-4222-8222-222222222222";
 const URL = `/api/service-weeks/${SERVICE_WEEK_ID}/member-view`;
 
 function jsonResponse(status: number, body: unknown): Response {

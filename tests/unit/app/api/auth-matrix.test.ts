@@ -33,7 +33,7 @@ beforeEach(() => {
 });
 
 describe("patchMemberRole (#27)", () => {
-  const TARGET_ID = "22222222-2222-2222-2222-222222222222";
+  const TARGET_ID = "22222222-2222-4222-8222-222222222222";
 
   // Minimal chainable query-builder mock, plus rpc() for writeAuditLog.
   // Mirrors tests/unit/app/api/church-group-members-role-route.test.ts.

@@ -75,7 +75,7 @@ describe("validateEventTiming (BR-10)", () => {
 
 describe("createEventSchema", () => {
   const validBody = {
-    serviceWeekId: "11111111-1111-1111-1111-111111111111",
+    serviceWeekId: "11111111-1111-4111-8111-111111111111",
     type: "rehearsal",
     name: "Full band rehearsal",
     location: "Main hall",
@@ -146,7 +146,7 @@ describe("updateEventSchema", () => {
     // from the parsed result rather than asserting parse failure.
     const result = updateEventSchema.safeParse({
       name: "New name",
-      serviceWeekId: "11111111-1111-1111-1111-111111111111",
+      serviceWeekId: "11111111-1111-4111-8111-111111111111",
     });
     expect(result.success).toBe(true);
     if (result.success) {

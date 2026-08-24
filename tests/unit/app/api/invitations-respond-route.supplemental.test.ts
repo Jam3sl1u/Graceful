@@ -26,8 +26,8 @@ import { getInvitationByToken } from "@/app/api/invitations/handler";
 const mockGetAnonSupabaseClient = getAnonSupabaseClient as unknown as jest.Mock;
 
 const TOKEN = "a".repeat(64);
-const INVITATION_ID = "11111111-1111-1111-1111-111111111111";
-const SERVICE_WEEK_ID = "22222222-2222-2222-2222-222222222222";
+const INVITATION_ID = "11111111-1111-4111-8111-111111111111";
+const SERVICE_WEEK_ID = "22222222-2222-4222-8222-222222222222";
 
 function makeRpcClient(result: { data: unknown; error: unknown }) {
   return { rpc: jest.fn(() => Promise.resolve(result)) };

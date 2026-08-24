@@ -90,7 +90,7 @@ describe("POST /api/invitations/:id/deny — malformed :id (issue #77)", () => {
       })),
     });
 
-    const wellFormedId = "33333333-3333-3333-3333-333333333333";
+    const wellFormedId = "33333333-3333-4333-8333-333333333333";
     const res = await denyInvitation(makeReq({}), wellFormedId, makeLookup("member"));
     // Passes validation and proceeds to the (mocked) DB lookup, which
     // resolves to "not found" here -- the important assertion is that this

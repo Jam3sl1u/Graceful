@@ -6,9 +6,9 @@
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import ConflictResolution from "@/app/(app)/conflicts/[id]/conflict-resolution";
 
-const CONFLICT_ID = "44444444-4444-4444-4444-444444444444";
-const OTHER_CONFLICT_ID = "55555555-5555-5555-5555-555555555555";
-const SERVICE_WEEK_ID = "22222222-2222-2222-2222-222222222222";
+const CONFLICT_ID = "44444444-4444-4444-8444-444444444444";
+const OTHER_CONFLICT_ID = "55555555-5555-4555-8555-555555555555";
+const SERVICE_WEEK_ID = "22222222-2222-4222-8222-222222222222";
 
 function jsonResponse(status: number, body: unknown): Response {
   return {

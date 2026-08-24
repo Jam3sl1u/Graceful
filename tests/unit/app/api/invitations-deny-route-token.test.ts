@@ -23,7 +23,7 @@ const mockAuth = auth as unknown as jest.Mock;
 const mockGetSupabaseClient = getSupabaseClient as unknown as jest.Mock;
 const mockGetAnonSupabaseClient = getAnonSupabaseClient as unknown as jest.Mock;
 
-const INVITATION_ID = "33333333-3333-3333-3333-333333333333";
+const INVITATION_ID = "33333333-3333-4333-8333-333333333333";
 const TOKEN = "a".repeat(64);
 
 function makeReq(body?: unknown): NextRequest {
