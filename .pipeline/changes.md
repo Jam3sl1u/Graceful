@@ -1,24 +1,28 @@
-# Changes — Issue #67: Correct Pingram wire contract
+# Changes — Make the Resend branch merge-ready
 
-This patch replaces the prior provisional Pingram integration with the
-documented `/sms` and events-webhook contracts.
+## Summary
 
-- **Dispatch:** `lib/pingram/client.ts` now posts `{ type, to, message,
-  from? }` to `https://api.pingram.io/sms`, returns `trackingId`, detects a
-  structured error in a 200 response, and accepts US phone numbers only.
-- **Webhook:** signature verification now uses `X-Pingram-Id`, `v1,{hex}` and
-  the documented tracking-id/timestamp/raw-body HMAC payload. Timestamp values
-  are milliseconds. The schema and handler consume Pingram event fields and
-  acknowledge all valid SMS events, including inbound and unknown events.
-- **SMS safety:** link-bearing templates preserve their full terminal link;
-  truncation is exact-length and GSM-7-safe. Member reminder inputs are bounded
-  before dispatch. PRD section 30 and the templates use ASCII hyphens.
-- **Configuration and tests:** environment guidance is normalized and focused
-  unit tests cover the corrected contract, failure responses, signatures,
-  events, long links, ASCII output, and reminder limits.
+Merged current `main` into issue #68 and resolved the shared-verifier conflict
+without regressing the completed Pingram integration. Addressed all four
+review findings.
 
-Vendor contract citations:
+## Implementation
 
-- https://www.pingram.io/docs/sms/overview
-- https://www.pingram.io/docs/api-reference/operations/sms_send
-- https://www.pingram.io/docs/features/events-webhook
+- `lib/api/webhook-verify.ts` now retains both `crypto` HMAC imports for
+  Pingram and Svix's `Webhook` import for Resend, with real verifier bodies
+  for both providers and unchanged Clerk/Modal stubs.
+- Environment documentation retains Pingram's optional base-URL/sender
+  settings and adds Resend's sender setting; `.env.example` contains all
+  provider variables.
+- `EmailDeliveryStatus` and its mapper now represent `email.failed` as
+  `failed`, so the existing handler logs and acknowledges it distinctly.
+- Added a no-mock Svix signature suite covering valid, tampered, wrong-secret,
+  and stale-timestamp payloads; added a malformed-body/bad-signature route
+  case proving verification occurs before parsing.
+
+## Verification
+
+- Focused Resend and Pingram coverage: 9 suites / 61 tests passed.
+- `bun run lint`: exit 0 with one existing generated-coverage warning.
+- `bun run typecheck`: passed.
+- Full `bun run test`: 135 suites / 3,018 tests passed.
