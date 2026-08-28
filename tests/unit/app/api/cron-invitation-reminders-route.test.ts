@@ -103,13 +103,17 @@ describe("GET /api/cron/invitation-reminders", () => {
       error: null,
     });
     mockGetAnonSupabaseClient.mockReturnValue(client);
-    mockSendSms.mockResolvedValue(undefined);
+    mockSendSms.mockResolvedValue({ status: "sent", messageId: "m1" });
 
     const res = await GET(makeReq(`Bearer ${CRON_SECRET}`));
     expect(res.status).toBe(200);
 
     expect(mockSendSms).toHaveBeenCalledTimes(1);
-    expect(mockSendSms).toHaveBeenCalledWith("+15551234567", expect.stringContaining("Jane Doe"));
+    expect(mockSendSms).toHaveBeenCalledWith({
+      to: "+15551234567",
+      body: expect.stringContaining("Jane Doe"),
+      smsOptedIn: true,
+    });
 
     const body = await res.json();
     expect(body.data).toEqual({ processed: 2, smsSent: 1, smsSkipped: 1, smsFailed: 0 });

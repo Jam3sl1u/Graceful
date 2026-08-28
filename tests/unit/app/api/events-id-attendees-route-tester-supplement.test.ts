@@ -35,7 +35,7 @@ const mockUnsyncEventFromUser = unsyncEventFromUser as unknown as jest.Mock;
 const USER_ID = "user-1";
 const CHURCH_GROUP_ID = "group-1";
 const EVENT_ID = "event-1";
-const TARGET_USER_ID = "22222222-2222-2222-2222-222222222222";
+const TARGET_USER_ID = "22222222-2222-4222-8222-222222222222";
 const GOOGLE_EVENT_ID = "gr-real-ordering-check";
 
 const fakeReq = {} as NextRequest;

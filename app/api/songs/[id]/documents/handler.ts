@@ -80,7 +80,7 @@ export async function createUploadUrl(
     const input = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -121,7 +121,7 @@ export async function registerDocument(
     const input = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -176,7 +176,7 @@ export async function listDocuments(
     requireRole(ctx, ["admin", "set_leader", "member"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -219,7 +219,7 @@ export async function deleteDocument(
     requireRole(ctx, ["admin", "set_leader"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

@@ -185,6 +185,7 @@ describe("lib/resend/client", () => {
       ["email.delivery_delayed", "delayed"],
       ["email.bounced", "bounced"],
       ["email.complained", "complained"],
+      ["email.failed", "failed"],
       ["email.opened", "opened"],
       ["email.clicked", "clicked"],
     ])("maps %s to %s", async (eventType, expected) => {

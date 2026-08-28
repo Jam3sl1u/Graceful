@@ -60,6 +60,17 @@ describe("POST /api/webhooks/resend", () => {
     expect(mockMapResendEventToStatus).not.toHaveBeenCalled();
   });
 
+  it("bad signature short-circuits before malformed JSON is parsed", async () => {
+    mockVerifyResendWebhook.mockResolvedValue(false);
+
+    const res = await POST(makeReq("not-json{{{"));
+
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.code).toBe("UNAUTHENTICATED");
+    expect(mockMapResendEventToStatus).not.toHaveBeenCalled();
+  });
+
   it("verify throws: 500 + INTERNAL", async () => {
     mockVerifyResendWebhook.mockRejectedValue(
       new Error("Resend webhook is not configured — RESEND_WEBHOOK_SECRET must be set"),

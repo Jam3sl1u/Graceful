@@ -34,7 +34,7 @@ export async function deleteMember(
     }
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

@@ -38,3 +38,13 @@ export function getUserClient(claims: TestClaims): SupabaseClient<any> {
     },
   );
 }
+
+/** Anon-key client with NO Authorization header — the unauthenticated caller. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getAnonClient(): SupabaseClient<any> {
+  return createClient(
+    requireEnv("SUPABASE_TEST_URL"),
+    requireEnv("SUPABASE_TEST_ANON_KEY"),
+    { auth: { persistSession: false } },
+  );
+}

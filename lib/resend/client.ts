@@ -10,6 +10,7 @@ export type EmailDeliveryStatus =
   | "delayed"
   | "bounced"
   | "complained"
+  | "failed"
   | "opened"
   | "clicked";
 
@@ -74,6 +75,8 @@ export function mapResendEventToStatus(eventType: string): EmailDeliveryStatus |
       return "bounced";
     case "email.complained":
       return "complained";
+    case "email.failed":
+      return "failed";
     case "email.opened":
       return "opened";
     case "email.clicked":

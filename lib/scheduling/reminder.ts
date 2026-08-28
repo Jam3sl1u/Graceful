@@ -1,3 +1,5 @@
+import { SMS_MAX_LENGTH, truncateField } from "@/lib/notifications/sms-templates";
+
 // Pure, mocked-time-testable reminder logic for issue #45 (24-hour
 // dual-party invitation reminder scheduler). Kept pure (no "server-only")
 // like lib/scheduling/conflict-detection.ts's exports, so it can be
@@ -21,7 +23,8 @@ export function isReminderDue(
 
 // Member SMS copy. Keep it short (SMS).
 export function buildMemberReminderSms(memberName: string, weekLabel: string): string {
-  return `Hi ${memberName}, you still have a pending invitation for ${weekLabel}. Please respond when you can.`;
+  const sms = `Hi ${truncateField(memberName, 40)}, you still have a pending invitation for ${truncateField(weekLabel, 40)}. Please respond when you can.`;
+  return sms.length <= SMS_MAX_LENGTH ? sms : sms.slice(0, SMS_MAX_LENGTH);
 }
 
 // Week label used in both the SMS and (conceptually) the admin body.

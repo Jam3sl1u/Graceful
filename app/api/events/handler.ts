@@ -8,6 +8,7 @@ import type { Database } from "@/lib/supabase/types";
 import type { EventType } from "@/types/domain";
 import { createEventSchema, validateEventTiming } from "@/schemas/events";
 import { syncEventToAttendees, toGoogleEventId } from "@/lib/google-calendar/sync";
+import { GUEST_ACCESS_STATUSES } from "@/lib/invitations/guest-access";
 
 type EventsRow = Database["public"]["Tables"]["events"]["Row"];
 
@@ -47,7 +48,7 @@ export async function listEvents(req: NextRequest, lookup?: UserLookup): Promise
     const ctx = await requireAuth(req, lookup);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -67,10 +68,14 @@ export async function listEvents(req: NextRequest, lookup?: UserLookup): Promise
       return ok({ events: (data ?? []).map(toEventResponse) });
     }
 
-    const { data: invitations, error: invitationsError } = await supabase
-      .from("invitations")
-      .select("service_week_id")
-      .eq("user_id", ctx.userId);
+    // Guests only ever have scoped access via a live (pending/accepted)
+    // invitation (#72) — denied/withdrawn/expired grant nothing. member/
+    // set_leader scoping is unchanged: any invitation status counts.
+    let invitationsQuery = supabase.from("invitations").select("service_week_id").eq("user_id", ctx.userId);
+    if (ctx.role === "guest") {
+      invitationsQuery = invitationsQuery.in("status", GUEST_ACCESS_STATUSES);
+    }
+    const { data: invitations, error: invitationsError } = await invitationsQuery;
 
     if (invitationsError) {
       return fail("Internal error", ErrorCode.INTERNAL, 500);
@@ -114,7 +119,7 @@ export async function createEvent(req: NextRequest, lookup?: UserLookup): Promis
     const parsed = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

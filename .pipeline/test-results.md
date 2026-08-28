@@ -1,39 +1,26 @@
-# Test Results — Harden Resend webhook and email dispatch
+# Test Results — Make the Resend branch merge-ready
 
 ## Verdict: PASS
 
-All feature-specific tests and the full Jest suite pass after restoring the
-lockfile-pinned Bun dependencies and clearing stale generated `.next` types.
+The merged branch passes all requested checks against current main's dependency
+baseline, including Resend v6, Zod v4, Clerk v7, and TypeScript v6.
 
-## Focused coverage
-
-```
-bun run test -- tests/unit/lib/resend/templates.test.ts tests/unit/lib/resend/client.test.ts tests/unit/lib/resend/client-tester-supplement.test.ts tests/unit/app/api/webhooks-resend-route.test.ts tests/unit/app/api/webhooks-resend-route-tester-supplement.test.ts
-```
-
-Result: **5 suites / 55 tests passed**.
-
-This verifies HTTPS-only template links, optional absent practice links,
-captured sender behavior after environment mutation, non-email callback
-acknowledgement without `email_id`, malformed email callback validation, and
-delivery-versus-engagement logging behavior.
-
-## Full verification
+## Commands and results
 
 ```
 bun install
+bun run test -- webhook-verify-resend webhooks-resend-route lib/resend/client webhook-verify.test webhooks-pingram-route
 bun run lint
 bun run typecheck
 bun run test
 ```
 
-- `bun install` restored the lockfile-pinned dependency tree without changing
-  `package.json` or `bun.lock`.
-- `bun run lint` exited 0 with one pre-existing warning in ignored generated
-  `coverage/lcov-report/block-navigation.js`; no lint errors.
-- `bun run typecheck` passed after deleting stale generated `.next` output
-  whose validator referenced routes absent from this checkout.
-- `bun run test` passed: **88 suites / 1,106 tests**.
+- Dependency install completed from the merged lockfile.
+- Focused webhook/client coverage: **9 suites / 61 tests passed**.
+- Lint exited 0; the sole warning is pre-existing generated coverage output.
+- Typecheck passed.
+- Full Jest suite: **135 suites / 3,018 tests passed**.
 
-The test suite emits existing intentional console output from unrelated tests;
-it does not affect the passing verdict.
+The focused run covers both Pingram and Resend verifiers, real Svix signatures,
+the Resend failure event mapping, and bad-signature short-circuiting before
+JSON parsing.

@@ -159,7 +159,7 @@ describe("GET /api/availability", () => {
     mockGetSupabaseClient.mockReturnValue(makeSupabaseClientForGet({ data: [], error: null }));
 
     const res = await getAvailability(
-      makeReq({ query: { user_id: "11111111-1111-1111-1111-111111111111" } }),
+      makeReq({ query: { user_id: "11111111-1111-4111-8111-111111111111" } }),
       makeLookup("member"),
     );
     expect(res.status).toBe(403);
@@ -172,7 +172,7 @@ describe("GET /api/availability", () => {
     "returns 200 when a '%s' requests another user's availability",
     async (role) => {
       setUpAuth();
-      const otherId = "11111111-1111-1111-1111-111111111111";
+      const otherId = "11111111-1111-4111-8111-111111111111";
       const client = makeSupabaseClientForGet({
         data: [{ ...rowA, user_id: otherId }],
         error: null,

@@ -240,16 +240,16 @@ function baseState(): FakeState {
       { id: PUBLISHED_SETLIST_ID, church_group_id: CHURCH_GROUP_ID, status: "published" },
     ],
     songs: [
-      { id: "11111111-1111-1111-1111-111111111111", church_group_id: CHURCH_GROUP_ID, default_key: "C" },
-      { id: "22222222-2222-2222-2222-222222222222", church_group_id: CHURCH_GROUP_ID, default_key: "D" },
-      { id: "33333333-3333-3333-3333-333333333333", church_group_id: CHURCH_GROUP_ID, default_key: "E" },
-      { id: "44444444-4444-4444-4444-444444444444", church_group_id: OTHER_CHURCH_GROUP_ID, default_key: "F" },
+      { id: "11111111-1111-4111-8111-111111111111", church_group_id: CHURCH_GROUP_ID, default_key: "C" },
+      { id: "22222222-2222-4222-8222-222222222222", church_group_id: CHURCH_GROUP_ID, default_key: "D" },
+      { id: "33333333-3333-4333-8333-333333333333", church_group_id: CHURCH_GROUP_ID, default_key: "E" },
+      { id: "44444444-4444-4444-8444-444444444444", church_group_id: OTHER_CHURCH_GROUP_ID, default_key: "F" },
     ],
     setlistSongs: [
       {
         id: "ss-1",
         setlist_id: SETLIST_ID,
-        song_id: "11111111-1111-1111-1111-111111111111",
+        song_id: "11111111-1111-4111-8111-111111111111",
         position: 1,
         key_override: "A",
         notes: null,
@@ -257,7 +257,7 @@ function baseState(): FakeState {
       {
         id: "ss-2",
         setlist_id: SETLIST_ID,
-        song_id: "22222222-2222-2222-2222-222222222222",
+        song_id: "22222222-2222-4222-8222-222222222222",
         position: 2,
         key_override: "C",
         notes: null,
@@ -265,7 +265,7 @@ function baseState(): FakeState {
       {
         id: "ss-3",
         setlist_id: SETLIST_ID,
-        song_id: "33333333-3333-3333-3333-333333333333",
+        song_id: "33333333-3333-4333-8333-333333333333",
         position: 3,
         key_override: null,
         notes: null,
@@ -287,9 +287,9 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     const res = await reorderSetlist(
       makeReq({
         songs: [
-          { songId: "33333333-3333-3333-3333-333333333333", keyOverride: "G" },
-          { songId: "11111111-1111-1111-1111-111111111111" }, // omitted -> clears existing "A" override
-          { songId: "22222222-2222-2222-2222-222222222222", keyOverride: null }, // explicit null -> clears existing "C"
+          { songId: "33333333-3333-4333-8333-333333333333", keyOverride: "G" },
+          { songId: "11111111-1111-4111-8111-111111111111" }, // omitted -> clears existing "A" override
+          { songId: "22222222-2222-4222-8222-222222222222", keyOverride: null }, // explicit null -> clears existing "C"
         ],
       }),
       SETLIST_ID,
@@ -303,7 +303,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
       {
         id: "ss-3",
         setlistId: SETLIST_ID,
-        songId: "33333333-3333-3333-3333-333333333333",
+        songId: "33333333-3333-4333-8333-333333333333",
         position: 1,
         keyOverride: "G",
         defaultKey: "E",
@@ -314,7 +314,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
       {
         id: "ss-1",
         setlistId: SETLIST_ID,
-        songId: "11111111-1111-1111-1111-111111111111",
+        songId: "11111111-1111-4111-8111-111111111111",
         position: 2,
         keyOverride: null,
         defaultKey: "C",
@@ -325,7 +325,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
       {
         id: "ss-2",
         setlistId: SETLIST_ID,
-        songId: "22222222-2222-2222-2222-222222222222",
+        songId: "22222222-2222-4222-8222-222222222222",
         position: 3,
         keyOverride: null,
         defaultKey: "D",
@@ -342,7 +342,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(state));
 
     const res = await reorderSetlist(
-      makeReq({ songs: [{ songId: "11111111-1111-1111-1111-111111111111" }, { songId: "22222222-2222-2222-2222-222222222222" }, { songId: "33333333-3333-3333-3333-333333333333" }] }),
+      makeReq({ songs: [{ songId: "11111111-1111-4111-8111-111111111111" }, { songId: "22222222-2222-4222-8222-222222222222" }, { songId: "33333333-3333-4333-8333-333333333333" }] }),
       SETLIST_ID,
       makeLookup("admin"),
     );
@@ -381,7 +381,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(baseState()));
 
     const res = await reorderSetlist(
-      makeReq({ songs: [{ songId: "11111111-1111-1111-1111-111111111111" }, { songId: "22222222-2222-2222-2222-222222222222" }] }), // song-3 missing
+      makeReq({ songs: [{ songId: "11111111-1111-4111-8111-111111111111" }, { songId: "22222222-2222-4222-8222-222222222222" }] }), // song-3 missing
       SETLIST_ID,
       makeLookup("admin"),
     );
@@ -397,10 +397,10 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     const res = await reorderSetlist(
       makeReq({
         songs: [
-          { songId: "11111111-1111-1111-1111-111111111111" },
-          { songId: "22222222-2222-2222-2222-222222222222" },
-          { songId: "33333333-3333-3333-3333-333333333333" },
-          { songId: "66666666-6666-6666-6666-666666666666" },
+          { songId: "11111111-1111-4111-8111-111111111111" },
+          { songId: "22222222-2222-4222-8222-222222222222" },
+          { songId: "33333333-3333-4333-8333-333333333333" },
+          { songId: "66666666-6666-4666-8666-666666666666" },
         ],
       }),
       SETLIST_ID,
@@ -414,7 +414,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(baseState()));
 
     const res = await reorderSetlist(
-      makeReq({ songs: [{ songId: "11111111-1111-1111-1111-111111111111" }, { songId: "11111111-1111-1111-1111-111111111111" }, { songId: "22222222-2222-2222-2222-222222222222" }] }),
+      makeReq({ songs: [{ songId: "11111111-1111-4111-8111-111111111111" }, { songId: "11111111-1111-4111-8111-111111111111" }, { songId: "22222222-2222-4222-8222-222222222222" }] }),
       SETLIST_ID,
       makeLookup("admin"),
     );
@@ -428,9 +428,9 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     const res = await reorderSetlist(
       makeReq({
         songs: [
-          { songId: "11111111-1111-1111-1111-111111111111", keyOverride: "H" },
-          { songId: "22222222-2222-2222-2222-222222222222" },
-          { songId: "33333333-3333-3333-3333-333333333333" },
+          { songId: "11111111-1111-4111-8111-111111111111", keyOverride: "H" },
+          { songId: "22222222-2222-4222-8222-222222222222" },
+          { songId: "33333333-3333-4333-8333-333333333333" },
         ],
       }),
       SETLIST_ID,
@@ -446,7 +446,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(baseState()));
 
     const res = await reorderSetlist(
-      makeReq({ songs: [{ songId: "11111111-1111-1111-1111-111111111111" }] }),
+      makeReq({ songs: [{ songId: "11111111-1111-4111-8111-111111111111" }] }),
       SETLIST_ID,
       makeLookup("admin", OTHER_CHURCH_GROUP_ID),
     );
@@ -460,7 +460,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(baseState()));
 
     const res = await reorderSetlist(
-      makeReq({ songs: [{ songId: "11111111-1111-1111-1111-111111111111" }] }),
+      makeReq({ songs: [{ songId: "11111111-1111-4111-8111-111111111111" }] }),
       PUBLISHED_SETLIST_ID,
       makeLookup("admin"),
     );
@@ -474,7 +474,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(baseState()));
 
     const res = await reorderSetlist(
-      makeReq({ songs: [{ songId: "11111111-1111-1111-1111-111111111111" }] }),
+      makeReq({ songs: [{ songId: "11111111-1111-4111-8111-111111111111" }] }),
       SETLIST_ID,
       makeLookup(role),
     );
@@ -486,7 +486,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     setUpAuth(null);
 
     const res = await reorderSetlist(
-      makeReq({ songs: [{ songId: "11111111-1111-1111-1111-111111111111" }] }),
+      makeReq({ songs: [{ songId: "11111111-1111-4111-8111-111111111111" }] }),
       SETLIST_ID,
       makeLookup("admin"),
     );
@@ -502,7 +502,7 @@ describe("PUT /api/setlists/:id (reorderSetlist)", () => {
     );
 
     const res = await reorderSetlist(
-      makeReq({ songs: [{ songId: "11111111-1111-1111-1111-111111111111" }, { songId: "22222222-2222-2222-2222-222222222222" }, { songId: "33333333-3333-3333-3333-333333333333" }] }),
+      makeReq({ songs: [{ songId: "11111111-1111-4111-8111-111111111111" }, { songId: "22222222-2222-4222-8222-222222222222" }, { songId: "33333333-3333-4333-8333-333333333333" }] }),
       SETLIST_ID,
       makeLookup("admin"),
     );
@@ -525,11 +525,11 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
     setUpAuth();
     const state = baseState();
     // remove song-3 from the setlist so it's addable
-    state.setlistSongs = state.setlistSongs.filter((r) => r.song_id !== "33333333-3333-3333-3333-333333333333");
+    state.setlistSongs = state.setlistSongs.filter((r) => r.song_id !== "33333333-3333-4333-8333-333333333333");
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(state));
 
     const res = await addSetlistSong(
-      makeReq({ songId: "33333333-3333-3333-3333-333333333333", keyOverride: "Bb" }),
+      makeReq({ songId: "33333333-3333-4333-8333-333333333333", keyOverride: "Bb" }),
       SETLIST_ID,
       makeLookup("set_leader"),
     );
@@ -539,7 +539,7 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
     const songs: SetlistSongResponse[] = body.data.songs;
     expect(songs).toHaveLength(3);
     expect(songs[2]).toMatchObject({
-      songId: "33333333-3333-3333-3333-333333333333",
+      songId: "33333333-3333-4333-8333-333333333333",
       position: 3,
       keyOverride: "Bb",
       defaultKey: "E",
@@ -554,7 +554,7 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(state));
 
     const res = await addSetlistSong(
-      makeReq({ songId: "44444444-4444-4444-4444-444444444444" }),
+      makeReq({ songId: "44444444-4444-4444-8444-444444444444" }),
       SETLIST_ID,
       makeLookup("admin"),
     );
@@ -569,7 +569,7 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(state));
 
     const res = await addSetlistSong(
-      makeReq({ songId: "11111111-1111-1111-1111-111111111111" }), // already in setlist per baseState
+      makeReq({ songId: "11111111-1111-4111-8111-111111111111" }), // already in setlist per baseState
       SETLIST_ID,
       makeLookup("admin"),
     );
@@ -582,11 +582,11 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
   it("returns 422 for an invalid keyOverride (BR-09)", async () => {
     setUpAuth();
     const state = baseState();
-    state.setlistSongs = state.setlistSongs.filter((r) => r.song_id !== "33333333-3333-3333-3333-333333333333");
+    state.setlistSongs = state.setlistSongs.filter((r) => r.song_id !== "33333333-3333-4333-8333-333333333333");
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(state));
 
     const res = await addSetlistSong(
-      makeReq({ songId: "33333333-3333-3333-3333-333333333333", keyOverride: "Zz" }),
+      makeReq({ songId: "33333333-3333-4333-8333-333333333333", keyOverride: "Zz" }),
       SETLIST_ID,
       makeLookup("admin"),
     );
@@ -606,7 +606,7 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(baseState()));
 
     const res = await addSetlistSong(
-      makeReq({ songId: "11111111-1111-1111-1111-111111111111" }),
+      makeReq({ songId: "11111111-1111-4111-8111-111111111111" }),
       SETLIST_ID,
       makeLookup("admin", OTHER_CHURCH_GROUP_ID),
     );
@@ -618,7 +618,7 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(baseState()));
 
     const res = await addSetlistSong(
-      makeReq({ songId: "11111111-1111-1111-1111-111111111111" }),
+      makeReq({ songId: "11111111-1111-4111-8111-111111111111" }),
       PUBLISHED_SETLIST_ID,
       makeLookup("admin"),
     );
@@ -629,7 +629,7 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
     setUpAuth();
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(baseState()));
 
-    const res = await addSetlistSong(makeReq({ songId: "11111111-1111-1111-1111-111111111111" }), SETLIST_ID, makeLookup(role));
+    const res = await addSetlistSong(makeReq({ songId: "11111111-1111-4111-8111-111111111111" }), SETLIST_ID, makeLookup(role));
     expect(res.status).toBe(403);
     expect(mockGetSupabaseClient).not.toHaveBeenCalled();
   });
@@ -637,7 +637,7 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
   it("returns 401 UNAUTHENTICATED when getToken yields no JWT", async () => {
     setUpAuth(null);
 
-    const res = await addSetlistSong(makeReq({ songId: "11111111-1111-1111-1111-111111111111" }), SETLIST_ID, makeLookup("admin"));
+    const res = await addSetlistSong(makeReq({ songId: "11111111-1111-4111-8111-111111111111" }), SETLIST_ID, makeLookup("admin"));
     expect(res.status).toBe(401);
     expect(mockGetSupabaseClient).not.toHaveBeenCalled();
   });
@@ -645,12 +645,12 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
   it("maps a generic insert error to 500 INTERNAL", async () => {
     setUpAuth();
     const state = baseState();
-    state.setlistSongs = state.setlistSongs.filter((r) => r.song_id !== "33333333-3333-3333-3333-333333333333");
+    state.setlistSongs = state.setlistSongs.filter((r) => r.song_id !== "33333333-3333-4333-8333-333333333333");
     mockGetSupabaseClient.mockReturnValue(
       makeFakeSupabase(state, { setlistSongsInsertError: { message: "connection refused" } }),
     );
 
-    const res = await addSetlistSong(makeReq({ songId: "33333333-3333-3333-3333-333333333333" }), SETLIST_ID, makeLookup("admin"));
+    const res = await addSetlistSong(makeReq({ songId: "33333333-3333-4333-8333-333333333333" }), SETLIST_ID, makeLookup("admin"));
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.code).toBe("INTERNAL");
@@ -659,7 +659,7 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
   it("maps a Postgres unique-violation (23505) race on insert to 409 CONFLICT, not 500", async () => {
     setUpAuth();
     const state = baseState();
-    state.setlistSongs = state.setlistSongs.filter((r) => r.song_id !== "33333333-3333-3333-3333-333333333333");
+    state.setlistSongs = state.setlistSongs.filter((r) => r.song_id !== "33333333-3333-4333-8333-333333333333");
     mockGetSupabaseClient.mockReturnValue(
       makeFakeSupabase(state, {
         setlistSongsInsertError: {
@@ -669,7 +669,7 @@ describe("POST /api/setlists/:id/songs (addSetlistSong)", () => {
       }),
     );
 
-    const res = await addSetlistSong(makeReq({ songId: "33333333-3333-3333-3333-333333333333" }), SETLIST_ID, makeLookup("admin"));
+    const res = await addSetlistSong(makeReq({ songId: "33333333-3333-4333-8333-333333333333" }), SETLIST_ID, makeLookup("admin"));
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.code).toBe("CONFLICT");
@@ -686,7 +686,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
     const state = baseState(); // song-1 pos1, song-2 pos2, song-3 pos3
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(state));
 
-    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "22222222-2222-2222-2222-222222222222", makeLookup("admin"));
+    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "22222222-2222-4222-8222-222222222222", makeLookup("admin"));
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -695,7 +695,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
       {
         id: "ss-1",
         setlistId: SETLIST_ID,
-        songId: "11111111-1111-1111-1111-111111111111",
+        songId: "11111111-1111-4111-8111-111111111111",
         position: 1,
         keyOverride: "A",
         defaultKey: "C",
@@ -706,7 +706,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
       {
         id: "ss-3",
         setlistId: SETLIST_ID,
-        songId: "33333333-3333-3333-3333-333333333333",
+        songId: "33333333-3333-4333-8333-333333333333",
         position: 2,
         keyOverride: null,
         defaultKey: "E",
@@ -723,7 +723,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
     state.setlistSongs = [state.setlistSongs[0]!]; // only song-1 left
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(state));
 
-    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "11111111-1111-1111-1111-111111111111", makeLookup("admin"));
+    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "11111111-1111-4111-8111-111111111111", makeLookup("admin"));
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -737,7 +737,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
     const res = await removeSetlistSong(
       makeReq(),
       SETLIST_ID,
-      "55555555-5555-5555-5555-555555555555",
+      "55555555-5555-4555-8555-555555555555",
       makeLookup("admin"),
     );
     expect(res.status).toBe(404);
@@ -752,7 +752,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
     const res = await removeSetlistSong(
       makeReq(),
       SETLIST_ID,
-      "11111111-1111-1111-1111-111111111111",
+      "11111111-1111-4111-8111-111111111111",
       makeLookup("admin", OTHER_CHURCH_GROUP_ID),
     );
     expect(res.status).toBe(404);
@@ -765,7 +765,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
     const res = await removeSetlistSong(
       makeReq(),
       PUBLISHED_SETLIST_ID,
-      "11111111-1111-1111-1111-111111111111",
+      "11111111-1111-4111-8111-111111111111",
       makeLookup("admin"),
     );
     expect(res.status).toBe(409);
@@ -775,7 +775,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
     setUpAuth();
     mockGetSupabaseClient.mockReturnValue(makeFakeSupabase(baseState()));
 
-    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "11111111-1111-1111-1111-111111111111", makeLookup(role));
+    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "11111111-1111-4111-8111-111111111111", makeLookup(role));
     expect(res.status).toBe(403);
     expect(mockGetSupabaseClient).not.toHaveBeenCalled();
   });
@@ -783,7 +783,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
   it("returns 401 UNAUTHENTICATED when getToken yields no JWT", async () => {
     setUpAuth(null);
 
-    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "11111111-1111-1111-1111-111111111111", makeLookup("admin"));
+    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "11111111-1111-4111-8111-111111111111", makeLookup("admin"));
     expect(res.status).toBe(401);
     expect(mockGetSupabaseClient).not.toHaveBeenCalled();
   });
@@ -795,7 +795,7 @@ describe("DELETE /api/setlists/:id/songs/:songId (removeSetlistSong)", () => {
       makeFakeSupabase(state, { setlistSongsDeleteError: { message: "connection refused" } }),
     );
 
-    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "11111111-1111-1111-1111-111111111111", makeLookup("admin"));
+    const res = await removeSetlistSong(makeReq(), SETLIST_ID, "11111111-1111-4111-8111-111111111111", makeLookup("admin"));
     expect(res.status).toBe(500);
     const body = await res.json();
     expect(body.code).toBe("INTERNAL");
