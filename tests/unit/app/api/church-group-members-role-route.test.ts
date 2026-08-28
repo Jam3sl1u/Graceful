@@ -16,8 +16,8 @@ const mockWriteAuditLog = writeAuditLog as unknown as jest.Mock;
 
 const JWT = "supabase-jwt";
 const CHURCH_GROUP_ID = "group-1";
-const ADMIN_ID = "11111111-1111-1111-1111-111111111111";
-const TARGET_ID = "22222222-2222-2222-2222-222222222222";
+const ADMIN_ID = "11111111-1111-4111-8111-111111111111";
+const TARGET_ID = "22222222-2222-4222-8222-222222222222";
 
 function makeLookup(role: UserRole, userId: string = ADMIN_ID): UserLookup {
   const ctx: AuthContext = { userId, churchGroupId: CHURCH_GROUP_ID, role };

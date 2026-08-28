@@ -23,7 +23,7 @@ export async function PUT(req: NextRequest) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
 
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

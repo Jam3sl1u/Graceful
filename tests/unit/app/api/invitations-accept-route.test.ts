@@ -17,7 +17,7 @@ const mockGetAnonSupabaseClient = getAnonSupabaseClient as unknown as jest.Mock;
 const JWT = "supabase-jwt";
 const USER_ID = "user-1";
 const CHURCH_GROUP_ID = "group-1";
-const INVITATION_ID = "11111111-1111-1111-1111-111111111111";
+const INVITATION_ID = "11111111-1111-4111-8111-111111111111";
 const TOKEN = "a".repeat(64);
 
 function makeReq(body?: unknown): NextRequest {

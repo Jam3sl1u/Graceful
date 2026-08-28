@@ -37,7 +37,7 @@ export async function listInstruments(req: NextRequest, lookup?: UserLookup): Pr
     const ctx = await requireAuth(req, lookup);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -76,7 +76,7 @@ export async function addInstrument(req: NextRequest, lookup?: UserLookup): Prom
     const parsed = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -137,7 +137,7 @@ export async function submitCustomInstrument(
     const parsed = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -188,7 +188,7 @@ export async function promoteInstrument(
     requireRole(ctx, ["admin"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -231,7 +231,7 @@ export async function deleteInstrument(
     requireRole(ctx, ["admin"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

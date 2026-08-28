@@ -24,7 +24,7 @@ export async function getProfile(req: NextRequest, lookup?: UserLookup): Promise
     const ctx = await requireAuth(req, lookup);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -81,7 +81,7 @@ export async function updateProfile(req: NextRequest, lookup?: UserLookup): Prom
     const parsed = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

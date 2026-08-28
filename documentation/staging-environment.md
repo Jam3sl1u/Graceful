@@ -59,8 +59,8 @@ production) versus which may be shared across environments.
 | Clerk | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `CLERK_WEBHOOK_SECRET` | Distinct — Clerk test instance/test mode keys (see §4) |
 | Pingram | `PINGRAM_API_KEY`, `PINGRAM_WEBHOOK_SECRET`, `PINGRAM_API_BASE_URL`, `PINGRAM_SENDER` | Distinct — Pingram test environment keys (see §4); `PINGRAM_API_BASE_URL`/`PINGRAM_SENDER` are optional overrides, left unset unless Pingram's staging account requires a distinct base URL or sender id |
 | Resend | `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET` | Distinct — Resend test/sandbox key (see §4) |
-| Google Calendar | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY` | Distinct — `GOOGLE_REDIRECT_URI` must point at the staging host; use a dedicated OAuth client and encryption key for staging |
-| Cloudflare R2 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT` | Distinct — separate staging R2 bucket and credentials (PRD §25.7) |
+| Google Calendar | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `TOKEN_ENCRYPTION_KEY` | Distinct — `GOOGLE_REDIRECT_URI` must point at the staging host; use a dedicated OAuth client and encryption key for staging (step-by-step: `google-oauth-r2-provisioning.md` §3–§4) |
+| Cloudflare R2 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT` | Distinct — separate staging R2 bucket and credentials (PRD §25.7) (step-by-step: `google-oauth-r2-provisioning.md` §5) |
 | Upstash Redis | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Distinct — dedicated staging Redis instance |
 | Upstash QStash | `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` | Distinct — dedicated staging QStash credentials |
 | Modal | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, `MODAL_WEBHOOK_SECRET` | Distinct — dedicated staging Modal token/webhook secret |
@@ -129,7 +129,8 @@ The `e2e` job in `.github/workflows/ci.yml` runs `bun run test:e2e`
 (Playwright) against the real staging deployment on every PR, gated by the
 same secrets-gated pattern as `rls-integration` (skipped, not failed, when
 secrets are absent — see `check-secrets`). It covers the invitation
-accept/deny/reminder flows and conflict detection
+accept/deny/reminder flows, conflict detection, the setlist publish flow,
+and Google Calendar event sync (issue #66)
 (`tests/e2e/*.spec.ts`), and needs two things beyond what §3–§6 already
 cover:
 
@@ -160,6 +161,11 @@ cover:
 | `E2E_SUPABASE_URL` | Staging Supabase project URL — seed/teardown only, never used to bypass app authorization |
 | `E2E_SUPABASE_SERVICE_ROLE_KEY` | Staging Supabase service-role key — seed/teardown only |
 | `CRON_SECRET` | Same secret as §6 — needed by `invitation-reminder.spec.ts` to trigger the reminder RPC directly |
+| `E2E_TOKEN_ENCRYPTION_KEY` | optional — `calendar-sync.spec.ts` skips when absent — encrypts the seeded Google token row; see §7.1 |
+| `E2E_GOOGLE_CLIENT_ID` | optional — `calendar-sync.spec.ts` skips when absent — OAuth client id used to redeem the test refresh token |
+| `E2E_GOOGLE_CLIENT_SECRET` | optional — `calendar-sync.spec.ts` skips when absent — OAuth client secret paired with the id above |
+| `E2E_GOOGLE_REFRESH_TOKEN` | optional — `calendar-sync.spec.ts` skips when absent — refresh token for the dedicated Google test account |
+| `E2E_GOOGLE_CALENDAR_ID` | optional — not part of the skip gate (see `GOOGLE_SYNC_VARS` in `tests/e2e/support/google.ts`) — defaults to `primary` when unset |
 
 **Note (issue #52 OQ2/OQ3):** `GET /api/notifications` is an unimplemented
 501 stub (`app/api/notifications/route.ts`) as of this issue, so admin
@@ -168,6 +174,47 @@ the service-role client rather than through that endpoint. Admin SMS/email
 on invitation deny is deferred until #67/#68 ship (both dispatch primitives
 are unimplemented throwing stubs today) and is not asserted here; the member
 side of the 24h reminder is dropped for the same reason (`sendSms` stub).
+
+The setlist publish specs (`setlist-publish.spec.ts`,
+`setlist-duplicate-song.spec.ts`, issue #66) need no secrets beyond the
+seven above — they gate on `e2eAuthEnabled` only.
+
+### 7.1 Google Calendar E2E (issue #66)
+
+`calendar-sync.spec.ts` exercises the real Google Calendar sync flow
+(`lib/google-calendar/sync.ts`, `app/api/events/**`) against an actual
+Google Calendar, not a mock. It gates on `e2eAuthEnabled` **and** the four
+`GOOGLE_SYNC_VARS` secrets above (`E2E_TOKEN_ENCRYPTION_KEY`,
+`E2E_GOOGLE_CLIENT_ID`, `E2E_GOOGLE_CLIENT_SECRET`, `E2E_GOOGLE_REFRESH_TOKEN`
+— see `tests/e2e/support/google.ts`) and skips cleanly when any of those four
+are absent — until a human completes the one-time setup below, it will not
+run in CI. `E2E_GOOGLE_CALENDAR_ID` is separate: it's not part of the skip
+gate, it only controls which calendar the spec targets (see below).
+
+Human setup steps:
+
+1. **Use a dedicated Google test account, and the SAME OAuth client the
+   staging deployment itself uses** (staging's `GOOGLE_CLIENT_ID` /
+   `GOOGLE_CLIENT_SECRET`) — a refresh token is only redeemable by the OAuth
+   client that issued it, so a different client id/secret pair will not
+   work.
+2. Complete the OAuth consent flow once, for that test account, with scope
+   `https://www.googleapis.com/auth/calendar.events`,
+   `access_type=offline`, and `prompt=consent` (offline + consent are
+   required to actually get a refresh token back rather than just an access
+   token). Store the resulting refresh token as the `E2E_GOOGLE_REFRESH_TOKEN`
+   GitHub repo secret.
+3. `E2E_TOKEN_ENCRYPTION_KEY` must be set to the **exact same value** as
+   staging's `TOKEN_ENCRYPTION_KEY` env var — the app decrypts the seeded
+   token row with its own key, so a mismatched key makes every sync attempt
+   fail to decrypt.
+4. `E2E_GOOGLE_CALENDAR_ID` is optional; it defaults to `primary` (the test
+   account's primary calendar) when unset.
+5. **Publishing status matters.** If the Google OAuth app is left in
+   "Testing" publishing status, Google expires refresh tokens after ~7 days
+   of inactivity, which will make the spec start *failing* (not skipping)
+   once that happens. Publish the OAuth app (or periodically re-mint the
+   refresh token) to avoid this.
 
 ## 8. Verification checklist
 
@@ -180,3 +227,23 @@ side of the 24h reminder is dropped for the same reason (`sendSms` stub).
       staging environment (verified via a Vercel deployment log entry).
 - [ ] This document exists at `documentation/staging-environment.md` and is
       linked from `README.md`.
+
+## 9. Load / performance testing (issue #81)
+
+The Phase 1 pre-launch load/performance test pass (PRD §14.1) runs a Bun +
+TypeScript harness (`tests/load/`, `bun run test:load`) against this staging
+environment — see
+[`documentation/performance-testing.md`](performance-testing.md) for the
+harness design, prerequisites, running instructions, known limitations, and
+the results table issue #83's production deploy gate reads.
+
+| Var | Required | Meaning |
+| --- | --- | --- |
+| `LOAD_TEST_BASE_URL` | yes (falls back to `STAGING_APP_URL`) | Staging base URL |
+| `LOAD_TEST_ADMIN_TOKENS` | yes | Comma-separated Clerk session JWTs for admin-persona user(s) |
+| `LOAD_TEST_MEMBER_TOKENS` | yes | Comma-separated Clerk session JWTs for member-persona user(s) |
+| `LOAD_TEST_SONG_ID` | no | Song uuid with ≥1 attached document; the signed-URL scenario is `skipped` when absent |
+
+These are local/operator-run env vars for a manual pass, not GitHub Actions
+secrets — `test:load` is not wired into `.github/workflows/ci.yml` (see
+`documentation/performance-testing.md` §3 for why).

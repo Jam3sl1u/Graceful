@@ -7,10 +7,10 @@
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import SetlistBuilder from "@/app/(app)/setlists/[id]/setlist-builder";
 
-const SETLIST_ID = "11111111-1111-1111-1111-111111111111";
-const SONG_1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"; // in setlist, default key C
-const SONG_2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"; // in setlist, default key null
-const SONG_3 = "cccccccc-cccc-cccc-cccc-cccccccccccc"; // catalog only, not in setlist
+const SETLIST_ID = "11111111-1111-4111-8111-111111111111";
+const SONG_1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"; // in setlist, default key C
+const SONG_2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"; // in setlist, default key null
+const SONG_3 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"; // catalog only, not in setlist
 
 function jsonResponse(status: number, body: unknown): Response {
   return {
@@ -230,7 +230,7 @@ describe("SetlistBuilder", () => {
   });
 
   it("quick-add flow: creates a song then adds it to the setlist", async () => {
-    const newSong = { id: "dddddddd-dddd-dddd-dddd-dddddddddddd", title: "Brand New Song", artist: null, defaultKey: null };
+    const newSong = { id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", title: "Brand New Song", artist: null, defaultKey: null };
     const fetchMock = jest.fn((url: string, init?: RequestInit) => {
       if (url === `/api/songs` && init?.method === "POST") {
         return Promise.resolve(jsonResponse(201, { data: { song: newSong } }));
@@ -275,7 +275,7 @@ describe("SetlistBuilder", () => {
   });
 
   it("quick-add flow: a failed add-to-setlist after a successful song creation still leaves the title resyncable (not stuck blank)", async () => {
-    const newSong = { id: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", title: "My Custom Title", artist: null, defaultKey: null };
+    const newSong = { id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", title: "My Custom Title", artist: null, defaultKey: null };
     const fetchMock = jest.fn((url: string, init?: RequestInit) => {
       if (url === `/api/songs` && init?.method === "POST") {
         return Promise.resolve(jsonResponse(201, { data: { song: newSong } }));

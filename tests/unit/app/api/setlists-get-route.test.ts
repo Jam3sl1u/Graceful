@@ -213,14 +213,14 @@ function baseState(): FakeState {
       },
     ],
     songs: [
-      { id: "11111111-1111-1111-1111-111111111111", church_group_id: CHURCH_GROUP_ID, default_key: "C" },
-      { id: "22222222-2222-2222-2222-222222222222", church_group_id: CHURCH_GROUP_ID, default_key: "D" },
+      { id: "11111111-1111-4111-8111-111111111111", church_group_id: CHURCH_GROUP_ID, default_key: "C" },
+      { id: "22222222-2222-4222-8222-222222222222", church_group_id: CHURCH_GROUP_ID, default_key: "D" },
     ],
     setlistSongs: [
       {
         id: "ss-1",
         setlist_id: SETLIST_ID,
-        song_id: "11111111-1111-1111-1111-111111111111",
+        song_id: "11111111-1111-4111-8111-111111111111",
         position: 1,
         key_override: "A",
         notes: "Play softly",
@@ -228,7 +228,7 @@ function baseState(): FakeState {
       {
         id: "ss-2",
         setlist_id: SETLIST_ID,
-        song_id: "22222222-2222-2222-2222-222222222222",
+        song_id: "22222222-2222-4222-8222-222222222222",
         position: 2,
         key_override: null,
         notes: null,
@@ -256,7 +256,7 @@ describe("GET /api/setlists/:id (getSetlistWithSongs)", () => {
       {
         id: "ss-1",
         setlistId: SETLIST_ID,
-        songId: "11111111-1111-1111-1111-111111111111",
+        songId: "11111111-1111-4111-8111-111111111111",
         position: 1,
         keyOverride: "A",
         defaultKey: "C",
@@ -267,7 +267,7 @@ describe("GET /api/setlists/:id (getSetlistWithSongs)", () => {
       {
         id: "ss-2",
         setlistId: SETLIST_ID,
-        songId: "22222222-2222-2222-2222-222222222222",
+        songId: "22222222-2222-4222-8222-222222222222",
         position: 2,
         keyOverride: null,
         defaultKey: "D",
@@ -379,8 +379,8 @@ describe("PUT /api/setlists/:id (reorderSetlist) — notes guard", () => {
     const res = await reorderSetlist(
       makeReq({
         songs: [
-          { songId: "11111111-1111-1111-1111-111111111111" }, // notes omitted
-          { songId: "22222222-2222-2222-2222-222222222222" }, // notes omitted
+          { songId: "11111111-1111-4111-8111-111111111111" }, // notes omitted
+          { songId: "22222222-2222-4222-8222-222222222222" }, // notes omitted
         ],
       }),
       SETLIST_ID,
@@ -390,7 +390,7 @@ describe("PUT /api/setlists/:id (reorderSetlist) — notes guard", () => {
 
     const body = await res.json();
     const songs: SetlistSongResponse[] = body.data.songs;
-    const song1 = songs.find((s) => s.songId === "11111111-1111-1111-1111-111111111111");
+    const song1 = songs.find((s) => s.songId === "11111111-1111-4111-8111-111111111111");
     expect(song1?.notes).toBe("Play softly"); // untouched
   });
 
@@ -402,8 +402,8 @@ describe("PUT /api/setlists/:id (reorderSetlist) — notes guard", () => {
     const res = await reorderSetlist(
       makeReq({
         songs: [
-          { songId: "11111111-1111-1111-1111-111111111111", notes: null },
-          { songId: "22222222-2222-2222-2222-222222222222" },
+          { songId: "11111111-1111-4111-8111-111111111111", notes: null },
+          { songId: "22222222-2222-4222-8222-222222222222" },
         ],
       }),
       SETLIST_ID,
@@ -413,7 +413,7 @@ describe("PUT /api/setlists/:id (reorderSetlist) — notes guard", () => {
 
     const body = await res.json();
     const songs: SetlistSongResponse[] = body.data.songs;
-    const song1 = songs.find((s) => s.songId === "11111111-1111-1111-1111-111111111111");
+    const song1 = songs.find((s) => s.songId === "11111111-1111-4111-8111-111111111111");
     expect(song1?.notes).toBeNull();
   });
 
@@ -425,8 +425,8 @@ describe("PUT /api/setlists/:id (reorderSetlist) — notes guard", () => {
     const res = await reorderSetlist(
       makeReq({
         songs: [
-          { songId: "11111111-1111-1111-1111-111111111111" },
-          { songId: "22222222-2222-2222-2222-222222222222", notes: "Bring capo" },
+          { songId: "11111111-1111-4111-8111-111111111111" },
+          { songId: "22222222-2222-4222-8222-222222222222", notes: "Bring capo" },
         ],
       }),
       SETLIST_ID,
@@ -436,7 +436,7 @@ describe("PUT /api/setlists/:id (reorderSetlist) — notes guard", () => {
 
     const body = await res.json();
     const songs: SetlistSongResponse[] = body.data.songs;
-    const song2 = songs.find((s) => s.songId === "22222222-2222-2222-2222-222222222222");
+    const song2 = songs.find((s) => s.songId === "22222222-2222-4222-8222-222222222222");
     expect(song2?.notes).toBe("Bring capo");
   });
 
@@ -448,10 +448,10 @@ describe("PUT /api/setlists/:id (reorderSetlist) — notes guard", () => {
       makeReq({
         songs: [
           {
-            songId: "11111111-1111-1111-1111-111111111111",
+            songId: "11111111-1111-4111-8111-111111111111",
             notes: "x".repeat(1001),
           },
-          { songId: "22222222-2222-2222-2222-222222222222" },
+          { songId: "22222222-2222-4222-8222-222222222222" },
         ],
       }),
       SETLIST_ID,

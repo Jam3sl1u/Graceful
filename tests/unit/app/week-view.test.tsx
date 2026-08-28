@@ -7,15 +7,15 @@
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import WeekView from "@/app/(app)/week/[id]/week-view";
 
-const SERVICE_WEEK_ID = "22222222-2222-2222-2222-222222222222";
-const PREV_WEEK_ID = "33333333-3333-3333-3333-333333333333";
-const NEXT_WEEK_ID = "44444444-4444-4444-4444-444444444444";
+const SERVICE_WEEK_ID = "22222222-2222-4222-8222-222222222222";
+const PREV_WEEK_ID = "33333333-3333-4333-8333-333333333333";
+const NEXT_WEEK_ID = "44444444-4444-4444-8444-444444444444";
 
-const MEMBER_OPEN = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-const MEMBER_PENDING = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-const MEMBER_CONFIRMED = "cccccccc-cccc-cccc-cccc-cccccccccccc";
-const MEMBER_DECLINED = "dddddddd-dddd-dddd-dddd-dddddddddddd";
-const MEMBER_CONFLICT = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+const MEMBER_OPEN = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const MEMBER_PENDING = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const MEMBER_CONFIRMED = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const MEMBER_DECLINED = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const MEMBER_CONFLICT = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
 function jsonResponse(status: number, body: unknown): Response {
   return {
@@ -375,6 +375,88 @@ describe("WeekView", () => {
 
       await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
       expect(within(openSlot).getByText("Open")).toBeInTheDocument();
+    });
+  });
+
+  describe("Invite a guest form (#72)", () => {
+    const GUEST_ID = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    const guestInvitation = {
+      id: "inv-guest-1",
+      serviceWeekId: SERVICE_WEEK_ID,
+      userId: GUEST_ID,
+      roleNote: null,
+      status: "pending",
+      responseDeadline: "2026-07-20T00:00:00Z",
+      createdAt: "2026-07-13T00:00:00Z",
+    };
+    const membersWithGuest = [...members, { id: GUEST_ID, name: "guest@example.com", role: "guest" }];
+
+    it("refreshes the directory after a successful invite, so the Guests section shows the new guest without a reload", async () => {
+      let membersCallCount = 0;
+      const fetchMock = jest.fn((url: string, init?: RequestInit) => {
+        if (url === "/api/church-group/members") {
+          membersCallCount += 1;
+          const body = membersCallCount === 1 ? members : membersWithGuest;
+          return Promise.resolve(jsonResponse(200, { data: { members: body } }));
+        }
+        if (url === "/api/invitations/guest" && init?.method === "POST") {
+          return Promise.resolve(
+            jsonResponse(201, {
+              data: { invitation: guestInvitation, isNewUser: false, accountSetupUrl: null },
+            }),
+          );
+        }
+        return mockFetchByUrl()(url);
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      render(<WeekView serviceWeekId={SERVICE_WEEK_ID} />);
+      await waitFor(() => expect(screen.getByText("Sunday Service")).toBeInTheDocument());
+      expect(screen.getByText("No guests invited for this week yet")).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText("Guest email"), {
+        target: { value: "guest@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /invite guest/i }));
+
+      await waitFor(() =>
+        expect(screen.queryByText("No guests invited for this week yet")).not.toBeInTheDocument(),
+      );
+      expect(screen.getByText("guest@example.com")).toBeInTheDocument();
+      expect(membersCallCount).toBe(2);
+    });
+
+    it("a members-refetch failure after a successful invite does not block the accountSetupUrl success feedback", async () => {
+      const setupUrl = "https://app.example/guest/token-123";
+      let membersCallCount = 0;
+      const fetchMock = jest.fn((url: string, init?: RequestInit) => {
+        if (url === "/api/church-group/members") {
+          membersCallCount += 1;
+          if (membersCallCount === 1) {
+            return Promise.resolve(jsonResponse(200, { data: { members } }));
+          }
+          return Promise.resolve(jsonResponse(500, { error: "Internal error", code: "INTERNAL" }));
+        }
+        if (url === "/api/invitations/guest" && init?.method === "POST") {
+          return Promise.resolve(
+            jsonResponse(201, {
+              data: { invitation: guestInvitation, isNewUser: true, accountSetupUrl: setupUrl },
+            }),
+          );
+        }
+        return mockFetchByUrl()(url);
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      render(<WeekView serviceWeekId={SERVICE_WEEK_ID} />);
+      await waitFor(() => expect(screen.getByText("Sunday Service")).toBeInTheDocument());
+
+      fireEvent.change(screen.getByLabelText("Guest email"), {
+        target: { value: "new-guest@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /invite guest/i }));
+
+      await waitFor(() => expect(screen.getByText(setupUrl)).toBeInTheDocument());
     });
   });
 });

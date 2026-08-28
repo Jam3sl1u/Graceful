@@ -6,6 +6,7 @@ import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import { updateServiceWeekSchema } from "@/schemas/service-weeks";
+import { guestHasWeekAccess } from "@/lib/invitations/guest-access";
 import { toServiceWeekResponse } from "../handler";
 
 // GET /api/service-weeks/:id — any authenticated member. Guests must have a
@@ -20,7 +21,7 @@ export async function getServiceWeek(
     const ctx = await requireAuth(req, lookup);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -41,19 +42,9 @@ export async function getServiceWeek(
     }
 
     if (ctx.role === "guest") {
-      const { data: invitation, error: invitationError } = await supabase
-        .from("invitations")
-        .select("id")
-        .eq("service_week_id", id)
-        .eq("user_id", ctx.userId)
-        .maybeSingle();
-
-      if (invitationError) {
-        return fail("Internal error", ErrorCode.INTERNAL, 500);
-      }
-      if (!invitation) {
-        return fail("Not found", ErrorCode.NOT_FOUND, 404);
-      }
+      const access = await guestHasWeekAccess(supabase, id, ctx.userId);
+      if (access.dbError) return fail("Internal error", ErrorCode.INTERNAL, 500);
+      if (!access.allowed) return fail("Not found", ErrorCode.NOT_FOUND, 404);
     }
 
     return ok({ serviceWeek: toServiceWeekResponse(data) });
@@ -81,7 +72,7 @@ export async function updateServiceWeek(
     const parsed = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -135,7 +126,7 @@ export async function deleteServiceWeek(
     requireRole(ctx, ["admin"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -215,7 +206,7 @@ async function setServiceWeekCancelled(
     requireRole(ctx, ["admin"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

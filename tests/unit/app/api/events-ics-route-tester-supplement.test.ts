@@ -34,9 +34,9 @@ import type { AuthContext, UserLookup } from "@/lib/api/auth";
 const mockAuth = auth as unknown as jest.Mock;
 const mockGetSupabaseClient = getSupabaseClient as unknown as jest.Mock;
 
-const USER_ID = "11111111-1111-1111-1111-111111111111";
+const USER_ID = "11111111-1111-4111-8111-111111111111";
 const CHURCH_GROUP_ID = "group-1";
-const EVENT_ID = "22222222-2222-2222-2222-222222222222";
+const EVENT_ID = "22222222-2222-4222-8222-222222222222";
 
 function makeReq(searchParams: Record<string, string> = {}): NextRequest {
   return {

@@ -27,7 +27,7 @@ const USER_ID = "user-1";
 const CHURCH_GROUP_ID = "group-1";
 const WEEK_ID = "week-1";
 const EVENT_ID = "event-1";
-const TARGET_USER_ID = "22222222-2222-2222-2222-222222222222";
+const TARGET_USER_ID = "22222222-2222-4222-8222-222222222222";
 const ATTENDEE_ID = "attendee-1";
 
 const fakeReq = {} as NextRequest;

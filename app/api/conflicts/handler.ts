@@ -34,7 +34,7 @@ export async function getOpenConflicts(req: NextRequest, lookup?: UserLookup): P
     requireRole(ctx, ["admin", "set_leader"]);
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }
@@ -151,7 +151,7 @@ export async function resolveConflict(
     const { resolution } = parsedResult.data;
 
     const { getToken } = await auth();
-    const jwt = await getToken({ template: "supabase" });
+    const jwt = await getToken();
     if (!jwt) {
       return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
     }

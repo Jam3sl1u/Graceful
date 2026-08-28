@@ -35,6 +35,10 @@ export type DenyInvitationInput = z.infer<typeof denyInvitationSchema>;
 
 export const acceptInvitationParamSchema = z.string().uuid();
 
+// Route param for /api/invitations/:id/* (deny, withdraw). Same shape as
+// acceptInvitationParamSchema.
+export const invitationIdParamSchema = z.string().uuid();
+
 // Body is optional: absent/empty for the in-app path; { responseToken } for the
 // no-session SMS/email path. Token is the 64-char hex response_token.
 export const acceptInvitationSchema = z.object({
@@ -58,3 +62,24 @@ export const listInvitationsQuerySchema = z.object({
   serviceWeekId: z.string().uuid(),
 });
 export type ListInvitationsQuery = z.infer<typeof listInvitationsQuerySchema>;
+
+// POST /api/invitations/guest body (#72). email is normalized to lowercase
+// here so the handler's existing-user lookup and the RPC insert agree.
+export const createGuestInvitationSchema = z.object({
+  serviceWeekId: z.string().uuid(),
+  email: z.string().trim().toLowerCase().email().max(255),
+  name: z.string().trim().min(1).max(100).optional(),
+  roleNote: z.string().trim().min(1).max(500).optional(),
+  acknowledgeConflict: z.boolean().optional(),
+});
+export type CreateGuestInvitationInput = z.infer<typeof createGuestInvitationSchema>;
+
+// POST /api/invitations/guest/claim body (#72). Same 64-char hex response_token
+// shape as acceptInvitationSchema.
+export const claimGuestInvitationSchema = z.object({
+  responseToken: z
+    .string()
+    .length(64)
+    .regex(/^[0-9a-f]{64}$/),
+});
+export type ClaimGuestInvitationInput = z.infer<typeof claimGuestInvitationSchema>;
