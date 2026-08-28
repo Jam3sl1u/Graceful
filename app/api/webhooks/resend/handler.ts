@@ -41,6 +41,13 @@ export async function handleResendWebhook(req: NextRequest): Promise<Response> {
     return fail("Invalid webhook payload", ErrorCode.VALIDATION_FAILED, 400);
   }
 
+  // This endpoint only tracks email delivery events. A Resend subscription
+  // may also include contact/domain callbacks, which do not have email_id;
+  // acknowledge them so Resend does not retry a deliberately ignored event.
+  if (!type.startsWith("email.")) {
+    return ok({ received: true, status: "ignored" });
+  }
+
   const emailId = typeof data === "object" && data !== null ? (data as { email_id?: unknown }).email_id : undefined;
   if (typeof emailId !== "string" || !emailId) {
     return fail("Invalid webhook payload", ErrorCode.VALIDATION_FAILED, 400);
@@ -49,8 +56,11 @@ export async function handleResendWebhook(req: NextRequest): Promise<Response> {
   const status = mapResendEventToStatus(type) ?? "ignored";
 
   // Never log recipient addresses or the payload — event type, email_id and
-  // status only (PRD §25.6).
-  console.info("resend webhook", { type, emailId, status });
+  // status only (PRD §25.6). Engagement events are intentionally omitted to
+  // avoid per-open/per-click log volume.
+  if (status !== "opened" && status !== "clicked") {
+    console.info("resend webhook", { type, emailId, status });
+  }
 
   return ok({ received: true, emailId, status });
 }

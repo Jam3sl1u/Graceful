@@ -3,6 +3,8 @@
 // re-import for the module-scope lazy singleton). Mocks the `resend` SDK —
 // no network calls.
 
+export {};
+
 const mockSend = jest.fn();
 const mockResendCtor = jest.fn().mockImplementation(() => ({ emails: { send: mockSend } }));
 

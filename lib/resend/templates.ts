@@ -57,6 +57,21 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
+function validateEmailLink(link: string | undefined): string | undefined {
+  if (link === undefined) return undefined;
+
+  try {
+    if (!link || link.trim() !== link) throw new Error("invalid link");
+
+    const url = new URL(link);
+    if (url.protocol !== "https:") throw new Error("invalid link");
+  } catch {
+    throw new Error("Email template link must be an absolute HTTPS URL");
+  }
+
+  return link;
+}
+
 function buildContent(key: EmailTemplateKey, data: EmailTemplateDataMap[EmailTemplateKey]): {
   subject: string;
   preview: string;
@@ -141,9 +156,10 @@ export function renderEmailTemplate<K extends EmailTemplateKey>(
   }
 
   const { subject, preview, link } = buildContent(key, data);
+  const validatedLink = validateEmailLink(link);
 
-  const linkHtml = link
-    ? `<p><a href="${escapeHtml(link)}">Open Graceful</a></p>`
+  const linkHtml = validatedLink
+    ? `<p><a href="${escapeHtml(validatedLink)}">Open Graceful</a></p>`
     : "";
   const html =
     `<!doctype html><html><body>` +
@@ -153,7 +169,7 @@ export function renderEmailTemplate<K extends EmailTemplateKey>(
     linkHtml +
     `</body></html>`;
 
-  const text = `${subject}\n\n${preview}` + (link ? `\n\n${link}` : "");
+  const text = `${subject}\n\n${preview}` + (validatedLink ? `\n\n${validatedLink}` : "");
 
   return { subject, preview, html, text };
 }

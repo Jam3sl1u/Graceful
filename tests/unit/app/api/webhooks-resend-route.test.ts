@@ -95,6 +95,41 @@ describe("POST /api/webhooks/resend", () => {
     expect(body.code).toBe("VALIDATION_FAILED");
   });
 
+  it("non-email event: 200 ignored without requiring email_id or mapping a status", async () => {
+    mockVerifyResendWebhook.mockResolvedValue(true);
+    const req = makeReq(JSON.stringify({ type: "contact.created", data: { contact_id: "contact-1" } }));
+
+    const res = await POST(req);
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.data).toEqual({ received: true, status: "ignored" });
+    expect(mockMapResendEventToStatus).not.toHaveBeenCalled();
+  });
+
+  it("logs delivery events but suppresses high-volume engagement events", async () => {
+    mockVerifyResendWebhook.mockResolvedValue(true);
+    const consoleInfo = jest.spyOn(console, "info").mockImplementation();
+
+    mockMapResendEventToStatus.mockReturnValue("delivered");
+    await POST(makeReq(JSON.stringify({ type: "email.delivered", data: { email_id: "email-1" } })));
+    expect(consoleInfo).toHaveBeenCalledWith("resend webhook", {
+      type: "email.delivered",
+      emailId: "email-1",
+      status: "delivered",
+    });
+
+    consoleInfo.mockClear();
+    mockMapResendEventToStatus.mockReturnValue("opened");
+    await POST(makeReq(JSON.stringify({ type: "email.opened", data: { email_id: "email-1" } })));
+    expect(consoleInfo).not.toHaveBeenCalled();
+
+    mockMapResendEventToStatus.mockReturnValue("clicked");
+    await POST(makeReq(JSON.stringify({ type: "email.clicked", data: { email_id: "email-1" } })));
+    expect(consoleInfo).not.toHaveBeenCalled();
+    consoleInfo.mockRestore();
+  });
+
   it("missing type: 400 + VALIDATION_FAILED", async () => {
     mockVerifyResendWebhook.mockResolvedValue(true);
     const req = makeReq(JSON.stringify({ data: { email_id: "email-1" } }));

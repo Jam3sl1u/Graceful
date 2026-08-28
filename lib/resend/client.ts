@@ -13,11 +13,13 @@ export type EmailDeliveryStatus =
   | "opened"
   | "clicked";
 
-// lazy singleton, follows lib/r2/client.ts's pattern
-let client: Resend | null = null;
+// lazy singleton, follows lib/r2/client.ts's pattern. Keep the validated
+// sender with its client so a later environment mutation cannot make a send
+// use an unvalidated or undefined `from` value.
+let resendConfig: { client: Resend; fromEmail: string } | null = null;
 
-function getClient(): Resend {
-  if (client) return client;
+function getClient(): { client: Resend; fromEmail: string } {
+  if (resendConfig) return resendConfig;
 
   const apiKey = process.env.RESEND_API_KEY;
   const fromEmail = process.env.RESEND_FROM_EMAIL;
@@ -25,8 +27,8 @@ function getClient(): Resend {
     throw new Error("Resend is not configured — missing required environment variable(s)");
   }
 
-  client = new Resend(apiKey);
-  return client;
+  resendConfig = { client: new Resend(apiKey), fromEmail };
+  return resendConfig;
 }
 
 export async function sendEmail<K extends EmailTemplateKey>(
@@ -38,13 +40,13 @@ export async function sendEmail<K extends EmailTemplateKey>(
     throw new Error("sendEmail requires a recipient address");
   }
 
-  const resend = getClient();
+  const { client: resend, fromEmail } = getClient();
   const { subject, html, text } = renderEmailTemplate(template, data);
 
   // RESEND_FROM_EMAIL is passed through verbatim (may be "a@b.com" or
   // "Graceful <a@b.com>") — never parse or reformat it.
   const { data: sendData, error } = await resend.emails.send({
-    from: process.env.RESEND_FROM_EMAIL!,
+    from: fromEmail,
     to,
     subject,
     html,

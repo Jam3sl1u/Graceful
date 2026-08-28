@@ -169,6 +169,33 @@ describe("renderEmailTemplate", () => {
     );
   });
 
+  it.each([
+    ["an empty link", ""],
+    ["a relative link", "/invitations/1"],
+    ["an http link", "http://graceful.app/invitations/1"],
+    ["a javascript link", "javascript:alert(1)"],
+    ["a malformed link", "https://"],
+  ])("rejects %s", (_description, link) => {
+    expect(() =>
+      renderEmailTemplate("set_invitation", {
+        date: "Aug 09, 2026",
+        adminName: "Pat Admin",
+        link,
+      }),
+    ).toThrow("Email template link must be an absolute HTTPS URL");
+  });
+
+  it("accepts an absolute HTTPS link and preserves it in html and text", () => {
+    const result = renderEmailTemplate("set_invitation", {
+      date: "Aug 09, 2026",
+      adminName: "Pat Admin",
+      link: "https://graceful.app/invitations/1?source=email",
+    });
+
+    expect(result.html).toContain('href="https://graceful.app/invitations/1?source=email"');
+    expect(result.text).toContain("https://graceful.app/invitations/1?source=email");
+  });
+
   it("escapes HTML special characters in interpolated values within html but not within text/subject/preview", () => {
     const result = renderEmailTemplate("invitation_denied", {
       memberName: '<script>alert("x")</script> & Co',

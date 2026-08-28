@@ -51,7 +51,7 @@ describe("lib/resend/client — tester supplement", () => {
     process.env = originalEnv;
   });
 
-  it("does not re-validate env vars on a second sendEmail once the client is already constructed", async () => {
+  it("uses the sender captured when the client is constructed on later sends", async () => {
     process.env.RESEND_API_KEY = "re_test_key";
     process.env.RESEND_FROM_EMAIL = "Graceful <notifications@graceful.app>";
     mockSend.mockResolvedValue({ data: { id: "email-123" }, error: null });
@@ -62,9 +62,11 @@ describe("lib/resend/client — tester supplement", () => {
       link: "https://graceful.app/invitations/1",
     });
 
-    // Now clear env entirely — a re-validating implementation would throw
-    // on the second call; a genuinely-cached singleton must not.
+    // Now change env entirely — a correctly captured sender must remain the
+    // validated original value, rather than becoming undefined or switching
+    // to the replacement value.
     clearEnv();
+    process.env.RESEND_FROM_EMAIL = "replacement@graceful.app";
 
     await expect(
       sendEmail("member2@example.com", "invitation_reminder_member", {
@@ -75,6 +77,9 @@ describe("lib/resend/client — tester supplement", () => {
 
     expect(mockResendCtor).toHaveBeenCalledTimes(1);
     expect(mockSend).toHaveBeenCalledTimes(2);
+    expect(mockSend).toHaveBeenLastCalledWith(
+      expect.objectContaining({ from: "Graceful <notifications@graceful.app>" }),
+    );
   });
 
   it("a from address without a display name (plain email) is also passed through verbatim", async () => {
