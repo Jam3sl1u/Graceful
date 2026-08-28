@@ -1,37 +1,37 @@
 import { z } from "zod";
 
-// POST /api/webhooks/pingram body (#67). Field names come from Pingram's
-// delivery-status callback (.pipeline/spec.md OPEN QUESTION Q3 — PROVISIONAL
-// DEFAULTS, §7). Zod v3 strips unknown keys by default — keep that so extra
-// provider fields don't 400 the callback.
+// POST /api/webhooks/pingram body (#67), confirmed against
+// https://www.pingram.io/docs/features/events-webhook. Zod strips unknown
+// keys so extra provider fields do not reject a callback.
 export const pingramWebhookSchema = z.object({
-  message_id: z.string().min(1),
-  status: z.string().min(1),
-  to: z.string().optional(),
-  error_code: z.string().nullish(),
-  occurred_at: z.string().optional(),
+  eventType: z.string().min(1),
+  trackingId: z.string().min(1),
+  channel: z.string().optional(),
+  userId: z.string().optional(),
+  notificationId: z.string().optional(),
+  failureCode: z.string().nullish(),
 });
 export type PingramWebhookPayload = z.infer<typeof pingramWebhookSchema>;
 
-export type PingramDeliveryStatus =
-  | "queued"
-  | "sent"
-  | "delivered"
-  | "failed"
-  | "undelivered"
-  | "unknown";
+export type PingramSmsEventType =
+  | "SMS_DELIVERED"
+  | "SMS_FAILED"
+  | "SMS_INBOUND"
+  | "SMS_SUBSCRIBE"
+  | "SMS_UNSUBSCRIBE"
+  | "UNKNOWN";
 
-const KNOWN_STATUSES: ReadonlySet<string> = new Set([
-  "queued",
-  "sent",
-  "delivered",
-  "failed",
-  "undelivered",
+const KNOWN_SMS_EVENTS: ReadonlySet<string> = new Set([
+  "SMS_DELIVERED",
+  "SMS_FAILED",
+  "SMS_INBOUND",
+  "SMS_SUBSCRIBE",
+  "SMS_UNSUBSCRIBE",
 ]);
 
 // Maps a raw provider status string to our canonical set. Unrecognized
 // provider statuses map to "unknown" — the route still 200s so Pingram does
 // not retry a callback we simply do not model yet.
-export function toDeliveryStatus(raw: string): PingramDeliveryStatus {
-  return KNOWN_STATUSES.has(raw) ? (raw as PingramDeliveryStatus) : "unknown";
+export function toSmsEventType(raw: string): PingramSmsEventType {
+  return KNOWN_SMS_EVENTS.has(raw) ? (raw as PingramSmsEventType) : "UNKNOWN";
 }

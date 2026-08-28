@@ -76,6 +76,12 @@ describe("buildMemberReminderSms", () => {
     expect(sms).toContain("Jane Doe");
     expect(sms).toContain("Aug 01, 2026");
   });
+
+  it("fits varchar(100) member and title inputs within one SMS segment", () => {
+    const sms = buildMemberReminderSms("m".repeat(100), "w".repeat(100));
+    expect(sms.length).toBeLessThanOrEqual(160);
+    expect(sms).toMatch(/^[\x00-\x7F]*$/);
+  });
 });
 
 describe("formatWeekLabel", () => {

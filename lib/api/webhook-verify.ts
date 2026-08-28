@@ -10,18 +10,14 @@ export async function verifyClerkWebhook(_rawBody: string, _headers: Headers): P
   throw new Error("verifyClerkWebhook not implemented — see Sprint 0 #5");
 }
 
-// --- Pingram webhook signature contract (issue #67 §7 — PROVISIONAL
-// DEFAULTS). Unverified against Pingram's real API pending a human
-// confirming it (.pipeline/spec.md OPEN QUESTION Q2); mirrors the send-side
-// block in lib/pingram/client.ts so a corrected contract is a one-place edit.
-//   Signature header:  x-pingram-signature (optional "sha256=" prefix)
-//   Timestamp header:  x-pingram-timestamp (unix seconds)
-//   Signed payload:    `${timestamp}.${rawBody}`
-//   Digest:            HMAC-SHA256, lowercase hex
-//   Replay window:     ±300 seconds
+// --- Pingram webhook signature contract (confirmed 2026-08-27) ---
+// https://www.pingram.io/docs/features/events-webhook
+// X-Pingram-Id is assumed to be the trackingId in the signed string; verify
+// that documented relationship with the first real staging callback.
+const PINGRAM_ID_HEADER = "x-pingram-id";
 const PINGRAM_SIGNATURE_HEADER = "x-pingram-signature";
 const PINGRAM_TIMESTAMP_HEADER = "x-pingram-timestamp";
-const PINGRAM_SIGNATURE_PREFIX = "sha256=";
+const PINGRAM_SIGNATURE_PREFIX = "v1,";
 const PINGRAM_REPLAY_WINDOW_SECONDS = 300;
 
 // Verifies an inbound Pingram delivery-status callback. Never throws for bad
@@ -36,7 +32,8 @@ export async function verifyPingramWebhook(rawBody: string, headers: Headers): P
 
   const signatureHeader = headers.get(PINGRAM_SIGNATURE_HEADER);
   const timestampHeader = headers.get(PINGRAM_TIMESTAMP_HEADER);
-  if (!signatureHeader || !timestampHeader) {
+  const trackingId = headers.get(PINGRAM_ID_HEADER);
+  if (!signatureHeader || !timestampHeader || !trackingId) {
     return false;
   }
 
@@ -44,8 +41,7 @@ export async function verifyPingramWebhook(rawBody: string, headers: Headers): P
     return false;
   }
   const timestamp = Number.parseInt(timestampHeader, 10);
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  if (Math.abs(nowSeconds - timestamp) > PINGRAM_REPLAY_WINDOW_SECONDS) {
+  if (Math.abs(Date.now() - timestamp) / 1000 > PINGRAM_REPLAY_WINDOW_SECONDS) {
     return false;
   }
 
@@ -53,10 +49,10 @@ export async function verifyPingramWebhook(rawBody: string, headers: Headers): P
     ? signatureHeader.slice(PINGRAM_SIGNATURE_PREFIX.length)
     : signatureHeader;
 
-  const signedPayload = `${timestampHeader}.${rawBody}`;
+  const signedPayload = `${trackingId}.${timestampHeader}.${rawBody}`;
   const expectedSignature = createHmac("sha256", secret).update(signedPayload).digest("hex");
 
-  const providedBuffer = Buffer.from(providedSignature, "utf8");
+  const providedBuffer = Buffer.from(providedSignature.toLowerCase(), "utf8");
   const expectedBuffer = Buffer.from(expectedSignature, "utf8");
   if (providedBuffer.length !== expectedBuffer.length) {
     return false;

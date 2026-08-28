@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { ok, fail } from "@/lib/api/response";
 import { ErrorCode } from "@/lib/api/errors";
 import { verifyPingramWebhook } from "@/lib/api/webhook-verify";
-import { pingramWebhookSchema, toDeliveryStatus } from "@/schemas/pingram";
+import { pingramWebhookSchema, toSmsEventType } from "@/schemas/pingram";
 
 // POST /api/webhooks/pingram (#67) — Pingram delivery-status callback. Public
 // route (middleware.ts already makes /api/webhooks(.*) public); no Clerk
@@ -38,11 +38,11 @@ export async function POST(req: NextRequest): Promise<Response> {
     return fail("Invalid webhook payload", ErrorCode.VALIDATION_FAILED, 400);
   }
 
-  const { message_id: messageId, status: rawStatus, error_code: errorCode } = result.data;
-  const status = toDeliveryStatus(rawStatus);
+  const { eventType: rawEventType, trackingId, failureCode } = result.data;
+  const event = toSmsEventType(rawEventType);
 
   // Never log the raw body or the full recipient number.
-  console.info("pingram webhook: delivery status", { messageId, status, rawStatus, errorCode });
+  console.info("pingram webhook: sms event", { trackingId, event, rawEventType, failureCode });
 
-  return ok({ received: true, messageId, status }, 200);
+  return ok({ received: true, trackingId, event }, 200);
 }

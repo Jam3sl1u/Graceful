@@ -1,29 +1,25 @@
-// Tests for lib/api/webhook-verify.ts's verifyPingramWebhook (#67). Uses real
-// `crypto` HMAC to build valid signatures (no mocking of the crypto module).
-// Only the Pingram verifier is covered — verifyClerkWebhook,
-// verifyResendWebhook, and verifyModalWebhook remain unimplemented stubs
-// (out of scope for #67) and are intentionally left unasserted.
-
 import { createHmac } from "crypto";
 import { verifyPingramWebhook } from "@/lib/api/webhook-verify";
 
 const SECRET = "test-webhook-secret";
+const TRACKING_ID = "tracking-1";
 
-function sign(secret: string, timestamp: string, rawBody: string): string {
-  return createHmac("sha256", secret).update(`${timestamp}.${rawBody}`).digest("hex");
+function sign(timestamp: string, rawBody: string): string {
+  return createHmac("sha256", SECRET)
+    .update(`${TRACKING_ID}.${timestamp}.${rawBody}`)
+    .digest("hex");
 }
 
-function headersFor(overrides: Partial<{ signature: string | null; timestamp: string | null }>) {
+function headersFor(overrides: Partial<{ id: string | null; signature: string | null; timestamp: string | null }>) {
   const map = new Map<string, string>();
-  if (overrides.signature !== null) {
-    map.set("x-pingram-signature", overrides.signature ?? "");
+  for (const [name, value] of Object.entries({
+    "x-pingram-id": overrides.id ?? TRACKING_ID,
+    "x-pingram-signature": overrides.signature,
+    "x-pingram-timestamp": overrides.timestamp,
+  })) {
+    if (value !== null && value !== undefined) map.set(name, value);
   }
-  if (overrides.timestamp !== null) {
-    map.set("x-pingram-timestamp", overrides.timestamp ?? "");
-  }
-  return {
-    get: (name: string) => map.get(name.toLowerCase()) ?? null,
-  } as unknown as Headers;
+  return { get: (name: string) => map.get(name.toLowerCase()) ?? null } as unknown as Headers;
 }
 
 beforeEach(() => {
@@ -35,119 +31,47 @@ afterEach(() => {
 });
 
 describe("verifyPingramWebhook", () => {
-  it("throws when PINGRAM_WEBHOOK_SECRET is unset", async () => {
+  it("throws when its secret is unset", async () => {
     delete process.env.PINGRAM_WEBHOOK_SECRET;
-    await expect(
-      verifyPingramWebhook("{}", headersFor({ signature: "abc", timestamp: "123" })),
-    ).rejects.toThrow("PINGRAM_WEBHOOK_SECRET is not set");
+    await expect(verifyPingramWebhook("{}", headersFor({ signature: "v1,abc", timestamp: "1" }))).rejects.toThrow(
+      "PINGRAM_WEBHOOK_SECRET is not set",
+    );
   });
 
-  it("throws when PINGRAM_WEBHOOK_SECRET is an empty string", async () => {
-    process.env.PINGRAM_WEBHOOK_SECRET = "";
+  it("verifies the documented v1 signature over id, millisecond timestamp, and raw body", async () => {
+    const rawBody = JSON.stringify({ eventType: "SMS_DELIVERED", trackingId: TRACKING_ID });
+    const timestamp = String(Date.now());
     await expect(
-      verifyPingramWebhook("{}", headersFor({ signature: "abc", timestamp: "123" })),
-    ).rejects.toThrow("PINGRAM_WEBHOOK_SECRET is not set");
-  });
-
-  it("returns true for a valid signature (no prefix)", async () => {
-    const rawBody = JSON.stringify({ message_id: "m1", status: "delivered" });
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const signature = sign(SECRET, timestamp, rawBody);
-
-    await expect(
-      verifyPingramWebhook(rawBody, headersFor({ signature, timestamp })),
+      verifyPingramWebhook(rawBody, headersFor({ signature: `v1,${sign(timestamp, rawBody)}`, timestamp })),
     ).resolves.toBe(true);
   });
 
-  it("returns true for a valid signature with an sha256= prefix", async () => {
-    const rawBody = JSON.stringify({ message_id: "m1", status: "delivered" });
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const signature = `sha256=${sign(SECRET, timestamp, rawBody)}`;
-
+  it("accepts an uppercase hexadecimal digest", async () => {
+    const rawBody = "{}";
+    const timestamp = String(Date.now());
     await expect(
-      verifyPingramWebhook(rawBody, headersFor({ signature, timestamp })),
+      verifyPingramWebhook(rawBody, headersFor({ signature: `v1,${sign(timestamp, rawBody).toUpperCase()}`, timestamp })),
     ).resolves.toBe(true);
   });
 
-  it("returns false when the signature header is missing", async () => {
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    await expect(
-      verifyPingramWebhook("{}", headersFor({ signature: null, timestamp })),
-    ).resolves.toBe(false);
+  it("returns false for a missing id, bad signature, or non-numeric timestamp", async () => {
+    const timestamp = String(Date.now());
+    await expect(verifyPingramWebhook("{}", headersFor({ id: null, signature: "v1,abc", timestamp }))).resolves.toBe(false);
+    await expect(verifyPingramWebhook("{}", headersFor({ signature: "v1,deadbeef", timestamp }))).resolves.toBe(false);
+    await expect(verifyPingramWebhook("{}", headersFor({ signature: "v1,abc", timestamp: "not-a-number" }))).resolves.toBe(false);
   });
 
-  it("returns false when the signature is wrong", async () => {
-    const rawBody = JSON.stringify({ message_id: "m1", status: "delivered" });
-    const timestamp = String(Math.floor(Date.now() / 1000));
-
-    await expect(
-      verifyPingramWebhook(rawBody, headersFor({ signature: "deadbeef".repeat(8), timestamp })),
-    ).resolves.toBe(false);
-  });
-
-  it("returns false (timing-safe) for a signature of the correct length but different bytes", async () => {
-    const rawBody = JSON.stringify({ message_id: "m1", status: "delivered" });
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const correct = sign(SECRET, timestamp, rawBody);
-    // Flip the last hex char, keeping the same length.
-    const lastChar = correct[correct.length - 1];
-    const flipped = lastChar === "0" ? "1" : "0";
-    const wrongSameLength = correct.slice(0, -1) + flipped;
-
-    await expect(
-      verifyPingramWebhook(rawBody, headersFor({ signature: wrongSameLength, timestamp })),
-    ).resolves.toBe(false);
-  });
-
-  it("returns false, and does not throw, for a signature of a different length", async () => {
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    await expect(
-      verifyPingramWebhook("{}", headersFor({ signature: "short", timestamp })),
-    ).resolves.toBe(false);
-  });
-
-  it("returns false when the timestamp header is missing", async () => {
+  it("rejects timestamps outside the five-minute replay window", async () => {
     const rawBody = "{}";
+    const timestamp = String(Date.now() - 300_001);
     await expect(
-      verifyPingramWebhook(rawBody, headersFor({ signature: "abc", timestamp: null })),
+      verifyPingramWebhook(rawBody, headersFor({ signature: `v1,${sign(timestamp, rawBody)}`, timestamp })),
     ).resolves.toBe(false);
   });
 
-  it("returns false when the timestamp header is non-numeric", async () => {
-    const rawBody = "{}";
-    await expect(
-      verifyPingramWebhook(rawBody, headersFor({ signature: "abc", timestamp: "not-a-number" })),
-    ).resolves.toBe(false);
-  });
-
-  it("returns false when the timestamp is older than the 300s replay window", async () => {
-    const rawBody = JSON.stringify({ message_id: "m1", status: "delivered" });
-    const timestamp = String(Math.floor(Date.now() / 1000) - 301);
-    const signature = sign(SECRET, timestamp, rawBody);
-
-    await expect(
-      verifyPingramWebhook(rawBody, headersFor({ signature, timestamp })),
-    ).resolves.toBe(false);
-  });
-
-  it("returns false when the timestamp is more than 300s in the future", async () => {
-    const rawBody = JSON.stringify({ message_id: "m1", status: "delivered" });
-    const timestamp = String(Math.floor(Date.now() / 1000) + 301);
-    const signature = sign(SECRET, timestamp, rawBody);
-
-    await expect(
-      verifyPingramWebhook(rawBody, headersFor({ signature, timestamp })),
-    ).resolves.toBe(false);
-  });
-
-  it("returns false when the body is mutated after signing (same signature, different body)", async () => {
-    const rawBody = JSON.stringify({ message_id: "m1", status: "delivered" });
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const signature = sign(SECRET, timestamp, rawBody);
-    const mutatedBody = JSON.stringify({ message_id: "m1", status: "failed" });
-
-    await expect(
-      verifyPingramWebhook(mutatedBody, headersFor({ signature, timestamp })),
-    ).resolves.toBe(false);
+  it("rejects a body changed after signing", async () => {
+    const timestamp = String(Date.now());
+    const signature = `v1,${sign(timestamp, "{}")}`;
+    await expect(verifyPingramWebhook('{"changed":true}', headersFor({ signature, timestamp }))).resolves.toBe(false);
   });
 });

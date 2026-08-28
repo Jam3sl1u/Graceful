@@ -1,18 +1,14 @@
 import "server-only";
 import { SMS_MAX_LENGTH } from "@/lib/notifications/sms-templates";
 
-// --- Pingram vendor contract (issue #67 §7 — PROVISIONAL DEFAULTS) ---
-// The repo has no confirmed Pingram API contract (no endpoint, header names,
-// payload shape, or SDK dependency anywhere). These constants are an
-// unverified best guess pending a human confirming them against Pingram's
-// own docs/dashboard (see .pipeline/spec.md OPEN QUESTION Q1). Keeping them
-// in one block here (and the mirrored block in lib/api/webhook-verify.ts for
-// Q2) makes a corrected contract a one-place edit.
-//   Send endpoint: POST ${PINGRAM_API_BASE_URL ?? DEFAULT_BASE_URL}/messages
-//   Auth header:   Authorization: Bearer ${PINGRAM_API_KEY}
-//   Request body:  { to, text, from? } — "from" only when PINGRAM_SENDER is set
-//   Response id:   "id", falling back to "message_id", then null
-const PINGRAM_DEFAULT_BASE_URL = "https://api.pingram.io/v1";
+// --- Pingram vendor contract (confirmed 2026-08-27) ---
+// https://www.pingram.io/docs/sms/overview
+// https://www.pingram.io/docs/api-reference/operations/sms_send
+// POST ${PINGRAM_API_BASE_URL ?? DEFAULT_BASE_URL}/sms with Bearer auth and
+// { type, to, message, from? }; trackingId identifies both successful and
+// structured-error responses.
+const PINGRAM_DEFAULT_BASE_URL = "https://api.pingram.io";
+const PINGRAM_NOTIFICATION_TYPE = "graceful_notification";
 const SEND_TIMEOUT_MS = 10_000;
 
 export class SmsNotConfiguredError extends Error {
@@ -61,7 +57,7 @@ export function toE164(raw: string | null | undefined): string | null {
 
   const stripped = raw.replace(/[\s\-.()]/g, "");
 
-  if (/^\+\d{8,15}$/.test(stripped)) {
+  if (/^\+1\d{10}$/.test(stripped)) {
     return stripped;
   }
   if (/^\d{10}$/.test(stripped)) {
@@ -113,9 +109,10 @@ export async function sendSms(params: SendSmsParams): Promise<SendSmsResult> {
   const baseUrl = process.env.PINGRAM_API_BASE_URL || PINGRAM_DEFAULT_BASE_URL;
   const sender = process.env.PINGRAM_SENDER;
 
-  const requestBody: { to: string; text: string; from?: string } = {
+  const requestBody: { type: string; to: string; message: string; from?: string } = {
+    type: PINGRAM_NOTIFICATION_TYPE,
     to: normalizedTo,
-    text: body,
+    message: body,
   };
   if (sender) {
     requestBody.from = sender;
@@ -123,7 +120,7 @@ export async function sendSms(params: SendSmsParams): Promise<SendSmsResult> {
 
   let res: Response;
   try {
-    res = await fetch(`${baseUrl}/messages`, {
+    res = await fetch(`${baseUrl}/sms`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -143,15 +140,23 @@ export async function sendSms(params: SendSmsParams): Promise<SendSmsResult> {
     throw new SmsDispatchError(`Pingram send failed with status ${res.status}`, res.status);
   }
 
-  let messageId: string | null = null;
+  let json: { trackingId?: unknown; error?: { message?: unknown } } | null = null;
   try {
-    const json = (await res.json()) as { id?: unknown; message_id?: unknown };
-    const id = json.id ?? json.message_id;
-    messageId = typeof id === "string" ? id : null;
+    json = (await res.json()) as {
+      trackingId?: unknown;
+      error?: { message?: unknown };
+    };
   } catch {
     // 2xx with a non-JSON body is still a success.
-    messageId = null;
+    return { status: "sent", messageId: null };
   }
 
-  return { status: "sent", messageId };
+  if (json.error) {
+    throw new SmsDispatchError(
+      typeof json.error.message === "string" ? json.error.message : "Pingram send failed",
+      res.status,
+    );
+  }
+
+  return { status: "sent", messageId: typeof json.trackingId === "string" ? json.trackingId : null };
 }

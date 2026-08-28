@@ -58,6 +58,10 @@ describe("toE164", () => {
     expect(toE164("155512345678")).toBeNull();
   });
 
+  it("rejects non-US E.164 numbers", () => {
+    expect(toE164("+442071838750")).toBeNull();
+  });
+
   it("returns null for empty/null/undefined", () => {
     expect(toE164("")).toBeNull();
     expect(toE164(null)).toBeNull();
@@ -113,7 +117,7 @@ describe("sendSms", () => {
   });
 
   it("allows a body of exactly 160 chars", async () => {
-    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ id: "m1" }) });
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ trackingId: "m1" }) });
     const body = "a".repeat(160);
     const result = await sendSms({ to: "+15551234567", body, smsOptedIn: true });
     expect(result).toEqual({ status: "sent", messageId: "m1" });
@@ -143,42 +147,46 @@ describe("sendSms", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("sends a POST to the default endpoint with Bearer auth and {to, text}", async () => {
-    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ id: "m1" }) });
+  it("sends a POST to the documented endpoint with Bearer auth and {type, to, message}", async () => {
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ trackingId: "m1" }) });
 
     await sendSms({ to: "(555) 123-4567", body: "hello", smsOptedIn: true });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("https://api.pingram.io/v1/messages");
+    expect(url).toBe("https://api.pingram.io/sms");
     expect(init.method).toBe("POST");
     expect(init.headers).toMatchObject({
       Authorization: "Bearer test-api-key",
       "Content-Type": "application/json",
     });
-    expect(JSON.parse(init.body as string)).toEqual({ to: "+15551234567", text: "hello" });
+    expect(JSON.parse(init.body as string)).toEqual({
+      type: "graceful_notification",
+      to: "+15551234567",
+      message: "hello",
+    });
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
   it("honors PINGRAM_API_BASE_URL override", async () => {
     process.env.PINGRAM_API_BASE_URL = "https://pingram.example.test";
-    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ id: "m1" }) });
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ trackingId: "m1" }) });
 
     await sendSms({ to: "+15551234567", body: "hello", smsOptedIn: true });
 
     const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("https://pingram.example.test/messages");
+    expect(url).toBe("https://pingram.example.test/sms");
   });
 
   it("includes 'from' only when PINGRAM_SENDER is set and non-empty", async () => {
-    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ id: "m1" }) });
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ trackingId: "m1" }) });
     await sendSms({ to: "+15551234567", body: "hello", smsOptedIn: true });
     let [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).not.toHaveProperty("from");
 
     process.env.PINGRAM_SENDER = "+15559990000";
     fetchMock.mockClear();
-    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ id: "m2" }) });
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ trackingId: "m2" }) });
     await sendSms({ to: "+15551234567", body: "hello", smsOptedIn: true });
     [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toMatchObject({ from: "+15559990000" });
@@ -231,14 +239,26 @@ describe("sendSms", () => {
     expect(result).toEqual({ status: "sent", messageId: null });
   });
 
-  it("falls back to message_id when id is absent", async () => {
+  it("returns messageId from trackingId", async () => {
     fetchMock.mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => ({ message_id: "fallback-id" }),
+      json: async () => ({ trackingId: "tracking-id" }),
     });
 
     const result = await sendSms({ to: "+15551234567", body: "hello", smsOptedIn: true });
-    expect(result).toEqual({ status: "sent", messageId: "fallback-id" });
+    expect(result).toEqual({ status: "sent", messageId: "tracking-id" });
+  });
+
+  it("throws SmsDispatchError when a 200 response contains a structured error", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ trackingId: "tracking-id", error: { message: "Sender unavailable" } }),
+    });
+
+    await expect(
+      sendSms({ to: "+15551234567", body: "hello", smsOptedIn: true }),
+    ).rejects.toMatchObject({ name: "SmsDispatchError", message: "Sender unavailable", status: 200 });
   });
 });
