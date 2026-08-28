@@ -1,21 +1,17 @@
 # Review — Issue #67: Correct Pingram wire contract
 
-## Verdict: NEEDS WORK
+## Verdict: SHIP
 
-The #67 implementation itself matches the reviewed Pingram contract: outbound
-dispatch uses `/sms` with the required payload, structured 200 errors fail,
-webhook signatures include the tracking ID and use millisecond timestamps, and
-SMS builders preserve links within the configured segment budget. Focused tests
-cover the happy paths, invalid inputs, tampering, unknown events, and long
-content.
+The corrected Pingram implementation matches the vendor contract: dispatch uses
+`POST /sms` with `{ type, to, message, from? }`, structured error responses
+fail even at HTTP 200, and `trackingId` is returned. Webhook verification uses
+the documented ID/signature/timestamp headers and HMAC input, and the endpoint
+acknowledges valid SMS events safely.
 
-The branch is not merge-ready because the required repository-wide test and
-typecheck gates are failing. The failures are demonstrably outside the #67
-diff: TypeScript 6 rejects the existing `baseUrl` configuration, and unrelated
-fixtures across 17 suites are invalid under Zod v4 UUID validation. Resolve or
-separately waive those repository-level regressions, then rerun this testing
-and review stage.
+SMS templates preserve terminal links within the length budget, use GSM-7-safe
+copy, and the cron reminder builder bounds database-sized inputs. The current
+`main` branch is merged, all required checks pass, and no unresolved conflicts
+or working-tree changes remain.
 
-Post-merge staging remains required: send one real SMS, confirm `trackingId`,
-and verify a real callback's `X-Pingram-Id` is the tracking ID used in the
-signature payload.
+Post-merge staging remains operational verification: send one real SMS and
+confirm a real callback’s `X-Pingram-Id` matches the signed tracking ID.
