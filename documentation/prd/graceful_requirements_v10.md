@@ -1696,13 +1696,13 @@ Working copy for all notification types. SMS copy is kept under 160 characters. 
 | Notification | SMS copy (< 160 chars) | Email subject / In-app copy |
 | --- | --- | --- |
 | **Set invitation** | *Graceful: You're invited to lead worship on [Date]. Role: [role_note]. Respond here: [link]* | Subject: You're invited to lead worship on [Date]. Preview: [Admin name] has selected you for [Date]. Tap to accept or decline. |
-| **24hr reminder (member)** | *Graceful: Reminder — your invitation for [Date] is still pending. Respond: [link]* | Subject: Your invitation for [Date] needs a response. Preview: You haven't responded yet. Please accept or decline. |
+| **24hr reminder (member)** | *Graceful: Reminder - your invitation for [Date] is still pending. Respond: [link]* | Subject: Your invitation for [Date] needs a response. Preview: You haven't responded yet. Please accept or decline. |
 | **24hr reminder (admin)** | *Graceful: [N] invitation(s) for [Date] still awaiting response. View roster: [link]* | Subject: [N] unanswered invitations for [Date]. Preview: The following members haven't responded: [names] |
 | **Invitation accepted** | *(In-app only — admin sees live roster update)* | [Member name] accepted their invitation for [Date]. Your roster now has [N] confirmed members. |
 | **Invitation denied** | *Graceful: [Member name] can't make [Date]. Reason: [reason]. View roster: [link]* | Subject: [Member name] declined for [Date]. Preview: Reason: [reason]. Open Graceful to find a replacement. |
-| **Scheduling conflict** | *Graceful: CONFLICT — [Member] is now unavailable for [Date]. View: [link]* | Subject: Scheduling conflict for [Date]. Preview: [Member name] changed their availability after confirming. Action may be needed. |
+| **Scheduling conflict** | *Graceful: CONFLICT - [Member] is now unavailable for [Date]. View: [link]* | Subject: Scheduling conflict for [Date]. Preview: [Member name] changed their availability after confirming. Action may be needed. |
 | **Setlist published** | *Graceful: The setlist for [Date] is live. View it here: [link]* | Subject: Setlist for [Date] is ready. Preview: [N] songs planned. Open Graceful to see the full setlist and your chord charts. |
-| **Practice reminder** | *Graceful: [Event name] is [tomorrow/today] at [Time] — [Location]* | Subject: Reminder: [Event name] in [N] hours. Preview: [Day, Date] at [Time] — [Location]. See you there. |
+| **Practice reminder** | *Graceful: [Event name] is [tomorrow/today] at [Time] - [Location]* | Subject: Reminder: [Event name] in [N] hours. Preview: [Day, Date] at [Time] - [Location]. See you there. |
 | **New document** | *(In-app only)* | New document added to [Church name] library: [Document name]. Tap to view. |
 | **Transcription complete** | *(In-app only)* | Sheet music for '[Song title]' in the key of [Key] is ready. View it in the song library. |
 
