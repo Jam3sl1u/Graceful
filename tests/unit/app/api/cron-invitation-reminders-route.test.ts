@@ -28,6 +28,15 @@ function makeSupabaseClient(rpcResult: { data: unknown; error: unknown }) {
   return { rpc: jest.fn().mockResolvedValue(rpcResult) };
 }
 
+// As of #69 send_invitation_reminders returns an object
+// { member_reminders, admin_reminders } instead of a bare array.
+function rpcOk(memberReminders: unknown[], adminReminders: unknown[] = []) {
+  return {
+    data: { member_reminders: memberReminders, admin_reminders: adminReminders },
+    error: null,
+  };
+}
+
 const reminderRow = (overrides: Partial<Record<string, unknown>> = {}) => ({
   invitation_id: "inv-1",
   user_id: "user-1",
@@ -90,8 +99,8 @@ describe("GET /api/cron/invitation-reminders", () => {
   });
 
   it("happy path: dispatches SMS for opted-in members with a phone, skips others", async () => {
-    const client = makeSupabaseClient({
-      data: [
+    const client = makeSupabaseClient(
+      rpcOk([
         reminderRow(),
         reminderRow({
           invitation_id: "inv-2",
@@ -99,9 +108,8 @@ describe("GET /api/cron/invitation-reminders", () => {
           phone: null,
           sms_opted_in: false,
         }),
-      ],
-      error: null,
-    });
+      ]),
+    );
     mockGetAnonSupabaseClient.mockReturnValue(client);
     mockSendSms.mockResolvedValue({ status: "sent", messageId: "m1" });
 
@@ -116,11 +124,17 @@ describe("GET /api/cron/invitation-reminders", () => {
     });
 
     const body = await res.json();
-    expect(body.data).toEqual({ processed: 2, smsSent: 1, smsSkipped: 1, smsFailed: 0 });
+    expect(body.data).toEqual({
+      processed: 2,
+      smsSent: 1,
+      smsSkipped: 1,
+      smsFailed: 0,
+      adminNotified: 0,
+    });
   });
 
   it("isolates an sendSms failure: still returns 200 and counts smsFailed, job does not throw", async () => {
-    const client = makeSupabaseClient({ data: [reminderRow()], error: null });
+    const client = makeSupabaseClient(rpcOk([reminderRow()]));
     mockGetAnonSupabaseClient.mockReturnValue(client);
     mockSendSms.mockRejectedValue(new Error("sendSms not implemented — see Sprint 4 #58"));
 
@@ -128,18 +142,30 @@ describe("GET /api/cron/invitation-reminders", () => {
     expect(res.status).toBe(200);
 
     const body = await res.json();
-    expect(body.data).toEqual({ processed: 1, smsSent: 0, smsSkipped: 0, smsFailed: 1 });
+    expect(body.data).toEqual({
+      processed: 1,
+      smsSent: 0,
+      smsSkipped: 0,
+      smsFailed: 1,
+      adminNotified: 0,
+    });
   });
 
   it("returns processed: 0 with no SMS dispatch when there are no due invitations", async () => {
-    const client = makeSupabaseClient({ data: [], error: null });
+    const client = makeSupabaseClient(rpcOk([]));
     mockGetAnonSupabaseClient.mockReturnValue(client);
 
     const res = await GET(makeReq(`Bearer ${CRON_SECRET}`));
     expect(res.status).toBe(200);
 
     const body = await res.json();
-    expect(body.data).toEqual({ processed: 0, smsSent: 0, smsSkipped: 0, smsFailed: 0 });
+    expect(body.data).toEqual({
+      processed: 0,
+      smsSent: 0,
+      smsSkipped: 0,
+      smsFailed: 0,
+      adminNotified: 0,
+    });
     expect(mockSendSms).not.toHaveBeenCalled();
   });
 });

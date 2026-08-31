@@ -9,15 +9,13 @@ import {
   teardownFixtures,
 } from "./support/fixtures";
 
-// Issue #52 AC #2: deny -> slot reopens -> admin notified. Per the human
-// OQ2 resolution (.pipeline/spec.md): only the observable, real behavior is
-// tested here (the invitation flips to `denied` with the given reason). The
-// admin SMS + email dispatch is skipped below with a tracked reason — the
-// deny handler only has a TODO for it (app/api/invitations/handler.ts ~line
-// 399: `TODO(#67/#68): dispatch SMS + email to invited_by`), and both
-// dispatch primitives are unimplemented throwing stubs
-// (lib/pingram/client.ts, lib/resend/client.ts). Implementing #67/#68 is
-// explicitly out of scope for this issue.
+// Issue #52 AC #2: deny -> slot reopens -> admin notified. Only the
+// observable, real behavior is tested here (the invitation flips to `denied`
+// with the given reason). As of #69 the deny handler DOES wire admin SMS +
+// email dispatch (app/api/invitations/handler.ts denyInvitation +
+// deny_invitation RPC, via lib/notifications/dispatch.ts); asserting real SMS
+// / email delivery end-to-end stays out of scope for this issue — #82 owns
+// full E2E regression for the notification channels.
 test.describe("invitation deny", () => {
   test.skip(!e2eAuthEnabled, "requires staging E2E secrets — see tests/e2e/support/env.ts");
 
@@ -65,11 +63,12 @@ test.describe("invitation deny", () => {
     }
   });
 
-  // Tracked, intentionally-always-skipped placeholder (OQ2): surfaces in the
-  // test report that admin SMS + email on deny is deliberately NOT covered
-  // here, rather than silently absent, until #67/#68 ship.
+  // Tracked, intentionally-always-skipped placeholder: admin SMS + email on
+  // deny IS wired as of #69 (handler + deny_invitation RPC + dispatch module),
+  // but asserting real end-to-end delivery is deferred to #82 (full E2E
+  // regression for the notification channels), not covered here.
   test.skip(
-    "admin receives SMS + email with the deny reason (deferred until #67/#68 ship — see app/api/invitations/handler.ts TODO and lib/pingram/client.ts + lib/resend/client.ts stubs)",
+    "admin receives SMS + email with the deny reason (wired in #69; real end-to-end delivery assertion deferred to #82 — see lib/notifications/dispatch.ts)",
     async () => {},
   );
 });

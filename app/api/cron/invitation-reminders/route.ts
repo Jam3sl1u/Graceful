@@ -4,6 +4,8 @@ import { ErrorCode } from "@/lib/api/errors";
 import { getAnonSupabaseClient } from "@/lib/supabase/client";
 import { sendSms } from "@/lib/pingram/client";
 import { buildMemberReminderSms, formatWeekLabel } from "@/lib/scheduling/reminder";
+import { adminReminderSms } from "@/lib/notifications/sms-templates";
+import { dispatchNotification, appNotificationUrl } from "@/lib/notifications/dispatch";
 
 // GET /api/cron/invitation-reminders (#45) — GitHub Actions hits this hourly
 // (.github/workflows/invitation-reminders-cron.yml) to fire the 24-hour
@@ -14,7 +16,8 @@ import { buildMemberReminderSms, formatWeekLabel } from "@/lib/scheduling/remind
 // notifications — happens atomically inside the send_invitation_reminders
 // SECURITY DEFINER RPC (mirrors the no-session accept_invitation path via
 // getAnonSupabaseClient()). This route's only remaining job is dispatching
-// the (stubbed) member SMS for each reminder the RPC reports.
+// the member SMS (#67) and, as of #69, the admin SMS (PRD §14:
+// "Invitation reminder | Member + Admin | SMS" — SMS only, no email).
 export async function GET(req: NextRequest): Promise<Response> {
   const cronSecret = process.env.CRON_SECRET;
   if (!cronSecret) {
@@ -33,7 +36,10 @@ export async function GET(req: NextRequest): Promise<Response> {
     return fail("Internal error", ErrorCode.INTERNAL, 500);
   }
 
-  const reminders = data ?? [];
+  const payload = data ?? { member_reminders: [], admin_reminders: [] };
+  const reminders = payload.member_reminders ?? [];
+  const adminReminders = payload.admin_reminders ?? [];
+
   let smsSent = 0;
   let smsSkipped = 0;
   let smsFailed = 0;
@@ -67,5 +73,38 @@ export async function GET(req: NextRequest): Promise<Response> {
     }
   }
 
-  return ok({ processed: reminders.length, smsSent, smsSkipped, smsFailed });
+  // Admin SMS reminders (PRD §14: SMS only — no email key). Each entry is one
+  // (service week × admin/set_leader) pair already resolved by the RPC. Fold
+  // the returned counters into the same three totals.
+  for (const admin of adminReminders) {
+    const counts = await dispatchNotification({
+      recipients: [
+        {
+          userId: admin.user_id,
+          name: admin.name,
+          email: null,
+          phone: admin.phone,
+          smsOptedIn: admin.sms_opted_in,
+        },
+      ],
+      sms: {
+        body: adminReminderSms({
+          count: admin.pending_count,
+          date: formatWeekLabel(admin.week_title, admin.service_date),
+          link: appNotificationUrl(`/week/${admin.service_week_id}`),
+        }),
+      },
+    });
+    smsSent += counts.smsSent;
+    smsSkipped += counts.smsSkipped;
+    smsFailed += counts.smsFailed;
+  }
+
+  return ok({
+    processed: reminders.length,
+    smsSent,
+    smsSkipped,
+    smsFailed,
+    adminNotified: adminReminders.length,
+  });
 }

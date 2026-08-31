@@ -7,6 +7,7 @@ import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
 import { assignAttendeeSchema } from "@/schemas/events";
 import { syncEventToUser, unsyncEventFromUser } from "@/lib/google-calendar/sync";
+import { dispatchGoogleCalendarEventEmail } from "@/lib/notifications/event-email";
 
 type EventAttendeesRow = Database["public"]["Tables"]["event_attendees"]["Row"];
 
@@ -130,6 +131,16 @@ export async function assignAttendee(
         // never block attendee assignment on sync failure
       }
     }
+
+    // Google Calendar event email — Email to the newly-assigned confirmed
+    // member (#69, PRD §14; OQ2 resolution: attendee assignment is a firing
+    // trigger). Best-effort: never throws, never affects the response.
+    await dispatchGoogleCalendarEventEmail(supabase, {
+      churchGroupId: ctx.churchGroupId,
+      serviceWeekId: event.service_week_id,
+      event: { name: event.name, location: event.location, startTime: event.start_time },
+      recipientUserIds: [parsed.userId],
+    });
 
     return ok({ attendee: toAttendeeResponse(attendee) }, 201);
   } catch (err) {

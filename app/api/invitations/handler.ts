@@ -19,6 +19,9 @@ import {
 } from "@/schemas/invitations";
 import type { EventType, InvitationStatus } from "@/types/domain";
 import { canTransition, applyTransition, canInvite, MAX_DENIALS_PER_WEEK } from "@/lib/invitations/state-machine";
+import { dispatchNotification, appNotificationUrl } from "@/lib/notifications/dispatch";
+import { setInvitationSms, invitationDeniedSms } from "@/lib/notifications/sms-templates";
+import { formatWeekLabel } from "@/lib/scheduling/reminder";
 
 type InvitationsRow = Database["public"]["Tables"]["invitations"]["Row"];
 
@@ -262,7 +265,39 @@ export async function createInvitation(req: NextRequest, lookup?: UserLookup): P
       },
     });
 
-    // TODO(#67/#68): dispatch SMS/email invitation notification here.
+    // Set invitation — SMS + Email to the member (PRD §14). Best-effort:
+    // a lookup miss or a total dispatch failure must not change the 201.
+    try {
+      const { data: partyRows, error: partyError } = await supabase
+        .from("users")
+        .select("id, name, email, phone, sms_opted_in")
+        .in("id", [parsed.userId, ctx.userId]);
+
+      const member = (partyRows ?? []).find((u) => u.id === parsed.userId);
+      if (!partyError && member) {
+        const adminRow = (partyRows ?? []).find((u) => u.id === ctx.userId);
+        const date = formatWeekLabel(week.title, week.service_date);
+        const link = appNotificationUrl(`/invite/${invitation.response_token}`);
+        await dispatchNotification({
+          recipients: [
+            {
+              userId: member.id,
+              name: member.name,
+              email: member.email,
+              phone: member.phone,
+              smsOptedIn: member.sms_opted_in,
+            },
+          ],
+          sms: { body: setInvitationSms({ date, roleNote: invitation.role_note, link }) },
+          email: {
+            template: "set_invitation",
+            data: { date, adminName: adminRow?.name ?? "Your worship leader", link },
+          },
+        });
+      }
+    } catch (err) {
+      console.error("createInvitation: notification dispatch failed", err);
+    }
 
     return ok({ invitation: toInvitationResponse(invitation) }, 201);
   } catch (err) {
@@ -495,7 +530,45 @@ export async function createGuestInvitation(
       },
     });
 
-    // TODO(#68): dispatch the guest invitation email with accountSetupUrl.
+    const inviteUrl = appUrl(`/invite/${invitation.response_token}`);
+    const accountSetupUrl = isNewUser ? appUrl(`/guest/${invitation.response_token}`) : null;
+
+    // Guest set invitation — SMS + Email to the (placeholder or existing)
+    // guest (PRD §14). New users land on account setup, existing users on the
+    // normal invite page. A freshly provisioned placeholder has phone: null /
+    // sms_opted_in false, so sendSms skips its own SMS with no special-casing.
+    // Best-effort: a lookup miss or total dispatch failure must not change 201.
+    try {
+      const { data: guestPartyRows, error: guestPartyError } = await supabase
+        .from("users")
+        .select("id, name, email, phone, sms_opted_in")
+        .in("id", [guestUserId, ctx.userId]);
+
+      const guest = (guestPartyRows ?? []).find((u) => u.id === guestUserId);
+      if (!guestPartyError && guest) {
+        const adminRow = (guestPartyRows ?? []).find((u) => u.id === ctx.userId);
+        const date = formatWeekLabel(week.title, week.service_date);
+        const link = accountSetupUrl ?? inviteUrl;
+        await dispatchNotification({
+          recipients: [
+            {
+              userId: guest.id,
+              name: guest.name,
+              email: guest.email,
+              phone: guest.phone,
+              smsOptedIn: guest.sms_opted_in,
+            },
+          ],
+          sms: { body: setInvitationSms({ date, roleNote: invitation.role_note, link }) },
+          email: {
+            template: "set_invitation",
+            data: { date, adminName: adminRow?.name ?? "Your worship leader", link },
+          },
+        });
+      }
+    } catch (err) {
+      console.error("createGuestInvitation: notification dispatch failed", err);
+    }
 
     return ok<GuestInvitationResponse>(
       {
@@ -503,8 +576,8 @@ export async function createGuestInvitation(
         isNewUser,
         guestUserId,
         email: parsed.email,
-        inviteUrl: appUrl(`/invite/${invitation.response_token}`),
-        accountSetupUrl: isNewUser ? appUrl(`/guest/${invitation.response_token}`) : null,
+        inviteUrl,
+        accountSetupUrl,
       },
       201,
     );
@@ -657,6 +730,37 @@ export async function denyInvitation(
         return fail("Internal error", ErrorCode.INTERNAL, 500);
       }
 
+      // Invitation denied (no-session path) — SMS + Email to the admin
+      // recipients the RPC resolved (invited_by if set, else all admins/
+      // set_leaders). anon cannot read `users`, so the contact rows come back
+      // from the SECURITY DEFINER RPC. Best-effort; the response body below is
+      // unchanged and never leaks recipient data to the caller.
+      try {
+        const denyRecipients = data.recipients ?? [];
+        if (denyRecipients.length > 0) {
+          const memberName = data.member_name ?? "";
+          const date = formatWeekLabel(data.week_title ?? null, data.service_date ?? "");
+          const link = appNotificationUrl(`/week/${data.service_week_id ?? ""}`);
+          const deniedReason = data.reason ?? null;
+          await dispatchNotification({
+            recipients: denyRecipients.map((r) => ({
+              userId: r.user_id,
+              name: r.name,
+              email: r.email,
+              phone: r.phone,
+              smsOptedIn: r.sms_opted_in,
+            })),
+            sms: { body: invitationDeniedSms({ memberName, date, reason: deniedReason, link }) },
+            email: {
+              template: "invitation_denied",
+              data: { memberName, date, reason: deniedReason, link },
+            },
+          });
+        }
+      } catch (err) {
+        console.error("denyInvitation (token path): notification dispatch failed", err);
+      }
+
       return ok({
         invitationId: id,
         status: data.status,
@@ -741,7 +845,61 @@ export async function denyInvitation(
       },
     });
 
-    // TODO(#67/#68): dispatch SMS + email to invited_by (admin) with member name and reason.
+    // Invitation denied — SMS + Email to the admin (PRD §14): the inviting
+    // admin if known, else every admin/set_leader in the group. Best-effort:
+    // any query error or zero recipients skips dispatch and still returns 200.
+    try {
+      const { data: denyingMember, error: denyingMemberError } = await supabase
+        .from("users")
+        .select("name")
+        .eq("id", inv.user_id)
+        .maybeSingle();
+
+      const { data: denyWeek, error: denyWeekError } = await supabase
+        .from("service_weeks")
+        .select("title, service_date")
+        .eq("id", inv.service_week_id)
+        .maybeSingle();
+
+      let recipientQuery = supabase
+        .from("users")
+        .select("id, name, email, phone, sms_opted_in");
+      recipientQuery =
+        inv.invited_by !== null
+          ? recipientQuery.eq("id", inv.invited_by)
+          : recipientQuery
+              .eq("church_group_id", ctx.churchGroupId)
+              .in("role", ["admin", "set_leader"]);
+      const { data: denyRecipients, error: denyRecipientsError } = await recipientQuery;
+
+      if (
+        !denyingMemberError &&
+        !denyWeekError &&
+        !denyRecipientsError &&
+        denyWeek &&
+        (denyRecipients ?? []).length > 0
+      ) {
+        const memberName = denyingMember?.name ?? "";
+        const date = formatWeekLabel(denyWeek.title, denyWeek.service_date);
+        const link = appNotificationUrl(`/week/${inv.service_week_id}`);
+        await dispatchNotification({
+          recipients: (denyRecipients ?? []).map((r) => ({
+            userId: r.id,
+            name: r.name,
+            email: r.email,
+            phone: r.phone,
+            smsOptedIn: r.sms_opted_in,
+          })),
+          sms: { body: invitationDeniedSms({ memberName, date, reason, link }) },
+          email: {
+            template: "invitation_denied",
+            data: { memberName, date, reason, link },
+          },
+        });
+      }
+    } catch (err) {
+      console.error("denyInvitation: notification dispatch failed", err);
+    }
 
     return ok({ invitation: toInvitationResponse(updated) });
   } catch (err) {
