@@ -1,0 +1,32 @@
+name: Practice reminders cron
+
+on:
+  schedule:
+    - cron: "0 * * * *" # hourly, UTC
+  workflow_dispatch: # manual test trigger
+
+jobs:
+  invoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secrets configured
+        id: check
+        env:
+          URL: ${{ secrets.STAGING_APP_URL }}
+          SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -n "$URL" ] && [ -n "$SECRET" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Invoke practice reminder endpoint
+        if: steps.check.outputs.configured == 'true'
+        env:
+          URL: ${{ secrets.STAGING_APP_URL }}
+          SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl --fail --show-error --silent \
+            -H "Authorization: Bearer ${SECRET}" \
+            "${URL%/}/api/cron/practice-reminders"

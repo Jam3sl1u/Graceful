@@ -12,6 +12,7 @@ import {
   unsyncEventFromAttendees,
   toGoogleEventId,
 } from "@/lib/google-calendar/sync";
+import { dispatchGoogleCalendarEventEmail } from "@/lib/notifications/event-email";
 
 // PUT /api/events/:id — set_leader/admin only. Re-enforces BR-10 whenever
 // startTime and/or endTime change.
@@ -127,6 +128,22 @@ export async function updateEvent(
       });
     } catch {
       // never block the update on sync failure
+    }
+
+    // Google Calendar event email — Email to confirmed members (#69, PRD §14).
+    // Per the OQ2 resolution: fire ONLY on a material change (start_time,
+    // end_time, or location changed) — never on a notes/name-only edit.
+    // Best-effort: never throws, never affects the response.
+    const materialChange =
+      data.start_time !== existing.start_time ||
+      data.end_time !== existing.end_time ||
+      data.location !== existing.location;
+    if (materialChange) {
+      await dispatchGoogleCalendarEventEmail(supabase, {
+        churchGroupId: ctx.churchGroupId,
+        serviceWeekId: data.service_week_id,
+        event: { name: data.name, location: data.location, startTime: data.start_time },
+      });
     }
 
     return ok({ event: toEventResponse(data) });

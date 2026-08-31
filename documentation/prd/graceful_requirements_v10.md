@@ -1705,6 +1705,9 @@ Working copy for all notification types. SMS copy is kept under 160 characters. 
 | **Practice reminder** | *Graceful: [Event name] is [tomorrow/today] at [Time] - [Location]* | Subject: Reminder: [Event name] in [N] hours. Preview: [Day, Date] at [Time] - [Location]. See you there. |
 | **New document** | *(In-app only)* | New document added to [Church name] library: [Document name]. Tap to view. |
 | **Transcription complete** | *(In-app only)* | Sheet music for '[Song title]' in the key of [Key] is ready. View it in the song library. |
+| **Google Calendar event** | *(Email + GCal — no SMS)* | Subject: Calendar update: [Event name] on [Day, Date]. Preview: [Event name] is now [Day, Date] at [Time] - [Location]. Your Google Calendar has been updated. |
+
+> **PROPOSED COPY — REQUIRES HUMAN APPROVAL.** The **Google Calendar event** row above was drafted in issue #69 (this table previously had no row for that email). Fired only on a material change — an event's start time, end time, or location changing, or an attendee being assigned — never on bare create or notes-only edits.
 
 # 31. Timeline Estimates
 

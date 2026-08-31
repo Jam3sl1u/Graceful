@@ -209,6 +209,15 @@ type NotificationsRow = {
   created_at: string;
 };
 
+// Added for #69 (practice reminder scheduler). Internal idempotency ledger for
+// the hourly practice-reminders cron — one row per (event, user) once reminded.
+type PracticeReminderSendsRow = {
+  id: string;
+  event_id: string;
+  user_id: string;
+  sent_at: string;
+};
+
 // Added for #70 (notification preferences API).
 // chat_preference is deliberately omitted: it is a Phase 2 chat concern and the
 // `ChatPref` union in types/domain.ts does not match the DB enum
@@ -457,6 +466,15 @@ export type Database = {
         Update: Partial<GoogleCalendarTokensRow>;
         Relationships: [];
       };
+      practice_reminder_sends: {
+        Row: PracticeReminderSendsRow;
+        Insert: Omit<PracticeReminderSendsRow, "id" | "sent_at"> & {
+          id?: string;
+          sent_at?: string;
+        };
+        Update: Partial<PracticeReminderSendsRow>;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -521,6 +539,18 @@ export type Database = {
         Returns: {
           status: InvitationStatus;
           already_responded: boolean;
+          member_name?: string | null;
+          service_week_id?: string | null;
+          service_date?: string | null;
+          week_title?: string | null;
+          reason?: string | null;
+          recipients?: Array<{
+            user_id: string;
+            name: string;
+            email: string | null;
+            phone: string | null;
+            sms_opted_in: boolean;
+          }>;
         };
       };
       get_invitation_by_token: {
@@ -543,15 +573,43 @@ export type Database = {
       };
       send_invitation_reminders: {
         Args: Record<string, never>;
+        Returns: {
+          member_reminders: Array<{
+            invitation_id: string;
+            user_id: string;
+            member_name: string;
+            phone: string | null;
+            sms_opted_in: boolean;
+            service_week_id: string;
+            service_date: string;
+            week_title: string | null;
+          }>;
+          admin_reminders: Array<{
+            user_id: string;
+            name: string;
+            phone: string | null;
+            sms_opted_in: boolean;
+            service_week_id: string;
+            service_date: string;
+            week_title: string | null;
+            pending_count: number;
+          }>;
+        };
+      };
+      send_practice_reminders: {
+        Args: Record<string, never>;
         Returns: Array<{
-          invitation_id: string;
+          event_id: string;
           user_id: string;
           member_name: string;
+          email: string | null;
           phone: string | null;
           sms_opted_in: boolean;
+          event_name: string;
+          location: string | null;
+          start_time: string;
           service_week_id: string;
-          service_date: string;
-          week_title: string | null;
+          reminder_hours_before: number;
         }>;
       };
       get_event_sync_targets: {

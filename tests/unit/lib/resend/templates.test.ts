@@ -215,6 +215,21 @@ describe("renderEmailTemplate", () => {
     expect(result.text).toContain('<script>alert("x")</script> & Co declined for Aug 09, 2026');
   });
 
+  it("renders the #69 google_calendar_event template (PROPOSED COPY) with subject, preview and link", () => {
+    const result = renderEmailTemplate("google_calendar_event", {
+      eventName: "Saturday Rehearsal",
+      dayDate: "Sat, Aug 01, 2026",
+      time: "6:00 PM UTC",
+      location: "Main Hall",
+      link: "https://graceful.app/week/abc",
+    });
+
+    expect(result.subject).toBe("Calendar update: Saturday Rehearsal on Sat, Aug 01, 2026");
+    expect(result.preview).toContain("Saturday Rehearsal is now Sat, Aug 01, 2026 at 6:00 PM UTC — Main Hall");
+    expect(result.preview).toContain("Your Google Calendar has been updated.");
+    expect(result.html).toContain('href="https://graceful.app/week/abc"');
+  });
+
   it("throws on an unknown template key", () => {
     expect(() =>
       renderEmailTemplate(
@@ -225,7 +240,7 @@ describe("renderEmailTemplate", () => {
     ).toThrow("Unknown email template: not_a_real_key");
   });
 
-  it("exports exactly the 7 PRD §30 template keys", () => {
+  it("exports exactly the PRD §30 template keys (incl. the #69 google_calendar_event proposed-copy key)", () => {
     expect(EMAIL_TEMPLATE_KEYS).toEqual([
       "set_invitation",
       "invitation_reminder_member",
@@ -234,6 +249,7 @@ describe("renderEmailTemplate", () => {
       "scheduling_conflict",
       "setlist_released",
       "practice_reminder",
+      "google_calendar_event",
     ]);
   });
 });
