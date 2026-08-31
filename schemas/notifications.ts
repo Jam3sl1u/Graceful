@@ -5,6 +5,18 @@ import { z } from "zod";
 export const notificationsSchema = z.object({});
 export type NotificationsInput = z.infer<typeof notificationsSchema>;
 
+// GET /api/notifications query params — pagination for the inbox feed. Shape
+// copied verbatim from schemas/audit-log.ts; only the pageSize default differs
+// (20 for an inbox feed vs 50 for the audit log).
+export const listNotificationsQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+});
+export type ListNotificationsQuery = z.infer<typeof listNotificationsQuerySchema>;
+
+// PATCH /api/notifications/:id/read path param.
+export const notificationIdParamSchema = z.string().uuid();
+
 // PRD §6.9.1 defaults — used when the caller has no notification_preferences
 // row yet, and as the merge base for a partial PUT.
 export const NOTIFICATION_PREFERENCE_DEFAULTS = {
