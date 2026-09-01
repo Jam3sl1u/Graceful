@@ -215,7 +215,15 @@ type PracticeReminderSendsRow = {
   id: string;
   event_id: string;
   user_id: string;
-  sent_at: string;
+  claimed_at: string;
+  sms_done: boolean;
+  email_done: boolean;
+  attempts: number;
+};
+
+type AppSecretsRow = {
+  key: string;
+  value: string;
 };
 
 // Added for #70 (notification preferences API).
@@ -468,11 +476,23 @@ export type Database = {
       };
       practice_reminder_sends: {
         Row: PracticeReminderSendsRow;
-        Insert: Omit<PracticeReminderSendsRow, "id" | "sent_at"> & {
+        Insert: Omit<
+          PracticeReminderSendsRow,
+          "id" | "claimed_at" | "sms_done" | "email_done" | "attempts"
+        > & {
           id?: string;
-          sent_at?: string;
+          claimed_at?: string;
+          sms_done?: boolean;
+          email_done?: boolean;
+          attempts?: number;
         };
         Update: Partial<PracticeReminderSendsRow>;
+        Relationships: [];
+      };
+      app_secrets: {
+        Row: AppSecretsRow;
+        Insert: AppSecretsRow;
+        Update: Partial<AppSecretsRow>;
         Relationships: [];
       };
     };
@@ -597,7 +617,7 @@ export type Database = {
         };
       };
       send_practice_reminders: {
-        Args: Record<string, never>;
+        Args: { p_cron_secret: string };
         Returns: Array<{
           event_id: string;
           user_id: string;
@@ -610,7 +630,21 @@ export type Database = {
           start_time: string;
           service_week_id: string;
           reminder_hours_before: number;
+          reminder_sms: boolean;
+          reminder_email: boolean;
+          sms_done: boolean;
+          email_done: boolean;
         }>;
+      };
+      confirm_practice_reminder_sent: {
+        Args: {
+          p_cron_secret: string;
+          p_event_id: string;
+          p_user_id: string;
+          p_sms_done: boolean;
+          p_email_done: boolean;
+        };
+        Returns: boolean;
       };
       get_event_sync_targets: {
         Args: { p_event_id: string };

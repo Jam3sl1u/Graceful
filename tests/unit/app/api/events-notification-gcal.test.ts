@@ -116,7 +116,10 @@ describe("updateEvent — GCal email gating (OQ2)", () => {
     );
     expect(res.status).toBe(200);
     expect(mockEmail).toHaveBeenCalledTimes(1);
-    expect(mockEmail.mock.calls[0][1]).toMatchObject({ serviceWeekId: WEEK_ID });
+    // review MJ1: recipients resolve from event_attendees for THIS event, not
+    // the whole week — so eventId must be plumbed through.
+    expect(mockEmail.mock.calls[0][1]).toMatchObject({ serviceWeekId: WEEK_ID, eventId: EVENT_ID });
+    expect(mockEmail.mock.calls[0][1].recipientUserIds).toBeUndefined();
   });
 
   it("fires on a location change", async () => {
@@ -190,6 +193,7 @@ describe("assignAttendee — GCal email (OQ2)", () => {
     expect(mockEmail).toHaveBeenCalledTimes(1);
     expect(mockEmail.mock.calls[0][1]).toMatchObject({
       serviceWeekId: WEEK_ID,
+      eventId: EVENT_ID,
       recipientUserIds: [MEMBER_ID],
     });
   });

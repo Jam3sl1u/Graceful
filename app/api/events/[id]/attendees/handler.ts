@@ -138,6 +138,7 @@ export async function assignAttendee(
     await dispatchGoogleCalendarEventEmail(supabase, {
       churchGroupId: ctx.churchGroupId,
       serviceWeekId: event.service_week_id,
+      eventId,
       event: { name: event.name, location: event.location, startTime: event.start_time },
       recipientUserIds: [parsed.userId],
     });

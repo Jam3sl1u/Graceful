@@ -202,6 +202,27 @@ describe("denyInvitation §4a — authenticated path", () => {
     expect(arg.email.data.reason).toBeNull();
   });
 
+  it("N5: a null denying-member name falls back to 'A member', not an empty string", async () => {
+    wire({
+      invitations: [
+        { data: pendingInv(), error: null },
+        { data: [], error: null },
+        { data: deniedInv(), error: null },
+      ],
+      users: [
+        { data: { name: null }, error: null }, // denying member row with no name
+        { data: [adminUser(ADMIN_ID)], error: null },
+      ],
+      service_weeks: [{ data: weekRow, error: null }],
+    });
+
+    await denyInvitation(makeReq({}), INVITATION_ID, lookup());
+
+    const arg = mockDispatch.mock.calls[0][0];
+    expect(arg.email.data.memberName).toBe("A member");
+    expect(arg.sms.body).not.toMatch(/^\s/);
+  });
+
   it("edge 9: an already-responded invitation dispatches nothing", async () => {
     wire({
       invitations: [{ data: deniedInv(), error: null }],
@@ -270,6 +291,26 @@ describe("denyInvitation §4b — no-session token path", () => {
     const res = await denyInvitation(makeReq({ responseToken: TOKEN }), INVITATION_ID);
     expect(res.status).toBe(200);
     expect(mockDispatch).not.toHaveBeenCalled();
+  });
+
+  it("N5: a null member_name from the RPC falls back to 'A member'", async () => {
+    wireRpc({
+      status: "denied",
+      already_responded: false,
+      member_name: null,
+      service_week_id: WEEK_ID,
+      service_date: "2026-07-12",
+      week_title: null,
+      reason: null,
+      recipients: [
+        { user_id: ADMIN_ID, name: "Alex", email: "a@b.com", phone: null, sms_opted_in: false },
+      ],
+    });
+
+    await denyInvitation(makeReq({ responseToken: TOKEN }), INVITATION_ID);
+
+    const arg = mockDispatch.mock.calls[0][0];
+    expect(arg.email.data.memberName).toBe("A member");
   });
 
   it("edge 10: RPC reason null -> dispatched reason is null", async () => {

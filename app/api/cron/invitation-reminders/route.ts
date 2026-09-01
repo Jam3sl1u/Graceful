@@ -36,7 +36,16 @@ export async function GET(req: NextRequest): Promise<Response> {
     return fail("Internal error", ErrorCode.INTERNAL, 500);
   }
 
-  const payload = data ?? { member_reminders: [], admin_reminders: [] };
+  // Accept both RPC return shapes for one release: migration 20260831000001
+  // changes send_invitation_reminders() from a bare member-reminder array to
+  // { member_reminders, admin_reminders }. If this code deploys before the
+  // migration is applied, `data` is still an array — treat it as the member
+  // list with no admin reminders rather than reading `undefined.member_reminders`
+  // (which would silently send zero SMS while the old RPC has already stamped
+  // last_reminded_at). Apply order: migration first, then this deploy.
+  const payload = Array.isArray(data)
+    ? { member_reminders: data, admin_reminders: [] }
+    : (data ?? { member_reminders: [], admin_reminders: [] });
   const reminders = payload.member_reminders ?? [];
   const adminReminders = payload.admin_reminders ?? [];
 

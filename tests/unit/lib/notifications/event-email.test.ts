@@ -1,7 +1,8 @@
 // Coder-stage coverage for #69 OQ2 — lib/notifications/event-email.ts: the
-// Google Calendar event email (Email to confirmed members, no SMS). Fired only
-// on a material change or attendee assignment; that gating lives in the event
-// handlers, this file covers the module's own recipient resolution + payload.
+// Google Calendar event email (Email to the members assigned to the event, no
+// SMS). Fired only on a material change or attendee assignment; that gating
+// lives in the event handlers, this file covers the module's own recipient
+// resolution (defaults to event_attendees for the event) + payload.
 
 jest.mock("@/lib/notifications/dispatch", () => ({
   dispatchNotification: jest.fn().mockResolvedValue({
@@ -24,10 +25,24 @@ const mockDispatch = dispatchNotification as unknown as jest.Mock;
 
 type QueryResult = { data: unknown; error: unknown };
 
-function chain(result: QueryResult) {
+// filters[table] accumulates every [column, value] passed to .eq() / .in() on
+// a query against that table, so tests can assert the WHERE clause, not just
+// the table name.
+type Filters = Record<string, [string, unknown][]>;
+
+function chain(result: QueryResult, table: string, filters: Filters) {
+  const record = (col: string, val: unknown) => {
+    (filters[table] ??= []).push([col, val]);
+  };
   const c: Record<string, unknown> & PromiseLike<QueryResult> = {
-    eq: jest.fn(() => c),
-    in: jest.fn(() => c),
+    eq: jest.fn((col: string, val: unknown) => {
+      record(col, val);
+      return c;
+    }),
+    in: jest.fn((col: string, val: unknown) => {
+      record(col, val);
+      return c;
+    }),
     select: jest.fn(() => c),
     maybeSingle: jest.fn(() => Promise.resolve(result)),
     then: (res: (v: QueryResult) => unknown, rej?: (e: unknown) => unknown) =>
@@ -36,7 +51,7 @@ function chain(result: QueryResult) {
   return c;
 }
 
-function makeSupabase(queues: Record<string, QueryResult[]>) {
+function makeSupabase(queues: Record<string, QueryResult[]>, filters: Filters = {}) {
   const counts: Record<string, number> = {};
   const next = (t: string) => {
     const q = queues[t] ?? [];
@@ -45,7 +60,7 @@ function makeSupabase(queues: Record<string, QueryResult[]>) {
     return q[i] ?? q[q.length - 1] ?? { data: null, error: null };
   };
   return {
-    from: jest.fn((t: string) => ({ select: jest.fn(() => chain(next(t))) })),
+    from: jest.fn((t: string) => ({ select: jest.fn(() => chain(next(t), t, filters)) })),
   } as unknown as SupabaseClient<Database>;
 }
 
@@ -74,15 +89,20 @@ describe("formatEventWhen", () => {
 });
 
 describe("dispatchGoogleCalendarEventEmail", () => {
-  it("emails every confirmed member of the week when no explicit recipients are given", async () => {
-    const supabase = makeSupabase({
-      invitations: [{ data: [{ user_id: "m1" }, { user_id: "m1" }, { user_id: "m2" }], error: null }],
-      users: [{ data: [contact("m1"), contact("m2")], error: null }],
-    });
+  it("emails the event's assigned attendees when no explicit recipients are given", async () => {
+    const filters: Filters = {};
+    const supabase = makeSupabase(
+      {
+        event_attendees: [{ data: [{ user_id: "m1" }, { user_id: "m1" }, { user_id: "m2" }], error: null }],
+        users: [{ data: [contact("m1"), contact("m2")], error: null }],
+      },
+      filters,
+    );
 
     await dispatchGoogleCalendarEventEmail(supabase, {
       churchGroupId: "group-1",
       serviceWeekId: "week-1",
+      eventId: "event-1",
       event,
     });
 
@@ -93,6 +113,12 @@ describe("dispatchGoogleCalendarEventEmail", () => {
     expect(arg.email.data.eventName).toBe("Saturday Rehearsal");
     expect(arg.email.data.link).toBe("https://app.test/week/week-1");
     expect(arg.recipients.map((r: { userId: string }) => r.userId).sort()).toEqual(["m1", "m2"]);
+
+    // review MJ1 / LOW-4: recipients come from event_attendees filtered by THIS
+    // event, and the users lookup is tenant-scoped.
+    expect(filters.event_attendees).toContainEqual(["event_id", "event-1"]);
+    expect(filters.users).toContainEqual(["church_group_id", "group-1"]);
+    expect(filters.users).toContainEqual(["id", ["m1", "m2"]]);
   });
 
   it("emails only the given recipientUserIds (attendee-assignment path)", async () => {
@@ -103,6 +129,7 @@ describe("dispatchGoogleCalendarEventEmail", () => {
     await dispatchGoogleCalendarEventEmail(supabase, {
       churchGroupId: "group-1",
       serviceWeekId: "week-1",
+      eventId: "event-1",
       event,
       recipientUserIds: ["m2"],
     });
@@ -118,6 +145,7 @@ describe("dispatchGoogleCalendarEventEmail", () => {
     await dispatchGoogleCalendarEventEmail(supabase, {
       churchGroupId: "group-1",
       serviceWeekId: "week-1",
+      eventId: "event-1",
       event: { ...event, location: null },
       recipientUserIds: ["m2"],
     });
@@ -125,12 +153,13 @@ describe("dispatchGoogleCalendarEventEmail", () => {
     expect(mockDispatch.mock.calls[0][0].email.data.location).toBe("TBD");
   });
 
-  it("no confirmed members -> no dispatch", async () => {
-    const supabase = makeSupabase({ invitations: [{ data: [], error: null }] });
+  it("no assigned attendees -> no dispatch", async () => {
+    const supabase = makeSupabase({ event_attendees: [{ data: [], error: null }] });
 
     await dispatchGoogleCalendarEventEmail(supabase, {
       churchGroupId: "group-1",
       serviceWeekId: "week-1",
+      eventId: "event-1",
       event,
     });
     expect(mockDispatch).not.toHaveBeenCalled();
@@ -138,13 +167,14 @@ describe("dispatchGoogleCalendarEventEmail", () => {
 
   it("a query error -> silent, no dispatch, no throw", async () => {
     const supabase = makeSupabase({
-      invitations: [{ data: null, error: { message: "boom" } }],
+      event_attendees: [{ data: null, error: { message: "boom" } }],
     });
 
     await expect(
       dispatchGoogleCalendarEventEmail(supabase, {
         churchGroupId: "group-1",
         serviceWeekId: "week-1",
+        eventId: "event-1",
         event,
       }),
     ).resolves.toBeUndefined();
@@ -162,6 +192,7 @@ describe("dispatchGoogleCalendarEventEmail", () => {
       dispatchGoogleCalendarEventEmail(throwing, {
         churchGroupId: "group-1",
         serviceWeekId: "week-1",
+        eventId: "event-1",
         event,
         recipientUserIds: ["m2"],
       }),

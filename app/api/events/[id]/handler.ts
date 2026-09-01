@@ -130,10 +130,11 @@ export async function updateEvent(
       // never block the update on sync failure
     }
 
-    // Google Calendar event email — Email to confirmed members (#69, PRD §14).
-    // Per the OQ2 resolution: fire ONLY on a material change (start_time,
-    // end_time, or location changed) — never on a notes/name-only edit.
-    // Best-effort: never throws, never affects the response.
+    // Google Calendar event email — Email to the members assigned to this event
+    // (#69, PRD §14; OQ2 resolution). Fire ONLY on a material change
+    // (start_time, end_time, or location changed) — never on a notes/name-only
+    // edit. Recipients default to event_attendees (the same set the GCal sync
+    // above writes to). Best-effort: never throws, never affects the response.
     const materialChange =
       data.start_time !== existing.start_time ||
       data.end_time !== existing.end_time ||
@@ -142,6 +143,7 @@ export async function updateEvent(
       await dispatchGoogleCalendarEventEmail(supabase, {
         churchGroupId: ctx.churchGroupId,
         serviceWeekId: data.service_week_id,
+        eventId: data.id,
         event: { name: data.name, location: data.location, startTime: data.start_time },
       });
     }

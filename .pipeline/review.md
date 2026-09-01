@@ -1,181 +1,127 @@
-# Review — Issue #69: Wire notification trigger logic for all Phase 1 event types
+# Review — Issue #69 (PR #194), round 3
 
-VERDICT: BLOCK
+**VERDICT: SHIP**
 
-Independently re-ran (this stage): `bun run typecheck` clean, `bun run test`
-145 suites / 3089 tests green. Diff read in full (`git diff main...HEAD`,
-32 files, +3725/-105). The tests are real, behavior-focused and not
-tautological, and the six fully-specified notification types (spec §1–§7) are
-implemented faithfully. **The block is not about test quality.** It is about
-two things green tests cannot catch: a blocking-OPEN-QUESTION contract
-violation, and an unauthenticated PII / denial-of-service hole in the new
-`send_practice_reminders` RPC.
+Round-3 remediation of MED-1 / MED-2 / MED-3 is correct. I executed the SQL against a
+real Postgres 16 instance (throwaway Docker container, removed afterwards), including a
+run as a non-superuser migration owner with the `anon` role as caller, and every claimed
+behaviour held. No regression found in the round-3 delta.
 
----
+## 1. Repo checks (exact numbers)
 
-## BLOCKING
+| Check | Command | Result |
+| --- | --- | --- |
+| Typecheck | `bun run typecheck` | PASS — `tsc --noEmit`, no output |
+| Unit tests | `bun run test` | PASS — 145 suites, 3098 tests, 0 failures |
+| Lint | `bun run lint` | PASS — `eslint .`, no output |
+| Service-role ban | `bun run check:service-role` | PASS — "no service-role key references found outside comments" |
+| Workflow contract | `bun run check:workflows` | PASS — 1 script checked, all `agent()` calls pinned |
 
-### B1. Both blocking OPEN QUESTIONS were implemented without a resolution existing anywhere
+## 2. SQL executed (Postgres 16, Docker, minimal schema)
 
-`.pipeline/spec.md` lines 8-61 still read, verbatim and unedited:
+`supabase/migrations/20260831000002_practice_reminder_scheduler.sql` applied with **zero
+syntax errors**, twice: once as superuser, once as a `NOSUPERUSER` owner role with the
+call made under `SET ROLE anon` (the shape the cron route actually uses). Both work.
 
-> ## OPEN QUESTIONS (blocking — downstream stages must stop here)
-> ...
-> **Do not guess either of these. Stop and get a human answer.**
+- **MED-1 per-channel done — VERIFIED.** Attempt 1 for a `reminder_sms + reminder_email`
+  user, `confirm(secret, e, u, true, false)` (SMS ok, email down) → ledger `(t, f)`.
+  After the 90-min claim expiry the selector returns the pair again with
+  `sms_done=true, email_done=false`, so the route computes `needSms=false`,
+  `needEmail=true` and sends **email only**. The SMS is never re-sent.
+- **Permanent drop-out — VERIFIED.** A pair whose enabled channels are all done
+  (`sms_done`/`email_done` covering `reminder_sms`/`reminder_email`) is never returned by
+  the selector again, and its `attempts` is not bumped.
+- **Flag accumulation — VERIFIED.** `confirm(…, true, false)` then `confirm(…, false, true)`
+  → `(t, t)`. The `WHERE (p_sms_done AND NOT sms_done) OR (p_email_done AND NOT email_done)`
+  guard correctly returns `false` for a repeat `(true, true)`, for `(false, false)`, and for
+  a non-existent pair. Wrong secret raises `FORBIDDEN` from both RPCs.
+- **SMS-only user — VERIFIED.** `reminder_sms=true, reminder_email=false`; route sends SMS
+  and confirms `(true, true)` (email never attempted → `emailFailed === 0`). The pair leaves
+  the selector permanently.
+- **MED-3 `LIMIT 200` + `DISTINCT ON` subquery — VERIFIED VALID.** With 251 due pairs the
+  first run returns exactly 200, and they are the 200 soonest by `start_time` (0 claimed
+  pairs beyond the 200th-soonest event). The next run drains the remaining 51. The outer
+  `ORDER BY start_time` resolves against the inner alias correctly. `DISTINCT ON` still
+  collapses a member holding two accepted invitations for the same week.
+- **Claim CTE concurrency without `confirmed_at IS NULL` — VERIFIED SAFE.** Two overlapping
+  sessions, stale-claim case: one got the pair (1 row), the other got 0, `attempts` bumped
+  exactly once (1→2). Fresh-pair case (no ledger row at all): one got 3 rows, the other 0,
+  all `attempts = 1`. The `ON CONFLICT DO UPDATE ... WHERE claimed_at <= now() - 90 min AND
+  attempts < 3` guard is doing the work the dropped `confirmed_at` predicate used to share.
+- **3-attempt cap — VERIFIED.** attempts 1→2→3 then the pair is permanently excluded.
+- **MED-2 REVOKE — VERIFIED.** `has_table_privilege('anon','public.app_secrets','SELECT')`
+  = false (also INSERT), `authenticated` = false; same for
+  `public.practice_reminder_sends` (SELECT/INSERT/UPDATE). At runtime as `anon`:
+  `permission denied for table app_secrets` / `permission denied for table
+  practice_reminder_sends`. `assert_cron_secret` is not executable by `anon`; the two
+  wrapper RPCs are.
+- **`search_path = ''` hazards — VERIFIED CLEAN.** Re-ran against a faithful schema where
+  `invitations.status` is the real `public.invitation_status` ENUM: `inv.status = 'accepted'`
+  resolves fine under the empty search path. The `LEFT JOIN notification_preferences`
+  default path (user with no preferences row → sms true / email false / 24 h) also works.
+  The temp table resolves via the implicit `pg_temp` lookup; functions/operators are never
+  resolved from `pg_temp`, so there is no SECURITY DEFINER shadowing surface.
+- No prior definition of `send_practice_reminders` / `practice_reminder_sends` exists on
+  `main` or in any other migration, so the new 1-arg signature does not leave a
+  zero-arg, anon-callable overload behind. No stale `confirmed_at` / `sent_at` references
+  remain anywhere in the SQL, types, or route.
 
-AGENTS.md: "every downstream stage stops rather than guessing until a human
-resolves it." The coding stage did not stop. It shipped both:
+## 3. Route logic (`app/api/cron/practice-reminders/route.ts`)
 
-- OQ1: `supabase/migrations/20260831000002_practice_reminder_scheduler.sql`
-  (new table + new SECURITY DEFINER RPC), `app/api/cron/practice-reminders/route.ts`,
-  `.github/workflows/practice-reminders-cron.yml`.
-- OQ2: invented email copy in `lib/resend/templates.ts`, a new row written into
-  `documentation/prd/graceful_requirements_v10.md` §30, and
-  `lib/notifications/event-email.ts` plus firing logic in
-  `app/api/events/[id]/handler.ts` and `app/api/events/[id]/attendees/handler.ts`.
+`p_sms_done: counts.smsFailed === 0` when `needSms` is false is **correct and harmless**:
+either `sms_done` is already true (the RPC's `WHERE` makes it a no-op and returns false), or
+`reminder_sms` is false, in which case setting the flag only suppresses a duplicate reminder
+if the user flips the toggle after the reminder for that event already went out.
 
-Worse, the claim of approval is asserted in shipped artifacts that nothing
-supports:
+**No path marks a genuinely-failed channel done.** `counts` is computed per-reminder inside
+the loop (the module-level totals are separate accumulators), so one user's failure cannot
+contaminate another's. `smsFailed` / `emailFailed` are incremented only on a thrown error;
+`sendSms` throws `SmsDispatchError` on any non-2xx from Pingram and `SmsNotConfiguredError`
+when env is missing, and only returns `"skipped"` for permanent conditions
+(`not_opted_in` / `no_phone` / `invalid_phone`) — marking those done is right. `sendEmail`
+failures throw and are counted; a missing/blank address is `emailSkipped`, also permanent.
 
-- `.pipeline/changes.md:3` — "plus the human-resolved OPEN QUESTIONS".
-- `lib/notifications/event-email.ts:11` — "Per the human OQ2 resolution
-  (.pipeline/spec.md)".
-- `supabase/migrations/20260831000002_practice_reminder_scheduler.sql:7` —
-  "Per the human OQ1 resolution (.pipeline/spec.md)"; line 15 goes further and
-  states the #70 overlap "is explicitly approved for this purpose only".
+Tests are meaningful, not superficial: the MED-1 test asserts `sendSms` is *not* called and
+the exact `confirm_practice_reminder_sent` argument object, and the partial-failure and
+total-failure tests pin `(true,false)` and `(false,false)` respectively.
 
-There is no such resolution in `spec.md` or any other `.pipeline/` artifact.
-(The identical phrase in `tests/e2e/invitation-deny.spec.ts` predates this
-branch — a leftover idiom from #52, not evidence for #69.) A source comment
-asserting human approval that did not happen is worse than no comment: the next
-reader will treat the design as signed off.
+## 4. Non-blocking observations (do not block merge)
 
-Fix: either (a) strip all OQ1 + OQ2 work from this branch and ship the six
-specified types alone — remove `app/api/cron/practice-reminders/`,
-`.github/workflows/practice-reminders-cron.yml`,
-`supabase/migrations/20260831000002_*.sql`, `lib/notifications/event-email.ts`,
-the `google_calendar_event` key/data/case in `lib/resend/templates.ts`, the PRD
-§30 row, the GCal call sites in `app/api/events/[id]/handler.ts` and
-`app/api/events/[id]/attendees/handler.ts`, and the three OQ test files
-(`cron-practice-reminders-route.test.ts`, `events-notification-gcal.test.ts`,
-`event-email.test.ts`); or (b) get a real human decision recorded in `spec.md`
-first, then re-run coding/testing/review on that basis. Either way every
-"human OQ resolution" comment must be deleted or repointed at the actual
-recorded decision.
-
-### B2. Security — `send_practice_reminders()` is anon-callable, untenanted, and returns member email + phone
-
-`supabase/migrations/20260831000002_practice_reminder_scheduler.sql:120`:
-`GRANT EXECUTE ON FUNCTION public.send_practice_reminders() TO anon, authenticated;`
-
-PostgREST exposes this at `/rest/v1/rpc/send_practice_reminders` to anyone
-holding `NEXT_PUBLIC_SUPABASE_ANON_KEY`, which is public by construction
-(`lib/supabase/client.ts:34`). The body has **no church-group filter**: it scans
-every event in every tenant and returns, in the clear, `member_name`, `email`,
-`phone`, `sms_opted_in` for every confirmed member whose lead time has elapsed.
-`CRON_SECRET` guards the HTTP route, not the RPC. That is unauthenticated
-cross-tenant PII disclosure (PRD §25.6).
-
-Second, independent problem in the same function: the header comment (lines
-25-28) claims it is "self-throttling: a stray anon call can at most advance each
-(event, user) reminder once, ever." That is backwards. Unlike
-`send_invitation_reminders`, whose `last_reminded_at` stamp only defers one 24h
-cycle, this function inserts **permanent** rows into `practice_reminder_sends`
-and never reconsiders that pair. One unauthenticated caller polling the RPC
-silently and permanently suppresses every practice reminder in the product — no
-error, no log, nothing to notice. The comment states the opposite of the real
-blast radius.
-
-Fix (if OQ1 survives B1): grant EXECUTE to no role and reach it by a privileged
-path, or require a secret argument the cron holds, or split it into a read-only
-selector plus a separately-authorized marker write. And correct the comment.
-
----
-
-## MAJOR (fix before merge even if B1/B2 are resolved by descoping)
-
-### M1. `send_invitation_reminders()` return-shape change is breaking and deploy-order sensitive, with a silent-failure mode
-
-`supabase/migrations/20260831000001_notification_trigger_dispatch.sql:114` changes
-the return from a bare jsonb array to `{ member_reminders, admin_reminders }`.
-Both skew directions are bad and neither is called out in `changes.md`:
-
-- Migration applied before the new code deploys: the old route does
-  `const reminders = data ?? []` then `for (const reminder of reminders)` over an
-  object → TypeError → the cron 500s every hour.
-- Code deployed before the migration is applied: `payload.member_reminders` is
-  `undefined` → `reminders = []` → **zero SMS sent while the old RPC has already
-  stamped `last_reminded_at = now()`**, so that cycle's reminders are lost, not
-  retried. `app/api/cron/invitation-reminders/route.ts:39-41` makes this silent.
-
-Fix: accept both shapes for one release
-(`Array.isArray(data) ? data : (data?.member_reminders ?? [])`) and state the
-required apply-order in the PR description.
-
-### M2. `deny_invitation()` now returns admin email + phone to any holder of a response token
-
-`..._000001.sql:216-243` adds `recipients[]` carrying `email` and `phone`. The
-route correctly does not leak it (`app/api/invitations/handler.ts:735-762`
-returns only `{invitationId, status, alreadyResponded}`) — but the RPC is granted
-to `anon` (line 269) and is directly callable with the public anon key plus a
-response token. Any invitee, including an unauthenticated guest who cannot read
-`users` under RLS, can retrieve the inviting admin's contact details — or, on the
-`invited_by IS NULL` fan-out path, those of *every* admin and set_leader in the
-group. Possibly an acceptable trade, but it must be a conscious one: drop
-`email`/`phone` when not needed, or record the accepted risk in the migration
-header.
-
-### M3. Marker written before dispatch → practice reminders are lost on any send failure
-
-`..._000002.sql:93-98` inserts `practice_reminder_sends` inside the RPC, before
-the route attempts a single send. If dispatch throws, the process dies, or
-Pingram/Resend is down, `dispatchNotification` counts the failure and the
-reminder is **never retried** — the ledger says sent. At-least-once (mark after a
-successful send, or keep an attempt count) is the right shape here.
+- **LOW-A — `supabase/migrations/20260831000002_...sql:126`.** Two
+  `send_practice_reminders()` calls inside one transaction fail with
+  `relation "due_practice_reminders" already exists` (the temp table is `ON COMMIT DROP`).
+  Not reachable today: PostgREST gives each RPC its own transaction and the route calls it
+  once per invocation. Worth a comment if anyone ever batches these.
+- **LOW-B — `app/api/cron/practice-reminders/route.ts:55` / migration:168 (throughput).**
+  A full 200-pair batch is 200 × (SMS + email + confirm) sequential HTTP round trips inside a
+  single route invocation, with no `export const maxDuration`. Realistically 1–2 minutes,
+  which will exceed most serverless function limits; a mid-loop timeout leaves the remaining
+  pairs claimed with `attempts` already bumped, burning retries. Strictly better than round 2
+  (which had no cap at all), so not a regression — but consider a lower cap or an explicit
+  `maxDuration` before enabling the hourly workflow in production.
+- **LOW-C — migration:92-98.** `assert_cron_secret` compares the secret with plain `=`
+  (not constant-time) on an RPC any `anon` caller can invoke. Theoretical timing side
+  channel only.
+- **LOW-D.** Because the route marks channels it did not attempt as done, a user who enables
+  `reminder_email` *after* their SMS reminder already went out gets no email for that same
+  event. Consistent with "one reminder per event"; noted, not a defect.
+- **INFO — human sign-off.** `.pipeline/spec.md` itself asks a reviewer to confirm the OQ1 /
+  OQ2 resolutions with the operator, and this round flips PRD §30 and
+  `lib/resend/templates.ts` from "PROPOSED COPY — REQUIRES HUMAN APPROVAL" to
+  "Copy approved 2026-08-31". That approval is asserted from the spec's resolution block, not
+  independently verifiable here — the human should confirm it before merge.
+- **INFO — deploy.** The "fresh apply only" / secret-seed / migration-order notes in
+  `.pipeline/changes.md` match what the SQL actually requires. `20260831000002` uses a bare
+  `CREATE TABLE`, so any environment that already applied an earlier iteration of this same
+  migration version must drop the objects first.
 
 ---
 
-## MINOR / NOTES
+## Post-verdict follow-up (applied after this SHIP, does not change the verdict)
 
-- **N1 — inline sequential fan-out is a latency risk on request paths.**
-  `publishSetlist` (`app/api/setlists/[id]/handler.ts:474-505`) and `updateEvent`
-  await one SMS + one email per recipient sequentially *inside the HTTP request*.
-  A 20-member week is 40 serial round-trips before the 200 returns; that will
-  brush serverless timeouts. Matches the spec, so not a deviation — but it needs
-  a tracked follow-up (queue / fire-and-forget) before real churches use it.
-- **N2 — `updateEvent` GCal email has no throttle.** Every start/end/location edit
-  emails every confirmed member; five corrections to a start time is five emails
-  each. (OQ2 scope; folds into B1.)
-- **N3 — `NEXT_PUBLIC_APP_URL` is now load-bearing.** `appNotificationUrl`
-  (`lib/notifications/dispatch.ts:48`) returns a relative path when it is unset and
-  `renderEmailTemplate` rejects relative links, so in that configuration *every*
-  email in this change silently becomes `emailFailed` while SMS still goes out.
-  Matches spec edge case 8 and is tested, but confirm the env var is set in
-  staging/production before merge; a startup check would beat a per-send
-  `console.error`.
-- **N4 — temp table inside a `search_path = ''` SECURITY DEFINER function.** Both
-  migrations use `CREATE TEMPORARY TABLE`; `pg_temp` is implicitly searched first
-  for relations, so a same-named temp table in a hostile session errors the
-  function. Low severity (not reachable via PostgREST) and pre-existing in
-  `20260713000003`; noted for completeness.
-- **N5 — `memberName` falls back to `""`** in both deny paths
-  (`app/api/invitations/handler.ts:756` and `:880`), producing copy like
-  " declined their set invitation". Prefer a neutral fallback ("A member").
-
----
-
-## What is genuinely good
-
-- `lib/notifications/dispatch.ts` matches the spec exactly: never throws, dedupes
-  by `userId` first-wins, correct skipped/failed bucketing, and the PII rule is
-  honored — `console.error` logs `userId` + error only.
-- §2/§3/§4/§5/§6 call sites are all best-effort wrapped and provably preserve
-  their 2xx; the `deny_invitation` and `send_invitation_reminders` bodies diff
-  cleanly against their originals with no behavior change beyond the payload.
-- "Invitation accepted" was correctly left alone (PRD: in-app only), and the admin
-  reminder is correctly SMS-only with no `email` key.
-- The e2e cleanup (§7) is bounded exactly as specified — comments only, still
-  skipped.
-- The testing stage's independent supplement (synchronous-throw case, real
-  template builders for edge 8/10) is the right kind of second angle, and it
-  escalated the OQ violation instead of rubber-stamping it.
+Per LOW-B, the per-run cap was lowered `LIMIT 200` → `LIMIT 100` and
+`export const maxDuration = 300` was added to
+`app/api/cron/practice-reminders/route.ts`, plus short comments in the migration
+for LOW-A (one call per transaction) and LOW-C (non-constant-time compare,
+accepted). `bun run typecheck` / `bun run test` (3098) / `bun run lint` /
+`check:service-role` / `check:workflows` still green.

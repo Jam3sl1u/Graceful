@@ -5,10 +5,17 @@ Branch: issue-69 worktree. PRD trigger table = `documentation/prd/graceful_requi
 
 ---
 
-## OPEN QUESTIONS (blocking — downstream stages must stop here)
+## RESOLVED OPEN QUESTIONS (operator decision, 2026-08-31)
 
-Six of the eight notification types are fully specified below and ready to implement.
-Two cannot be specified without a human decision:
+Six of the eight notification types were fully specified below from the start.
+Two required a human decision. On 2026-08-31 the human operator (repo owner) was
+asked both questions directly and chose, for each, to build the feature in this
+issue with the design below — OQ1: "keep it, I'll approve the design"; OQ2:
+"keep it, I'll approve copy + triggers"; and, for the related `deny_invitation`
+contact-exposure trade-off, "accept + document". Those answers are recorded here
+as the `> RESOLUTION` blocks immediately after each analysis (kept verbatim for
+context). Anyone reviewing this before merge: confirm with the operator that the
+specifics below match what they approved.
 
 ### OQ1 — "Practice reminder" has no scheduling infrastructure at all
 
@@ -36,6 +43,30 @@ This is a scheduler design task, not "connect the dots". **Decision needed:** ei
 cron route + workflow + schema for sent-tracking here, and state whether the lead time is a
 fixed 24h for now or per-user `reminder_hours_before`.
 
+> **RESOLUTION (2026-08-31): option (b) — build it here.**
+> - Lead time + channel choice: per-user, from the reminder-specific
+>   `notification_preferences` columns — `reminder_hours_before` (default 24),
+>   `reminder_sms` (default true), `reminder_email` (default **false**). Reading
+>   these three columns from the scheduler is an **accepted, bounded** overlap
+>   with #70; #70 still owns the preferences UI and all other per-type channel
+>   gating. Because `reminder_email` defaults false, the email channel is
+>   effectively opt-in until #70 surfaces the toggle — that is intentional (do
+>   not email members whose stored preference is false).
+> - Idempotency: a per-`(event, user)` `practice_reminder_sends` **claim/confirm**
+>   ledger (`supabase/migrations/20260831000002_practice_reminder_scheduler.sql`),
+>   a new hourly cron route (`app/api/cron/practice-reminders/route.ts`), and a
+>   matching GitHub Actions workflow.
+> - **Security:** a practice reminder is one-shot, so its "sent" marker is
+>   permanent — an anon-writable permanent marker is a product-wide DoS vector.
+>   Both RPCs (`send_practice_reminders`, `confirm_practice_reminder_sent`) are
+>   therefore gated on the `CRON_SECRET` (matched against a no-policy +
+>   `REVOKE`d `app_secrets` row seeded out-of-band after deploy; fail-closed
+>   until then). The ledger is claim/confirm with **per-channel** done flags, a
+>   90-minute claim expiry, a 3-attempt cap, and a `LIMIT 100` per run — so a
+>   transient outage on one channel is retried without re-sending the other, a
+>   permanently-undeliverable recipient stops after 3 tries, and a backlog
+>   drains across runs rather than being claimed-then-dropped on a timeout.
+
 ### OQ2 — "Google Calendar event" email has no copy and no defined trigger
 
 PRD §14: `Google Calendar event | Confirmed members | Email + GCal | When an event is created
@@ -58,7 +89,21 @@ The GCal half is already done (`lib/google-calendar/sync.ts`, called from
 **Decision needed:** the exact email subject/preview copy, and which event mutations fire it
 (create only? update only when start_time/end_time/location change? attendee assignment?).
 
-**Do not guess either of these. Stop and get a human answer.**
+> **RESOLUTION (2026-08-31): build it here, with this copy and these triggers.**
+> - New email template key `google_calendar_event`. Copy (also added to PRD §30,
+>   matching that table's plain style):
+>   - Subject: `Calendar update: [Event name] on [Day, Date]`
+>   - Preview: `[Event name] is now [Day, Date] at [Time] — [Location]. Your Google
+>     Calendar has been updated.`
+> - Fires **only** on a material change: an event's `start_time`, `end_time`, or
+>   `location` changing (`PUT /api/events/:id`), or an attendee being assigned
+>   (`POST /api/events/:id/attendees`). **Never** on bare create, never on a
+>   notes/name-only edit.
+> - Recipients: the members **assigned to that event** (`event_attendees`) — the
+>   same set the GCal-sync half writes to, and the only people for whom the copy
+>   ("Your Google Calendar has been updated") is true. Not the whole week.
+> - **Email channel only** (no SMS); the GCal-sync half already exists
+>   (`lib/google-calendar/sync.ts`).
 
 ---
 

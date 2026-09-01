@@ -215,7 +215,7 @@ describe("renderEmailTemplate", () => {
     expect(result.text).toContain('<script>alert("x")</script> & Co declined for Aug 09, 2026');
   });
 
-  it("renders the #69 google_calendar_event template (PROPOSED COPY) with subject, preview and link", () => {
+  it("renders the #69 google_calendar_event template (copy approved 2026-08-31) with subject, preview and link", () => {
     const result = renderEmailTemplate("google_calendar_event", {
       eventName: "Saturday Rehearsal",
       dayDate: "Sat, Aug 01, 2026",
@@ -240,7 +240,7 @@ describe("renderEmailTemplate", () => {
     ).toThrow("Unknown email template: not_a_real_key");
   });
 
-  it("exports exactly the PRD §30 template keys (incl. the #69 google_calendar_event proposed-copy key)", () => {
+  it("exports exactly the PRD §30 template keys (incl. the #69 google_calendar_event key)", () => {
     expect(EMAIL_TEMPLATE_KEYS).toEqual([
       "set_invitation",
       "invitation_reminder_member",

@@ -76,7 +76,7 @@ async function dispatchConflictNotificationsInner(
   if (recipientsError) return;
   if ((recipientRows ?? []).length === 0) return;
 
-  const memberName = memberRow?.name ?? "";
+  const memberName = memberRow?.name ?? "A member";
   const label = formatWeekLabel(null, date);
   const link = appNotificationUrl("/conflicts");
 

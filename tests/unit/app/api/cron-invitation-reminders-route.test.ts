@@ -168,4 +168,26 @@ describe("GET /api/cron/invitation-reminders", () => {
     });
     expect(mockSendSms).not.toHaveBeenCalled();
   });
+
+  it("still drives the member loop when the RPC returns the OLD bare-array shape (M1 back-compat)", async () => {
+    // Deploy skew: this code live before migration 20260831000001 is applied,
+    // so send_invitation_reminders() still returns a bare array. The route must
+    // treat it as the member list, not read `undefined.member_reminders`.
+    const client = makeSupabaseClient({ data: [reminderRow()], error: null });
+    mockGetAnonSupabaseClient.mockReturnValue(client);
+    mockSendSms.mockResolvedValue({ status: "sent", messageId: "m1" });
+
+    const res = await GET(makeReq(`Bearer ${CRON_SECRET}`));
+    expect(res.status).toBe(200);
+
+    expect(mockSendSms).toHaveBeenCalledTimes(1);
+    const body = await res.json();
+    expect(body.data).toEqual({
+      processed: 1,
+      smsSent: 1,
+      smsSkipped: 0,
+      smsFailed: 0,
+      adminNotified: 0,
+    });
+  });
 });

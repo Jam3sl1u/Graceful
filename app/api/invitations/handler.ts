@@ -738,7 +738,7 @@ export async function denyInvitation(
       try {
         const denyRecipients = data.recipients ?? [];
         if (denyRecipients.length > 0) {
-          const memberName = data.member_name ?? "";
+          const memberName = data.member_name ?? "A member";
           const date = formatWeekLabel(data.week_title ?? null, data.service_date ?? "");
           const link = appNotificationUrl(`/week/${data.service_week_id ?? ""}`);
           const deniedReason = data.reason ?? null;
@@ -879,7 +879,7 @@ export async function denyInvitation(
         denyWeek &&
         (denyRecipients ?? []).length > 0
       ) {
-        const memberName = denyingMember?.name ?? "";
+        const memberName = denyingMember?.name ?? "A member";
         const date = formatWeekLabel(denyWeek.title, denyWeek.service_date);
         const link = appNotificationUrl(`/week/${inv.service_week_id}`);
         await dispatchNotification({

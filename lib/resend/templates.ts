@@ -41,10 +41,10 @@ export type EmailTemplateDataMap = {
     location: string;
     link?: string;
   };
-  // PROPOSED COPY — REQUIRES HUMAN APPROVAL. PRD §30 has no content-template
-  // row for the Google Calendar event email; the subject/preview below were
-  // drafted for #69 to match §30's existing plain style and added to PRD §30
-  // in the same PR, flagged as proposed.
+  // Copy approved 2026-08-31 (.pipeline/spec.md OQ2 resolution). PRD §30 had no
+  // content-template row for the Google Calendar event email; the subject/preview
+  // below were drafted for #69 to match §30's existing plain style and added to
+  // PRD §30 in the same PR.
   google_calendar_event: {
     eventName: string;
     dayDate: string;
@@ -154,7 +154,7 @@ function buildContent(key: EmailTemplateKey, data: EmailTemplateDataMap[EmailTem
       };
     }
     case "google_calendar_event": {
-      // PROPOSED COPY — REQUIRES HUMAN APPROVAL (see EmailTemplateDataMap).
+      // Copy approved 2026-08-31 (.pipeline/spec.md OQ2 resolution).
       const d = data as EmailTemplateDataMap["google_calendar_event"];
       return {
         subject: `Calendar update: ${d.eventName} on ${d.dayDate}`,

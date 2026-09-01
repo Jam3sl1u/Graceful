@@ -15,6 +15,24 @@
 -- Both functions are CREATE OR REPLACE only: no new tables, columns, grants, or
 -- selectors — just a richer return payload. Follows the per-migration
 -- convention of 20260713000003_invitation_reminder_scheduler.sql.
+--
+-- ACCEPTED RISK (review M2, accepted 2026-08-31): deny_invitation() now returns
+-- the admin recipient contact rows (name / email / phone / sms_opted_in) in its
+-- result. The function is GRANT EXECUTE ... TO anon and is authorized by the
+-- invitation's response_token, so a holder of that token can call the RPC
+-- directly (bypassing the route, which itself never returns those fields) and
+-- read the inviting admin's contact details — or, on the invited_by IS NULL
+-- fan-out path, every admin's / set_leader's. This is an accepted trade for
+-- Phase 1: the token holder is an invited member, and the data is contact info
+-- for the people who invited them. Tightening this (drop email/phone from the
+-- payload and dispatch from a separately-authorized path) is tracked for a
+-- later hardening pass.
+--
+-- Deploy order: apply this migration BEFORE deploying the code that reads the
+-- new send_invitation_reminders() object shape. The cron route
+-- (app/api/cron/invitation-reminders/route.ts) tolerates both the old bare
+-- array and the new { member_reminders, admin_reminders } object for one
+-- release, but applying the migration first avoids the array-shaped window.
 
 -- ============ UP ============
 
@@ -203,6 +221,10 @@ BEGIN
   -- Notify admin in-app: the inviting user if known, else every admin/
   -- set_leader in the group.
   SELECT name INTO v_member_name FROM public.users WHERE id = v_inv.user_id;
+  -- Neutral fallback (review N5) so a null name never produces a leading-space
+  -- body like " declined their set invitation" or a null member_name in the
+  -- dispatch payload.
+  v_member_name := coalesce(v_member_name, 'A member');
   SELECT service_date, title INTO v_service_date, v_week_title
   FROM public.service_weeks WHERE id = v_inv.service_week_id;
 
