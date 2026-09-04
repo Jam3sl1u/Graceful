@@ -34,7 +34,7 @@
     "@clerk/nextjs": "^7.7.5",
     "@supabase/supabase-js": "^2.112.4",
     "@upstash/qstash": "^2.11.3",
-    "@upstash/redis": "^1.38.2",
+    "@upstash/redis": "^1.38.3",
     "next": "^15.5.23",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
