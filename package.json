@@ -51,7 +51,7 @@
     "@swc/core": "^1.16.0",
     "@swc/jest": "^0.2.39",
     "@testing-library/jest-dom": "^6.10.0",
-    "@testing-library/react": "^16.3.2",
+    "@testing-library/react": "^16.3.3",
     "@types/jest": "^30.0.0",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.3.0",
