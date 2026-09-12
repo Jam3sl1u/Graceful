@@ -188,3 +188,20 @@ Copy of `invitation-reminders-cron.yml`, hourly, hits `/api/cron/practice-remind
   whole dispatch (or the recipient lookup) fails.
 - **GCal email gating**: fires on start/end/location change + attendee assign;
   NOT on bare create or notes/name-only edits.
+
+## Unrelated: dependency-vulnerability fix bundled into this PR
+
+PR #194's CI (`bun audit --audit-level=high`) was failing on freshly-published
+advisories against packages already in the tree — confirmed also failing on
+`main`, so not caused by this branch. Bundled the fix here rather than a
+separate issue/PR (same class of problem as issue #158/PR #159) since it's a
+same-range patch bump with no code change:
+
+| Package | Was (vulnerable) | Now | Change |
+| --- | --- | --- | --- |
+| `next` | `15.5.23` | `15.5.25` | in-range patch (`dependencies.next` floor bumped `^15.5.23` → `^15.5.25`); fixes two critical unauthenticated-RCE advisories |
+| `sharp` | `0.35.3` | `0.35.4` | in-range patch (`overrides.sharp` `^0.35.0` → `^0.35.4`); fixes a libheif advisory |
+| `js-yaml` | `3.15.1` | `3.15.2` | in-range patch (`overrides["js-yaml"]` `^3.15.1` → `^3.15.2`); fixes a CPU-exhaustion advisory |
+
+No major-version jumps, no behavior change. Verified: `bun audit --audit-level=high`
+clean, `lint`/`typecheck`/`test` (145/3098) unchanged, `bun run build` succeeds.
