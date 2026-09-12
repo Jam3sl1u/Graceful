@@ -1,88 +1,86 @@
-# Test Results — Issue #69: Wire notification trigger logic for all Phase 1 event types
+# Test Results — Issue #71: In-app notification inbox endpoints
 
-**Verdict: ALL TESTS PASS.** Post-BLOCK remediation, round 3 (rounds 1 and 2 were
-each reviewed; round 1's practice-reminder fix was incomplete, round 2 was
-`NEEDS WORK` on MED-1..3 — all now addressed).
+**Verdict: PASS** — all checks green, coder's claims independently verified.
 
----
+## Automated checks (re-run from this worktree with Bun)
 
-## Checks run (independently re-run after the round-3 edits)
+| Check              | Result | Notes                                              |
+| ------------------ | ------ | -------------------------------------------------- |
+| `bun install`      | OK     | 709 packages                                       |
+| `bun run lint`     | PASS   | `eslint .` clean                                   |
+| `bun run typecheck`| PASS   | `tsc --noEmit` clean                               |
+| `bun run test`     | PASS   | 137 suites, 3064 tests (3050 pre-existing + 14 new)|
 
-| Check | Command | Result |
-| ----- | ------- | ------ |
-| Lint | `bun run lint` | PASS (eslint, no output) |
-| Typecheck | `bun run typecheck` | PASS (`tsc --noEmit`, clean) |
-| Unit tests | `bun run test` | PASS — 145 suites, 3098 tests |
-| Service-role ban | `bun run check:service-role` | PASS |
-| Workflow contract | `bun run check:workflows` | PASS |
+The coder claimed "3050 passed"; confirmed 3050 pre-existing pass unchanged,
+and the coder's own `notifications-inbox-route.test.ts` (32 tests) passes.
 
-Original run: 145 / 3089. Now 145 / 3098 (+9), no new suite.
+## Independent verification added
 
-The SECOND independent reviewer (round 2) stood up Postgres 16 and executed the
-migration: verified `assert_cron_secret` is fail-closed, the claim CTE returns
-only rows the run actually claimed (concurrency), the 3-attempt cap terminates,
-`GET DIAGNOSTICS … ROW_COUNT` works, and MJ2 (`reminder_email` default false is
-honoured). That empirical check predates the round-3 per-channel change but the
-predicate structure is unchanged; re-running it against `…000002.sql` is the
-recommended final gate.
+New file: `tests/unit/app/api/notifications-inbox-route.tester.test.ts`
+(14 tests, all passing). It is a standalone harness — it does not import or
+depend on the coder's test file — and targets spec edge cases the coder's
+suite under-covered:
 
----
+- **Spec item 10 (401 on a missing Supabase JWT for *all four* endpoints).**
+  The coder tested this for `listNotifications`, `getUnreadNotificationCount`,
+  and `markAllNotificationsRead` but NOT for `markNotificationRead`. Added:
+  `markNotificationRead` returns 401 `UNAUTHENTICATED` with no Supabase client
+  constructed, plus re-checks of the other three. All pass.
+- **Spec item 3 (null `link_entity_id` rows visible to non-guest roles).**
+  Verified `admin` / `set_leader` / `member` all receive a
+  `google_calendar_reauth_required`-style null-link row, no `.in` filter is
+  applied, and the guest-scope lookup (`invitations` query) is skipped
+  entirely. Also verified a member can PATCH a null-link row read (no false
+  404). All pass.
+- **Guest scope `.in` filter on `unread-count`.** The coder only tested the
+  guest *empty-scope* short-circuit here; added a guest-with-invitations case
+  asserting the scoped `link_entity_id` list AND `is_read=false` both reach
+  the query. Pass.
+- **Failure case: DB error on the PATCH *update* leg -> 500 `INTERNAL`.** The
+  coder tested a 500 on the *fetch* leg only. Added: update-leg driver error
+  yields 500 with the generic `"Internal error"` message (no `"deadlock
+  detected"` leak), and a null update result yields 404. Pass.
+- **Pagination boundary.** `pageSize=100` is accepted (range math correct at
+  `page=2` -> `{from:100,to:199}`); `page=-1` rejected with 400. Pass.
+- **Key spec decision: guest scope uses ALL invitation statuses.** Verified a
+  guest whose only invitation is effectively withdrawn still gets a non-empty
+  scope containing the invitation id + week id, the `invitation_withdrawn`
+  notification is returned, and the `invitations` query filters by `user_id`
+  only (no `status` filter). Pass.
 
-## Round-3 coverage (MED-1..3 + LOW)
+## Behavior confirmed against the spec's named edge cases
 
-- `cron-practice-reminders-route.test.ts` — reworked for per-channel confirm:
-  - cron secret passed through to `send_practice_reminders`;
-  - RPC error (secret not seeded → `FORBIDDEN`) → 500;
-  - per-user `reminder_sms` / `reminder_email` gating;
-  - **`sms_done` already true → only email is re-sent, SMS is not** (MED-1);
-  - partial failure (SMS ok, email down) → `confirm(p_sms_done: true,
-    p_email_done: false)`;
-  - total failure → `confirm(false, false)`, pair stays retryable;
-  - clean dispatch → `confirm(true, true)`, `confirmed` counter.
-- `event-email.test.ts` — recipients default to `event_attendees` for the event
-  (MJ1); a new assertion checks the actual `.eq("event_id", …)` /
-  `.eq("church_group_id", …)` / `.in("id", …)` filters, not just the table name
-  (LOW-4).
-- `events-notification-gcal.test.ts` — `eventId` plumbed from both callers.
-- `templates.test.ts` — "PROPOSED COPY" labels → "approved" (LOW-3).
+All 13 edge cases in `spec.md` are now covered by passing tests (coder's suite
++ the additions above):
 
-Round-1/2 coverage still in place: M1 bare-array back-compat; N5 `"A member"` on
-both deny paths.
+1. Guest scoping by invitation / week / setlist ids — covered
+2. Guest with zero invitations (empty inbox, count 0, updatedCount 0, PATCH 404) — covered
+3. Null `link_entity_id` excluded for guests, visible to other roles — covered (added)
+4. Already-read PATCH is idempotent (200, no write issued) — covered
+5. PATCH 404 (not 403) for missing / other-user / out-of-scope-guest / null-link-guest — covered
+6. PATCH non-UUID id -> 400 `VALIDATION_FAILED`, no Supabase client built — covered
+7. Invalid pagination (`page=0`, `page=abc`, `pageSize=0`, `pageSize=101`, `page=-1`) -> 400; missing -> defaults — covered
+8. Page past the end -> 200 with `[]` and real total — covered
+9. `mark-all-read` with nothing unread -> 200 `{updatedCount: 0}` — covered
+10. Missing JWT -> 401 on all four — covered (gap on `markNotificationRead` closed)
+11. Any Supabase error (including guest-scope lookup, and PATCH update leg) -> 500 generic — covered (update-leg gap closed)
+12. `count: null` coerced to 0 — covered
+13. Ordering `created_at desc, id desc` — covered (order-call assertions)
 
----
+## Notes for the reviewer (not defects — judgement calls to sanity-check)
 
-## Findings status
-
-| Finding | Status |
-| --- | --- |
-| B1 | Resolved — spec `> RESOLUTION` blocks; no stale approval language in code. |
-| B2 / B2-R1 / B2-R2 / M3 | Resolved — secret-gated RPCs (fail-closed), claim/confirm with per-channel flags, 90-min expiry, 3-attempt cap. |
-| M1 | Resolved + tested. |
-| M2 | Accepted + documented. |
-| MJ1 | Resolved — GCal update email targets `event_attendees`. |
-| MJ2 | Resolved — `reminder_email` (default false) honoured in the selector. |
-| MED-1 | Resolved — per-channel `sms_done` / `email_done`; a succeeded channel is never re-sent. |
-| MED-2 | Resolved — `REVOKE ALL … FROM PUBLIC, anon, authenticated` on `app_secrets` and `practice_reminder_sends`. |
-| MED-3 | Resolved — `LIMIT 100`, soonest-first, so a backlog drains across runs. |
-| MN1 | Resolved — `conflict-detection.ts` fallback `"A member"`. |
-| LOW-1 | Resolved — `users` lookup tenant-scoped in `event-email.ts`. |
-| LOW-2 | Resolved — PRD §30 em dash matches the template. |
-| LOW-3 / LOW-4 | Resolved — test labels + filter assertions. |
-| LOW-5 | Documented — fresh-apply-only note in Deploy notes. |
-| LOW-6 / N1 / MN5 | Informational — no change (pre-existing pattern / spec-conformant, tracked follow-up). |
-
----
-
-## Limitations Review must check by hand
-
-1. **Migration bodies are not executed by the Jest suite.** Recommended:
-   re-run the round-2 reviewer's Postgres check against the current
-   `…000002.sql` (per-channel columns, `confirm_practice_reminder_sent`'s
-   5-arg signature, the `LIMIT 100` subquery, both table `REVOKE`s).
-2. **Deploy order + secret seed + `NEXT_PUBLIC_APP_URL`** — see
-   `.pipeline/changes.md` "Deploy notes".
-3. **Human sign-off on OQ1/OQ2** — recorded in `.pipeline/spec.md` from a direct
-   operator answer on 2026-08-31; a reviewer should still confirm the specifics
-   with the operator before merge.
-4. **`send_invitation_reminders()`** keeps its pre-existing `anon` grant
-   (bounded); a `CRON_SECRET` gate for it is a tracked follow-up, not #69.
+- **Validation-before-auth-token ordering in `listNotifications` /
+  `markNotificationRead`:** `requireAuth` (Clerk) runs first, then Zod
+  validation (400), then the Supabase `getToken()` 401 check. So an
+  authenticated Clerk user with a bad `page` param gets 400 even if their
+  Supabase JWT is absent. This matches the spec's written step order and the
+  `withdrawInvitation` precedent; flagging only so it is a conscious choice.
+- **Guest PATCH scope check is post-fetch in JS, not a DB `.in` filter:** the
+  row is fetched with only the `user_id` / `church_group_id` `.eq` filters,
+  then the guest scope membership is checked in the handler. Functionally
+  equivalent and matches the spec; the row never leaves the handler on a
+  scope miss (404). No cross-tenant leak because RLS + the `.eq` filters
+  still bound the fetch.
+- **`mark-all-read` returns `data.length`, not a true affected-row count:**
+  relies on `.select("id")` returning one row per updated row. Correct for
+  PostgREST; worth a glance.

@@ -1,514 +1,283 @@
-# Spec — Issue #69: Wire notification trigger logic for all Phase 1 event types
+# Spec — Issue #71: In-app notification inbox endpoints
 
 Branch: issue-69 worktree. PRD trigger table = `documentation/prd/graceful_requirements_v10.md`
 §14 (lines 435-447; the issue calls it "§6.9"). Copy templates = §30 (lines 1696-1707).
 
----
+None. Everything below is resolved against the current code; the judgement
+calls are recorded under "Decisions" with their rationale.
+
+## Current state (verified in this worktree)
+
+- The 4 route files already exist but return `notImplemented(...)` 501 stubs:
+  - `app/api/notifications/route.ts`
+  - `app/api/notifications/unread-count/route.ts`
+  - `app/api/notifications/[id]/read/route.ts`
+  - `app/api/notifications/mark-all-read/route.ts`
+- `app/api/notifications/preferences/{handler,route}.ts` are fully implemented
+  (#70) — same directory, different feature. Do not touch them.
+- The `notifications` table exists (`supabase/migrations/20260702000005_cluster_5_partial.sql`):
+  `id, church_group_id, user_id, type, title, body, link_entity_type,
+  link_entity_id, is_read, created_at`. Indexes already cover
+  `(user_id, is_read)` and `(user_id, created_at desc)`.
+- RLS (`supabase/migrations/20260704000001_rls_policies.sql`) already restricts
+  SELECT and UPDATE on `notifications` to `church_group_id = auth_church_group_id()
+  AND user_id = auth_user_id()`. **No migration is needed for this issue.**
+- `lib/supabase/types.ts` already has `NotificationsRow` + the `notifications`
+  table entry (Row/Insert/Update). **No changes needed there.**
+- Producers (#69) already write rows with these `link_entity_type` values:
+  `"invitation"`, `"service_week"`, `"setlist"`, `"conflict"`,
+  `"google_calendar"` (the last with `link_entity_id = NULL`).
+- `lib/invitations/guest-access.ts` (`guestHasWeekAccess`) is the existing guest
+  scoping helper for single-week reads.
 
 ## RESOLVED OPEN QUESTIONS (operator decision, 2026-08-31)
 
-Six of the eight notification types were fully specified below from the start.
-Two required a human decision. On 2026-08-31 the human operator (repo owner) was
-asked both questions directly and chose, for each, to build the feature in this
-issue with the design below — OQ1: "keep it, I'll approve the design"; OQ2:
-"keep it, I'll approve copy + triggers"; and, for the related `deny_invitation`
-contact-exposure trade-off, "accept + document". Those answers are recorded here
-as the `> RESOLUTION` blocks immediately after each analysis (kept verbatim for
-context). Anyone reviewing this before merge: confirm with the operator that the
-specifics below match what they approved.
+Implement the 4 inbox endpoints only. No migration, no UI, no SMS/email, no
+type filter, no audit-log writes, no rate limiting.
 
-### OQ1 — "Practice reminder" has no scheduling infrastructure at all
+## Files to create
 
-PRD §14: `Practice reminder | Confirmed members | SMS + Email | Configurable lead time
-before each event (24hr, 2hr, etc.)`.
+### 1. `lib/notifications/guest-inbox-scope.ts` (new)
 
-Current state: `practiceReminderSms` (`lib/notifications/sms-templates.ts:91`) and the
-`practice_reminder` email template (`lib/resend/templates.ts:135`) both exist, but **nothing
-calls them and no trigger exists to wire up**. Specifically, there is:
-
-- no cron route (`app/api/cron/` contains only `invitation-reminders/`),
-- no GitHub Actions workflow other than `.github/workflows/invitation-reminders-cron.yml`,
-- no "reminder already sent" marker on `events` (see the table DDL,
-  `supabase/migrations/20260702000003_cluster_3_scheduling_core.sql:60-74`) and no
-  per-(event, user) sent-marker table, so nothing can make sends idempotent across hourly runs,
-- no agreed lead-time source: the only one in the schema is per-user
-  `notification_preferences.reminder_hours_before` (default 24, see
-  `schemas/notifications.ts:16`), and reading it to decide *when* to fire is arguably the
-  "Notification preferences enforcement" that this issue's Out of Scope section explicitly
-  defers to #70. A per-user lead time also rules out a single `events.reminder_sent_at`
-  column, forcing a new table.
-
-This is a scheduler design task, not "connect the dots". **Decision needed:** either
-(a) descope practice reminder from #69 into its own issue, or (b) approve building a new
-cron route + workflow + schema for sent-tracking here, and state whether the lead time is a
-fixed 24h for now or per-user `reminder_hours_before`.
-
-> **RESOLUTION (2026-08-31): option (b) — build it here.**
-> - Lead time + channel choice: per-user, from the reminder-specific
->   `notification_preferences` columns — `reminder_hours_before` (default 24),
->   `reminder_sms` (default true), `reminder_email` (default **false**). Reading
->   these three columns from the scheduler is an **accepted, bounded** overlap
->   with #70; #70 still owns the preferences UI and all other per-type channel
->   gating. Because `reminder_email` defaults false, the email channel is
->   effectively opt-in until #70 surfaces the toggle — that is intentional (do
->   not email members whose stored preference is false).
-> - Idempotency: a per-`(event, user)` `practice_reminder_sends` **claim/confirm**
->   ledger (`supabase/migrations/20260831000002_practice_reminder_scheduler.sql`),
->   a new hourly cron route (`app/api/cron/practice-reminders/route.ts`), and a
->   matching GitHub Actions workflow.
-> - **Security:** a practice reminder is one-shot, so its "sent" marker is
->   permanent — an anon-writable permanent marker is a product-wide DoS vector.
->   Both RPCs (`send_practice_reminders`, `confirm_practice_reminder_sent`) are
->   therefore gated on the `CRON_SECRET` (matched against a no-policy +
->   `REVOKE`d `app_secrets` row seeded out-of-band after deploy; fail-closed
->   until then). The ledger is claim/confirm with **per-channel** done flags, a
->   90-minute claim expiry, a 3-attempt cap, and a `LIMIT 100` per run — so a
->   transient outage on one channel is retried without re-sending the other, a
->   permanently-undeliverable recipient stops after 3 tries, and a backlog
->   drains across runs rather than being claimed-then-dropped on a timeout.
-
-### OQ2 — "Google Calendar event" email has no copy and no defined trigger
-
-PRD §14: `Google Calendar event | Confirmed members | Email + GCal | When an event is created
-or updated`.
-
-The GCal half is already done (`lib/google-calendar/sync.ts`, called from
-`app/api/events/handler.ts:187`, `app/api/events/[id]/handler.ts`,
-`app/api/events/[id]/attendees/handler.ts`). The **email** half cannot be built as specified:
-
-- PRD §30 (the content-template table) has **no row** for a Google Calendar / event email.
-  `lib/resend/templates.ts:1-6` is explicitly constrained to "Copy exactly (PRD §30) — do not
-  add styling, images, or layout", so adding a `google_calendar_event` template key means
-  inventing subject/preview copy that no source material defines.
-- The trigger is also undefined in practice: firing on *every* `PATCH /api/events/:id` would
-  email every confirmed member on each trivial edit (e.g. a notes typo), and `createEvent`
-  normally runs before anyone is an attendee, so a create-time email has no recipients.
-- The `google_calendar_event` value exists in `types/domain.ts:34` and the DB enum but is
-  never written anywhere.
-
-**Decision needed:** the exact email subject/preview copy, and which event mutations fire it
-(create only? update only when start_time/end_time/location change? attendee assignment?).
-
-> **RESOLUTION (2026-08-31): build it here, with this copy and these triggers.**
-> - New email template key `google_calendar_event`. Copy (also added to PRD §30,
->   matching that table's plain style):
->   - Subject: `Calendar update: [Event name] on [Day, Date]`
->   - Preview: `[Event name] is now [Day, Date] at [Time] — [Location]. Your Google
->     Calendar has been updated.`
-> - Fires **only** on a material change: an event's `start_time`, `end_time`, or
->   `location` changing (`PUT /api/events/:id`), or an attendee being assigned
->   (`POST /api/events/:id/attendees`). **Never** on bare create, never on a
->   notes/name-only edit.
-> - Recipients: the members **assigned to that event** (`event_attendees`) — the
->   same set the GCal-sync half writes to, and the only people for whom the copy
->   ("Your Google Calendar has been updated") is true. Not the whole week.
-> - **Email channel only** (no SMS); the GCal-sync half already exists
->   (`lib/google-calendar/sync.ts`).
-
----
-
-## Current state (verified, do not re-derive)
-
-Already implemented — **do not touch**:
-
-- `lib/pingram/client.ts` — `sendSms({ to, body, smsOptedIn })` → `{status:"sent"|"skipped"}`;
-  enforces `sms_opted_in` itself and returns `{status:"skipped", reason}` for
-  `not_opted_in` / `no_phone` / `invalid_phone` with no network call. Throws
-  `SmsNotConfiguredError` / `SmsValidationError` / `SmsDispatchError`.
-- `lib/resend/client.ts` — `sendEmail(to, template, data)`. Throws when unconfigured or on
-  Resend error.
-- `lib/notifications/sms-templates.ts` and `lib/resend/templates.ts` — all copy builders.
-- **Invitation accepted** (PRD channel: *In-app only*) — already correct.
-  `accept_invitation` RPC (`supabase/migrations/20260712000001_accept_invitation_rpc.sql:101-123`)
-  inserts the `invitation_accepted` in-app notification to `invited_by`, or to all
-  admins/set_leaders when `invited_by` is null. **No SMS/email may be added here** — the PRD
-  channel is in-app only. This type requires zero code change; the coder must note that in
-  `.pipeline/changes.md` so the tester covers it as a no-regression case.
-- **Invitation reminder — member SMS** — already sent from
-  `app/api/cron/invitation-reminders/route.ts:41-68`. Only the *admin* SMS is missing (below).
-
-RLS facts that make the plan below work (`supabase/migrations/20260704000001_rls_policies.sql:72`):
-`users_select_tenant` lets **any** authenticated user SELECT **every** `users` row in their own
-church group, including `name`, `email`, `phone`, `sms_opted_in`. So authenticated handlers can
-look up recipient contact details directly. The `anon` (no-session) paths cannot — those need the
-data returned from a SECURITY DEFINER RPC (see §3 and §5).
-
-The service-role key stays banned in `app/` and `lib/` (`scripts/check-service-role.mjs`).
-
----
-
-## 1. New file: `lib/notifications/dispatch.ts`
-
-Pattern to copy: `lib/scheduling/conflict-detection.ts` (server-only lib module wrapping a
-side-effecting call, with a doc comment explaining the RLS/consent constraints).
+Pattern to copy: `lib/invitations/guest-access.ts` (same shape — `"server-only"`
+import, typed `SupabaseClient<Database>` param, never throws, returns a
+`dbError` flag instead of throwing).
 
 ```ts
-import "server-only";
+export type GuestInboxScope = { linkEntityIds: string[]; dbError: boolean };
 
-export type NotificationRecipient = {
-  userId: string;
-  name: string;
-  email: string | null;
-  phone: string | null;
-  smsOptedIn: boolean;
-};
-
-export type DispatchCounts = {
-  smsSent: number;
-  smsSkipped: number;
-  smsFailed: number;
-  emailSent: number;
-  emailSkipped: number;
-  emailFailed: number;
-};
-
-// Absolute app URL for a notification deep link. Mirrors the existing `appUrl`
-// helper in app/api/invitations/handler.ts (line ~276): NEXT_PUBLIC_APP_URL with
-// trailing slashes stripped, or a site-relative path when it is unset.
-export function appNotificationUrl(path: string): string;
-
-export async function dispatchNotification<K extends EmailTemplateKey>(params: {
-  recipients: NotificationRecipient[];
-  sms?: { body: string };
-  email?: { template: K; data: EmailTemplateDataMap[K] };
-}): Promise<DispatchCounts>;
-```
-
-(`EmailTemplateKey` / `EmailTemplateDataMap` imported from `@/lib/resend/templates`.)
-
-Required behavior:
-
-- **Never throws.** Every call site awaits it and must still return its normal success
-  response even when every send fails.
-- Dedupe `recipients` by `userId`, first occurrence wins.
-- `sms` omitted → the SMS channel is not attempted at all (all sms counters stay 0).
-  `email` omitted → likewise.
-- Per recipient, SMS: `await sendSms({ to: r.phone, body: params.sms.body, smsOptedIn: r.smsOptedIn })`.
-  `status:"sent"` → `smsSent++`; `status:"skipped"` → `smsSkipped++`; a thrown error →
-  `smsFailed++` and `console.error`.
-- Per recipient, email: `r.email` null/blank → `emailSkipped++` with no call. Otherwise
-  `await sendEmail(r.email, params.email.template, params.email.data)` → `emailSent++`; a
-  thrown error (including a `renderEmailTemplate` link-validation throw) → `emailFailed++`
-  and `console.error`.
-- **PII rule (PRD §25.6, already followed in `lib/resend/client.ts:58`):** `console.error` may
-  log the recipient's `userId` and the error only — never a phone number, email address,
-  message body, or subject.
-- Sends are sequential (`for … of` with `await`), matching the existing loop in
-  `app/api/cron/invitation-reminders/route.ts`.
-
----
-
-## 2. Set invitation — SMS + Email to the member
-
-PRD row: `Set invitation | Member | SMS + Email`.
-
-### 2a. `app/api/invitations/handler.ts` → `createInvitation`
-
-Replace the TODO at line 265 (`// TODO(#67/#68): dispatch SMS/email invitation notification here.`).
-Insert after `writeAuditLog`, before the `return ok(...)`.
-
-- Look up both parties in one query:
-  `supabase.from("users").select("id, name, email, phone, sms_opted_in").in("id", [parsed.userId, ctx.userId])`.
-  On error or when the member row is missing → skip dispatch entirely and still return 201.
-- `const date = formatWeekLabel(week.title, week.service_date)` — import `formatWeekLabel`
-  from `@/lib/scheduling/reminder`. (`week` is already in scope, selected with `select("*")`.)
-- `const link = appNotificationUrl(\`/invite/${invitation.response_token}\`)` — matches the
-  existing public route `app/(public)/invite/[token]/page.tsx`.
-- `await dispatchNotification({ recipients: [member], sms: { body: setInvitationSms({ date, roleNote: invitation.role_note, link }) }, email: { template: "set_invitation", data: { date, adminName: adminRow?.name ?? "Your worship leader", link } } })`.
-- The response body is unchanged.
-
-### 2b. `app/api/invitations/handler.ts` → `createGuestInvitation`
-
-Replace the TODO at line 498 (`// TODO(#68): dispatch the guest invitation email with accountSetupUrl.`).
-
-- Hoist `inviteUrl` / `accountSetupUrl` (currently built inline in the `ok(...)` payload at
-  lines 506-507) into consts above, and reuse them in the response so the values stay identical.
-- `const link = accountSetupUrl ?? inviteUrl` (new users land on account setup, existing users
-  on the normal invite page).
-- Look up `[guestUserId, ctx.userId]` with the same `users` select as 2a; skip dispatch on
-  error / missing row.
-- Same `dispatchNotification` call as 2a, with `roleNote: invitation.role_note`. Pass **both**
-  `sms` and `email` — a freshly provisioned placeholder guest has `phone: null` and
-  `sms_opted_in` default false, so `sendSms` skips it by itself; do not special-case it.
-- The response body is unchanged.
-
----
-
-## 3. Invitation reminder — add the missing **admin** SMS
-
-PRD row: `Invitation reminder | Member + Admin | SMS` (SMS only — **no email**).
-
-### 3a. Migration `supabase/migrations/20260831000001_notification_trigger_dispatch.sql`
-
-One migration file covers §3 and §5. Follow the header-comment + `-- ============ UP ============`
-/ commented-`DOWN` shape of `supabase/migrations/20260713000003_invitation_reminder_scheduler.sql`.
-
-`CREATE OR REPLACE FUNCTION public.send_invitation_reminders()` — same body as today, except the
-return value changes from a bare jsonb array to a jsonb object:
-
-```
-RETURN jsonb_build_object(
-  'member_reminders', v_reminders,     -- unchanged shape, still may be []
-  'admin_reminders',  v_admin_reminders
-);
-```
-
-`v_admin_reminders` is accumulated inside the **existing** per-week / per-recipient loop (the
-one at lines 106-117 that inserts the admin in-app notification) — one entry per
-(service week × admin/set_leader recipient), with the recipient's contact columns:
-
-```
-{ 'user_id', 'name', 'phone', 'sms_opted_in',
-  'service_week_id', 'service_date', 'week_title', 'pending_count' }
-```
-
-`pending_count` is the `v_count` already computed for that week. Do not change the selector,
-the `last_reminded_at` stamping, the in-app notification inserts, or the GRANT.
-
-### 3b. `lib/supabase/types.ts`
-
-Change `Functions.send_invitation_reminders.Returns` (lines 544-556) from the array to:
-
-```ts
-Returns: {
-  member_reminders: Array<{ /* existing 8 fields, unchanged */ }>;
-  admin_reminders: Array<{
-    user_id: string;
-    name: string;
-    phone: string | null;
-    sms_opted_in: boolean;
-    service_week_id: string;
-    service_date: string;
-    week_title: string | null;
-    pending_count: number;
-  }>;
-};
-```
-
-### 3c. `app/api/cron/invitation-reminders/route.ts`
-
-- `const payload = data ?? { member_reminders: [], admin_reminders: [] };` and defensively
-  default each array (`payload.member_reminders ?? []`).
-- The member loop is unchanged in behavior — keep the existing pre-loop
-  `!reminder.phone || reminder.sms_opted_in !== true` guard, `buildMemberReminderSms`,
-  `formatWeekLabel`, and the sent/skipped/failed counters exactly as they are.
-- Add an admin loop after it. For each `admin_reminders` entry:
-  `await dispatchNotification({ recipients: [{ userId: a.user_id, name: a.name, email: null, phone: a.phone, smsOptedIn: a.sms_opted_in }], sms: { body: adminReminderSms({ count: a.pending_count, date: formatWeekLabel(a.week_title, a.service_date), link: appNotificationUrl(\`/week/${a.service_week_id}\`) }) } })`
-  — no `email` key (PRD channel is SMS only). Fold the returned
-  `smsSent`/`smsSkipped`/`smsFailed` into the same three counters.
-- Response body: keep `{ processed, smsSent, smsSkipped, smsFailed }` (`processed` stays
-  `member_reminders.length`) and **add** `adminNotified: admin_reminders.length`. Existing
-  assertions on the four current fields must keep passing.
-
----
-
-## 4. Invitation denied — SMS + Email to the admin
-
-PRD row: `Invitation denied | Admin | SMS + Email`. Both deny paths must fire it.
-
-Shared payload for both paths:
-- `memberName` = the denying member's `users.name`
-- `date` = `formatWeekLabel(week.title, week.service_date)` for the invitation's service week
-- `reason` = the recorded `denial_reason` (may be null)
-- `link` = `appNotificationUrl(\`/week/${serviceWeekId}\`)`
-- `sms.body` = `invitationDeniedSms({ memberName, date, reason, link })`
-- `email` = `{ template: "invitation_denied", data: { memberName, date, reason, link } }`
-
-### 4a. Authenticated path — `app/api/invitations/handler.ts` → `denyInvitation`
-
-Replace the TODO at line 744. Insert after `writeAuditLog`, before `return ok(...)`. Uses the
-denying member's own RLS client (allowed by `users_select_tenant`). Follow the multi-query
-in-memory-join style of `app/api/conflicts/handler.ts` `getOpenConflicts`:
-
-1. member name: `.from("users").select("name").eq("id", inv.user_id).maybeSingle()`
-2. week: `.from("service_weeks").select("title, service_date").eq("id", inv.service_week_id).maybeSingle()`
-3. recipients (`select("id, name, email, phone, sms_opted_in")`):
-   - `inv.invited_by !== null` → `.eq("id", inv.invited_by)`
-   - else → `.eq("church_group_id", ctx.churchGroupId).in("role", ["admin", "set_leader"])`
-     (mirrors the same fallback in `deny_invitation`, migration lines 105-123)
-4. Any query error, or zero recipients → skip dispatch and still return the normal 200.
-
-The early `if (!canTransition(inv.status, "deny")) return ok(...)` idempotency branch (line 694)
-must **not** dispatch.
-
-### 4b. No-session token path — needs RPC data
-
-`anon` cannot read `users`, so recipients come from the RPC.
-
-**Migration** (same file as §3a): `CREATE OR REPLACE FUNCTION public.deny_invitation(uuid, text, text)`
-— body unchanged except the success return value gains dispatch data:
-
-```
-RETURN jsonb_build_object(
-  'status', 'denied',
-  'already_responded', false,
-  'member_name', v_member_name,
-  'service_week_id', v_inv.service_week_id,
-  'service_date', <service_weeks.service_date for v_inv.service_week_id>,
-  'week_title',   <service_weeks.title    for v_inv.service_week_id>,
-  'reason', p_reason,
-  'recipients', v_recipients
-);
-```
-
-`v_recipients` is a jsonb array of `{ user_id, name, email, phone, sms_opted_in }` built from the
-**same** recipient set the in-app notification loop already uses (`invited_by` if non-null, else
-all admins/set_leaders in the group). The already-responded early return (lines 72-77) must add
-`'recipients', '[]'::jsonb` so the route can branch uniformly. Remove the now-satisfied
-`TODO(#67/#68)` comment at line 134. Keep the GRANT unchanged.
-
-**`lib/supabase/types.ts`**: extend `Functions.deny_invitation.Returns` (lines 521-524) with the
-new optional-shaped fields (`member_name: string | null`, `service_week_id: string | null`,
-`service_date: string | null`, `week_title: string | null`, `reason: string | null`,
-`recipients: Array<{ user_id: string; name: string; email: string | null; phone: string | null; sms_opted_in: boolean }>`).
-
-**Route** (`denyInvitation`, the `responseToken !== undefined` branch, lines 638-665): after the
-RPC succeeds and before `return ok(...)`, if `(data.recipients ?? []).length > 0` build the shared
-payload from `data` and `await dispatchNotification(...)`. The returned JSON body must stay exactly
-`{ invitationId, status, alreadyResponded }` — do not leak recipient data to the caller.
-
----
-
-## 5. Setlist released — SMS + Email to confirmed members
-
-PRD row: `Setlist released | All confirmed | SMS + Email`.
-
-`app/api/setlists/[id]/handler.ts` → `publishSetlist`. Replace the TODO at line 471, inside the
-existing `if (recipientIds.length > 0)` block, after the in-app `notifications` insert.
-
-- Contact rows: `.from("users").select("id, name, email, phone, sms_opted_in").in("id", recipientIds)`.
-- Week label: `.from("service_weeks").select("title, service_date").eq("id", updated.service_week_id).maybeSingle()`
-  → `formatWeekLabel(...)`.
-- `link = appNotificationUrl(\`/week/${updated.service_week_id}\`)`.
-- `sms.body = setlistPublishedSms({ date, link })`;
-  `email = { template: "setlist_released", data: { date, songCount, link } }`
-  (`songCount` is already computed at line 437 and may legitimately be 0 — BR-01).
-- On a contact/week query error: skip dispatch, still return 200. The in-app notifications are
-  already committed and are the source of truth.
-
----
-
-## 6. Scheduling conflict — SMS + Email to admins
-
-PRD row: `Scheduling conflict | Admin only | SMS + Email`.
-
-No migration needed: the trigger path runs as an authenticated member, and `users_select_tenant`
-lets them read the admins' contact rows.
-
-### 6a. `lib/scheduling/conflict-detection.ts` — add a second export
-
-```ts
-export async function dispatchConflictNotifications(
+export async function getGuestInboxLinkEntityIds(
   supabase: SupabaseClient<Database>,
-  actor: { userId: string; churchGroupId: string },
-  date: string, // YYYY-MM-DD, the availability date
-): Promise<void>;
+  userId: string,
+): Promise<GuestInboxScope>;
 ```
 
-Best-effort, **never throws** (unlike `recordAvailabilityConflict`, which throws on DB error —
-keep that one as is). Behavior:
+Behaviour:
 
-- member name: `.from("users").select("name").eq("id", actor.userId).maybeSingle()`
-- recipients: `.from("users").select("id, name, email, phone, sms_opted_in").eq("church_group_id", actor.churchGroupId).in("role", ["admin", "set_leader"]).neq("id", actor.userId)`
-  — the `.neq` mirrors the RPC's "excluding the triggering member" rule
-  (`supabase/migrations/20260713000001_conflict_notification.sql:99-106`).
-- `const label = formatWeekLabel(null, date)` (import from `@/lib/scheduling/reminder`).
-- `link = appNotificationUrl("/conflicts")` (route `app/(app)/conflicts/page.tsx`).
-- `sms.body = schedulingConflictSms({ memberName, date: label, link })`;
-  `email = { template: "scheduling_conflict", data: { memberName, date: label, link } }`.
-- Zero recipients or any query error → return silently.
+1. `supabase.from("invitations").select("id, service_week_id").eq("user_id", userId)`
+   — **all statuses**, no status filter (see Decisions). On error return
+   `{ linkEntityIds: [], dbError: true }`.
+2. `invitationIds` = the returned `id`s; `weekIds` = unique `service_week_id`s.
+3. If `weekIds.length === 0`, return `{ linkEntityIds: [], dbError: false }`.
+4. `supabase.from("setlists").select("id").in("service_week_id", weekIds)`.
+   On error return `{ linkEntityIds: [], dbError: true }`.
+5. Return `{ linkEntityIds: [...new Set([...invitationIds, ...weekIds, ...setlistIds])], dbError: false }`.
 
-### 6b. `app/api/availability/handler.ts` — two call sites
+Add a comment explaining that ids from different tables can be mixed in one
+`.in("link_entity_id", ...)` filter because they are all UUID primary keys and
+therefore globally unique — that is why no per-`link_entity_type` `.or()` group
+is needed.
 
-- `setAvailability` (loop at lines 163-168): when `recordAvailabilityConflict(...)` returns
-  `true` for a date, `await dispatchConflictNotifications(supabase, ctx, date)` for that date.
-- `deleteAvailability` (line 234): when `conflictTriggered` is `true`,
-  `await dispatchConflictNotifications(supabase, ctx, parsedDate.data)`.
+### 2. `app/api/notifications/handler.ts` (new)
 
-Response bodies are unchanged in both.
+Pattern to copy: `app/api/church-group/audit-log/handler.ts` for the paginated
+query (`page`/`pageSize` -> `range(from, to)` + `count: "exact"` + `created_at`
+desc with `id` desc tiebreak), and `app/api/notifications/preferences/handler.ts`
+for the auth/JWT/error-envelope boilerplate.
 
----
+Shared, module-level:
 
-## 7. Comment-only cleanup (bounded — no behavior change)
+```ts
+const COLUMNS = "id, type, title, body, link_entity_type, link_entity_id, is_read, created_at";
 
-`tests/e2e/invitation-deny.spec.ts` lines 12-20 and 68-74 assert in prose that the deny handler
-"only has a TODO" and that the dispatch primitives are "unimplemented throwing stubs". That is
-now false. Update the two comment blocks (and the `test.skip` title string on line 72) to state
-that admin SMS+email dispatch **is** wired as of #69 but that asserting real delivery stays out
-of scope for this issue (#82 owns full E2E regression). **Do not un-skip the test, do not change
-any test logic, and do not touch any other e2e or load-test file.**
+export type NotificationItem = {
+  id: string;
+  type: NotificationType;          // from "@/types/domain"
+  title: string;
+  body: string | null;
+  linkEntityType: string | null;
+  linkEntityId: string | null;
+  isRead: boolean;
+  createdAt: string;               // ISO timestamp
+};
+```
 
----
+plus a private `mapRow(row): NotificationItem` (snake_case -> camelCase), and a
+private helper that resolves the guest scope once per request, e.g.
+
+```ts
+// Returns null for non-guest callers (no extra filtering), the scoped id list
+// for guests. Callers must handle the dbError case as a 500.
+async function resolveGuestScope(
+  supabase: SupabaseClient<Database>,
+  ctx: AuthContext,
+): Promise<{ ids: string[] | null; dbError: boolean }>;
+```
+
+Exported handlers (every one wrapped in the repo's standard
+`try { ... } catch (err) { if (err instanceof ApiException) return fail(err.message, err.code, err.status); return fail("Internal error", ErrorCode.INTERNAL, 500); }`):
+
+```ts
+export async function listNotifications(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+export async function getUnreadNotificationCount(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+export async function markNotificationRead(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>;
+export async function markAllNotificationsRead(req: NextRequest, lookup?: UserLookup): Promise<Response>;
+```
+
+Common to all four: `await requireAuth(req, lookup)`; **no `requireRole` call**
+— PRD §22.12 auth is "Any", and all 4 roles including `guest` must work. Then
+`const { getToken } = await auth(); const jwt = await getToken();` -> 401
+`UNAUTHENTICATED` if falsy -> `getSupabaseClient(jwt)`. Every query additionally
+filters `.eq("user_id", ctx.userId).eq("church_group_id", ctx.churchGroupId)` as
+defense in depth on top of RLS.
+
+**`listNotifications`** — `GET /api/notifications`
+
+- Parse `listNotificationsQuerySchema.safeParse(Object.fromEntries(req.nextUrl.searchParams))`;
+  invalid -> 400 `VALIDATION_FAILED`.
+- Guest with an empty scope -> return the empty page without querying:
+  `ok({ notifications: [], pagination: { page, pageSize, total: 0 } })`.
+- Query: `.from("notifications").select(COLUMNS, { count: "exact" })`, the two
+  `.eq` scope filters, `.in("link_entity_id", scopeIds)` when the caller is a
+  guest, `.order("created_at", { ascending: false }).order("id", { ascending: false })`,
+  `.range((page - 1) * pageSize, (page - 1) * pageSize + pageSize - 1)`.
+- Response: `ok({ notifications: NotificationItem[], pagination: { page, pageSize, total: count ?? 0 } })`.
+
+**`getUnreadNotificationCount`** — `GET /api/notifications/unread-count`
+
+- No query params.
+- Guest with empty scope -> `ok({ unreadCount: 0 })`.
+- Query: `.select("id", { count: "exact", head: true })` + scope filters +
+  `.eq("is_read", false)` (+ guest `.in`).
+- Response: `ok({ unreadCount: count ?? 0 })`.
+
+**`markNotificationRead`** — `PATCH /api/notifications/:id/read`
+
+- After `requireAuth`, validate the path param with
+  `notificationIdParamSchema.safeParse(id)`; invalid -> 400 `VALIDATION_FAILED`
+  (same auth-then-validate order as `withdrawInvitation` in
+  `app/api/invitations/handler.ts`).
+- Ignore the request body entirely (do not call `req.json()`).
+- Fetch the row first: `.select(COLUMNS).eq("id", id)` + scope filters +
+  `.maybeSingle()`. DB error -> 500; no row -> 404 `NOT_FOUND`.
+- Guest: if the row's `link_entity_id` is null or not in the scoped id list ->
+  404 `NOT_FOUND` (never 403 — matches the anti-enumeration rule in
+  `app/api/service-weeks/[id]/handler.ts`).
+- If already `is_read === true`, skip the write and return the row as-is
+  (idempotent 200, not 409).
+- Otherwise `.update(patch).eq("id", id)` + scope filters + `.select(COLUMNS).maybeSingle()`,
+  where `const patch: Database["public"]["Tables"]["notifications"]["Update"] = { is_read: true };`
+  (typed-patch pattern from `app/api/conflicts/handler.ts`). DB error or missing
+  row -> 500 / 404 respectively.
+- Response: `ok({ notification: NotificationItem })`.
+
+**`markAllNotificationsRead`** — `POST /api/notifications/mark-all-read`
+
+- No body parsing, no query params.
+- Guest with empty scope -> `ok({ updatedCount: 0 })`.
+- `.update({ is_read: true })` (typed patch as above) + scope filters +
+  `.eq("is_read", false)` (+ guest `.in`) + `.select("id")`. DB error -> 500.
+- Response: `ok({ updatedCount: (data ?? []).length })`.
+
+## Files to modify
+
+### 3. `schemas/notifications.ts`
+
+Add (keep the existing exports untouched, including the placeholder
+`notificationsSchema`):
+
+```ts
+export const listNotificationsQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+});
+export type ListNotificationsQuery = z.infer<typeof listNotificationsQuerySchema>;
+
+export const notificationIdParamSchema = z.string().uuid();
+```
+
+Copy the pagination schema shape verbatim from `schemas/audit-log.ts` (only the
+`pageSize` default differs: 20 for an inbox feed).
+
+### 4-7. The four route files
+
+Replace the `notImplemented` bodies with thin delegations. Pattern to copy:
+`app/api/notifications/preferences/route.ts`, and
+`app/api/conflicts/[id]/resolve/route.ts` for the dynamic-param route.
+
+- `app/api/notifications/route.ts`:
+  `export async function GET(req: NextRequest): Promise<Response> { return listNotifications(req); }`
+- `app/api/notifications/unread-count/route.ts`:
+  `export async function GET(req: NextRequest): Promise<Response> { return getUnreadNotificationCount(req); }`
+- `app/api/notifications/mark-all-read/route.ts`:
+  `export async function POST(req: NextRequest): Promise<Response> { return markAllNotificationsRead(req); }`
+- `app/api/notifications/[id]/read/route.ts`:
+  ```ts
+  type Ctx = { params: Promise<{ id: string }> };
+  export async function PATCH(req: NextRequest, { params }: Ctx): Promise<Response> {
+    const { id } = await params;
+    return markNotificationRead(req, id);
+  }
+  ```
+
+All four import from `@/app/api/notifications/handler`. Remove the now-unused
+`notImplemented` imports.
 
 ## Edge cases the implementation must handle
 
-1. `sms_opted_in === false` → `sendSms` returns `{status:"skipped", reason:"not_opted_in"}`; no
-   Pingram HTTP call is made. Counted as `smsSkipped`. **This is the AC's "opted-out members
-   excluded" case.**
-2. `phone` null/blank, or a phone that `toE164` cannot normalize → `smsSkipped`, no HTTP call.
-3. `email` null or whitespace-only → `emailSkipped`, `sendEmail` is not called; the SMS channel
-   still runs for that recipient.
-4. Zero recipients (e.g. publish with no accepted invitations, deny with `invited_by` null and no
-   admins) → no send calls, no throw, normal success response.
-5. Duplicate `userId` in `recipients` → exactly one SMS and one email.
-6. `sendSms` throws (`SmsNotConfiguredError`, `SmsDispatchError`, `SmsValidationError`) →
-   `smsFailed`, logged, request still returns its normal 2xx.
-7. `sendEmail` throws (Resend unconfigured, Resend API error) → `emailFailed`, request still 2xx.
-8. `NEXT_PUBLIC_APP_URL` unset → `appNotificationUrl` returns a site-relative path;
-   `renderEmailTemplate` rejects it (`Email template link must be an absolute HTTPS URL`,
-   `lib/resend/templates.ts:60-73`). `dispatchNotification` must catch this as `emailFailed` —
-   **it must not 500 the request**, and the SMS must still go out (SMS templates accept a
-   relative link without throwing).
-9. Deny/accept idempotency: an already-responded invitation dispatches nothing on either the
-   authenticated or the token path.
-10. `denial_reason` null → `invitationDeniedSms` and the `invitation_denied` email both omit the
-    reason clause; do not substitute `"null"` or an empty `Reason:` label.
-11. Publish with `songCount === 0` still dispatches (BR-01 permits publishing an empty setlist).
-12. Guest invitation, existing-user branch (`isNewUser === false`) → link is `inviteUrl`;
-    new-user branch → `accountSetupUrl`.
-13. A conflict triggered by a member who is themselves an admin/set_leader → they do not notify
-    themselves.
-14. Cross-group `userId` in `createInvitation` → the `users` lookup returns nothing under RLS →
-    skip dispatch, still return 201 (do not throw on the missing row).
-15. `console.error` on any dispatch failure logs `userId` + error only, never phone/email/body.
+1. **Guest scoping (AC bullet 5)**: a guest sees only notifications whose
+   `link_entity_id` is one of their own invitation ids, one of the service-week
+   ids they were invited to, or a setlist id belonging to one of those weeks.
+   This matters for a user demoted from `member` to `guest`, who still owns rows
+   for weeks they were never invited to.
+2. **Guest with zero invitations**: empty inbox, `unreadCount: 0`,
+   `updatedCount: 0`, and 404 on any PATCH — no crash, no unfiltered query.
+3. **Notifications with `link_entity_id = NULL`** (e.g. the
+   `google_calendar_reauth_required` row written by
+   `supabase/migrations/20260716000001_google_calendar_sync.sql`) are excluded
+   for guests by the `.in(...)` filter, and always visible to the other 3 roles.
+4. **Already-read PATCH** is idempotent: 200 with the unchanged item, never 409.
+5. **PATCH on an id that does not exist, belongs to another user, or is outside
+   a guest's scope**: 404 `NOT_FOUND` — never 403, never a distinguishable
+   message between those cases.
+6. **PATCH with a non-UUID id**: 400 `VALIDATION_FAILED`.
+7. **Invalid pagination** (`page=0`, `page=abc`, `pageSize=0`, `pageSize=101`):
+   400 `VALIDATION_FAILED`. Missing params fall back to `page=1`, `pageSize=20`.
+8. **Page past the end**: 200 with `notifications: []` and the real `total`.
+9. **`mark-all-read` with nothing unread**: 200 `{ updatedCount: 0 }`.
+10. **Missing Supabase JWT** (`getToken()` returns null): 401 `UNAUTHENTICATED`,
+    on all four endpoints.
+11. **Any Supabase error**, including an error from the guest-scope lookup:
+    500 `INTERNAL` with the generic `"Internal error"` message — never leak the
+    driver error.
+12. **`count` returned as `null`** by PostgREST: coerce to `0`.
+13. **Ordering stability**: `created_at desc, id desc` so pagination cannot skip
+    or duplicate rows sharing a timestamp (bulk inserts write identical
+    `created_at` values — see the fan-out inserts in
+    `app/api/setlists/[id]/handler.ts`).
 
----
+## Decisions (recorded so the reviewer does not re-litigate them)
 
-## Tests the coder must write (`bun run test`)
+- **"Invited weeks" means any invitation row, regardless of status.** This
+  deliberately differs from `guestHasWeekAccess`/`GUEST_ACCESS_STATUSES`
+  (`pending`/`accepted`), which gates *content* access. Using live statuses here
+  would make the `invitation_withdrawn` notification vanish at the exact moment
+  it is written (the withdraw path in `app/api/invitations/handler.ts` sets
+  `status = 'withdrawn'` immediately before inserting it), so the guest could
+  never learn they were withdrawn — which contradicts the issue's "source of
+  truth for did I get notified about this". Add a comment saying so.
+- **No type filter.** PRD §22.12 mentions "filterable by type", but §13.2 marks
+  "Filter by type" as Phase 2 and the issue's ACs do not ask for it. Out of
+  scope.
+- **No `requireRole`.** Auth is "Any" (all 4 roles); guest access is narrowed by
+  the scope filter, not by a role gate.
+- **No audit-log writes.** Reading and marking one's own inbox is not an audited
+  admin action; `writeAuditLog` is not used here.
+- **No new migration.** The table, indexes, RLS policies, and TypeScript row
+  types all already exist.
 
-Follow `tests/unit/app/api/setlists-publish-route.test.ts` (stateful in-memory fake Supabase
-client + `jest.mock("@clerk/nextjs/server")` + `jest.mock("@/lib/supabase/client")`) and
-`tests/unit/app/api/cron-invitation-reminders-route-issue67-supplement.test.ts`
-(`jest.mock("@/lib/pingram/client", () => ({ sendSms: jest.fn() }))`).
+### OQ1 — "Practice reminder" has no scheduling infrastructure at all
 
-New files — do not overwrite any existing test file:
+Run from the worktree root with Bun (never npm/npx):
 
-- `tests/unit/lib/notifications/dispatch.test.ts` — edge cases 1-8 and 15 against
-  `dispatchNotification` / `appNotificationUrl` directly, with `sendSms` and `sendEmail` mocked.
-- `tests/unit/app/api/invitations-route-notifications.test.ts` — §2a and §2b; asserts the
-  template key, the rendered link, and edge cases 12 and 14.
-- `tests/unit/app/api/invitations-deny-route-notifications.test.ts` — §4a and §4b (both branches),
-  plus edge cases 9 and 10 and the `invited_by === null` fan-out.
-- `tests/unit/app/api/setlists-publish-notifications.test.ts` — §5, plus edge cases 4 and 11.
-- `tests/unit/app/api/availability-conflict-notifications.test.ts` — §6, plus edge case 13.
-- `tests/unit/app/api/cron-invitation-reminders-admin-sms.test.ts` — §3c: admin SMS fires with
-  `pending_count`, uses SMS only (assert `sendEmail` is never called), counters aggregate across
-  both loops, and the member loop's existing behavior is unchanged.
+- `bun run lint`
+- `bun run typecheck`
+- `bun run test`
 
-Every route-level test must additionally assert that a total dispatch failure still yields the
-handler's normal success status code.
-
-Verify with `bun run lint`, `bun run typecheck`, `bun run test`, `bun run check:service-role`.
-
----
-
-## Out of scope — do not touch
-
-- In-app inbox UI / routes (`app/(app)/notifications/`, `app/api/notifications/*`) — #71/#73.
-- `notification_preferences` enforcement (channel-per-type gating, `reminder_hours_before`) —
-  #70. The only opt-out honored here is `users.sms_opted_in`, which `sendSms` already enforces.
-- `schemas/notifications.ts`'s `notificationsSchema` TODO.
-- Adding SMS or email to **Invitation accepted** (PRD: in-app only).
-- Chat mention, devotion shared, new church document, transcription complete (Phase 2+).
-- Any e2e (`tests/e2e/`) or load (`tests/load/`) file other than the bounded comment edit in §7.
-- The Pingram/Resend delivery-status webhooks — already shipped by #67/#68.
+Unit tests belong in `tests/unit/app/api/notifications-inbox-route.test.ts`;
+copy the Clerk/Supabase mocking harness from
+`tests/unit/app/api/audit-log-route.test.ts` (it already models
+`select -> order -> order -> range` with `count`), extending the fake client
+with `in`, `update`, `maybeSingle`, and `head: true` count support. Handlers
+take an injectable `lookup?: UserLookup` precisely so tests can vary
+`ctx.role` across `admin` / `set_leader` / `member` / `guest`.

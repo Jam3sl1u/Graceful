@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { markAllNotificationsRead } from "@/app/api/notifications/handler";
 
-export async function POST(_req: NextRequest) {
-  return notImplemented("POST /api/notifications/mark-all-read");
+export async function POST(req: NextRequest): Promise<Response> {
+  return markAllNotificationsRead(req);
 }

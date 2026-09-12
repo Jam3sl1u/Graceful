@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { listNotifications } from "@/app/api/notifications/handler";
 
-export async function GET(_req: NextRequest) {
-  return notImplemented("GET /api/notifications");
+export async function GET(req: NextRequest): Promise<Response> {
+  return listNotifications(req);
 }

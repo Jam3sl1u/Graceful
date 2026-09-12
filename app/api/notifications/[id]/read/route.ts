@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
-import { notImplemented } from "@/lib/api/response";
+import { markNotificationRead } from "@/app/api/notifications/handler";
 
-export async function PATCH(_req: NextRequest) {
-  return notImplemented("PATCH /api/notifications/[id]/read");
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function PATCH(req: NextRequest, { params }: Ctx): Promise<Response> {
+  const { id } = await params;
+  return markNotificationRead(req, id);
 }
