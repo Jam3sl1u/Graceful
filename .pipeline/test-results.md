@@ -1,86 +1,107 @@
-# Test Results — Issue #71: In-app notification inbox endpoints
+# Test Results — Issue #73: Notification Inbox screen (+ in-app invitation response, option C)
 
-**Verdict: PASS** — all checks green, coder's claims independently verified.
+## Verdict: ALL PASS
 
-## Automated checks (re-run from this worktree with Bun)
+Independently re-ran and verified against the code in this worktree (not just
+trusting `changes.md`'s claims):
 
-| Check              | Result | Notes                                              |
-| ------------------ | ------ | -------------------------------------------------- |
-| `bun install`      | OK     | 709 packages                                       |
-| `bun run lint`     | PASS   | `eslint .` clean                                   |
-| `bun run typecheck`| PASS   | `tsc --noEmit` clean                               |
-| `bun run test`     | PASS   | 137 suites, 3064 tests (3050 pre-existing + 14 new)|
+- `bun run lint` — pass, no warnings/errors.
+- `bun run typecheck` — pass.
+- `bun run test` — **153 suites / 3227 tests, all pass** (baseline before this
+  stage: 147 suites / 3144 tests; 6 new test files / 83 new tests added by
+  this stage, zero pre-existing tests touched or broken).
 
-The coder claimed "3050 passed"; confirmed 3050 pre-existing pass unchanged,
-and the coder's own `notifications-inbox-route.test.ts` (32 tests) passes.
+## New test files (this stage)
 
-## Independent verification added
+1. `tests/unit/lib/notifications/inbox-links.test.ts` (40 tests)
+   - `NOTIFICATION_FILTERS` exact order/labels.
+   - `filterForType` full table (all 15 `NotificationType` values, incl. the
+     3 that map to `null`).
+   - `matchesFilter`: `"all"` always true, category match/mismatch, no-category
+     types never match a non-`"all"` filter.
+   - `resolveNotificationHref`: all 4 known `linkEntityType`s incl.
+     `"invitation"` → `/invitations/:id` (the option-C behavior), `null` for
+     `"google_calendar"` even with a non-null id, `null` for null id/empty
+     id/null type, `null` (no throw) for an unknown/future type.
+   - `formatRelativeTime`: all boundary values (60s/60m/24h/7d, both just
+     under and exactly at each boundary), the >=7d absolute-date format,
+     future-timestamp clock skew → `"just now"` (never negative), unparseable
+     and empty-string input → `""` without throwing.
 
-New file: `tests/unit/app/api/notifications-inbox-route.tester.test.ts`
-(14 tests, all passing). It is a standalone harness — it does not import or
-depend on the coder's test file — and targets spec edge cases the coder's
-suite under-covered:
+2. `tests/unit/app/notification-bell.test.tsx` (7 tests)
+   - Happy path badge render + accessible label; `unreadCount === 0` → no
+     badge; `unreadCount > 99` → `"99+"`; refresh on
+     `UNREAD_CHANGED_EVENT`/`notifyUnreadChanged()`; silent failure on a
+     non-OK response and on a network error (no badge, no error UI).
 
-- **Spec item 10 (401 on a missing Supabase JWT for *all four* endpoints).**
-  The coder tested this for `listNotifications`, `getUnreadNotificationCount`,
-  and `markAllNotificationsRead` but NOT for `markNotificationRead`. Added:
-  `markNotificationRead` returns 401 `UNAUTHENTICATED` with no Supabase client
-  constructed, plus re-checks of the other three. All pass.
-- **Spec item 3 (null `link_entity_id` rows visible to non-guest roles).**
-  Verified `admin` / `set_leader` / `member` all receive a
-  `google_calendar_reauth_required`-style null-link row, no `.in` filter is
-  applied, and the guest-scope lookup (`invitations` query) is skipped
-  entirely. Also verified a member can PATCH a null-link row read (no false
-  404). All pass.
-- **Guest scope `.in` filter on `unread-count`.** The coder only tested the
-  guest *empty-scope* short-circuit here; added a guest-with-invitations case
-  asserting the scoped `link_entity_id` list AND `is_read=false` both reach
-  the query. Pass.
-- **Failure case: DB error on the PATCH *update* leg -> 500 `INTERNAL`.** The
-  coder tested a 500 on the *fetch* leg only. Added: update-leg driver error
-  yields 500 with the generic `"Internal error"` message (no `"deadlock
-  detected"` leak), and a null update result yields 404. Pass.
-- **Pagination boundary.** `pageSize=100` is accepted (range math correct at
-  `page=2` -> `{from:100,to:199}`); `page=-1` rejected with 400. Pass.
-- **Key spec decision: guest scope uses ALL invitation statuses.** Verified a
-  guest whose only invitation is effectively withdrawn still gets a non-empty
-  scope containing the invitation id + week id, the `invitation_withdrawn`
-  notification is returned, and the `invitations` query filters by `user_id`
-  only (no `status` filter). Pass.
+3. `tests/unit/app/notification-inbox.test.tsx` (16 tests)
+   - Loading state; happy-path row rendering (title/body/timestamp/link
+     href); `body === null` renders no body element (not the string
+     `"null"`); `linkEntityId === null` renders a non-clickable button row
+     that still issues the read PATCH on tap; unknown `linkEntityType` is
+     non-clickable and doesn't throw; unread rows get the visually-hidden
+     "Unread" marker and read rows don't; the Chat filter's empty state with
+     no refetch; empty-inbox state + disabled mark-all-read; the "Showing N
+     of Total" footnote (present/absent); mark-all-read disabled-when-nothing-
+     unread (no request issued), happy path (flips rows + dispatches the
+     event), and HTTP-failure path (inline error, list state unchanged,
+     screen stays usable); already-read row taps issue no PATCH; list-fetch
+     failure (non-OK and network-error) both show the error view.
 
-## Behavior confirmed against the spec's named edge cases
+4. `tests/unit/app/api/invitations-get-own-route.test.ts` (8 tests) — new
+   `getOwnInvitation` handler.
+   - 401 when no JWT; 400 on a malformed id; happy path returns the exact
+     `PublicInvitationLookup` shape; computed `"expired"` for a pending
+     invitation past its deadline; an already-responded invitation is never
+     recomputed to `"expired"` even past its deadline; 404 for a nonexistent
+     invitation; **same 404 body for "not owned"/"nonexistent" cases — no
+     existence leak**; 500 on a Supabase query error.
 
-All 13 edge cases in `spec.md` are now covered by passing tests (coder's suite
-+ the additions above):
+5. `tests/unit/app/invitation-response.test.tsx` (9 tests) — new in-app
+   accept/deny screen (`app/(app)/invitations/[id]/invitation-response.tsx`).
+   - Loading state; happy path fetches by id (`/api/invitations/:id`, no
+     token in the URL); accept posts an **empty body** (no `responseToken`)
+     and shows accepted-success; accept dispatches `notifyUnreadChanged()`
+     end-to-end; decline posts `{ reason }` (no `responseToken`) and shows
+     declined-success; expired-on-load and already-responded-on-load both
+     show the friendly unavailable copy (never the raw status); a 404 lookup
+     and a network error on the lookup both show the not-found unavailable
+     view, not a crash.
 
-1. Guest scoping by invitation / week / setlist ids — covered
-2. Guest with zero invitations (empty inbox, count 0, updatedCount 0, PATCH 404) — covered
-3. Null `link_entity_id` excluded for guests, visible to other roles — covered (added)
-4. Already-read PATCH is idempotent (200, no write issued) — covered
-5. PATCH 404 (not 403) for missing / other-user / out-of-scope-guest / null-link-guest — covered
-6. PATCH non-UUID id -> 400 `VALIDATION_FAILED`, no Supabase client built — covered
-7. Invalid pagination (`page=0`, `page=abc`, `pageSize=0`, `pageSize=101`, `page=-1`) -> 400; missing -> defaults — covered
-8. Page past the end -> 200 with `[]` and real total — covered
-9. `mark-all-read` with nothing unread -> 200 `{updatedCount: 0}` — covered
-10. Missing JWT -> 401 on all four — covered (gap on `markNotificationRead` closed)
-11. Any Supabase error (including guest-scope lookup, and PATCH update leg) -> 500 generic — covered (update-leg gap closed)
-12. `count: null` coerced to 0 — covered
-13. Ordering `created_at desc, id desc` — covered (order-call assertions)
+6. `tests/unit/invitations-id-route-auth-gate.test.ts` (3 tests) — exercises
+   `middleware.ts`'s real (unmocked) `isPublicRoute` matcher.
+   - `GET /api/invitations/:id` is NOT public (protected by default —
+     `auth.protect()` runs, so an unauthenticated request is redirected/401'd,
+     never returning invitation data).
+   - `/invitations/:id` (the in-app response page) is NOT public.
+   - Contrast check: the existing public, token-gated `/accept`, `/deny`, and
+     `/respond/:token` endpoints remain public (regression guard against this
+     change accidentally widening or narrowing that allowlist).
 
-## Notes for the reviewer (not defects — judgement calls to sanity-check)
+## Spec/edge-case coverage cross-check
 
-- **Validation-before-auth-token ordering in `listNotifications` /
-  `markNotificationRead`:** `requireAuth` (Clerk) runs first, then Zod
-  validation (400), then the Supabase `getToken()` 401 check. So an
-  authenticated Clerk user with a bad `page` param gets 400 even if their
-  Supabase JWT is absent. This matches the spec's written step order and the
-  `withdrawInvitation` precedent; flagging only so it is a conscious choice.
-- **Guest PATCH scope check is post-fetch in JS, not a DB `.in` filter:** the
-  row is fetched with only the `user_id` / `church_group_id` `.eq` filters,
-  then the guest scope membership is checked in the handler. Functionally
-  equivalent and matches the spec; the row never leaves the handler on a
-  scope miss (404). No cross-tenant leak because RLS + the `.eq` filters
-  still bound the fetch.
-- **`mark-all-read` returns `data.length`, not a true affected-row count:**
-  relies on `.select("id")` returning one row per updated row. Correct for
-  PostgREST; worth a glance.
+All items from spec.md's "Edge cases the implementation must handle" (1–15)
+and changes.md's "What the Tester should focus on" (1–5) are covered above,
+including the option-C-specific `resolveNotificationHref("invitation", id)`
+behavior and the `getOwnInvitation` no-existence-leak / expired-status-parity
+checks the coder flagged as needing independent verification.
+
+## Notes for the Reviewer
+
+- No failures encountered; nothing was patched around. The one hiccup during
+  authoring was in my own test fixture (an invitation `response_deadline` of
+  `2026-07-15` was in the past relative to today's actual date, 2026-09-12,
+  which made the "still pending" happy-path fixture spuriously compute as
+  `"expired"` — fixed by using a fixture deadline in 2099; not a code defect).
+- `console.error: Error: Not implemented: navigation (except hash changes)`
+  appears in jsdom output when clicking a `next/link` row in
+  `notification-inbox.test.tsx` and `invitation-response.test.tsx` — this is
+  jsdom's standard harmless noise for unmocked anchor navigation (same
+  pattern already present in this repo's other Link-based screens, e.g.
+  `conflicts-list.test.tsx`), not a test failure.
+- Manual code review (not just tests) confirms: `getOwnInvitation` scopes its
+  query by both `church_group_id` and `user_id` before falling back to a
+  uniform 404, matching `denyInvitation`'s existing in-app-branch precedent;
+  no `schemas/**`, `lib/supabase/**`, or `supabase/migrations/**` files were
+  touched, matching the spec's scope boundary; `AppShell.tsx`/`.module.css`
+  changes are additive only (`.sidebar`/`.shell`/`.content` untouched).
