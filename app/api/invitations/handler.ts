@@ -1098,6 +1098,104 @@ export type PublicInvitationLookup = {
   }>;
 };
 
+// GET /api/invitations/:id (#73) — in-app, authenticated member viewing
+// their own invitation without the public response_token (PRD Screen 3 /
+// #73 OPEN QUESTION option C). Direct table reads, no RPC needed: RLS
+// already grants an authenticated caller SELECT on their own invitations
+// row (invitations_select_own) and on any tenant-scoped service_weeks/
+// events row (service_weeks_select_tenant, events_select_tenant — see
+// supabase/migrations/20260704000001_rls_policies.sql). Not-owned/
+// not-found/wrong-group all resolve to the same 404, mirroring
+// denyInvitation's in-app branch — never leaks existence of another
+// member's invitation. Returns the same PublicInvitationLookup shape as
+// getInvitationByToken (below) so the two response screens can share a
+// data contract.
+export async function getOwnInvitation(
+  req: NextRequest,
+  id: string,
+  lookup?: UserLookup,
+): Promise<Response> {
+  try {
+    const parsedId = invitationIdParamSchema.safeParse(id);
+    if (!parsedId.success) {
+      return fail("Validation failed", ErrorCode.VALIDATION_FAILED, 400);
+    }
+
+    const ctx = await requireAuth(req, lookup);
+
+    const { getToken } = await auth();
+    const jwt = await getToken();
+    if (!jwt) {
+      return fail("Authentication required", ErrorCode.UNAUTHENTICATED, 401);
+    }
+    const supabase = getSupabaseClient(jwt);
+
+    const { data: inv, error: invError } = await supabase
+      .from("invitations")
+      .select("id, status, role_note, response_deadline, service_week_id")
+      .eq("id", id)
+      .eq("church_group_id", ctx.churchGroupId)
+      .eq("user_id", ctx.userId)
+      .maybeSingle();
+
+    if (invError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    if (!inv) {
+      return fail("Not found", ErrorCode.NOT_FOUND, 404);
+    }
+
+    const { data: week, error: weekError } = await supabase
+      .from("service_weeks")
+      .select("id, service_date, title")
+      .eq("id", inv.service_week_id)
+      .maybeSingle();
+
+    if (weekError || !week) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    const { data: events, error: eventsError } = await supabase
+      .from("events")
+      .select("id, type, name, location, start_time, end_time")
+      .eq("service_week_id", inv.service_week_id)
+      .order("start_time");
+
+    if (eventsError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+
+    // Computed "expired" state mirrors get_invitation_by_token_rpc: only a
+    // still-pending invitation past its deadline; already-responded rows
+    // keep their real status.
+    const status: InvitationStatus =
+      inv.status === "pending" &&
+      inv.response_deadline !== null &&
+      new Date() > new Date(inv.response_deadline)
+        ? "expired"
+        : inv.status;
+
+    return ok<PublicInvitationLookup>({
+      invitationId: inv.id,
+      status,
+      roleNote: inv.role_note,
+      responseDeadline: inv.response_deadline,
+      serviceWeek: { id: week.id, serviceDate: week.service_date, title: week.title },
+      events: (events ?? []).map((e) => ({
+        id: e.id,
+        type: e.type,
+        name: e.name,
+        location: e.location,
+        startTime: e.start_time,
+        endTime: e.end_time,
+      })),
+    });
+  } catch (err) {
+    if (err instanceof ApiException) return fail(err.message, err.code, err.status);
+    return fail("Internal error", ErrorCode.INTERNAL, 500);
+  }
+}
+
 // GET /api/invitations/respond/:token (#44) — no-session, no-Clerk-auth,
 // read-only lookup for someone tapping an SMS/email link. Token possession
 // is the only credential; runs entirely through the get_invitation_by_token
