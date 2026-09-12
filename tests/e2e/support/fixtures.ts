@@ -180,7 +180,7 @@ export async function seedInvitation(
 export async function seedSong(
   svc: SupabaseClient,
   churchGroupId: string,
-  opts?: { title?: string; artist?: string | null; defaultKey?: string | null },
+  opts?: { title?: string; artist?: string | null; defaultKey?: string | null; createdBy?: string },
 ): Promise<{ id: string; title: string }> {
   const id = crypto.randomUUID();
   const title = opts?.title ?? `E2E Song ${crypto.randomUUID().slice(0, 8)}`;
@@ -190,7 +190,7 @@ export async function seedSong(
     title,
     artist: opts?.artist ?? null,
     default_key: opts?.defaultKey ?? null,
-    created_by: FIXTURE.adminUserId,
+    created_by: opts?.createdBy ?? FIXTURE.adminUserId,
   });
   if (error) throw new Error(`seedSong failed: ${error.message}`);
   return { id, title };
@@ -236,6 +236,7 @@ export type TeardownIds = {
   songIds?: string[];
   googleTokenUserIds?: string[]; // google_calendar_tokens rows by user_id
   userIds?: string[]; // synthetic users only, never FIXTURE ids
+  churchGroupIds?: string[]; // throwaway groups created by disposable personas (issue #82) — deleted last, cascades everything under them
 };
 
 // Per-test cleanup — deletes only the variable fixtures a test created
@@ -276,5 +277,54 @@ export async function teardownFixtures(svc: SupabaseClient, ids: TeardownIds): P
   // idempotently-upserted fixture rows every other test depends on.
   if (ids.userIds && ids.userIds.length > 0) {
     await svc.from("users").delete().in("id", ids.userIds);
+  }
+  // Deleted last: cascades service_weeks/invitations/notifications/songs/etc.
+  // (every church_group_id FK is `on delete cascade`). Same stable-fixture
+  // guard as resetDisposablePersona — never delete FIXTURE.churchGroupId.
+  if (ids.churchGroupIds && ids.churchGroupIds.length > 0) {
+    if (ids.churchGroupIds.includes(FIXTURE.churchGroupId)) {
+      throw new Error("teardownFixtures: refusing to delete FIXTURE.churchGroupId");
+    }
+    await svc.from("church_groups").delete().in("id", ids.churchGroupIds);
+  }
+}
+
+// Clears a disposable Clerk persona's app-side state so it can create/join a
+// group again on the next run (issue #82). Deletes any church group the
+// persona OWNS (cascades its users row) and otherwise deletes just the
+// persona's users row. Hard guard: throws if the resolved group is
+// FIXTURE.churchGroupId — never touch the stable fixture.
+export async function resetDisposablePersona(svc: SupabaseClient, email: string): Promise<void> {
+  const clerkId = await resolveClerkUserId(email);
+  const { data: row, error } = await svc
+    .from("users")
+    .select("id, church_group_id, role")
+    .eq("clerk_id", clerkId)
+    .maybeSingle();
+  if (error) {
+    throw new Error(`resetDisposablePersona: users lookup failed: ${error.message}`);
+  }
+  if (!row) return;
+
+  if (row.church_group_id === FIXTURE.churchGroupId) {
+    throw new Error(
+      `resetDisposablePersona: ${email} resolved to FIXTURE.churchGroupId — refusing to delete ` +
+        "the stable fixture. This means the test used the wrong persona email.",
+    );
+  }
+
+  if (row.role === "admin") {
+    const { error: groupError } = await svc
+      .from("church_groups")
+      .delete()
+      .eq("id", row.church_group_id);
+    if (groupError) {
+      throw new Error(`resetDisposablePersona: church_groups delete failed: ${groupError.message}`);
+    }
+  } else {
+    const { error: userError } = await svc.from("users").delete().eq("id", row.id);
+    if (userError) {
+      throw new Error(`resetDisposablePersona: users delete failed: ${userError.message}`);
+    }
   }
 }

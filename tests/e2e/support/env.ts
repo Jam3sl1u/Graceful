@@ -23,6 +23,16 @@
  *   E2E_SUPABASE_SERVICE_ROLE_KEY   — staging Supabase service-role key (seed/teardown only)
  *
  * tests/e2e/invitation-reminder.spec.ts additionally requires CRON_SECRET.
+ *
+ * Issue #82 adds two more, disposable Clerk staging personas — required only
+ * by tests/e2e/week-setup-flow.spec.ts and the new-user test in
+ * tests/e2e/guest-invitation.spec.ts (gated on `e2eDisposablePersonasEnabled`
+ * below, not `e2eAuthEnabled`), because the stable E2E_ADMIN_EMAIL /
+ * E2E_MEMBER_EMAIL fixture personas are permanently bound to the stable
+ * fixture group (tests/e2e/support/fixtures.ts) and can't create/join a
+ * second group:
+ *   E2E_SETUP_ADMIN_EMAIL           — disposable Clerk test user, creates a throwaway group
+ *   E2E_GUEST_EMAIL                 — disposable Clerk test user, joins that group / claims a guest invite
  */
 
 const REQUIRED_VARS = [
@@ -42,6 +52,11 @@ export function checkEnv(extra: readonly string[] = []): boolean {
 
 /** True only when every var in REQUIRED_VARS is set. Computed once at import time. */
 export const e2eAuthEnabled = checkEnv();
+
+export const DISPOSABLE_PERSONA_VARS = ["E2E_SETUP_ADMIN_EMAIL", "E2E_GUEST_EMAIL"] as const;
+
+/** True only when the base E2E secrets AND both disposable-persona emails are set. */
+export const e2eDisposablePersonasEnabled: boolean = checkEnv(DISPOSABLE_PERSONA_VARS);
 
 export function requireEnv(name: string): string {
   const val = process.env[name];
