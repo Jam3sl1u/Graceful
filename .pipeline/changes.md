@@ -1,82 +1,103 @@
-# Changes — Issue #71: In-app notification inbox endpoints
+# Changes — Issue #73: Notification Inbox screen (+ in-app invitation response, option C)
+
+## Scope note
+
+The planner's OPEN QUESTION ("where should an `invitation` notification
+deep-link to?") was resolved by a human operator as **option C**: build the
+in-app accept/deny screen now (PRD Screen 3), even though it expands scope
+beyond the original Screen-6-only spec. That resolution overrides spec.md's
+"No API handler, schema, or migration changes" framing — this changeset
+does add one new API endpoint, but **no schema or migration changes** were
+needed (see below).
 
 ## New files
 
-### `lib/notifications/guest-inbox-scope.ts`
-`getGuestInboxLinkEntityIds(supabase, userId)` — resolves the set of
-notification `link_entity_id`s a guest may see: their own invitation ids, the
-service-week ids those invitations point at, and setlist ids belonging to those
-weeks. Modeled on `lib/invitations/guest-access.ts` (`"server-only"`, typed
-`SupabaseClient<Database>`, never throws, returns `{ linkEntityIds, dbError }`).
-Uses ALL invitation rows regardless of status (comment explains why — the
-`invitation_withdrawn` notification must stay visible). Returns
-`{ linkEntityIds: [], dbError: false }` early when the guest has no invited
-weeks. Comment explains why cross-table UUID ids can share one `.in()` filter.
+- `lib/notifications/inbox-links.ts` — pure helpers: `NOTIFICATION_FILTERS`,
+  `filterForType`, `matchesFilter`, `resolveNotificationHref`,
+  `formatRelativeTime`. `resolveNotificationHref("invitation", id)` returns
+  `/invitations/${id}` (option C), everything else per the spec's table.
+- `app/(app)/notifications/notification-inbox.tsx` + `.module.css` — the
+  Notification Inbox screen: loads `GET /api/notifications`, filter row,
+  mark-all-read, per-row read-on-tap (Link when `resolveNotificationHref`
+  returns a href, button otherwise), unread styling + visually-hidden
+  "Unread" marker, empty states, "Showing N of Total" footnote. Follows the
+  `conflicts-list.tsx` pattern (ViewState, `cancelled` fetch flag, local row
+  type instead of importing from `app/api/**`).
+- `app/(app)/notifications/page.tsx` (replace) — tiny server component
+  rendering `NotificationInbox`.
+- `components/layout/NotificationBell.tsx` + `.module.css` — bell icon
+  linking to `/notifications`, fetches `GET /api/notifications/unread-count`
+  on mount, refreshes on the `notifications:unread-changed` custom event
+  (`UNREAD_CHANGED_EVENT` / `notifyUnreadChanged()` exported from this
+  file), `99+` badge cap, accessible `aria-label`.
+- `components/layout/AppShell.tsx` (modified) — added a persistent nav
+  containing `<NotificationBell />` inside the sidebar; kept the "Graceful"
+  wordmark and amended (did not delete) the `TODO(Sprint 1+)` comment.
+- `components/layout/AppShell.module.css` (modified) — added
+  `.sidebarHeader` / `.nav`, left `.shell`/`.sidebar`/`.content` untouched.
 
-### `app/api/notifications/handler.ts`
-Four handlers plus shared helpers:
-- `COLUMNS`, `NotificationItem` type, private `mapRow` (snake_case ->
-  camelCase), private `resolveGuestScope` (returns `ids: null` for non-guests,
-  the scoped list for guests, `dbError` flag).
-- `listNotifications` — `GET /api/notifications`. Parses
-  `listNotificationsQuerySchema`; 400 on invalid. Guest empty-scope short-circuit.
-  Query: `select(COLUMNS, { count: "exact" })` + `.eq("user_id")` +
-  `.eq("church_group_id")` + guest `.in("link_entity_id", ids)` +
-  `created_at desc, id desc` + `range`. Returns
-  `{ notifications, pagination: { page, pageSize, total } }`.
-- `getUnreadNotificationCount` — `GET /api/notifications/unread-count`.
-  `select("id", { count: "exact", head: true })` + scope filters +
-  `.eq("is_read", false)`. Returns `{ unreadCount: count ?? 0 }`.
-- `markNotificationRead` — `PATCH /api/notifications/:id/read`. Auth then
-  `notificationIdParamSchema` validation (400). Ignores request body. Fetches
-  row with scope filters + `maybeSingle`; 404 if missing. Guest: 404 if row's
-  `link_entity_id` is null or not in scope (never 403). Already-read -> idempotent
-  200 with the row, no write. Otherwise typed `Update` patch `{ is_read: true }`
-  + `.select(COLUMNS).maybeSingle()`. Returns `{ notification }`.
-- `markAllNotificationsRead` — `POST /api/notifications/mark-all-read`. No body.
-  Guest empty-scope -> `{ updatedCount: 0 }`. `update({ is_read: true })` +
-  scope filters + `.eq("is_read", false)` + guest `.in` + `.select("id")`.
-  Returns `{ updatedCount: (data ?? []).length }`.
+## Option C — in-app invitation accept/deny screen
 
-All four: `requireAuth` (no `requireRole` — auth is "Any"), JWT -> 401
-`UNAUTHENTICATED` if absent, standard try/catch error envelope, generic
-`"Internal error"` / `INTERNAL` / 500 for any DB error including the guest-scope
-lookup.
-
-### `tests/unit/app/api/notifications-inbox-route.test.ts`
-32 tests across all four handlers: 401 paths, member happy paths, camelCase
-mapping, pagination (defaults, range math, page-past-end, null count, invalid
-params), 500 on DB error, guest scoping (scoped `.in` filter, zero-invitation
-short-circuit, scope-lookup error), idempotent PATCH, 404 (missing / other user
-/ out-of-scope guest / null link for guest), non-UUID -> 400, mark-all counts
-and guest filtering.
-
-## Modified files
-
-### `schemas/notifications.ts`
-Added `listNotificationsQuerySchema` (+ `ListNotificationsQuery` type) copied
-from `schemas/audit-log.ts` with `pageSize` default 20, and
-`notificationIdParamSchema = z.string().uuid()`. Existing exports untouched.
-
-### `app/api/notifications/route.ts`
-### `app/api/notifications/unread-count/route.ts`
-### `app/api/notifications/mark-all-read/route.ts`
-### `app/api/notifications/[id]/read/route.ts`
-Replaced the `notImplemented` 501 stubs with thin delegations to
-`@/app/api/notifications/handler`. The `[id]/read` route awaits
-`params: Promise<{ id: string }>` and passes `id` through. Removed the unused
-`notImplemented` imports.
-
-## Not changed (per spec)
-No migration, no `lib/supabase/types.ts` change, no `preferences/*` change, no
-type filter, no audit-log writes, no UI.
+- `app/api/invitations/handler.ts` — added `getOwnInvitation(req, id, lookup)`:
+  a new in-app, authenticated read of a member's **own** invitation, scoped
+  by `church_group_id` + `user_id` (not-owned/not-found/wrong-group all
+  return the same 404, mirroring `denyInvitation`'s in-app branch — no
+  existence leak). Returns the same `PublicInvitationLookup` shape as the
+  existing `getInvitationByToken` (service week + role note + events +
+  computed `"expired"` status), so both response screens share one data
+  contract. **No new RPC/migration**: RLS already grants an authenticated
+  caller `SELECT` on their own `invitations` row (`invitations_select_own`)
+  and on tenant-scoped `service_weeks`/`events` rows
+  (`service_weeks_select_tenant`, `events_select_tenant` — see
+  `supabase/migrations/20260704000001_rls_policies.sql`), so this is a
+  direct table read, not a `SECURITY DEFINER` RPC like the token path.
+- `app/api/invitations/[id]/route.ts` — added `GET`, wired to
+  `getOwnInvitation` (the `DELETE` → `withdrawInvitation` route was already
+  there, untouched).
+- **No changes to `accept`/`deny` handlers or routes** — their existing
+  in-app branch (no `responseToken` in the body → identity from the Clerk
+  session, scoped to the caller's own invitation) already does exactly what
+  this screen needs; it was unused by any UI until now.
+- `app/(app)/invitations/[id]/page.tsx` + `invitation-response.tsx` +
+  `.module.css` (new) — a member-facing accept/deny screen, structurally a
+  copy of the public `app/(public)/invite/[token]/invite-response.tsx`
+  (same `ViewState`/`UnavailableReason` shape, same card/button layout, CSS
+  copied verbatim) but: fetches `GET /api/invitations/:id` (no token in the
+  URL), posts to `/accept` and `/deny` with an empty/`{ reason }` body (no
+  `responseToken` field), and calls `notifyUnreadChanged()` after a
+  successful accept/deny so the sidebar bell's unread count refreshes.
+  `middleware.ts`'s route matcher required no changes — `/api/invitations/:id`
+  GET was already outside the public-route list (protected by default), and
+  `/invitations/[id]` is inside the `(app)` route group (already
+  auth-protected).
 
 ## Verification
-`bun run lint`, `bun run typecheck`, `bun run test` (3050 passed) all green.
 
-## Tester focus
-- Guest scoping correctness: the mixed-table `.in("link_entity_id", ...)` list
-  and the "all invitation statuses" decision.
-- PATCH 404-not-403 anti-enumeration for the three distinct miss cases.
-- Idempotent already-read PATCH (200, no write).
-- `head: true` count query shape for unread-count.
+- `bun run lint` — pass (no warnings/errors).
+- `bun run typecheck` — pass.
+- `bun run test` — 147 suites / 3144 tests, all pass (pre-existing suite;
+  no new unit tests were added in this pass — that's the Testing stage's
+  job per AGENTS.md).
+
+## What the Tester should focus on
+
+1. `lib/notifications/inbox-links.ts`: `filterForType`/`matchesFilter` table
+   coverage, `resolveNotificationHref`'s `"invitation"` → `/invitations/:id`
+   case specifically (this is the option-C behavior change vs. the
+   planner's recommended option A), `formatRelativeTime` edge cases
+   (future timestamp, unparseable string, boundary values at 60s/60m/24h/7d).
+2. `notification-inbox.tsx`: mark-all-read disabled/error states, per-row
+   read-on-tap firing exactly once and not blocking navigation, the Chat
+   filter's empty state, the `total > notifications.length` footnote.
+3. `NotificationBell.tsx`: 0/badge-hidden, >99 → "99+", refresh on the
+   custom event, silent failure (no badge, no error UI).
+4. **New surface**: `getOwnInvitation` — verify a non-owner/wrong-group/
+   nonexistent id all 404 identically (no existence leak), the computed
+   `"expired"` status matches `get_invitation_by_token`'s logic, and that
+   accept/deny via `invitation-response.tsx` (no `responseToken`) actually
+   updates the invitation status end-to-end (this reuses existing,
+   previously-untested-from-the-UI in-app branches of `acceptInvitation`/
+   `denyInvitation`).
+5. Confirm `/invitations/:id` and `/api/invitations/:id` (GET) are properly
+   auth-gated (unauthenticated request → redirect/401, not the invitation
+   data).

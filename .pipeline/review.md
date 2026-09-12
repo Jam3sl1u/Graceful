@@ -1,103 +1,136 @@
-# Review — Issue #71: In-app notification inbox endpoints
+# Review — Issue #73: Notification Inbox screen (+ in-app invitation response)
 
-VERDICT: SHIP
+VERDICT: BLOCK
 
-Reviewed: `.pipeline/spec.md`, `.pipeline/changes.md`, `.pipeline/test-results.md`,
-`git diff main...HEAD`, the untracked tester supplement, plus the surrounding
-code the diff depends on (RLS policies, the four notification producers, the
-`invitations` DDL, `middleware.ts` rate-limit tiers, and the `audit-log` /
-`preferences` handlers the spec said to copy).
+Tests are green (I re-ran the 6 new suites: 83/83 pass) and the Screen-6 work
+itself is good. The BLOCK is on the option-C scope expansion that was bolted on:
+the new in-app decline path talks to a response shape the real handler never
+returns, and the tests "prove" it works only because they mock a contract that
+does not exist.
 
-## Independently re-run in this worktree
+---
 
-| Check | Result |
-| --- | --- |
-| `bun run lint` | clean |
-| `bun run typecheck` | clean |
-| `bun run test` | 137 suites / 3064 tests, all pass |
-| inbox suites only | 46 tests pass (32 coder + 14 tester) |
+## BLOCK 1 — In-app decline reads a response shape `denyInvitation` never returns
 
-## Does the code match the spec?
+`app/(app)/invitations/[id]/invitation-response.tsx:186-196`
 
-Yes, item by item. All four ACs from the issue are implemented, and every one
-of the spec's 13 named edge cases is present in the code (not just asserted in
-a test): guest `.in` scoping, guest empty-scope short-circuit on
-list/unread-count/mark-all-read, null `link_entity_id` excluded for guests,
-idempotent already-read PATCH, uniform 404 (never 403) for missing /
-other-user / out-of-scope, 400 on a non-UUID id, pagination validation with
-`page=1,pageSize=20` defaults, `created_at desc, id desc` tiebreak,
-`count ?? 0`, 401 on a missing Supabase JWT on all four handlers, and a
-generic `"Internal error"` for every driver error including the guest-scope
-lookup. Scope discipline is good: no migration, no `lib/supabase/types.ts`
-edit, no `preferences/*` change, no type filter, no unrelated refactors.
+```ts
+const body = await res.json();
+const data: { status: InvitationStatus; alreadyResponded: boolean } = body.data;
+if (data.alreadyResponded && data.status !== "denied") { ...unavailable... }
+notifyUnreadChanged();
+setView("declined-success");
+```
 
-## Claims I verified rather than trusted
+The **in-app** branch of `denyInvitation` (the branch this screen hits — no
+`responseToken` in the body) returns a completely different shape:
 
-- **The "all invitation statuses" decision is actually necessary.** Both
-  withdraw paths (`app/api/invitations/handler.ts:822` and
-  `app/api/conflicts/handler.ts:247`) set `status = 'withdrawn'` and then
-  insert the notification, and neither deletes the invitation row. Filtering
-  by `GUEST_ACCESS_STATUSES` would have made the `invitation_withdrawn`
-  notification invisible to the guest it was written for. The code is right
-  and the comment explains why.
-- **The guest scope covers every notification a guest can actually receive.**
-  The only four producers write `link_entity_type` of `"service_week"`
-  (id = week id), `"invitation"` (x2, id = invitation id) and `"setlist"`
-  (id = setlist id) — all three families are in the scope list. No producer
-  writes a `"conflict"` link (the spec's list was slightly stale there, but
-  the code is not affected).
-- **RLS lets the guest-scope helper actually read what it queries.**
-  `invitations_select_own` covers the invitations query; the
-  `setlist_released` notification is only written on publish, and
-  `setlists_select_published_members` lets a guest read published setlists, so
-  the setlist ids do come back. No service-role escalation was introduced.
-- **The DB permits the writes.** `notifications_update_own` has both USING and
-  WITH CHECK on `user_id = auth_user_id()`, so PATCH and mark-all-read are not
-  silent no-ops under RLS.
-- **`service_week_id` is `not null`** in the invitations DDL, so the
-  `weekIds`/`.in("service_week_id", weekIds)` path cannot smuggle a `null`.
-- **The endpoints are auth-protected and rate-limited for free**: they are not
-  in `isPublicRoute`, and `resolveTier` falls through to `read`/`write` for
-  any `/api/*` path, so the spec's "no rate limiting" scope cut leaves no gap.
-- **Tests are meaningful, not superficial.** They assert the actual filter
-  arguments reaching the fake client (`calls.in`, `calls.eq`, `calls.order`,
-  `calls.range`, `calls.update`), not merely status codes, and they assert
-  negative facts too (`calls.in` empty for non-guests, `from` never touching
-  `invitations` for non-guests, no Supabase client constructed on the 401/400
-  paths). The tester's supplement is genuinely independent (own harness) and
-  closed two real gaps: the missing `markNotificationRead` 401 case and the
-  500 on the PATCH *update* leg.
+- `app/api/invitations/handler.ts:902` — `return ok({ invitation: toInvitationResponse(updated) })`
+- `app/api/invitations/handler.ts:798` (idempotent/terminal branch) — `return ok({ invitation: toInvitationResponse(inv) })`
 
-## Findings (none blocking)
+Only the **token** branch returns `{ invitationId, status, alreadyResponded }`
+(handler.ts ~line 755; asserted in `tests/unit/app/api/invitations-deny-route-notifications.test.ts:279`,
+which is a token-path test). Consequences:
 
-1. **Uncommitted work — must be committed before the PR.**
-   `tests/unit/app/api/notifications-inbox-route.tester.test.ts` is untracked
-   and `.pipeline/test-results.md` is modified but uncommitted. The single
-   commit `41fa7dc` contains only the coder's output. This matches the #70
-   pattern ("Add tester supplement test and finalize pipeline artifacts"), so
-   it is a shipping step, not a defect — but if it is skipped, 14 of the 46
-   tests and the test report never reach the PR.
-2. **Route wrappers are untested (repo-wide convention).** Nothing imports
-   `app/api/notifications/[id]/read/route.ts`, so the
-   `await params` -> `markNotificationRead(req, id)` wiring is only covered by
-   `tsc`. Consistent with every other route in this repo (including
-   `preferences`), so not a change to make here.
-3. **`.in("link_entity_id", ids)` is unbounded for guests.** A guest with many
-   invitations across many weeks produces a long PostgREST URL filter. At this
-   product's scale (a church group's guests) this is a non-issue; worth
-   remembering if guest invitation volume ever grows.
-4. **Guests can never see or clear a null-`link_entity_id` notification.**
-   Intentional per spec item 3, and self-consistent (list, unread-count and
-   mark-all-read all apply the same filter, so no stuck badge). But any future
-   notification type written with a null link will be silently invisible to
-   guests — worth a line in the #73 UI issue rather than a change here.
-5. **Page-past-the-end is proven only against the mock.** Real PostgREST can
-   answer an out-of-range `Range` with 416 depending on version/config. The
-   existing `audit-log` handler has exactly the same shape, so this is a
-   pre-existing repo-wide question, not a regression introduced here.
-6. **Minor perf nit:** for a guest, `markNotificationRead` resolves the scope
-   (up to 2 extra queries) before it knows the notification even exists. Two
-   wasted round-trips on a 404. Not worth restructuring.
+1. `data.status` and `data.alreadyResponded` are both `undefined` at runtime, so
+   the `alreadyResponded` guard is dead code. An already-withdrawn / already-
+   accepted invitation hits the idempotent 200 branch (no state change) and the
+   member is still shown **"Response recorded"**. That is a false success
+   message about a scheduling commitment — exactly the class of bug this screen
+   exists to avoid, and the public token screen handles correctly.
+2. `toInvitationResponse` includes **`responseToken`** (handler.ts:39-51). This
+   change is the first time that payload is delivered to a browser. The repo's
+   own comments call `response_token` "the no-session credential — never
+   expose" (handler.ts:61-63) and explicitly warn "never reuse
+   `InvitationResponse`/`toInvitationResponse` for this endpoint" for the
+   roster case. It is the member's own token, so this is not a cross-tenant
+   leak, but it puts a permanent, session-less accept/deny credential into a
+   browser-readable response body for no reason.
 
-None of the above changes behavior in a way that would make a user-visible
-result wrong. Ship it, after committing finding 1.
+Fix (pick one, in `app/api/invitations/handler.ts` + the screen):
+- Preferred: make the in-app deny branch return the same
+  `{ invitationId, status, alreadyResponded }` contract as the token branch
+  (both success and idempotent returns), and keep the client as-is. Update
+  any existing caller/test that depends on `{ invitation }`.
+- Or: leave the handler alone and rewrite `handleDeclineConfirm` to read
+  `body.data.invitation.status`. This still leaks `responseToken` over the
+  wire, so it is the worse option unless the handler also stops returning it.
+
+Note the same file's accept path *is* correct — `acceptInvitation`
+(handler.ts:1073-1078) genuinely returns `{ invitationId, status,
+alreadyResponded, attendeesAdded }`. The two paths were assumed symmetric and
+are not.
+
+## BLOCK 2 — OPEN QUESTION resolution has no recorded provenance, and it expanded scope
+
+`.pipeline/spec.md:9-40` still contains the unresolved, blocking
+**OPEN QUESTION** verbatim, with no amendment, no answer, no sign-off. The only
+evidence of a human decision is the coder's own prose
+(`.pipeline/changes.md:5-11`) and a self-authored code comment
+(`lib/notifications/inbox-links.ts` — "resolved by human operator, 2026-09").
+Per AGENTS.md, every downstream stage stops until a human resolves it, and this
+repo has a documented prior incident (#69) of a coder asserting an approval that
+did not exist.
+
+The chosen answer (option C) is also the one the planner labelled **scope
+creep**, and it directly contradicts spec.md's stated boundaries: "Backend (#71)
+is already shipped — this issue is UI only. **No API handler, schema, or
+migration changes**" (spec.md:4-5) and the Out-of-scope line "any change to
+`app/api/**`" (spec.md:274). The diff adds a new public GET endpoint and a whole
+new PRD Screen 3.
+
+Required before ship: the operator's resolution recorded in `.pipeline/spec.md`
+itself (answer + date + who), with the OPEN QUESTION section marked RESOLVED and
+the out-of-scope list amended. If no such resolution actually happened, revert to
+option A (`resolveNotificationHref("invitation", …) → null`) and drop the entire
+`app/(app)/invitations/**` + `getOwnInvitation` + `app/api/invitations/[id]/route.ts`
+GET addition from this changeset.
+
+## NEEDS WORK 3 — The new tests assert a fictional contract
+
+`tests/unit/app/invitation-response.test.tsx:122-146` mocks the decline response
+as `{ data: { status: "denied", alreadyResponded: false } }` — a shape the real
+in-app handler does not produce. That is why BLOCK 1 slipped through green.
+`.pipeline/test-results.md` §"What the Tester should focus on" item 4 claims
+accept/deny "actually updates the invitation status end-to-end"; nothing in the
+suite exercises `denyInvitation`/`acceptInvitation` against this client's
+expectations. Add at least one test that pins the in-app deny/accept response
+body of the *handler* and one that feeds that exact body to the component. Same
+gap applies to the accept path's `alreadyResponded` branch.
+
+## Minor (not blocking, fix while you're in here)
+
+- `app/(app)/invitations/[id]/invitation-response.tsx:132-136,175-179` — a `404`
+  is mapped to `UNAVAILABLE_MESSAGES.expired` ("This invitation has expired.").
+  For the in-app path 404 means "not yours / doesn't exist"; `"not-found"` is the
+  honest message. `410` correctly means expired.
+- `app/(app)/invitations/[id]/invitation-response.tsx:152-155` — if accept
+  returns a non-`"accepted"` status with `alreadyResponded` falsy, the component
+  silently does nothing: no view change, no error. Add a fallback.
+- `app/(app)/notifications/notification-inbox.tsx:200` — `<p>{row.body}</p>`
+  renders inside a `<button>` for non-linkable rows. `<p>` is not valid inside a
+  `<button>`; React will emit a `validateDOMNesting` warning. Use a `<span>`.
+- The 6 new test files and the modified `.pipeline/test-results.md` are
+  **untracked/uncommitted** (`git status`) — only `3342b40` exists. They must be
+  committed or the PR ships implementation with zero tests.
+
+## What is good (no changes needed)
+
+- `lib/notifications/inbox-links.ts` matches the spec's tables exactly; the
+  `formatRelativeTime` clock-skew (`diffMs < MINUTE_MS` catches negatives) and
+  `NaN` guards are correct, and the boundary tests are real, not superficial.
+- `notification-inbox.tsx` follows the `conflicts-list.tsx` pattern faithfully:
+  `cancelled` flag, local row type, fire-and-forget PATCH that does not block
+  navigation, no PATCH on already-read rows, mark-all-read failure isolated to an
+  inline `role="alert"` instead of flipping the whole view, correct
+  `total === 0` vs. filtered-empty split.
+- `NotificationBell.tsx` — silent failure, `99+` cap, listener cleanup, event
+  contract exported from one place. Correct.
+- `getOwnInvitation` (handler.ts:1101-1197) is well-built: user-JWT RLS client,
+  scoped by both `church_group_id` and `user_id`, uniform 404 for
+  not-owned/not-found (no existence leak), explicit column select (no
+  `response_token`), `expired` computed only for still-pending rows. The
+  auth-gate test against the real `isPublicRoute` matcher is a genuinely good
+  regression guard.
+- `AppShell` changes are additive and scoped to the notifications entry, as
+  specified; the TODO was amended, not deleted.
