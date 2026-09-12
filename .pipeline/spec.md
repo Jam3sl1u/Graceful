@@ -1,6 +1,7 @@
 # Spec — Issue #71: In-app notification inbox endpoints
 
-## OPEN QUESTIONS
+Branch: issue-69 worktree. PRD trigger table = `documentation/prd/graceful_requirements_v10.md`
+§14 (lines 435-447; the issue calls it "§6.9"). Copy templates = §30 (lines 1696-1707).
 
 None. Everything below is resolved against the current code; the judgement
 calls are recorded under "Decisions" with their rationale.
@@ -29,7 +30,7 @@ calls are recorded under "Decisions" with their rationale.
 - `lib/invitations/guest-access.ts` (`guestHasWeekAccess`) is the existing guest
   scoping helper for single-week reads.
 
-## Scope
+## RESOLVED OPEN QUESTIONS (operator decision, 2026-08-31)
 
 Implement the 4 inbox endpoints only. No migration, no UI, no SMS/email, no
 type filter, no audit-log writes, no rate limiting.
@@ -265,7 +266,7 @@ All four import from `@/app/api/notifications/handler`. Remove the now-unused
 - **No new migration.** The table, indexes, RLS policies, and TypeScript row
   types all already exist.
 
-## Verification
+### OQ1 — "Practice reminder" has no scheduling infrastructure at all
 
 Run from the worktree root with Bun (never npm/npx):
 

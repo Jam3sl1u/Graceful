@@ -9,6 +9,9 @@ import type { Database } from "@/lib/supabase/types";
 import { isValidSongKey } from "@/schemas/songs";
 import { reorderSetlistSchema, addSetlistSongSchema } from "@/schemas/setlists";
 import { toSetlistResponse } from "@/app/api/service-weeks/[id]/setlist/handler";
+import { dispatchNotification, appNotificationUrl } from "@/lib/notifications/dispatch";
+import { setlistPublishedSms } from "@/lib/notifications/sms-templates";
+import { formatWeekLabel } from "@/lib/scheduling/reminder";
 
 type SetlistSongsRow = Database["public"]["Tables"]["setlist_songs"]["Row"];
 
@@ -468,7 +471,39 @@ export async function publishSetlist(
         return fail("Internal error", ErrorCode.INTERNAL, 500);
       }
 
-      // TODO(#67/#68): SMS/email fan-out for confirmed members.
+      // Setlist released — SMS + Email to confirmed members (PRD §14). The
+      // in-app notifications above are already committed and are the source of
+      // truth: a contact/week query error just skips dispatch, still 200.
+      try {
+        const { data: contactRows, error: contactError } = await supabase
+          .from("users")
+          .select("id, name, email, phone, sms_opted_in")
+          .in("id", recipientIds);
+
+        const { data: week, error: weekError } = await supabase
+          .from("service_weeks")
+          .select("title, service_date")
+          .eq("id", updated.service_week_id)
+          .maybeSingle();
+
+        if (!contactError && !weekError && week) {
+          const date = formatWeekLabel(week.title, week.service_date);
+          const link = appNotificationUrl(`/week/${updated.service_week_id}`);
+          await dispatchNotification({
+            recipients: (contactRows ?? []).map((r) => ({
+              userId: r.id,
+              name: r.name,
+              email: r.email,
+              phone: r.phone,
+              smsOptedIn: r.sms_opted_in,
+            })),
+            sms: { body: setlistPublishedSms({ date, link }) },
+            email: { template: "setlist_released", data: { date, songCount, link } },
+          });
+        }
+      } catch (err) {
+        console.error("publishSetlist: notification dispatch failed", err);
+      }
     }
 
     return ok({ setlist: toSetlistResponse(updated) });
