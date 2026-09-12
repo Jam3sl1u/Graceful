@@ -11,7 +11,10 @@ import {
   setAvailabilitySchema,
   type SetAvailabilityEntry,
 } from "@/schemas/availability";
-import { recordAvailabilityConflict } from "@/lib/scheduling/conflict-detection";
+import {
+  recordAvailabilityConflict,
+  dispatchConflictNotifications,
+} from "@/lib/scheduling/conflict-detection";
 
 export type AvailabilityEntry = {
   userId: string;
@@ -163,7 +166,12 @@ export async function setAvailability(req: NextRequest, lookup?: UserLookup): Pr
     for (const [date, { isAvailable }] of byDate.entries()) {
       if (isAvailable === false) {
         const triggered = await recordAvailabilityConflict(supabase, date, "marked_unavailable");
-        if (triggered) conflictTriggered = true;
+        if (triggered) {
+          conflictTriggered = true;
+          // Scheduling conflict — SMS + Email to admins (#69, PRD §14).
+          // Best-effort; never throws, never affects the response.
+          await dispatchConflictNotifications(supabase, ctx, date);
+        }
       }
     }
 
@@ -236,6 +244,12 @@ export async function deleteAvailability(
       parsedDate.data,
       "availability_deleted",
     );
+
+    if (conflictTriggered) {
+      // Scheduling conflict — SMS + Email to admins (#69, PRD §14).
+      // Best-effort; never throws, never affects the response.
+      await dispatchConflictNotifications(supabase, ctx, parsedDate.data);
+    }
 
     return ok<DeleteAvailabilityResult>({ date: parsedDate.data, conflictTriggered });
   } catch (err) {

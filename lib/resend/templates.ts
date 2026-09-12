@@ -12,7 +12,8 @@ export type EmailTemplateKey =
   | "invitation_denied"
   | "scheduling_conflict"
   | "setlist_released"
-  | "practice_reminder";
+  | "practice_reminder"
+  | "google_calendar_event";
 
 export const EMAIL_TEMPLATE_KEYS: readonly EmailTemplateKey[] = [
   "set_invitation",
@@ -22,6 +23,7 @@ export const EMAIL_TEMPLATE_KEYS: readonly EmailTemplateKey[] = [
   "scheduling_conflict",
   "setlist_released",
   "practice_reminder",
+  "google_calendar_event",
 ];
 
 export type EmailTemplateDataMap = {
@@ -34,6 +36,17 @@ export type EmailTemplateDataMap = {
   practice_reminder: {
     eventName: string;
     hoursUntil: number;
+    dayDate: string;
+    time: string;
+    location: string;
+    link?: string;
+  };
+  // Copy approved 2026-08-31 (.pipeline/spec.md OQ2 resolution). PRD §30 had no
+  // content-template row for the Google Calendar event email; the subject/preview
+  // below were drafted for #69 to match §30's existing plain style and added to
+  // PRD §30 in the same PR.
+  google_calendar_event: {
+    eventName: string;
     dayDate: string;
     time: string;
     location: string;
@@ -137,6 +150,15 @@ function buildContent(key: EmailTemplateKey, data: EmailTemplateDataMap[EmailTem
       return {
         subject: `Reminder: ${d.eventName} in ${d.hoursUntil} hours`,
         preview: `${d.dayDate} at ${d.time} — ${d.location}. See you there.`,
+        link: d.link,
+      };
+    }
+    case "google_calendar_event": {
+      // Copy approved 2026-08-31 (.pipeline/spec.md OQ2 resolution).
+      const d = data as EmailTemplateDataMap["google_calendar_event"];
+      return {
+        subject: `Calendar update: ${d.eventName} on ${d.dayDate}`,
+        preview: `${d.eventName} is now ${d.dayDate} at ${d.time} — ${d.location}. Your Google Calendar has been updated.`,
         link: d.link,
       };
     }

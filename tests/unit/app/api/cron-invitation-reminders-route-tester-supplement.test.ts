@@ -42,6 +42,14 @@ function makeSupabaseClient(rpcResult: { data: unknown; error: unknown }) {
   return { rpc: jest.fn().mockResolvedValue(rpcResult) };
 }
 
+// As of #69 send_invitation_reminders returns { member_reminders, admin_reminders }.
+function rpcOk(memberReminders: unknown[], adminReminders: unknown[] = []) {
+  return {
+    data: { member_reminders: memberReminders, admin_reminders: adminReminders },
+    error: null,
+  };
+}
+
 const reminderRow = (overrides: Partial<Record<string, unknown>> = {}) => ({
   invitation_id: "inv-1",
   user_id: "user-1",
@@ -66,10 +74,9 @@ afterEach(() => {
 
 describe("GET /api/cron/invitation-reminders — tester supplement", () => {
   it("skips SMS for a member with a phone but sms_opted_in: false (phone alone is not sufficient)", async () => {
-    const client = makeSupabaseClient({
-      data: [reminderRow({ phone: "+15559876543", sms_opted_in: false })],
-      error: null,
-    });
+    const client = makeSupabaseClient(
+      rpcOk([reminderRow({ phone: "+15559876543", sms_opted_in: false })]),
+    );
     mockGetAnonSupabaseClient.mockReturnValue(client);
 
     const res = await GET(makeReq(`Bearer ${CRON_SECRET}`));
@@ -77,14 +84,17 @@ describe("GET /api/cron/invitation-reminders — tester supplement", () => {
     expect(mockSendSms).not.toHaveBeenCalled();
 
     const body = await res.json();
-    expect(body.data).toEqual({ processed: 1, smsSent: 0, smsSkipped: 1, smsFailed: 0 });
+    expect(body.data).toEqual({
+      processed: 1,
+      smsSent: 0,
+      smsSkipped: 1,
+      smsFailed: 0,
+      adminNotified: 0,
+    });
   });
 
   it("skips SMS for a member opted in but with no phone on file (opt-in alone is not sufficient)", async () => {
-    const client = makeSupabaseClient({
-      data: [reminderRow({ phone: null, sms_opted_in: true })],
-      error: null,
-    });
+    const client = makeSupabaseClient(rpcOk([reminderRow({ phone: null, sms_opted_in: true })]));
     mockGetAnonSupabaseClient.mockReturnValue(client);
 
     const res = await GET(makeReq(`Bearer ${CRON_SECRET}`));
@@ -92,10 +102,16 @@ describe("GET /api/cron/invitation-reminders — tester supplement", () => {
     expect(mockSendSms).not.toHaveBeenCalled();
 
     const body = await res.json();
-    expect(body.data).toEqual({ processed: 1, smsSent: 0, smsSkipped: 1, smsFailed: 0 });
+    expect(body.data).toEqual({
+      processed: 1,
+      smsSent: 0,
+      smsSkipped: 1,
+      smsFailed: 0,
+      adminNotified: 0,
+    });
   });
 
-  it("treats an RPC response of { data: null, error: null } the same as an empty array", async () => {
+  it("treats an RPC response of { data: null, error: null } the same as an empty result", async () => {
     const client = makeSupabaseClient({ data: null, error: null });
     mockGetAnonSupabaseClient.mockReturnValue(client);
 
@@ -103,7 +119,13 @@ describe("GET /api/cron/invitation-reminders — tester supplement", () => {
     expect(res.status).toBe(200);
 
     const body = await res.json();
-    expect(body.data).toEqual({ processed: 0, smsSent: 0, smsSkipped: 0, smsFailed: 0 });
+    expect(body.data).toEqual({
+      processed: 0,
+      smsSent: 0,
+      smsSkipped: 0,
+      smsFailed: 0,
+      adminNotified: 0,
+    });
     expect(mockSendSms).not.toHaveBeenCalled();
   });
 });

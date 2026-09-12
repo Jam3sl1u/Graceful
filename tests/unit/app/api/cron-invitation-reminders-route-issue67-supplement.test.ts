@@ -37,6 +37,14 @@ function makeSupabaseClient(rpcResult: { data: unknown; error: unknown }) {
   return { rpc: jest.fn().mockResolvedValue(rpcResult) };
 }
 
+// As of #69 send_invitation_reminders returns { member_reminders, admin_reminders }.
+function rpcOk(memberReminders: unknown[], adminReminders: unknown[] = []) {
+  return {
+    data: { member_reminders: memberReminders, admin_reminders: adminReminders },
+    error: null,
+  };
+}
+
 const reminderRow = (overrides: Partial<Record<string, unknown>> = {}) => ({
   invitation_id: "inv-1",
   user_id: "user-1",
@@ -61,7 +69,7 @@ afterEach(() => {
 
 describe("GET /api/cron/invitation-reminders — issue #67 tester supplement", () => {
   it("counts a sendSms { status: 'skipped' } resolution as smsSkipped, not smsSent or smsFailed", async () => {
-    const client = makeSupabaseClient({ data: [reminderRow()], error: null });
+    const client = makeSupabaseClient(rpcOk([reminderRow()]));
     mockGetAnonSupabaseClient.mockReturnValue(client);
     mockSendSms.mockResolvedValue({ status: "skipped", reason: "invalid_phone" });
 
@@ -69,11 +77,17 @@ describe("GET /api/cron/invitation-reminders — issue #67 tester supplement", (
     expect(res.status).toBe(200);
 
     const body = await res.json();
-    expect(body.data).toEqual({ processed: 1, smsSent: 0, smsSkipped: 1, smsFailed: 0 });
+    expect(body.data).toEqual({
+      processed: 1,
+      smsSent: 0,
+      smsSkipped: 1,
+      smsFailed: 0,
+      adminNotified: 0,
+    });
   });
 
   it("calls sendSms with the options-object signature (to/body/smsOptedIn), not positional args", async () => {
-    const client = makeSupabaseClient({ data: [reminderRow()], error: null });
+    const client = makeSupabaseClient(rpcOk([reminderRow()]));
     mockGetAnonSupabaseClient.mockReturnValue(client);
     mockSendSms.mockResolvedValue({ status: "sent", messageId: "m1" });
 
@@ -89,14 +103,13 @@ describe("GET /api/cron/invitation-reminders — issue #67 tester supplement", (
   });
 
   it("tallies sent, skipped, and failed independently across a mixed batch", async () => {
-    const client = makeSupabaseClient({
-      data: [
+    const client = makeSupabaseClient(
+      rpcOk([
         reminderRow({ invitation_id: "inv-1", phone: "+15551111111" }),
         reminderRow({ invitation_id: "inv-2", phone: "+15552222222" }),
         reminderRow({ invitation_id: "inv-3", phone: "+15553333333" }),
-      ],
-      error: null,
-    });
+      ]),
+    );
     mockGetAnonSupabaseClient.mockReturnValue(client);
     mockSendSms
       .mockResolvedValueOnce({ status: "sent", messageId: "m1" })
@@ -107,6 +120,12 @@ describe("GET /api/cron/invitation-reminders — issue #67 tester supplement", (
     expect(res.status).toBe(200);
 
     const body = await res.json();
-    expect(body.data).toEqual({ processed: 3, smsSent: 1, smsSkipped: 1, smsFailed: 1 });
+    expect(body.data).toEqual({
+      processed: 3,
+      smsSent: 1,
+      smsSkipped: 1,
+      smsFailed: 1,
+      adminNotified: 0,
+    });
   });
 });
