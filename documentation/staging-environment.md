@@ -144,6 +144,24 @@ cover:
    emails as the `E2E_ADMIN_EMAIL` / `E2E_MEMBER_EMAIL` secrets below. No
    password is needed: the helper signs in via a short-lived Clerk sign-in
    ticket (Clerk Backend API), keyed only by email.
+
+   Issue #82 additionally uses **two disposable staging Clerk test-mode
+   users** — `E2E_SETUP_ADMIN_EMAIL` and `E2E_GUEST_EMAIL` — for the
+   full admin week-setup flow and the guest new-user claim flow. Those two
+   flows exercise `PUT /api/church-group` / `POST /api/church-group/join` /
+   `claim_guest_invitation`, all of which require a Clerk identity with no
+   `users` row yet — something the stable `E2E_ADMIN_EMAIL` /
+   `E2E_MEMBER_EMAIL` personas can never satisfy again once seeded
+   (`users.clerk_id` is UNIQUE). Provision these two as throwaway Clerk
+   test-mode users the same way as the other two. Unlike the stable
+   fixture, every test that uses them resets their app-side state on both
+   ends — before running (defensive, in case a prior run crashed) and in
+   its `finally` block — via `resetDisposablePersona`
+   (`tests/e2e/support/fixtures.ts`): it deletes the church group the
+   persona owns (if it created one; cascades its `users` row) or just its
+   `users` row (if it only joined one), so the next run can create/join a
+   group again. `resetDisposablePersona` hard-guards against ever touching
+   `FIXTURE.churchGroupId`.
 2. **Service-role seed/teardown access to the staging Supabase project.**
    `tests/e2e/support/fixtures.ts` seeds a stable admin/member/church-group
    fixture (once, idempotently) plus per-test service weeks/invitations,
@@ -158,6 +176,8 @@ cover:
 | `CLERK_SECRET_KEY` | Staging Clerk test-mode instance secret key |
 | `E2E_ADMIN_EMAIL` | Seeded staging Clerk test user (admin persona) |
 | `E2E_MEMBER_EMAIL` | Seeded staging Clerk test user (member persona) |
+| `E2E_SETUP_ADMIN_EMAIL` | optional — disposable Clerk test user; the #82 week-setup-flow spec and the guest-invitation new-user test skip when absent |
+| `E2E_GUEST_EMAIL` | optional — disposable Clerk test user; the #82 week-setup-flow spec and the guest-invitation new-user test skip when absent |
 | `E2E_SUPABASE_URL` | Staging Supabase project URL — seed/teardown only, never used to bypass app authorization |
 | `E2E_SUPABASE_SERVICE_ROLE_KEY` | Staging Supabase service-role key — seed/teardown only |
 | `CRON_SECRET` | Same secret as §6 — needed by `invitation-reminder.spec.ts` to trigger the reminder RPC directly |
@@ -167,13 +187,18 @@ cover:
 | `E2E_GOOGLE_REFRESH_TOKEN` | optional — `calendar-sync.spec.ts` skips when absent — refresh token for the dedicated Google test account |
 | `E2E_GOOGLE_CALENDAR_ID` | optional — not part of the skip gate (see `GOOGLE_SYNC_VARS` in `tests/e2e/support/google.ts`) — defaults to `primary` when unset |
 
-**Note (issue #52 OQ2/OQ3):** `GET /api/notifications` is an unimplemented
-501 stub (`app/api/notifications/route.ts`) as of this issue, so admin
-in-app notification assertions read the `notifications` table directly via
-the service-role client rather than through that endpoint. Admin SMS/email
-on invitation deny is deferred until #67/#68 ship (both dispatch primitives
-are unimplemented throwing stubs today) and is not asserted here; the member
-side of the 24h reminder is dropped for the same reason (`sendSms` stub).
+**Note (issue #52 OQ2/OQ3, now stale):** at the time of #52, `GET
+/api/notifications` was an unimplemented 501 stub, so admin in-app
+notification assertions read the `notifications` table directly via the
+service-role client rather than through that endpoint. This is now obsolete:
+issue #71 shipped the real inbox API (`GET /api/notifications`, `GET
+/api/notifications/unread-count`, `PATCH /api/notifications/:id/read`,
+`POST /api/notifications/mark-all-read`), and `notification-inbox.spec.ts`
+(issue #82) asserts through it directly from the authenticated browser
+session. Admin SMS/email on invitation deny is still deferred until #67/#68
+ship (both dispatch primitives are unimplemented throwing stubs today) and
+is not asserted here; the member side of the 24h reminder is dropped for the
+same reason (`sendSms` stub).
 
 The setlist publish specs (`setlist-publish.spec.ts`,
 `setlist-duplicate-song.spec.ts`, issue #66) need no secrets beyond the
@@ -215,6 +240,19 @@ Human setup steps:
    of inactivity, which will make the spec start *failing* (not skipping)
    once that happens. Publish the OAuth app (or periodically re-mint the
    refresh token) to avoid this.
+
+### 7.2 Phase 1 regression pass (issue #82)
+
+The full Phase 1 critical-path regression suite — #52's suite
+(invitation-accept/deny/reminder, conflict-detection), #66's suite
+(setlist-publish, setlist-duplicate-song, calendar-sync), and #82's
+additions (week-setup-flow, notification-inbox, guest-invitation) — all run
+together in the single `bun run test:e2e` invocation the `e2e` CI job
+already performs against one staging deploy; no separate run or workflow is
+needed. `week-setup-flow.spec.ts` and the guest-invitation new-user test
+additionally require the two disposable personas described in item 1 above
+and skip (not fail) when `E2E_SETUP_ADMIN_EMAIL` / `E2E_GUEST_EMAIL` are
+absent.
 
 ## 8. Verification checklist
 
