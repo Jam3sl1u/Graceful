@@ -80,7 +80,14 @@ describe("InvitationResponse (in-app)", () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(200, { data: baseLookup() }))
       .mockResolvedValueOnce(
-        jsonResponse(200, { data: { status: "accepted", alreadyResponded: false } }),
+        jsonResponse(200, {
+          data: {
+            invitationId: INVITATION_ID,
+            status: "accepted",
+            alreadyResponded: false,
+            attendeesAdded: 2,
+          },
+        }),
       );
 
     render(<InvitationResponse invitationId={INVITATION_ID} />);
@@ -105,7 +112,14 @@ describe("InvitationResponse (in-app)", () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(200, { data: baseLookup() }))
       .mockResolvedValueOnce(
-        jsonResponse(200, { data: { status: "accepted", alreadyResponded: false } }),
+        jsonResponse(200, {
+          data: {
+            invitationId: INVITATION_ID,
+            status: "accepted",
+            alreadyResponded: false,
+            attendeesAdded: 2,
+          },
+        }),
       );
 
     const listener = jest.fn();
@@ -123,7 +137,9 @@ describe("InvitationResponse (in-app)", () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(200, { data: baseLookup() }))
       .mockResolvedValueOnce(
-        jsonResponse(200, { data: { status: "denied", alreadyResponded: false } }),
+        jsonResponse(200, {
+          data: { invitationId: INVITATION_ID, status: "denied", alreadyResponded: false },
+        }),
       );
 
     render(<InvitationResponse invitationId={INVITATION_ID} />);
@@ -165,6 +181,77 @@ describe("InvitationResponse (in-app)", () => {
     render(<InvitationResponse invitationId={INVITATION_ID} />);
 
     await waitFor(() => expect(screen.getByText(/couldn.t find this invitation/i)).toBeInTheDocument());
+  });
+
+  it("action 404 shows the not-found unavailable view", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, { data: baseLookup() }))
+      .mockResolvedValueOnce(jsonResponse(404, { error: "Not found", code: "NOT_FOUND" }));
+    render(<InvitationResponse invitationId={INVITATION_ID} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /accept/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /accept/i }));
+
+    await waitFor(() => expect(screen.getByText(/couldn.t find this invitation/i)).toBeInTheDocument());
+  });
+
+  it("action 410 shows the expired unavailable view", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, { data: baseLookup() }))
+      .mockResolvedValueOnce(jsonResponse(410, { error: "Invitation expired", code: "EXPIRED" }));
+    render(<InvitationResponse invitationId={INVITATION_ID} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /accept/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /accept/i }));
+
+    await waitFor(() => expect(screen.getByText(/this invitation has expired/i)).toBeInTheDocument());
+  });
+
+  it.each(["accepted", "withdrawn"] as const)(
+    "declining an already-%s invitation shows unavailable rather than a false success",
+    async (status) => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(200, { data: baseLookup() }))
+        .mockResolvedValueOnce(
+          jsonResponse(200, {
+            data: { invitationId: INVITATION_ID, status, alreadyResponded: true },
+          }),
+        );
+      render(<InvitationResponse invitationId={INVITATION_ID} />);
+
+      await waitFor(() => expect(screen.getByRole("button", { name: /decline/i })).toBeInTheDocument());
+      fireEvent.click(screen.getByRole("button", { name: /decline/i }));
+      fireEvent.click(screen.getByRole("button", { name: /confirm decline/i }));
+
+      await waitFor(() => expect(screen.getByText(/already responded|withdrawn/i)).toBeInTheDocument());
+      expect(screen.queryByText(/response recorded/i)).not.toBeInTheDocument();
+    },
+  );
+
+  it("unexpected successful action data shows a retryable error", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, { data: baseLookup() }))
+      .mockResolvedValueOnce(jsonResponse(200, { data: { status: "pending", alreadyResponded: false } }));
+    render(<InvitationResponse invitationId={INVITATION_ID} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /accept/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /accept/i }));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/something went wrong/i));
+    expect(screen.queryByText(/on the schedule/i)).not.toBeInTheDocument();
+  });
+
+  it("malformed successful action payload shows a retryable error", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, { data: baseLookup() }))
+      .mockResolvedValueOnce(jsonResponse(200, { data: { status: "accepted" } }));
+    render(<InvitationResponse invitationId={INVITATION_ID} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /accept/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /accept/i }));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/something went wrong/i));
+    expect(screen.queryByText(/on the schedule/i)).not.toBeInTheDocument();
   });
 
   it("failure case: a network error on the lookup shows the unavailable view, not a crash", async () => {

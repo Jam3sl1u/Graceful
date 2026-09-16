@@ -1,12 +1,19 @@
 # Spec — Issue #73: [Sprint 4] Build Notification Inbox screen
 
 PRD: `documentation/prd/graceful_requirements_v10.md` §13 Screen 6 (line 1320) and §13.2 (line 392).
-Backend (#71) is already shipped — this issue is UI only. **No API handler, schema, or
-migration changes.**
+Backend (#71) is already shipped. The original Screen-6 work is UI-only; the approved
+option-C decision below adds the tightly scoped in-app invitation response surface. No
+schema or migration changes are authorized.
 
 ---
 
-## OPEN QUESTION (blocking — pipeline stops here until a human answers)
+## RESOLVED DECISION — invitation notification deep link (option C)
+
+**Resolution:** The human operator approved **option C** in this conversation on
+**2026-09-15**. Invitation notifications deep-link to `/invitations/:id`, where an
+authenticated member can view and respond to their own invitation. This explicitly
+authorizes the companion PRD Screen-3 UI, member-scoped `GET /api/invitations/:id`, and
+the existing authenticated accept/deny endpoints required by that flow.
 
 **Where should an `invitation` notification deep-link to?**
 
@@ -36,8 +43,8 @@ So a working deep link for `invitation` rows cannot be built from what exists. O
 - (C) Build the in-app accept/deny screen in this issue (scope creep — that is PRD
   Screen 3 / "In-app response" work, not Screen 6).
 
-Everything else in this spec is unambiguous and unaffected by the answer; the coder should
-implement all of it and apply the chosen option in `resolveNotificationHref` only.
+Everything else in this spec is unambiguous and unaffected by the answer. The scope
+expansion is limited to the option-C invitation response flow described above.
 
 ---
 
@@ -122,7 +129,7 @@ is `null`/empty, `linkEntityType` is `null`, or the type is unknown:
 | `"setlist"`      | `/setlists/${linkEntityId}` |
 | `"conflict"`     | `/conflicts/${linkEntityId}` |
 | `"service_week"` | `/member-week/${linkEntityId}` |
-| `"invitation"`   | per the OPEN QUESTION answer |
+| `"invitation"`   | `/invitations/${linkEntityId}` (approved option C) |
 | anything else (incl. `"google_calendar"`) | `null` |
 
 `formatRelativeTime(iso, now = new Date())` — plain English, no new dependency
@@ -270,8 +277,9 @@ Add only what the nav needs (e.g. `.sidebarHeader` / `.nav`); leave `.shell`,
 
 Push/SMS/email delivery, pagination or infinite scroll, per-notification delete,
 notification preferences UI (already shipped as `/api/notifications/preferences`),
-any Chat functionality, a "System" filter, any other nav link in `AppShell`, and any
-change to `app/api/**`, `schemas/**`, `lib/supabase/**`, or `supabase/migrations/**`.
+any Chat functionality, a "System" filter, any other nav link in `AppShell`, any API
+change beyond the approved member-scoped invitation-response flow, or any change to
+`schemas/**`, `lib/supabase/**`, or `supabase/migrations/**`.
 
 ## Verification
 

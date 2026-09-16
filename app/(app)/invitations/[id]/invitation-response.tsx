@@ -51,6 +51,24 @@ function isUnavailableReason(status: InvitationStatus): status is Exclude<Invita
   return status !== "pending";
 }
 
+type InvitationActionResult = {
+  status: InvitationStatus;
+  alreadyResponded: boolean;
+};
+
+function isInvitationActionResult(value: unknown): value is InvitationActionResult {
+  if (typeof value !== "object" || value === null) return false;
+  const data = value as Record<string, unknown>;
+  return (
+    typeof data.alreadyResponded === "boolean" &&
+    (data.status === "pending" ||
+      data.status === "accepted" ||
+      data.status === "denied" ||
+      data.status === "withdrawn" ||
+      data.status === "expired")
+  );
+}
+
 function formatServiceDate(dateStr: string): string {
   const date = new Date(`${dateStr}T00:00:00`);
   return date.toLocaleDateString(undefined, {
@@ -129,8 +147,14 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
         body: JSON.stringify({}),
       });
 
-      if (res.status === 410 || res.status === 404) {
+      if (res.status === 410) {
         setUnavailableReason("expired");
+        setView("unavailable");
+        return;
+      }
+
+      if (res.status === 404) {
+        setUnavailableReason("not-found");
         setView("unavailable");
         return;
       }
@@ -141,7 +165,12 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
       }
 
       const body = await res.json();
-      const data: { status: InvitationStatus; alreadyResponded: boolean } = body.data;
+      const data = body.data;
+
+      if (!isInvitationActionResult(data)) {
+        setActionError("Something went wrong. Please try again.");
+        return;
+      }
 
       if (data.alreadyResponded && data.status !== "accepted") {
         setUnavailableReason(isUnavailableReason(data.status) ? data.status : "not-found");
@@ -152,7 +181,10 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
       if (data.status === "accepted") {
         notifyUnreadChanged();
         setView("accepted-success");
+        return;
       }
+
+      setActionError("Something went wrong. Please try again.");
     } catch {
       setActionError("Something went wrong. Please try again.");
     } finally {
@@ -172,8 +204,14 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
         body: JSON.stringify({ reason }),
       });
 
-      if (res.status === 410 || res.status === 404) {
+      if (res.status === 410) {
         setUnavailableReason("expired");
+        setView("unavailable");
+        return;
+      }
+
+      if (res.status === 404) {
+        setUnavailableReason("not-found");
         setView("unavailable");
         return;
       }
@@ -184,7 +222,12 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
       }
 
       const body = await res.json();
-      const data: { status: InvitationStatus; alreadyResponded: boolean } = body.data;
+      const data = body.data;
+
+      if (!isInvitationActionResult(data)) {
+        setActionError("Something went wrong. Please try again.");
+        return;
+      }
 
       if (data.alreadyResponded && data.status !== "denied") {
         setUnavailableReason(isUnavailableReason(data.status) ? data.status : "not-found");
@@ -192,8 +235,13 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
         return;
       }
 
-      notifyUnreadChanged();
-      setView("declined-success");
+      if (data.status === "denied") {
+        notifyUnreadChanged();
+        setView("declined-success");
+        return;
+      }
+
+      setActionError("Something went wrong. Please try again.");
     } catch {
       setActionError("Something went wrong. Please try again.");
     } finally {

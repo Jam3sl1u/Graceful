@@ -37,6 +37,25 @@ export type InvitationResponse = {
   createdAt: string;
 };
 
+// Compact result returned by accept/deny endpoints. Unlike InvitationResponse,
+// it deliberately excludes responseToken, which is a no-session credential.
+export type InvitationActionResponse = {
+  invitationId: string;
+  status: InvitationStatus;
+  alreadyResponded: boolean;
+};
+
+function toInvitationActionResponse(
+  row: Pick<InvitationsRow, "id" | "status">,
+  alreadyResponded: boolean,
+): InvitationActionResponse {
+  return {
+    invitationId: row.id,
+    status: row.status,
+    alreadyResponded,
+  };
+}
+
 export function toInvitationResponse(row: InvitationsRow): InvitationResponse {
   return {
     id: row.id,
@@ -796,7 +815,7 @@ export async function denyInvitation(
     // current status with no side effects. canTransition is the shared
     // source of truth for which statuses are terminal (lib/invitations/state-machine.ts).
     if (!canTransition(inv.status, "deny")) {
-      return ok({ invitation: toInvitationResponse(inv) });
+      return ok(toInvitationActionResponse(inv, true));
     }
 
     // BR-08 denial_count is per member+week, counted across invitation rows
@@ -901,7 +920,7 @@ export async function denyInvitation(
       console.error("denyInvitation: notification dispatch failed", err);
     }
 
-    return ok({ invitation: toInvitationResponse(updated) });
+    return ok(toInvitationActionResponse(updated, false));
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);

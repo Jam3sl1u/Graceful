@@ -91,8 +91,12 @@ describe("POST /api/invitations/:id/accept", () => {
     expect(res.status).toBe(200);
 
     const body = await res.json();
-    expect(body.data.status).toBe("accepted");
-    expect(body.data.alreadyResponded).toBe(false);
+    expect(body.data).toEqual({
+      invitationId: INVITATION_ID,
+      status: "accepted",
+      alreadyResponded: false,
+      attendeesAdded: 1,
+    });
 
     expect(mockGetSupabaseClient).toHaveBeenCalledWith(JWT);
     expect(mockGetAnonSupabaseClient).not.toHaveBeenCalled();

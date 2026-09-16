@@ -3,7 +3,7 @@
 // app/(app)/notifications/notification-inbox.tsx. `fetch` is mocked
 // directly, mirroring tests/unit/app/conflicts-list.test.tsx.
 
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import NotificationInbox from "@/app/(app)/notifications/notification-inbox";
 import { UNREAD_CHANGED_EVENT } from "@/components/layout/NotificationBell";
 
@@ -89,9 +89,10 @@ describe("NotificationInbox", () => {
 
     await waitFor(() => expect(screen.getByText("New setlist released")).toBeInTheDocument());
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    const row = screen.getByRole("button", { name: /new setlist released/i });
-
-    fireEvent.click(row);
+    const card = screen.getByRole("button", { name: /new setlist released/i });
+    expect(within(card).getByText("Check out this week's setlist.").tagName).toBe("SPAN");
+    expect(card.querySelector("p")).toBeNull();
+    fireEvent.click(card);
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith("/api/notifications/n1/read", { method: "PATCH" }),
     );

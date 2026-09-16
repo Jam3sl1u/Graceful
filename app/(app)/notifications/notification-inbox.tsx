@@ -197,7 +197,7 @@ export default function NotificationInbox() {
                   {!row.isRead ? (
                     <span className={styles.srOnly}>Unread</span>
                   ) : null}
-                  {row.body !== null ? <p>{row.body}</p> : null}
+                  {row.body !== null ? <span className={styles.body}>{row.body}</span> : null}
                   <time className={styles.timestamp} dateTime={row.createdAt}>
                     {formatRelativeTime(row.createdAt)}
                   </time>

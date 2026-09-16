@@ -2,8 +2,8 @@
 
 ## Scope note
 
-The planner's OPEN QUESTION ("where should an `invitation` notification
-deep-link to?") was resolved by a human operator as **option C**: build the
+The planner's former open question ("where should an `invitation` notification
+deep-link to?") was resolved by a human operator on 2026-09-15 as **option C**: build the
 in-app accept/deny screen now (PRD Screen 3), even though it expands scope
 beyond the original Screen-6-only spec. That resolution overrides spec.md's
 "No API handler, schema, or migration changes" framing — this changeset
@@ -54,10 +54,9 @@ needed (see below).
 - `app/api/invitations/[id]/route.ts` — added `GET`, wired to
   `getOwnInvitation` (the `DELETE` → `withdrawInvitation` route was already
   there, untouched).
-- **No changes to `accept`/`deny` handlers or routes** — their existing
-  in-app branch (no `responseToken` in the body → identity from the Clerk
-  session, scoped to the caller's own invitation) already does exactly what
-  this screen needs; it was unused by any UI until now.
+- `acceptInvitation` remains unchanged. `denyInvitation`'s authenticated
+  branch now returns the same credential-free action summary used by the
+  token path, so the in-app client has one stable response contract.
 - `app/(app)/invitations/[id]/page.tsx` + `invitation-response.tsx` +
   `.module.css` (new) — a member-facing accept/deny screen, structurally a
   copy of the public `app/(public)/invite/[token]/invite-response.tsx`
@@ -70,6 +69,19 @@ needed (see below).
   GET was already outside the public-route list (protected by default), and
   `/invitations/[id]` is inside the `(app)` route group (already
   auth-protected).
+
+## Review remediation
+
+- `denyInvitation`'s authenticated branch now returns the same compact action
+  response as the token branch: `{ invitationId, status, alreadyResponded }`.
+  The pending-to-denied response reports `alreadyResponded: false`; terminal
+  idempotent responses report `true`. It no longer serializes the full invitation
+  row, so `responseToken` never reaches the in-app response screen.
+- The in-app response UI validates action payloads, treats only the requested
+  accepted/denied status as success, maps 404 to not-found and 410 to expired,
+  and shows a retryable error for unexpected successful responses.
+- Notification body copy now uses a block-level styled `span`, which is valid
+  inside both linked and button card rows.
 
 ## Verification
 

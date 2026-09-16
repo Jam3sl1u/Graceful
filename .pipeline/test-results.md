@@ -7,9 +7,10 @@ trusting `changes.md`'s claims):
 
 - `bun run lint` — pass, no warnings/errors.
 - `bun run typecheck` — pass.
-- `bun run test` — **153 suites / 3227 tests, all pass** (baseline before this
-  stage: 147 suites / 3144 tests; 6 new test files / 83 new tests added by
-  this stage, zero pre-existing tests touched or broken).
+- `bun run test` — **153 suites / 3233 tests, all pass** (baseline before this
+  stage: 147 suites / 3144 tests; 6 new test files / 89 new tests added by
+  this stage; existing handler assertions were strengthened and no pre-existing
+  tests were broken).
 
 ## New test files (this stage)
 
@@ -57,16 +58,20 @@ trusting `changes.md`'s claims):
      invitation; **same 404 body for "not owned"/"nonexistent" cases — no
      existence leak**; 500 on a Supabase query error.
 
-5. `tests/unit/app/invitation-response.test.tsx` (9 tests) — new in-app
+5. `tests/unit/app/invitation-response.test.tsx` (15 tests) — new in-app
    accept/deny screen (`app/(app)/invitations/[id]/invitation-response.tsx`).
    - Loading state; happy path fetches by id (`/api/invitations/:id`, no
      token in the URL); accept posts an **empty body** (no `responseToken`)
      and shows accepted-success; accept dispatches `notifyUnreadChanged()`
      end-to-end; decline posts `{ reason }` (no `responseToken`) and shows
-     declined-success; expired-on-load and already-responded-on-load both
-     show the friendly unavailable copy (never the raw status); a 404 lookup
-     and a network error on the lookup both show the not-found unavailable
-     view, not a crash.
+     declined-success using the exact handler action-response body.
+   - Declining an already accepted or withdrawn invitation never shows the
+     false success state; action 404 maps to not-found, 410 to expired, and
+     an unexpected successful action status or malformed payload shows a
+     retryable error.
+   - Expired-on-load and already-responded-on-load both show the friendly
+     unavailable copy (never the raw status); a 404 lookup and a network error
+     on the lookup both show the not-found unavailable view, not a crash.
 
 6. `tests/unit/invitations-id-route-auth-gate.test.ts` (3 tests) — exercises
    `middleware.ts`'s real (unmocked) `isPublicRoute` matcher.
@@ -85,6 +90,17 @@ and changes.md's "What the Tester should focus on" (1–5) are covered above,
 including the option-C-specific `resolveNotificationHref("invitation", id)`
 behavior and the `getOwnInvitation` no-existence-leak / expired-status-parity
 checks the coder flagged as needing independent verification.
+
+## Review-remediation verification
+
+- The authenticated deny handler returns exactly `{ invitationId, status,
+  alreadyResponded }` for both a new denial and an idempotent terminal result;
+  its tests assert that the response never includes `responseToken`.
+- The authenticated accept handler's exact response body is asserted, and the
+  in-app component tests consume real handler-shaped action bodies rather than
+  a fictional `{ status, alreadyResponded }` fixture.
+- The non-linkable notification card asserts a `span` body with no nested
+  paragraph inside its button.
 
 ## Notes for the Reviewer
 
