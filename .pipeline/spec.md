@@ -1,283 +1,286 @@
-# Spec — Issue #71: In-app notification inbox endpoints
+# Spec — Issue #73: [Sprint 4] Build Notification Inbox screen
 
-Branch: issue-69 worktree. PRD trigger table = `documentation/prd/graceful_requirements_v10.md`
-§14 (lines 435-447; the issue calls it "§6.9"). Copy templates = §30 (lines 1696-1707).
+PRD: `documentation/prd/graceful_requirements_v10.md` §13 Screen 6 (line 1320) and §13.2 (line 392).
+Backend (#71) is already shipped. The original Screen-6 work is UI-only; the approved
+option-C decision below adds the tightly scoped in-app invitation response surface. No
+schema or migration changes are authorized.
 
-None. Everything below is resolved against the current code; the judgement
-calls are recorded under "Decisions" with their rationale.
+---
+
+## RESOLVED DECISION — invitation notification deep link (option C)
+
+**Resolution:** The human operator approved **option C** in this conversation on
+**2026-09-15**. Invitation notifications deep-link to `/invitations/:id`, where an
+authenticated member can view and respond to their own invitation. This explicitly
+authorizes the companion PRD Screen-3 UI, member-scoped `GET /api/invitations/:id`, and
+the existing authenticated accept/deny endpoints required by that flow.
+
+**Where should an `invitation` notification deep-link to?**
+
+The acceptance criterion says "invitation → accept/deny flow", but verified current state:
+
+- Invitation notifications are written with `link_entity_type: "invitation"`,
+  `link_entity_id = <invitation id>`
+  (`app/api/invitations/handler.ts:980`, `app/api/conflicts/handler.ts:247`, and the
+  accept/deny RPC migrations).
+- **There is no in-app accept/deny screen.** The only response UI is the public,
+  token-gated `app/(public)/invite/[token]/invite-response.tsx`, and its URL needs
+  `response_token`, which `GET /api/notifications` deliberately does not return and
+  which `app/api/invitations/handler.ts:61-63` calls "the no-session credential —
+  never expose".
+- There is also no member-accessible endpoint that maps an invitation id to its
+  `service_week_id` (`GET /api/invitations` is admin/set_leader-only and requires a
+  `serviceWeekId` query param).
+
+So a working deep link for `invitation` rows cannot be built from what exists. Options:
+
+- **(A) Recommended:** render `invitation` rows as non-clickable (same treatment as any
+  unresolvable target — see "Deep-link resolution" below); tapping still marks read.
+  No new endpoints, nothing dead-links to a 404.
+- (B) Link to `/invitations/${linkEntityId}` and accept that it 404s today (precedent:
+  `app/(app)/conflicts/[id]/conflict-resolution.tsx:171` already links to a
+  not-yet-built `/invitations/new`).
+- (C) Build the in-app accept/deny screen in this issue (scope creep — that is PRD
+  Screen 3 / "In-app response" work, not Screen 6).
+
+Everything else in this spec is unambiguous and unaffected by the answer. The scope
+expansion is limited to the option-C invitation response flow described above.
+
+---
 
 ## Current state (verified in this worktree)
 
-- The 4 route files already exist but return `notImplemented(...)` 501 stubs:
-  - `app/api/notifications/route.ts`
-  - `app/api/notifications/unread-count/route.ts`
-  - `app/api/notifications/[id]/read/route.ts`
-  - `app/api/notifications/mark-all-read/route.ts`
-- `app/api/notifications/preferences/{handler,route}.ts` are fully implemented
-  (#70) — same directory, different feature. Do not touch them.
-- The `notifications` table exists (`supabase/migrations/20260702000005_cluster_5_partial.sql`):
-  `id, church_group_id, user_id, type, title, body, link_entity_type,
-  link_entity_id, is_read, created_at`. Indexes already cover
-  `(user_id, is_read)` and `(user_id, created_at desc)`.
-- RLS (`supabase/migrations/20260704000001_rls_policies.sql`) already restricts
-  SELECT and UPDATE on `notifications` to `church_group_id = auth_church_group_id()
-  AND user_id = auth_user_id()`. **No migration is needed for this issue.**
-- `lib/supabase/types.ts` already has `NotificationsRow` + the `notifications`
-  table entry (Row/Insert/Update). **No changes needed there.**
-- Producers (#69) already write rows with these `link_entity_type` values:
-  `"invitation"`, `"service_week"`, `"setlist"`, `"conflict"`,
-  `"google_calendar"` (the last with `link_entity_id = NULL`).
-- `lib/invitations/guest-access.ts` (`guestHasWeekAccess`) is the existing guest
-  scoping helper for single-week reads.
+- `app/(app)/notifications/page.tsx` is a 4-line "coming soon" stub.
+- `components/layout/AppShell.tsx` renders a sidebar containing the literal string
+  "Graceful" and **no nav links at all** (its TODO comment names this exact gap).
+- Endpoints already implemented in `app/api/notifications/handler.ts`:
+  - `GET /api/notifications?page=&pageSize=` → `{ data: { notifications: NotificationItem[],
+    pagination: { page, pageSize, total } } }`; `pageSize` max 100, default 20.
+  - `GET /api/notifications/unread-count` → `{ data: { unreadCount: number } }`
+  - `PATCH /api/notifications/:id/read` → `{ data: { notification } }` (idempotent)
+  - `POST /api/notifications/mark-all-read` → `{ data: { updatedCount: number } }`
+- `NotificationItem` (exported from `app/api/notifications/handler.ts`):
+  `{ id, type: NotificationType, title, body: string | null, linkEntityType: string | null,
+  linkEntityId: string | null, isRead: boolean, createdAt: string /* ISO */ }`
+- `NotificationType` union: `types/domain.ts:22-37`.
+- `link_entity_type` values actually produced today: `"invitation"`, `"service_week"`,
+  `"setlist"`, `"conflict"`, `"google_calendar"` (the last with `link_entity_id = null`).
+- Existing app routes available as link targets: `/week/[id]`, `/member-week/[id]`,
+  `/conflicts/[id]`, `/setlists/[id]`, `/dashboard`, `/documents`, `/profile`,
+  `/notifications`.
+- CSS variables available (`app/globals.css`): `--color-bg`, `--color-fg`,
+  `--color-border`, `--color-accent`.
 
-## RESOLVED OPEN QUESTIONS (operator decision, 2026-08-31)
+## Pattern to copy
 
-Implement the 4 inbox endpoints only. No migration, no UI, no SMS/email, no
-type filter, no audit-log writes, no rate limiting.
+`app/(app)/conflicts/` is the model for this screen — copy its structure exactly:
+
+- `page.tsx`: tiny server component that renders the `"use client"` child, no shell.
+- `conflicts-list.tsx`: `"use client"`, `ViewState = "loading" | "ready" | "error"`,
+  `useEffect` + `fetch` with a `cancelled` flag, reads `body.data.<key>`, a CSS module.
+- `conflicts-list.module.css`: `.container` / `.list` / `.card` conventions.
+- Test pattern (for the tester stage): `tests/unit/app/conflicts-list.test.tsx`
+  (`/** @jest-environment jsdom */`, `global.fetch` mocked with a `jsonResponse` helper).
+
+---
 
 ## Files to create
 
-### 1. `lib/notifications/guest-inbox-scope.ts` (new)
-
-Pattern to copy: `lib/invitations/guest-access.ts` (same shape — `"server-only"`
-import, typed `SupabaseClient<Database>` param, never throws, returns a
-`dbError` flag instead of throwing).
+### 1. `lib/notifications/inbox-links.ts` (new, pure, no React, no `"server-only"`)
 
 ```ts
-export type GuestInboxScope = { linkEntityIds: string[]; dbError: boolean };
+import type { NotificationType } from "@/types/domain";
 
-export async function getGuestInboxLinkEntityIds(
-  supabase: SupabaseClient<Database>,
-  userId: string,
-): Promise<GuestInboxScope>;
+export type NotificationFilter = "all" | "invitations" | "setlists" | "events" | "chat";
+
+export const NOTIFICATION_FILTERS: { id: NotificationFilter; label: string }[];
+// exactly: all → "All", invitations → "Invitations", setlists → "Setlists",
+// events → "Events", chat → "Chat" (in that order)
+
+export function filterForType(type: NotificationType): NotificationFilter | null;
+
+export function matchesFilter(type: NotificationType, filter: NotificationFilter): boolean;
+
+export function resolveNotificationHref(
+  linkEntityType: string | null,
+  linkEntityId: string | null,
+): string | null;
+
+export function formatRelativeTime(iso: string, now?: Date): string;
 ```
+
+`filterForType` mapping (anything not listed returns `null` → only visible under "All"):
+
+| filter        | types |
+| ------------- | ----- |
+| `invitations` | `set_invitation`, `invitation_reminder`, `invitation_accepted`, `invitation_denied`, `invitation_withdrawn` |
+| `setlists`    | `setlist_released` |
+| `events`      | `practice_reminder`, `scheduling_conflict`, `google_calendar_event`, `service_week_cancelled`, `service_week_reactivated` |
+| `chat`        | `chat_mention` |
+| `null`        | `devotion_shared`, `new_church_document`, `google_calendar_reauth_required` |
+
+`matchesFilter(type, "all")` is always `true`; otherwise `filterForType(type) === filter`.
+
+`resolveNotificationHref` — returns `null` (row not clickable) whenever `linkEntityId`
+is `null`/empty, `linkEntityType` is `null`, or the type is unknown:
+
+| `linkEntityType` | href |
+| ---------------- | ---- |
+| `"setlist"`      | `/setlists/${linkEntityId}` |
+| `"conflict"`     | `/conflicts/${linkEntityId}` |
+| `"service_week"` | `/member-week/${linkEntityId}` |
+| `"invitation"`   | `/invitations/${linkEntityId}` (approved option C) |
+| anything else (incl. `"google_calendar"`) | `null` |
+
+`formatRelativeTime(iso, now = new Date())` — plain English, no new dependency
+(use `Intl.RelativeTimeFormat` or manual arithmetic, coder's choice):
+`< 60s` → `"just now"`; `< 60m` → `"Nm ago"`; `< 24h` → `"Nh ago"`; `< 7d` → `"Nd ago"`;
+otherwise the absolute date via `toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })`.
+A future timestamp (clock skew) must render `"just now"`, never a negative value.
+An unparseable `iso` must return `""` and must not throw.
+
+### 2. `app/(app)/notifications/notification-inbox.tsx` (new, `"use client"`)
+
+Default export `NotificationInbox()`. No props.
+
+State: `view: "loading" | "ready" | "error"`, `notifications: NotificationItem[]`
+(declare the row type locally in this file, mirroring how `conflicts-list.tsx` declares
+its own `Conflict` type — do not import from `app/api/**` into a client component),
+`total: number`, `filter: NotificationFilter` (default `"all"`),
+`markingAll: boolean`.
 
 Behaviour:
 
-1. `supabase.from("invitations").select("id, service_week_id").eq("user_id", userId)`
-   — **all statuses**, no status filter (see Decisions). On error return
-   `{ linkEntityIds: [], dbError: true }`.
-2. `invitationIds` = the returned `id`s; `weekIds` = unique `service_week_id`s.
-3. If `weekIds.length === 0`, return `{ linkEntityIds: [], dbError: false }`.
-4. `supabase.from("setlists").select("id").in("service_week_id", weekIds)`.
-   On error return `{ linkEntityIds: [], dbError: true }`.
-5. Return `{ linkEntityIds: [...new Set([...invitationIds, ...weekIds, ...setlistIds])], dbError: false }`.
+- On mount, `fetch("/api/notifications?page=1&pageSize=50")`; on non-ok or throw →
+  `view = "error"` with the same copy as `conflicts-list.tsx` ("Something went wrong" /
+  "Please try again later."). Use the `cancelled` cleanup flag pattern.
+- Header: `<h1>Notifications</h1>` plus a **"Mark all read"** `<button>`. Disabled when
+  `markingAll` is true or when no loaded notification is unread. On click:
+  `POST /api/notifications/mark-all-read` → on ok, set every loaded row's `isRead` to
+  `true` in local state and dispatch the unread-count refresh event (below). On failure,
+  leave state untouched and show an inline error message near the button; do not flip
+  the whole screen to the error view.
+- Filter row: a `<nav>`/`<div>` of buttons built from `NOTIFICATION_FILTERS`, the active
+  one marked with `aria-pressed={true}` (or `aria-current`). Selecting a filter only
+  changes local state — **no refetch**.
+- List: `<ul>` of `<li>`, one per notification passing `matchesFilter`. Each row shows,
+  in order: a type icon (a plain text/emoji glyph via a local
+  `iconForType(type: NotificationType): string` map with a sensible default — no icon
+  library, no new dependency), `title`, `body` (omit the element entirely when `null`),
+  and `formatRelativeTime(createdAt)` rendered inside a
+  `<time dateTime={createdAt}>` element.
+- Unread rows get an extra CSS class (`styles.unread`) **and** a visually-hidden
+  `"Unread"` text marker (e.g. `<span className={styles.srOnly}>Unread</span>`) so the
+  distinction is assertable in tests and available to screen readers.
+- Row interaction: when `resolveNotificationHref` returns a string, the row content is a
+  `next/link` `<Link href={...}>`; when it returns `null`, render the same content inside
+  a `<button type="button">` styled as the card. In **both** cases, activating the row
+  first fires `PATCH /api/notifications/${id}/read` (fire-and-forget: do not await before
+  navigating, do not block navigation on failure) and optimistically sets that row's
+  `isRead` to `true`, then dispatches the unread-count refresh event. Already-read rows
+  must **not** issue the PATCH.
+- Empty states (all rendered inside the same `.container`, never a blank screen):
+  - `total === 0` → "No notifications yet."
+  - loaded rows exist but none match the active filter → "No <label> notifications."
+    (this is what the inert **Chat** filter hits today — it must render this empty state,
+    not break the layout).
+- If `total > notifications.length`, render one line of muted text below the list:
+  `Showing the {notifications.length} most recent of {total} notifications.`
+  No pagination controls (out of scope).
 
-Add a comment explaining that ids from different tables can be mixed in one
-`.in("link_entity_id", ...)` filter because they are all UUID primary keys and
-therefore globally unique — that is why no per-`link_entity_type` `.or()` group
-is needed.
+### 3. `app/(app)/notifications/notification-inbox.module.css` (new)
 
-### 2. `app/api/notifications/handler.ts` (new)
+Copy `app/(app)/conflicts/conflicts-list.module.css` conventions
+(`.container`, `.list`, `.card`) and add: `.header` (flex row, space-between),
+`.filters`, `.filterButton`, `.filterButtonActive`, `.unread`
+(e.g. `border-left: 3px solid var(--color-accent)` + `font-weight: 600` on the title),
+`.icon`, `.timestamp` (muted), `.empty`, `.footnote`, `.srOnly` (standard
+clip/1px visually-hidden rule). Only `var(--color-*)` tokens listed above.
 
-Pattern to copy: `app/api/church-group/audit-log/handler.ts` for the paginated
-query (`page`/`pageSize` -> `range(from, to)` + `count: "exact"` + `created_at`
-desc with `id` desc tiebreak), and `app/api/notifications/preferences/handler.ts`
-for the auth/JWT/error-envelope boilerplate.
+### 4. `components/layout/NotificationBell.tsx` (new, `"use client"`)
 
-Shared, module-level:
-
-```ts
-const COLUMNS = "id, type, title, body, link_entity_type, link_entity_id, is_read, created_at";
-
-export type NotificationItem = {
-  id: string;
-  type: NotificationType;          // from "@/types/domain"
-  title: string;
-  body: string | null;
-  linkEntityType: string | null;
-  linkEntityId: string | null;
-  isRead: boolean;
-  createdAt: string;               // ISO timestamp
-};
+```tsx
+export function NotificationBell(): React.JSX.Element;
 ```
 
-plus a private `mapRow(row): NotificationItem` (snake_case -> camelCase), and a
-private helper that resolves the guest scope once per request, e.g.
+- Renders `<Link href="/notifications" aria-label="Notifications">` containing a bell
+  glyph and, when `unreadCount > 0`, a badge element showing the count
+  (`unreadCount > 99` → the string `"99+"`).
+- Fetches `GET /api/notifications/unread-count` on mount; reads `body.data.unreadCount`.
+  On any failure, render the icon with no badge and no error UI (`unreadCount = 0`).
+- Refreshes on the custom event `notifications:unread-changed`:
+  add a `window.addEventListener` in a `useEffect` and remove it on cleanup. Export the
+  event name and a dispatch helper **from this file** so the inbox screen imports them:
+  ```ts
+  export const UNREAD_CHANGED_EVENT = "notifications:unread-changed";
+  export function notifyUnreadChanged(): void; // no-op when `typeof window === "undefined"`
+  ```
+  (`notification-inbox.tsx` calls `notifyUnreadChanged()` after mark-all-read and after
+  each per-row PATCH is issued.)
+- The badge must be exposed accessibly: `aria-label={`${unreadCount} unread notifications`}`
+  on the badge element.
 
-```ts
-// Returns null for non-guest callers (no extra filtering), the scoped id list
-// for guests. Callers must handle the dbError case as a 500.
-async function resolveGuestScope(
-  supabase: SupabaseClient<Database>,
-  ctx: AuthContext,
-): Promise<{ ids: string[] | null; dbError: boolean }>;
-```
+### 5. `components/layout/NotificationBell.module.css` (new)
 
-Exported handlers (every one wrapped in the repo's standard
-`try { ... } catch (err) { if (err instanceof ApiException) return fail(err.message, err.code, err.status); return fail("Internal error", ErrorCode.INTERNAL, 500); }`):
-
-```ts
-export async function listNotifications(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-export async function getUnreadNotificationCount(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-export async function markNotificationRead(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>;
-export async function markAllNotificationsRead(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-```
-
-Common to all four: `await requireAuth(req, lookup)`; **no `requireRole` call**
-— PRD §22.12 auth is "Any", and all 4 roles including `guest` must work. Then
-`const { getToken } = await auth(); const jwt = await getToken();` -> 401
-`UNAUTHENTICATED` if falsy -> `getSupabaseClient(jwt)`. Every query additionally
-filters `.eq("user_id", ctx.userId).eq("church_group_id", ctx.churchGroupId)` as
-defense in depth on top of RLS.
-
-**`listNotifications`** — `GET /api/notifications`
-
-- Parse `listNotificationsQuerySchema.safeParse(Object.fromEntries(req.nextUrl.searchParams))`;
-  invalid -> 400 `VALIDATION_FAILED`.
-- Guest with an empty scope -> return the empty page without querying:
-  `ok({ notifications: [], pagination: { page, pageSize, total: 0 } })`.
-- Query: `.from("notifications").select(COLUMNS, { count: "exact" })`, the two
-  `.eq` scope filters, `.in("link_entity_id", scopeIds)` when the caller is a
-  guest, `.order("created_at", { ascending: false }).order("id", { ascending: false })`,
-  `.range((page - 1) * pageSize, (page - 1) * pageSize + pageSize - 1)`.
-- Response: `ok({ notifications: NotificationItem[], pagination: { page, pageSize, total: count ?? 0 } })`.
-
-**`getUnreadNotificationCount`** — `GET /api/notifications/unread-count`
-
-- No query params.
-- Guest with empty scope -> `ok({ unreadCount: 0 })`.
-- Query: `.select("id", { count: "exact", head: true })` + scope filters +
-  `.eq("is_read", false)` (+ guest `.in`).
-- Response: `ok({ unreadCount: count ?? 0 })`.
-
-**`markNotificationRead`** — `PATCH /api/notifications/:id/read`
-
-- After `requireAuth`, validate the path param with
-  `notificationIdParamSchema.safeParse(id)`; invalid -> 400 `VALIDATION_FAILED`
-  (same auth-then-validate order as `withdrawInvitation` in
-  `app/api/invitations/handler.ts`).
-- Ignore the request body entirely (do not call `req.json()`).
-- Fetch the row first: `.select(COLUMNS).eq("id", id)` + scope filters +
-  `.maybeSingle()`. DB error -> 500; no row -> 404 `NOT_FOUND`.
-- Guest: if the row's `link_entity_id` is null or not in the scoped id list ->
-  404 `NOT_FOUND` (never 403 — matches the anti-enumeration rule in
-  `app/api/service-weeks/[id]/handler.ts`).
-- If already `is_read === true`, skip the write and return the row as-is
-  (idempotent 200, not 409).
-- Otherwise `.update(patch).eq("id", id)` + scope filters + `.select(COLUMNS).maybeSingle()`,
-  where `const patch: Database["public"]["Tables"]["notifications"]["Update"] = { is_read: true };`
-  (typed-patch pattern from `app/api/conflicts/handler.ts`). DB error or missing
-  row -> 500 / 404 respectively.
-- Response: `ok({ notification: NotificationItem })`.
-
-**`markAllNotificationsRead`** — `POST /api/notifications/mark-all-read`
-
-- No body parsing, no query params.
-- Guest with empty scope -> `ok({ updatedCount: 0 })`.
-- `.update({ is_read: true })` (typed patch as above) + scope filters +
-  `.eq("is_read", false)` (+ guest `.in`) + `.select("id")`. DB error -> 500.
-- Response: `ok({ updatedCount: (data ?? []).length })`.
+`.link`, `.icon`, `.badge` (small pill, `background: var(--color-accent)`, white text,
+positioned relative to `.link`).
 
 ## Files to modify
 
-### 3. `schemas/notifications.ts`
+### 6. `app/(app)/notifications/page.tsx` (replace whole file)
 
-Add (keep the existing exports untouched, including the placeholder
-`notificationsSchema`):
+Mirror `app/(app)/conflicts/page.tsx`: a comment naming PRD Screen 6 / issue #73, then
+a default-export server component returning `<NotificationInbox />`. No shell wrapper
+(the `(app)` layout already supplies `AppShell`).
 
-```ts
-export const listNotificationsQuerySchema = z.object({
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(100).default(20),
-});
-export type ListNotificationsQuery = z.infer<typeof listNotificationsQuerySchema>;
+### 7. `components/layout/AppShell.tsx` (modify)
 
-export const notificationIdParamSchema = z.string().uuid();
-```
+Keep it a server component. Inside `.sidebar`, keep the "Graceful" wordmark and add a
+persistent nav containing `<NotificationBell />`. Scope: **only** the notifications
+entry — do not add dashboard/week/setlist/profile links, and do not delete the existing
+`TODO(Sprint 1+)` comment (amend it to note that notifications is now wired up).
 
-Copy the pagination schema shape verbatim from `schemas/audit-log.ts` (only the
-`pageSize` default differs: 20 for an inbox feed).
+### 8. `components/layout/AppShell.module.css` (modify)
 
-### 4-7. The four route files
+Add only what the nav needs (e.g. `.sidebarHeader` / `.nav`); leave `.shell`,
+`.sidebar`, `.content` as they are.
 
-Replace the `notImplemented` bodies with thin delegations. Pattern to copy:
-`app/api/notifications/preferences/route.ts`, and
-`app/api/conflicts/[id]/resolve/route.ts` for the dynamic-param route.
-
-- `app/api/notifications/route.ts`:
-  `export async function GET(req: NextRequest): Promise<Response> { return listNotifications(req); }`
-- `app/api/notifications/unread-count/route.ts`:
-  `export async function GET(req: NextRequest): Promise<Response> { return getUnreadNotificationCount(req); }`
-- `app/api/notifications/mark-all-read/route.ts`:
-  `export async function POST(req: NextRequest): Promise<Response> { return markAllNotificationsRead(req); }`
-- `app/api/notifications/[id]/read/route.ts`:
-  ```ts
-  type Ctx = { params: Promise<{ id: string }> };
-  export async function PATCH(req: NextRequest, { params }: Ctx): Promise<Response> {
-    const { id } = await params;
-    return markNotificationRead(req, id);
-  }
-  ```
-
-All four import from `@/app/api/notifications/handler`. Remove the now-unused
-`notImplemented` imports.
+---
 
 ## Edge cases the implementation must handle
 
-1. **Guest scoping (AC bullet 5)**: a guest sees only notifications whose
-   `link_entity_id` is one of their own invitation ids, one of the service-week
-   ids they were invited to, or a setlist id belonging to one of those weeks.
-   This matters for a user demoted from `member` to `guest`, who still owns rows
-   for weeks they were never invited to.
-2. **Guest with zero invitations**: empty inbox, `unreadCount: 0`,
-   `updatedCount: 0`, and 404 on any PATCH — no crash, no unfiltered query.
-3. **Notifications with `link_entity_id = NULL`** (e.g. the
-   `google_calendar_reauth_required` row written by
-   `supabase/migrations/20260716000001_google_calendar_sync.sql`) are excluded
-   for guests by the `.in(...)` filter, and always visible to the other 3 roles.
-4. **Already-read PATCH** is idempotent: 200 with the unchanged item, never 409.
-5. **PATCH on an id that does not exist, belongs to another user, or is outside
-   a guest's scope**: 404 `NOT_FOUND` — never 403, never a distinguishable
-   message between those cases.
-6. **PATCH with a non-UUID id**: 400 `VALIDATION_FAILED`.
-7. **Invalid pagination** (`page=0`, `page=abc`, `pageSize=0`, `pageSize=101`):
-   400 `VALIDATION_FAILED`. Missing params fall back to `page=1`, `pageSize=20`.
-8. **Page past the end**: 200 with `notifications: []` and the real `total`.
-9. **`mark-all-read` with nothing unread**: 200 `{ updatedCount: 0 }`.
-10. **Missing Supabase JWT** (`getToken()` returns null): 401 `UNAUTHENTICATED`,
-    on all four endpoints.
-11. **Any Supabase error**, including an error from the guest-scope lookup:
-    500 `INTERNAL` with the generic `"Internal error"` message — never leak the
-    driver error.
-12. **`count` returned as `null`** by PostgREST: coerce to `0`.
-13. **Ordering stability**: `created_at desc, id desc` so pagination cannot skip
-    or duplicate rows sharing a timestamp (bulk inserts write identical
-    `created_at` values — see the fan-out inserts in
-    `app/api/setlists/[id]/handler.ts`).
+1. `body === null` → no body element rendered (must not print "null").
+2. `linkEntityId === null` (e.g. `google_calendar` rows) → non-clickable row, still
+   markable as read.
+3. Unknown / future `linkEntityType` string → treated as non-clickable, never throws.
+4. Notification types with no filter category (`devotion_shared`,
+   `new_church_document`, `google_calendar_reauth_required`) → visible under "All" only.
+5. **Chat filter selected** → the "No Chat notifications." empty state; layout intact;
+   no fetch, no error.
+6. `unreadCount === 0` → bell renders with no badge at all.
+7. `unreadCount > 99` → badge shows `"99+"`.
+8. Mark-all-read when nothing is unread → button disabled, no request issued.
+9. Mark-all-read HTTP failure → list state unchanged, inline error shown, screen stays
+   usable.
+10. Per-row PATCH failure → navigation still happens; the optimistic unread flip is
+    allowed to stand (the next page load re-reads the truth).
+11. Tapping an already-read row → no PATCH request.
+12. Empty inbox (`total === 0`, `notifications: []`) → "No notifications yet.", and
+    mark-all-read disabled.
+13. Fetch rejects / non-2xx on the list endpoint → error view (no crash, no infinite
+    loading).
+14. Unmount before fetch resolves → no `setState` (use the `cancelled` flag).
+15. `createdAt` in the future or unparseable → `"just now"` / `""`, never `NaN` or a
+    negative duration.
 
-## Decisions (recorded so the reviewer does not re-litigate them)
+## Out of scope (do not build)
 
-- **"Invited weeks" means any invitation row, regardless of status.** This
-  deliberately differs from `guestHasWeekAccess`/`GUEST_ACCESS_STATUSES`
-  (`pending`/`accepted`), which gates *content* access. Using live statuses here
-  would make the `invitation_withdrawn` notification vanish at the exact moment
-  it is written (the withdraw path in `app/api/invitations/handler.ts` sets
-  `status = 'withdrawn'` immediately before inserting it), so the guest could
-  never learn they were withdrawn — which contradicts the issue's "source of
-  truth for did I get notified about this". Add a comment saying so.
-- **No type filter.** PRD §22.12 mentions "filterable by type", but §13.2 marks
-  "Filter by type" as Phase 2 and the issue's ACs do not ask for it. Out of
-  scope.
-- **No `requireRole`.** Auth is "Any" (all 4 roles); guest access is narrowed by
-  the scope filter, not by a role gate.
-- **No audit-log writes.** Reading and marking one's own inbox is not an audited
-  admin action; `writeAuditLog` is not used here.
-- **No new migration.** The table, indexes, RLS policies, and TypeScript row
-  types all already exist.
+Push/SMS/email delivery, pagination or infinite scroll, per-notification delete,
+notification preferences UI (already shipped as `/api/notifications/preferences`),
+any Chat functionality, a "System" filter, any other nav link in `AppShell`, any API
+change beyond the approved member-scoped invitation-response flow, or any change to
+`schemas/**`, `lib/supabase/**`, or `supabase/migrations/**`.
 
-### OQ1 — "Practice reminder" has no scheduling infrastructure at all
+## Verification
 
-Run from the worktree root with Bun (never npm/npx):
-
-- `bun run lint`
-- `bun run typecheck`
-- `bun run test`
-
-Unit tests belong in `tests/unit/app/api/notifications-inbox-route.test.ts`;
-copy the Clerk/Supabase mocking harness from
-`tests/unit/app/api/audit-log-route.test.ts` (it already models
-`select -> order -> order -> range` with `count`), extending the fake client
-with `in`, `update`, `maybeSingle`, and `head: true` count support. Handlers
-take an injectable `lookup?: UserLookup` precisely so tests can vary
-`ctx.role` across `admin` / `set_leader` / `member` / `guest`.
+`bun run lint`, `bun run typecheck`, `bun run test` must all pass.
