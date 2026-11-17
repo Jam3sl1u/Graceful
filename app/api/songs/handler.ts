@@ -5,7 +5,12 @@ import { ok, fail } from "@/lib/api/response";
 import { ApiException, ErrorCode } from "@/lib/api/errors";
 import { getSupabaseClient } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
-import { createSongSchema, songSearchQuerySchema, isValidSongKey } from "@/schemas/songs";
+import {
+  createSongSchema,
+  songSearchQuerySchema,
+  isValidSongKey,
+  type SongFamiliarityLevel,
+} from "@/schemas/songs";
 import { escapePostgrestFilterValue } from "@/lib/api/postgrest";
 
 export type SongResponse = {
@@ -17,6 +22,9 @@ export type SongResponse = {
   tags: string[];
   createdBy: string | null;
   createdAt: string;
+  // The caller's own familiarity (PRD §13.4); null until they set one. Only
+  // present on the list endpoint.
+  myFamiliarity?: SongFamiliarityLevel | null;
 };
 
 function toSongResponse(row: {
@@ -80,7 +88,25 @@ export async function listSongs(req: NextRequest, lookup?: UserLookup): Promise<
       return fail("Internal error", ErrorCode.INTERNAL, 500);
     }
 
-    return ok({ songs: (data ?? []).map(toSongResponse) });
+    // The caller's own familiarity per song (RLS also limits this to their rows).
+    const { data: familiarityRows, error: familiarityError } = await supabase
+      .from("song_familiarity")
+      .select("song_id, level")
+      .eq("church_group_id", ctx.churchGroupId)
+      .eq("user_id", ctx.userId);
+    if (familiarityError) {
+      return fail("Internal error", ErrorCode.INTERNAL, 500);
+    }
+    const mine = new Map<string, SongFamiliarityLevel>(
+      (familiarityRows ?? []).map((r) => [r.song_id, r.level as SongFamiliarityLevel]),
+    );
+
+    return ok({
+      songs: (data ?? []).map((row) => ({
+        ...toSongResponse(row),
+        myFamiliarity: mine.get(row.id) ?? null,
+      })),
+    });
   } catch (err) {
     if (err instanceof ApiException) return fail(err.message, err.code, err.status);
     return fail("Internal error", ErrorCode.INTERNAL, 500);

@@ -87,6 +87,15 @@ type SongDocumentsRow = {
   created_at: string;
 };
 
+type SongFamiliarityRow = {
+  id: string;
+  church_group_id: string;
+  user_id: string;
+  song_id: string;
+  level: "comfortable" | "learning" | "not_learned";
+  updated_at: string;
+};
+
 type AuditLogsRow = {
   id: string;
   church_group_id: string;
@@ -320,6 +329,15 @@ export type Database = {
           uploaded_by?: string | null;
         };
         Update: Partial<SongDocumentsRow>;
+        Relationships: [];
+      };
+      song_familiarity: {
+        Row: SongFamiliarityRow;
+        Insert: Omit<SongFamiliarityRow, "id" | "updated_at"> & {
+          id?: string;
+          updated_at?: string;
+        };
+        Update: Partial<SongFamiliarityRow>;
         Relationships: [];
       };
       audit_logs: {

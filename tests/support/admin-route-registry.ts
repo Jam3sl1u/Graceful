@@ -65,6 +65,7 @@ import {
   removeSetlistSong,
 } from "@/app/api/setlists/[id]/handler";
 import { listSongs, createSong } from "@/app/api/songs/handler";
+import { setSongFamiliarity } from "@/app/api/songs/[id]/familiarity/handler";
 import {
   createUploadUrl,
   registerDocument,
@@ -599,6 +600,13 @@ export const ADMIN_ROUTE_REGISTRY: RouteEntry[] = [
     allowedRoles: AL,
     scope: "group",
     invoke: (lookup) => createSong(makeApiReq({ body: { title: "Song" } }), lookup),
+  },
+  {
+    name: "PUT /api/songs/:id/familiarity",
+    allowedRoles: ALM,
+    scope: "group",
+    invoke: (lookup) =>
+      setSongFamiliarity(makeApiReq({ body: { level: "learning" } }), R1, lookup),
   },
   {
     name: "POST /api/songs/:id/documents/upload-url",
