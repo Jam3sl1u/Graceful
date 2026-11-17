@@ -87,6 +87,19 @@ type SongDocumentsRow = {
   created_at: string;
 };
 
+type DocumentsRow = {
+  id: string;
+  church_group_id: string;
+  name: string;
+  file_key: string;
+  file_type: string;
+  file_size_bytes: number;
+  folder: string;
+  description: string | null;
+  uploaded_by: string | null;
+  created_at: string;
+};
+
 type AuditLogsRow = {
   id: string;
   church_group_id: string;
@@ -320,6 +333,18 @@ export type Database = {
           uploaded_by?: string | null;
         };
         Update: Partial<SongDocumentsRow>;
+        Relationships: [];
+      };
+      documents: {
+        Row: DocumentsRow;
+        Insert: Omit<DocumentsRow, "id" | "created_at" | "folder" | "description"> & {
+          id?: string;
+          created_at?: string;
+          folder?: string;
+          description?: string | null;
+        };
+        // No UPDATE policy exists: documents are immutable once written.
+        Update: Record<string, never>;
         Relationships: [];
       };
       audit_logs: {
