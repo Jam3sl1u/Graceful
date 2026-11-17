@@ -32,3 +32,8 @@ It matches the spec. Verified by reading:
 - Re-run after the fixes described in `changes.md`: `bun run lint` pass, `bun run typecheck` pass, `bun run test` pass (154 suites / 3254 tests; the static migration suite is now 21 tests).
 - STILL NOT RUN: every RLS integration case, now 18 in `chat.test.ts` (new: 15 soft-delete-only, 16 membership edge cases, 17 and 18 invitee update guard), and both migrations against a live Postgres. The trigger's plpgsql and the column-privilege behaviour are unproven until a human runs `bun run test:rls` with the SUPABASE_TEST_* secrets.
 - Pre-existing N3 failure unchanged.
+
+## Remediation round 2 addendum (2026-11-16)
+- Re-run after round 2: `bun run lint` pass, `bun run typecheck` pass, `bun run test` pass (154 suites / 3259 tests; the static migration suite now covers all three migrations).
+- STILL NOT RUN: every RLS integration case (20 in `chat.test.ts`, the chat blocks in `cross-tenant-bypass.test.ts`, and the changed Phase 1 case in `rls.test.ts`), and all three migrations against a live Postgres. `bun run test:rls` skipped 12 suites for missing SUPABASE_TEST_* secrets. Both trigger functions and the column grant are unproven until a human runs it.
+- Pre-existing N3 failure unchanged.

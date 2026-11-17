@@ -743,13 +743,17 @@ describeRls("Cross-tenant bypass matrix (Church A → Church B)", () => {
 
     it("UPDATE no-op (memberA)", async () => {
       await assertUpdateNoOp(memberA, serviceClient, "chat_messages", IDS.chatMessages.B, {
-        content: "Hacked",
+        // is_deleted is the only column authenticated callers may write, so
+        // this is refused by the row policy rather than by column privilege.
+        is_deleted: true,
       });
     });
 
     it("UPDATE no-op (adminA)", async () => {
       await assertUpdateNoOp(adminA, serviceClient, "chat_messages", IDS.chatMessages.B, {
-        content: "Hacked",
+        // is_deleted is the only column authenticated callers may write, so
+        // this is refused by the row policy rather than by column privilege.
+        is_deleted: true,
       });
     });
 

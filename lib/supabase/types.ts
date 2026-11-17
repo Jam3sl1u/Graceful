@@ -506,7 +506,9 @@ export type Database = {
           metadata?: Record<string, unknown> | null;
           is_deleted?: boolean;
         };
-        Update: Partial<ChatMessagesRow>;
+        // Only is_deleted is writable with a user JWT (column-level grant in
+        // 20261116000001_chat_tables_rls.sql), and only to true.
+        Update: { is_deleted?: boolean };
         Relationships: [];
       };
       chat_mentions: {

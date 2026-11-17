@@ -39,3 +39,16 @@ Operator decision in chat: fix review finding 2 in this PR rather than a separat
 ### Human steps
 - Run `bun run test:rls` against a real Supabase with both migrations applied before merge.
 - Apply both migrations to staging/production.
+
+## Remediation round 2 (2026-11-16, after the independent second-pass review of round 1)
+
+Operator decision in chat: fix the users privileged-column finding in this PR.
+
+- **users role / church / login columns were writable by direct update.** New migration `supabase/migrations/20261116000003_users_privileged_column_guard.sql`: BEFORE UPDATE trigger on `users`. For direct `authenticated` updates, `id`, `clerk_id` and `church_group_id` are immutable and `role` can only be changed by an admin. Service role and SECURITY DEFINER RPCs unaffected. This is what the chat membership rule and the round 1 invitation guard rest on; round 1's "bypass closed" claim was not true without it.
+- **Direct accept skipped `accept_invitation()`'s checks.** The invitation guard now allows only pending -> denied by direct update. One Phase 1 test (`tests/integration/rls/rls.test.ts`, "member_a can UPDATE their own invitation (respond)") is changed from accept to deny accordingly; this was the reviewer's preferred fix and was not separately confirmed by the operator.
+- **Cross-tenant chat_messages UPDATE tests** now patch `is_deleted`, so they exercise the row policy again instead of failing on column privilege.
+- **RPC coverage:** `chat.test.ts` case 18 now accepts and denies through `accept_invitation` / `deny_invitation`. New cases 19 and 20 cover the users guard (attacks, then positive controls).
+- `lib/supabase/types.ts`: `chat_messages.Update` narrowed to `is_deleted`.
+
+### Verification after round 2
+- See `test-results.md` addendum. The SQL (now three migrations) has still never been executed; all RLS cases remain NOT RUN.

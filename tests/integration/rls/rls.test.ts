@@ -300,10 +300,12 @@ maybeDescribe("RLS Integration", () => {
       }
     });
 
+    // Declines, not accepts: since issue #208 a direct update may only move a
+    // pending invitation to denied; accepting goes through accept_invitation().
     it("member_a can UPDATE their own invitation (respond)", async () => {
       const { error } = await clients.memberA()
         .from("invitations")
-        .update({ status: "accepted", responded_at: new Date().toISOString() })
+        .update({ status: "denied", responded_at: new Date().toISOString() })
         .eq("id", IDS.invitations.memberA);
       expect(error).toBeNull();
     });

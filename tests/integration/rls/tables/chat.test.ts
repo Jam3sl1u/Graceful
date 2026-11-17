@@ -45,6 +45,7 @@ const F = {
   I_W6_A2_WITHDRAWN: `${P}000000000042`,
   I_W7_A2_PENDING: `${P}000000000043`,
   I_W1_A2_PENDING: `${P}000000000044`,
+  I_W3_A2_PENDING: `${P}000000000045`,
 };
 
 describeRls("Chat tables — membership, archive, content and mention rules", () => {
@@ -105,6 +106,7 @@ describeRls("Chat tables — membership, archive, content and mention rules", ()
       { church_group_id: A, service_week_id: F.W6, user_id: U.guestA, status: "denied", response_token: "chat-tok-w6-guestA-denied" },
       { church_group_id: A, service_week_id: F.W6, user_id: U.guestA, status: "accepted", response_token: "chat-tok-w6-guestA-accepted" },
       { id: F.I_W7_A2_PENDING, church_group_id: A, service_week_id: F.W7, user_id: U.memberA2, status: "pending", response_token: "chat-tok-w7-memberA2" },
+      { id: F.I_W3_A2_PENDING, church_group_id: A, service_week_id: F.W3, user_id: U.memberA2, status: "pending", response_token: "chat-tok-w3-memberA2" },
     ]);
     await mustInsert("chat_messages", [
       { id: F.M1, chat_room_id: F.R1, church_group_id: A, user_id: U.memberA, content: "M1" },
@@ -350,6 +352,11 @@ describeRls("Chat tables — membership, archive, content and mention rules", ()
     await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W7_A2_PENDING, { response_token: "chat-tok-forged" });
     // Self-withdraw is a leader action.
     await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W7_A2_PENDING, { status: "withdrawn" });
+    // Accepting by direct update would skip accept_invitation()'s checks.
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W7_A2_PENDING, {
+      status: "accepted",
+      responded_at: new Date().toISOString(),
+    });
 
     const direct = await memberA2
       .from("invitations")
@@ -377,13 +384,26 @@ describeRls("Chat tables — membership, archive, content and mention rules", ()
     await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W1_A2_PENDING, { status: "accepted" });
     await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W1_A2_PENDING, { denial_reason: "changed my mind" });
 
-    // Invitee accepts a pending invitation directly and gains that week's chat.
-    const accept = await memberA2
-      .from("invitations")
-      .update({ status: "accepted", responded_at: new Date().toISOString() })
-      .eq("id", F.I_W7_A2_PENDING);
+    // Invitee accepts through the SECURITY DEFINER RPC (the guard must not
+    // fire inside it) and gains that week's chat.
+    const accept = await memberA2.rpc("accept_invitation", {
+      p_invitation_id: F.I_W7_A2_PENDING,
+      p_response_token: null,
+    });
     expect(accept.error).toBeNull();
+    const { data: accepted } = await svc.from("invitations").select("status").eq("id", F.I_W7_A2_PENDING).single();
+    expect(accepted?.status).toBe("accepted");
     await assertSelectAllowed(memberA2, "chat_rooms", { id: F.R7 });
+
+    // The deny RPC is likewise unaffected by the guard.
+    const rpcDeny = await memberA2.rpc("deny_invitation", {
+      p_invitation_id: F.I_W3_A2_PENDING,
+      p_response_token: null,
+      p_reason: "rpc deny",
+    });
+    expect(rpcDeny.error).toBeNull();
+    const { data: rpcDenied } = await svc.from("invitations").select("status").eq("id", F.I_W3_A2_PENDING).single();
+    expect(rpcDenied?.status).toBe("denied");
     await assertSelectAllowed(memberA2, "chat_messages", { id: F.M7 });
 
     // Leaders are not restricted: withdraw an accepted invitation and edit its note.
@@ -399,6 +419,63 @@ describeRls("Chat tables — membership, archive, content and mention rules", ()
 
     // The service role (and, like it, the SECURITY DEFINER RPCs) is not restricted either.
     const svcUpdate = await svc.from("invitations").update({ status: "pending" }).eq("id", F.I_W7_A2_PENDING);
+    expect(svcUpdate.error).toBeNull();
+  });
+
+  it("19. privileged users columns: nobody can self-promote, change church or re-bind an account by direct update", async () => {
+    const B = IDS.churches.B;
+    // A member cannot make themselves a leader or admin...
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { role: "admin" });
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { role: "set_leader" });
+    // ...nor move to another church, alone or together with a role change.
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { church_group_id: B });
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { church_group_id: B, role: "admin" });
+    // ...nor take over another login.
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { clerk_id: IDS.clerkIds.adminA });
+    // A guest is held to the same rule.
+    await assertUpdateNoOp(guestA, svc, "users", U.guestA, { role: "member" });
+    // A set leader may edit other rows but not grant roles, to others or to themselves.
+    await assertUpdateNoOp(leaderA, svc, "users", U.memberA2, { role: "admin" });
+    await assertUpdateNoOp(leaderA, svc, "users", U.leaderA, { role: "admin" });
+    // Even an admin cannot move a user between churches or re-bind a login.
+    await assertUpdateNoOp(adminA, svc, "users", U.memberA2, { church_group_id: B });
+    await assertUpdateNoOp(adminA, svc, "users", U.memberA2, { clerk_id: "forged_clerk_id" });
+
+    const direct = await memberA2.from("users").update({ role: "admin" }).eq("id", U.memberA2);
+    expect(direct.error).not.toBeNull();
+
+    // The attempts bought nothing: still not a member of a room they hold no
+    // accepted invitation for, and still bound by the invitation guard.
+    const still = await memberA2.rpc("is_chat_room_member", { p_chat_room_id: F.R6 });
+    expect(still.error).toBeNull();
+    expect(still.data).toBe(false);
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W6_A2_WITHDRAWN, { status: "accepted" });
+  });
+
+  it("20. privileged users columns: ordinary edits and admin role changes still work", async () => {
+    // Positive controls, so the no-ops above mean "blocked", not "all updates fail".
+    const own = await memberA2.from("users").update({ name: "Member A2 (self-edited)" }).eq("id", U.memberA2);
+    expect(own.error).toBeNull();
+    const byLeader = await leaderA.from("users").update({ name: "Member A2 (leader-edited)" }).eq("id", U.memberA2);
+    expect(byLeader.error).toBeNull();
+    const { data: named } = await svc.from("users").select("name").eq("id", U.memberA2).single();
+    expect(named?.name).toBe("Member A2 (leader-edited)");
+
+    // An admin changes a role (the role-change handler's path) and it takes effect.
+    const promote = await adminA.from("users").update({ role: "set_leader" }).eq("id", U.memberA2);
+    expect(promote.error).toBeNull();
+    const { data: promoted } = await svc.from("users").select("role").eq("id", U.memberA2).single();
+    expect(promoted?.role).toBe("set_leader");
+
+    // Restore, as admin again, so later suites see the seeded state.
+    const demote = await adminA.from("users").update({ role: "member", name: "Member A2" }).eq("id", U.memberA2);
+    expect(demote.error).toBeNull();
+    const { data: restored } = await svc.from("users").select("role, name").eq("id", U.memberA2).single();
+    expect(restored).toEqual({ role: "member", name: "Member A2" });
+
+    // The service role (and the SECURITY DEFINER RPCs, which also do not run
+    // as `authenticated`) is not restricted.
+    const svcUpdate = await svc.from("users").update({ church_group_id: A }).eq("id", U.memberA2);
     expect(svcUpdate.error).toBeNull();
   });
 });

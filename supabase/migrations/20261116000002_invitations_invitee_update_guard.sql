@@ -12,8 +12,12 @@
 -- What it does: a BEFORE UPDATE trigger that restricts what an invitee may
 -- change on their own invitation when updating directly as `authenticated`:
 --   * only status, denial_reason, denial_count and responded_at may change;
---   * status may only move pending -> accepted or pending -> denied;
+--   * status may only move pending -> denied;
 --   * if status does not change, nothing may change.
+-- Accepting is deliberately NOT allowed as a direct update: accept_invitation()
+-- is the only path that enforces the response deadline and writes the roster
+-- rows, the admin notification and the audit entry, and the app never accepts
+-- any other way (app/api/invitations/handler.ts calls the RPC).
 --
 -- What it does NOT touch:
 --   * leaders and admins (invitations_update_leader_admin) — unrestricted, so
@@ -57,8 +61,8 @@ BEGIN
   END IF;
 
   IF NEW.status IS DISTINCT FROM OLD.status THEN
-    IF OLD.status <> 'pending' OR NEW.status NOT IN ('accepted', 'denied') THEN
-      RAISE EXCEPTION 'an invitation can only be answered while it is pending'
+    IF OLD.status <> 'pending' OR NEW.status <> 'denied' THEN
+      RAISE EXCEPTION 'an invitee may only decline a pending invitation directly'
         USING ERRCODE = '42501';
     END IF;
   ELSIF to_jsonb(NEW) IS DISTINCT FROM to_jsonb(OLD) THEN
