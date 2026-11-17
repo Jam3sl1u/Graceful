@@ -1,0 +1,99 @@
+/**
+ * Static checks for the chat tables migration (issue #208, P2-01).
+ * Runs without a database: reads the migration SQL and asserts its shape.
+ */
+
+import { readFileSync, readdirSync } from "fs";
+import { join } from "path";
+
+const ROOT = join(__dirname, "..", "..", "..");
+const MIGRATIONS_DIR = join(ROOT, "supabase", "migrations");
+const MIGRATION_NAME = "20261116000001_chat_tables_rls.sql";
+
+const sql = readFileSync(join(MIGRATIONS_DIR, MIGRATION_NAME), "utf8");
+const DOWN_MARKER = "-- ============ DOWN ============";
+const downIdx = sql.indexOf(DOWN_MARKER);
+const up = downIdx === -1 ? sql : sql.slice(0, downIdx);
+const down = downIdx === -1 ? "" : sql.slice(downIdx + DOWN_MARKER.length);
+
+/** Collapse whitespace and lowercase for tolerant matching. */
+const norm = (s: string) => s.replace(/\s+/g, " ").toLowerCase();
+const upN = norm(up);
+
+function stripComments(s: string): string {
+  return s
+    .split("\n")
+    .map((l) => l.replace(/--.*$/, ""))
+    .join("\n");
+}
+
+function policyBlock(name: string): string {
+  const start = upN.indexOf(`create policy ${name}`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const end = upN.indexOf("create policy", start + 1);
+  return upN.slice(start, end === -1 ? undefined : end);
+}
+
+describe("chat tables migration (static)", () => {
+  it.each(["chat_rooms", "chat_messages", "chat_mentions"])("creates table %s", (t) => {
+    expect(upN).toMatch(new RegExp(`create table (public\\.)?${t}\\b`));
+  });
+
+  it("chat_rooms.service_week_id is unique", () => {
+    expect(upN).toMatch(/service_week_id uuid not null unique references service_weeks/);
+  });
+
+  it("enforces 2000-character content limit", () => {
+    expect(upN).toContain("char_length(content) <= 2000");
+  });
+
+  it("defines chat_message_kind with text and devotion", () => {
+    expect(upN).toMatch(/create type public\.chat_message_kind as enum \('text', 'devotion'\)/);
+  });
+
+  it("metadata is nullable jsonb", () => {
+    expect(upN).toMatch(/metadata jsonb(,|\s*\))/);
+    expect(upN).not.toMatch(/metadata jsonb not null/);
+  });
+
+  it.each(["chat_rooms", "chat_messages", "chat_mentions"])("enables RLS on %s", (t) => {
+    expect(upN).toMatch(new RegExp(`alter table public\\.${t}\\s+enable row level security`));
+  });
+
+  it("is_chat_room_member is SECURITY DEFINER with empty search_path and checks accepted", () => {
+    const start = upN.indexOf("function public.is_chat_room_member");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const fn = upN.slice(start, upN.indexOf("$$;", upN.indexOf("$$", start + 40) + 2));
+    expect(fn).toContain("security definer");
+    expect(fn).toContain("set search_path = ''");
+    expect(fn).toContain("status = 'accepted'");
+  });
+
+  it("chat_messages INSERT policy refuses archived rooms", () => {
+    expect(policyBlock("chat_messages_insert_member")).toContain("is_archived = false");
+  });
+
+  it("has no DELETE policy on any chat table", () => {
+    expect(upN).not.toMatch(/create policy \S+ on public\.chat_\w+ for delete/);
+    expect(upN).not.toMatch(/for delete/);
+  });
+
+  it("has a fully commented DOWN block", () => {
+    expect(downIdx).toBeGreaterThan(0);
+    const lines = down.split("\n").filter((l) => l.trim() !== "");
+    expect(lines.length).toBeGreaterThan(0);
+    for (const l of lines) {
+      expect(l.trimStart().startsWith("--")).toBe(true);
+    }
+  });
+
+  it("no other migration references chat_rooms outside comments", () => {
+    const others = readdirSync(MIGRATIONS_DIR).filter(
+      (f) => f.endsWith(".sql") && f !== MIGRATION_NAME,
+    );
+    for (const f of others) {
+      const body = stripComments(readFileSync(join(MIGRATIONS_DIR, f), "utf8"));
+      expect({ file: f, mentions: /chat_rooms/i.test(body) }).toEqual({ file: f, mentions: false });
+    }
+  });
+});
