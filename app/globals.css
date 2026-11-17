@@ -171,7 +171,7 @@ body {
 
 body {
   min-height: 100dvh;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 h1,

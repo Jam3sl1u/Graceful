@@ -710,7 +710,13 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
                         </th>
                         {availabilityWindow.map((date) => (
                           <th key={date} scope="col" className={styles.availabilityDate}>
-                            {formatShortDate(date)}
+                            {formatShortDate(date)
+                              .split(", ")
+                              .map((part) => (
+                                <span key={part} className={styles.availabilityDatePart}>
+                                  {part}
+                                </span>
+                              ))}
                           </th>
                         ))}
                       </tr>

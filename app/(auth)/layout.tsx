@@ -1,7 +1,13 @@
+import { PublicHeader } from "@/components/layout/PublicHeader";
+import styles from "./auth.module.css";
+
 export default function AuthLayout({ children }: { children: React.ReactNode }) {
   return (
-    <div style={{ display: "flex", justifyContent: "center", padding: "3rem 1rem" }}>
-      {children}
-    </div>
+    <>
+      <PublicHeader />
+      <main id="main" className={styles.wrap}>
+        {children}
+      </main>
+    </>
   );
 }

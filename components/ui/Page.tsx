@@ -9,7 +9,7 @@ type PageProps = {
 /** The `<main>` of a screen: consistent max-width, gutters and vertical rhythm. */
 export function Page({ width = "medium", children, className }: PageProps) {
   return (
-    <main id="main" className={`${styles.page} ${styles[width]} ${className ?? ""}`}>
+    <main id="main" tabIndex={-1} className={`${styles.page} ${styles[width]} ${className ?? ""}`}>
       {children}
     </main>
   );

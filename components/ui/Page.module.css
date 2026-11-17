@@ -58,3 +58,8 @@
     padding-top: var(--space-6);
   }
 }
+
+.page:focus {
+  outline: none;
+  box-shadow: none;
+}
