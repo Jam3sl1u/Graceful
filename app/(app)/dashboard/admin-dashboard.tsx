@@ -36,16 +36,23 @@ function formatServiceDate(dateStr: string): string {
 }
 
 export default function AdminDashboard() {
-  const [view, setView] = useState<ViewState>("loading");
   const [weeks, setWeeks] = useState<OverviewWeek[]>([]);
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
   const [filterError, setFilterError] = useState<string | null>(null);
+  const requestKey = `${status}\0${startDate}\0${endDate}`;
+  const [settled, setSettled] = useState<{
+    key: string;
+    outcome: Exclude<ViewState, "loading">;
+  } | null>(null);
+  // A new filter key is "loading" until its fetch settles. Deriving that
+  // during render avoids a synchronous setState in the effect below.
+  const view: ViewState = settled?.key === requestKey ? settled.outcome : "loading";
 
   useEffect(() => {
     let cancelled = false;
-    setView("loading");
+    const key = requestKey;
 
     async function load() {
       try {
@@ -58,7 +65,7 @@ export default function AdminDashboard() {
         if (cancelled) return;
 
         if (res.status === 403) {
-          setView("forbidden");
+          setSettled({ key, outcome: "forbidden" });
           return;
         }
         if (res.status === 400) {
@@ -66,11 +73,11 @@ export default function AdminDashboard() {
           setFilterError(
             "Check the date range — the start date must be on or before the end date.",
           );
-          setView("ready");
+          setSettled({ key, outcome: "ready" });
           return;
         }
         if (!res.ok) {
-          setView("error");
+          setSettled({ key, outcome: "error" });
           return;
         }
 
@@ -79,9 +86,9 @@ export default function AdminDashboard() {
 
         setWeeks(body.data.serviceWeeks);
         setFilterError(null);
-        setView("ready");
+        setSettled({ key, outcome: "ready" });
       } catch {
-        if (!cancelled) setView("error");
+        if (!cancelled) setSettled({ key, outcome: "error" });
       }
     }
 
@@ -89,7 +96,7 @@ export default function AdminDashboard() {
     return () => {
       cancelled = true;
     };
-  }, [startDate, endDate, status]);
+  }, [requestKey, startDate, endDate, status]);
 
   if (view === "loading") {
     return (

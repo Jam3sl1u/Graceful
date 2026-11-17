@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { Button } from "@/components/ui/Button";
 import {
   isInstallPromptDismissed,
@@ -13,41 +13,60 @@ import styles from "./InstallPrompt.module.css";
 
 type Mode = "hidden" | "android" | "ios";
 
+function detectInstallMode(): Mode {
+  if (typeof window === "undefined") return "hidden";
+  if (
+    isRunningStandalone({
+      matchMedia: window.matchMedia?.bind(window),
+      navigator: window.navigator as unknown as { standalone?: boolean },
+    })
+  ) {
+    return "hidden";
+  }
+  if (isInstallPromptDismissed(window.localStorage)) return "hidden";
+  if (isIosInstallCapable(navigator.userAgent, navigator.maxTouchPoints)) return "ios";
+  return "hidden";
+}
+
+function subscribeInstallMode() {
+  return () => {};
+}
+
 export function InstallPrompt(): React.ReactElement | null {
-  const [mode, setMode] = useState<Mode>("hidden");
+  const detected = useSyncExternalStore(
+    subscribeInstallMode,
+    detectInstallMode,
+    () => "hidden" as const,
+  );
+  const [override, setOverride] = useState<Mode | null>(null);
+  const mode = override ?? detected;
   const [deferred, setDeferred] = useState<BeforeInstallPromptEvent | null>(null);
 
   useEffect(() => {
-    // `navigator.standalone` is a real, long-standing iOS Safari property
-    // that lib.dom.d.ts intentionally doesn't type (it's non-standard) — the
-    // cast is narrowly scoped to that gap, not a workaround for our own code.
     if (
       isRunningStandalone({
         matchMedia: window.matchMedia?.bind(window),
         navigator: window.navigator as unknown as { standalone?: boolean },
       })
-    )
+    ) {
       return;
+    }
     if (isInstallPromptDismissed(window.localStorage)) return;
 
     const handleBeforeInstallPrompt = (event: Event) => {
       event.preventDefault();
       setDeferred(event as BeforeInstallPromptEvent);
-      setMode("android");
+      setOverride("android");
     };
 
     const handleAppInstalled = () => {
       markInstallPromptDismissed(window.localStorage);
-      setMode("hidden");
+      setOverride("hidden");
       setDeferred(null);
     };
 
     window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
     window.addEventListener("appinstalled", handleAppInstalled);
-
-    if (isIosInstallCapable(navigator.userAgent, navigator.maxTouchPoints)) {
-      setMode("ios");
-    }
 
     return () => {
       window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
@@ -58,7 +77,7 @@ export function InstallPrompt(): React.ReactElement | null {
   async function handleInstall() {
     const event = deferred;
     if (!event) {
-      setMode("hidden");
+      setOverride("hidden");
       return;
     }
     // Clear before awaiting: the event is single-use, so a double click must
@@ -71,14 +90,14 @@ export function InstallPrompt(): React.ReactElement | null {
       // A rejected/thrown prompt() still finalizes below like any other
       // outcome — the banner must not stay stuck or crash.
     } finally {
-      setMode("hidden");
+      setOverride("hidden");
       markInstallPromptDismissed(window.localStorage);
     }
   }
 
   function handleDismiss() {
     markInstallPromptDismissed(window.localStorage);
-    setMode("hidden");
+    setOverride("hidden");
   }
 
   if (mode === "hidden") return null;

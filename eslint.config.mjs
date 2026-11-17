@@ -1,26 +1,18 @@
-import { FlatCompat } from "@eslint/eslintrc";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { defineConfig, globalIgnores } from "eslint/config";
+import nextVitals from "eslint-config-next/core-web-vitals";
+import nextTs from "eslint-config-next/typescript";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const compat = new FlatCompat({
-  baseDirectory: __dirname,
-});
-
-const eslintConfig = [
-  ...compat.extends("next/core-web-vitals", "next/typescript"),
-  {
-    ignores: [
-      "song2score/**",
-      ".claude/**",
-      ".pipeline/**",
-      "documentation/**",
-      ".next/**",
-      "next-env.d.ts",
-    ],
-  },
+const eslintConfig = defineConfig([
+  ...nextVitals,
+  ...nextTs,
+  globalIgnores([
+    "song2score/**",
+    ".claude/**",
+    ".pipeline/**",
+    "documentation/**",
+    ".next/**",
+    "next-env.d.ts",
+  ]),
   {
     rules: {
       // Scaffolded route/lib stubs intentionally name unused params `_foo`
@@ -31,6 +23,6 @@ const eslintConfig = [
       ],
     },
   },
-];
+]);
 
 export default eslintConfig;
