@@ -292,8 +292,10 @@ export async function teardownFixtures(svc: SupabaseClient, ids: TeardownIds): P
 // Clears a disposable Clerk persona's app-side state so it can create/join a
 // group again on the next run (issue #82). Deletes any church group the
 // persona OWNS (cascades its users row) and otherwise deletes just the
-// persona's users row. Hard guard: throws if the resolved group is
-// FIXTURE.churchGroupId — never touch the stable fixture.
+// persona's users row (member/guest rows are safe to delete even inside
+// FIXTURE.churchGroupId, e.g. left over from a crashed guest Test B). Hard
+// guards: throws if the persona resolves to a stable fixture user
+// (FIXTURE.adminUserId / memberUserId) or is an admin of FIXTURE.churchGroupId.
 export async function resetDisposablePersona(svc: SupabaseClient, email: string): Promise<void> {
   const clerkId = await resolveClerkUserId(email);
   const { data: row, error } = await svc
@@ -306,14 +308,20 @@ export async function resetDisposablePersona(svc: SupabaseClient, email: string)
   }
   if (!row) return;
 
-  if (row.church_group_id === FIXTURE.churchGroupId) {
+  if (row.id === FIXTURE.adminUserId || row.id === FIXTURE.memberUserId) {
     throw new Error(
-      `resetDisposablePersona: ${email} resolved to FIXTURE.churchGroupId — refusing to delete ` +
-        "the stable fixture. This means the test used the wrong persona email.",
+      `resetDisposablePersona: ${email} resolved to a stable fixture user — refusing to delete. ` +
+        "This means the test used the wrong persona email.",
     );
   }
 
   if (row.role === "admin") {
+    if (row.church_group_id === FIXTURE.churchGroupId) {
+      throw new Error(
+        `resetDisposablePersona: ${email} is an admin of FIXTURE.churchGroupId — refusing to ` +
+          "cascade-delete the stable fixture group.",
+      );
+    }
     const { error: groupError } = await svc
       .from("church_groups")
       .delete()

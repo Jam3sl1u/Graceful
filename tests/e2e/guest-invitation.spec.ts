@@ -4,6 +4,7 @@ import { getE2EServiceClient } from "./support/db";
 import {
   FIXTURE,
   futureDateString,
+  generateResponseToken,
   resetDisposablePersona,
   seedServiceWeek,
   teardownFixtures,
@@ -158,13 +159,25 @@ test.describe("guest invitation", () => {
         .single();
       expect(acceptedInvitation?.status).toBe("accepted");
 
-      // Failure/edge case: re-claiming the same token from the guest session
-      // is a 409 CONFLICT (claim_guest_invitation's ALREADY_CLAIMED branch —
-      // app/api/invitations/handler.ts claimGuestInvitation).
+      // Edge case: re-claiming the same token from the SAME Clerk session is
+      // idempotent. claim_guest_invitation step 4 (20260805000001_guest_
+      // invitation_flow.sql ~lines 131-139) returns already_claimed = true
+      // before the step-6 ALREADY_CLAIMED raise, so the handler responds 201.
       const reclaimRes = await guestPage.request.post("/api/invitations/guest/claim", {
         data: { responseToken },
       });
-      expect(reclaimRes.status()).toBe(409);
+      expect(reclaimRes.status()).toBe(201);
+      const reclaimBody = await reclaimRes.json();
+      expect(reclaimBody.data.alreadyClaimed).toBe(true);
+      expect(reclaimBody.data.invitationId).toBe(invitationId);
+      expect(reclaimBody.data.guest.userId).toBe(guestUserId);
+
+      // Failure case: a schema-valid (64 hex) token that matches no invitation
+      // reaches the RPC's step-2 NOT_FOUND and returns 404 (not a 400).
+      const unknownTokenRes = await guestPage.request.post("/api/invitations/guest/claim", {
+        data: { responseToken: generateResponseToken() },
+      });
+      expect(unknownTokenRes.status()).toBe(404);
     } finally {
       try {
         await adminContext?.close();

@@ -17,8 +17,9 @@ import { signInAsEmail } from "./support/auth";
 // E2E_ADMIN_EMAIL/E2E_MEMBER_EMAIL fixture (tests/e2e/support/fixtures.ts),
 // because create_church_group/join_church_group both 409
 // USER_ALREADY_IN_GROUP for any Clerk identity that already has a `users`
-// row (see .pipeline/spec.md OQ1, resolved by provisioning
-// E2E_SETUP_ADMIN_EMAIL / E2E_GUEST_EMAIL as GitHub Actions secrets).
+// row. This test requires the two disposable staging Clerk personas
+// E2E_SETUP_ADMIN_EMAIL and E2E_GUEST_EMAIL (see
+// documentation/staging-environment.md §7), and skips when they are absent.
 test.describe("admin week setup flow", () => {
   test.skip(
     !e2eDisposablePersonasEnabled,
@@ -91,6 +92,7 @@ test.describe("admin week setup flow", () => {
         .single();
       const joinerUserId = joinerRow?.id as string;
       const joinerName = joinerRow?.name as string;
+      expect(joinerName).toBeTruthy();
       expect(joinerUserId).toBeTruthy();
 
       const serviceDate = futureDateString(10);
@@ -162,7 +164,10 @@ test.describe("admin week setup flow", () => {
       // no invitation for their own week either), so scope to the joiner's
       // roster slot by their name (the div containing the name span and the
       // button — see week-view.tsx's rosterSlot layout).
-      const joinerRosterSlot = adminPage.getByText(joinerName, { exact: true }).locator("..");
+      const joinerRosterSlot = adminPage
+        .locator('[class*="rosterSlot"]')
+        .filter({ has: adminPage.getByText(joinerName, { exact: true }) });
+      await expect(joinerRosterSlot).toHaveCount(1);
       await joinerRosterSlot.getByRole("button", { name: "+ Invite" }).click();
       await expect(joinerRosterSlot.getByText("Pending", { exact: true })).toBeVisible();
 
