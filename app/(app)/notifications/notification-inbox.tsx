@@ -11,6 +11,11 @@ import {
   type NotificationFilter,
 } from "@/lib/notifications/inbox-links";
 import { notifyUnreadChanged } from "@/components/layout/NotificationBell";
+import { Button } from "@/components/ui/Button";
+import { Icon, type IconName } from "@/components/ui/Icon";
+import { Page, PageHeader } from "@/components/ui/Page";
+import { EmptyState, ErrorAlert, ErrorState, LoadingState } from "@/components/ui/States";
+import { useToast } from "@/components/ui/Toast";
 import styles from "./notification-inbox.module.css";
 
 // Data shape returned by GET /api/notifications, wrapped in { data }
@@ -30,26 +35,28 @@ type NotificationRow = {
 
 type ViewState = "loading" | "ready" | "error";
 
-const ICON_BY_TYPE: Record<NotificationType, string> = {
-  set_invitation: "📩",
-  invitation_reminder: "⏰",
-  invitation_accepted: "✅",
-  invitation_denied: "❌",
-  invitation_withdrawn: "↩️",
-  practice_reminder: "⏰",
-  setlist_released: "🎵",
-  scheduling_conflict: "⚠️",
-  chat_mention: "💬",
-  devotion_shared: "📖",
-  new_church_document: "📄",
-  google_calendar_event: "📅",
-  service_week_cancelled: "🚫",
-  service_week_reactivated: "🔁",
-  google_calendar_reauth_required: "🔒",
+type Tone = "info" | "success" | "warning" | "danger";
+
+const ICON_BY_TYPE: Record<NotificationType, { icon: IconName; tone: Tone }> = {
+  set_invitation: { icon: "mail", tone: "warning" },
+  invitation_reminder: { icon: "clock", tone: "warning" },
+  invitation_accepted: { icon: "checkCircle", tone: "success" },
+  invitation_denied: { icon: "x", tone: "danger" },
+  invitation_withdrawn: { icon: "undo", tone: "info" },
+  practice_reminder: { icon: "clock", tone: "info" },
+  setlist_released: { icon: "music", tone: "info" },
+  scheduling_conflict: { icon: "alert", tone: "danger" },
+  chat_mention: { icon: "chat", tone: "info" },
+  devotion_shared: { icon: "book", tone: "info" },
+  new_church_document: { icon: "file", tone: "info" },
+  google_calendar_event: { icon: "calendar", tone: "info" },
+  service_week_cancelled: { icon: "ban", tone: "danger" },
+  service_week_reactivated: { icon: "refresh", tone: "success" },
+  google_calendar_reauth_required: { icon: "lock", tone: "warning" },
 };
 
-function iconForType(type: NotificationType): string {
-  return ICON_BY_TYPE[type] ?? "🔔";
+function iconForType(type: NotificationType): { icon: IconName; tone: Tone } {
+  return ICON_BY_TYPE[type] ?? { icon: "bell", tone: "info" };
 }
 
 export default function NotificationInbox() {
@@ -59,6 +66,8 @@ export default function NotificationInbox() {
   const [filter, setFilter] = useState<NotificationFilter>("all");
   const [markingAll, setMarkingAll] = useState(false);
   const [markAllError, setMarkAllError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const { toast } = useToast();
 
   useEffect(() => {
     let cancelled = false;
@@ -88,7 +97,7 @@ export default function NotificationInbox() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reloadKey]);
 
   const hasUnread = notifications.some((n) => !n.isRead);
 
@@ -105,6 +114,7 @@ export default function NotificationInbox() {
       }
       setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
       notifyUnreadChanged();
+      toast("All notifications marked as read");
     } catch {
       setMarkAllError("Something went wrong. Please try again.");
     } finally {
@@ -125,44 +135,48 @@ export default function NotificationInbox() {
 
   if (view === "loading") {
     return (
-      <main className={styles.container}>
-        <p>Loading…</p>
-      </main>
+      <Page>
+        <LoadingState cards={3} />
+      </Page>
     );
   }
 
   if (view === "error") {
     return (
-      <main className={styles.container}>
-        <h1>Something went wrong</h1>
-        <p>Please try again later.</p>
-      </main>
+      <Page>
+        <ErrorState
+          onRetry={() => {
+            setView("loading");
+            setReloadKey((k) => k + 1);
+          }}
+        />
+      </Page>
     );
   }
 
   const visible = notifications.filter((n) => matchesFilter(n.type, filter));
   const activeFilterLabel =
     NOTIFICATION_FILTERS.find((f) => f.id === filter)?.label ?? "All";
+  const unreadCount = notifications.filter((n) => !n.isRead).length;
 
   return (
-    <main className={styles.container}>
-      <div className={styles.header}>
-        <h1>Notifications</h1>
-        <button
-          type="button"
+    <Page>
+      <PageHeader
+        title="Notifications"
+        subtitle={unreadCount > 0 ? `${unreadCount} unread` : "You're all caught up"}
+      >
+        <Button
+          variant="secondary"
           onClick={handleMarkAllRead}
           disabled={markingAll || !hasUnread}
+          loading={markingAll}
         >
           {markingAll ? "Marking…" : "Mark all read"}
-        </button>
-      </div>
-      {markAllError ? (
-        <p role="alert" className={styles.error}>
-          {markAllError}
-        </p>
-      ) : null}
+        </Button>
+      </PageHeader>
+      {markAllError ? <ErrorAlert>{markAllError}</ErrorAlert> : null}
 
-      <nav className={styles.filters}>
+      <div className={styles.filters} role="group" aria-label="Filter notifications">
         {NOTIFICATION_FILTERS.map((f) => (
           <button
             key={f.id}
@@ -176,32 +190,35 @@ export default function NotificationInbox() {
             {f.label}
           </button>
         ))}
-      </nav>
+      </div>
 
       {total === 0 ? (
-        <p className={styles.empty}>No notifications yet.</p>
+        <EmptyState icon="bell" compact={false} title="No notifications yet.">
+          Invitations, setlists and schedule changes will show up here.
+        </EmptyState>
       ) : visible.length === 0 ? (
-        <p className={styles.empty}>No {activeFilterLabel} notifications.</p>
+        <EmptyState icon="bell" title={`No ${activeFilterLabel} notifications.`} />
       ) : (
         <ul className={styles.list}>
           {visible.map((row) => {
             const href = resolveNotificationHref(row.linkEntityType, row.linkEntityId);
             const rowClassName = `${styles.card} ${row.isRead ? "" : styles.unread}`;
+            const { icon, tone } = iconForType(row.type);
             const content = (
               <>
-                <span className={styles.icon} aria-hidden="true">
-                  {iconForType(row.type)}
+                <span className={`${styles.icon} ${styles[tone]}`}>
+                  <Icon name={icon} />
                 </span>
-                <span>
-                  <span>{row.title}</span>
-                  {!row.isRead ? (
-                    <span className={styles.srOnly}>Unread</span>
-                  ) : null}
+                <span className={styles.text}>
+                  <span className={styles.title}>{row.title}</span>
+                  {!row.isRead ? <span className="sr-only">Unread</span> : null}
                   {row.body !== null ? <span className={styles.body}>{row.body}</span> : null}
                   <time className={styles.timestamp} dateTime={row.createdAt}>
                     {formatRelativeTime(row.createdAt)}
                   </time>
                 </span>
+                {!row.isRead ? <span className={styles.dot} aria-hidden="true" /> : null}
+                {href ? <Icon name="chevronRight" className={styles.chevron} /> : null}
               </>
             );
 
@@ -235,6 +252,6 @@ export default function NotificationInbox() {
           Showing the {notifications.length} most recent of {total} notifications.
         </p>
       ) : null}
-    </main>
+    </Page>
   );
 }

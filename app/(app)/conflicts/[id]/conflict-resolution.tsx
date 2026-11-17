@@ -1,8 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
-import { Button } from "@/components/ui/Button";
+import { Avatar } from "@/components/ui/Avatar";
+import { Badge } from "@/components/ui/Badge";
+import { Button, ButtonLink } from "@/components/ui/Button";
+import { Card } from "@/components/ui/Card";
+import { Icon } from "@/components/ui/Icon";
+import { Page } from "@/components/ui/Page";
+import { ErrorAlert, LoadingState, NoticeState, SuccessState } from "@/components/ui/States";
+import { formatServiceDate } from "@/lib/format/dates";
 import styles from "./conflict-resolution.module.css";
 
 // Data shape returned by GET /api/conflicts, wrapped in { data } (types/api.ts).
@@ -21,26 +27,21 @@ type ViewState = "loading" | "ready" | "unavailable" | "resolved-success";
 
 type Resolution = "member_reconfirmed" | "admin_dismissed";
 
-function formatServiceDate(dateStr: string): string {
-  const date = new Date(`${dateStr}T00:00:00`);
-  return date.toLocaleDateString(undefined, {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-}
-
 export default function ConflictResolution({ conflictId }: { conflictId: string }) {
   const [view, setView] = useState<ViewState>("loading");
   const [conflict, setConflict] = useState<Conflict | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // Which of the two resolve buttons is in flight, so only that one spins.
+  const [pending, setPending] = useState<Resolution | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
+      setLoadFailed(false);
       try {
         const res = await fetch("/api/conflicts");
         const body = await res.json();
@@ -62,6 +63,7 @@ export default function ConflictResolution({ conflictId }: { conflictId: string 
         setView("ready");
       } catch {
         if (!cancelled) {
+          setLoadFailed(true);
           setView("unavailable");
         }
       }
@@ -71,11 +73,12 @@ export default function ConflictResolution({ conflictId }: { conflictId: string 
     return () => {
       cancelled = true;
     };
-  }, [conflictId]);
+  }, [conflictId, reloadKey]);
 
   async function resolve(resolution: Resolution) {
     if (submitting) return;
     setSubmitting(true);
+    setPending(resolution);
     setActionError(null);
 
     try {
@@ -100,39 +103,58 @@ export default function ConflictResolution({ conflictId }: { conflictId: string 
       setActionError("Something went wrong. Please try again.");
     } finally {
       setSubmitting(false);
+      setPending(null);
     }
   }
 
+  const backLink = (
+    <ButtonLink href="/conflicts" variant="secondary">
+      Back to conflicts
+    </ButtonLink>
+  );
+
   if (view === "loading") {
     return (
-      <main className={styles.container}>
-        <p>Loading…</p>
-      </main>
+      <Page width="narrow">
+        <LoadingState cards={1} />
+      </Page>
     );
   }
 
   if (view === "unavailable") {
     return (
-      <main className={styles.container}>
-        <h1>This conflict has been resolved or no longer exists.</h1>
-        <Link className={styles.appLink} href="/conflicts">
-          Back to conflicts
-        </Link>
-      </main>
+      <Page width="narrow">
+        <NoticeState
+          icon="checkCircle"
+          tone="info"
+          title="This conflict has been resolved or no longer exists."
+          actions={
+            <>
+              {loadFailed ? (
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setView("loading");
+                    setReloadKey((k) => k + 1);
+                  }}
+                >
+                  <Icon name="refresh" size={18} />
+                  Try again
+                </Button>
+              ) : null}
+              {backLink}
+            </>
+          }
+        />
+      </Page>
     );
   }
 
   if (view === "resolved-success") {
     return (
-      <main className={styles.container}>
-        <p className={styles.checkmark} aria-hidden="true">
-          ✓
-        </p>
-        <h1>Conflict resolved</h1>
-        <Link className={styles.appLink} href="/conflicts">
-          Back to conflicts
-        </Link>
-      </main>
+      <Page width="narrow">
+        <SuccessState title="Conflict resolved" actions={backLink} />
+      </Page>
     );
   }
 
@@ -140,11 +162,25 @@ export default function ConflictResolution({ conflictId }: { conflictId: string 
   if (!conflict) return null;
 
   return (
-    <main className={styles.container}>
-      <div className={styles.card}>
-        <h1>{conflict.serviceWeekTitle ?? "Service"}</h1>
-        <p className={styles.date}>{formatServiceDate(conflict.serviceDate)}</p>
-        <p>{conflict.memberName}</p>
+    <Page width="narrow">
+      <ButtonLink href="/conflicts" variant="ghost" size="sm" className={styles.back}>
+        <Icon name="chevronLeft" size={18} />
+        All conflicts
+      </ButtonLink>
+
+      <Card as="section" aria-labelledby="conflict-title">
+        <p className={styles.badgeRow}>
+          <Badge tone="danger">Scheduling conflict</Badge>
+        </p>
+        <h1 id="conflict-title">{conflict.serviceWeekTitle ?? "Service"}</h1>
+        <p className={styles.date}>
+          <Icon name="calendar" size={18} />
+          {formatServiceDate(conflict.serviceDate)}
+        </p>
+        <p className={styles.member}>
+          <Avatar name={conflict.memberName} />
+          <span>{conflict.memberName}</span>
+        </p>
         {conflict.roleNote ? (
           <p className={styles.roleNote}>
             <strong>Original role:</strong> {conflict.roleNote}
@@ -155,40 +191,56 @@ export default function ConflictResolution({ conflictId }: { conflictId: string 
             <strong>Reason:</strong> {conflict.triggerReason}
           </p>
         ) : null}
-      </div>
+      </Card>
 
-      {actionError ? (
-        <p role="alert" className={styles.error}>
-          {actionError}
-        </p>
-      ) : null}
+      {actionError ? <ErrorAlert>{actionError}</ErrorAlert> : null}
 
       {/* Phase 4 (out of scope): AI-suggested replacement renders here */}
 
       <div className={styles.buttonRow}>
-        <a
-          className={styles.replacementLink}
+        <ButtonLink
+          variant="accent"
+          size="lg"
+          fullWidth
           href={`/invitations/new?serviceWeekId=${conflict.serviceWeekId}&roleNote=${encodeURIComponent(
             conflict.roleNote ?? "",
           )}`}
         >
           Find a Replacement
-        </a>
-        <Button
-          variant="primary"
-          onClick={() => resolve("member_reconfirmed")}
-          disabled={submitting}
-        >
-          {submitting ? "Submitting…" : "Mark as Resolved"}
-        </Button>
-        <Button
-          variant="secondary"
-          onClick={() => resolve("admin_dismissed")}
-          disabled={submitting}
-        >
-          {submitting ? "Submitting…" : "Dismiss"}
-        </Button>
+        </ButtonLink>
+        <div>
+          <Button
+            variant="primary"
+            size="lg"
+            fullWidth
+            onClick={() => resolve("member_reconfirmed")}
+            disabled={submitting}
+            loading={pending === "member_reconfirmed"}
+            aria-describedby="resolve-hint"
+          >
+            {submitting ? "Submitting…" : "Mark as Resolved"}
+          </Button>
+          <p id="resolve-hint" className={styles.hint}>
+            The member has confirmed they can still serve.
+          </p>
+        </div>
+        <div>
+          <Button
+            variant="secondary"
+            size="lg"
+            fullWidth
+            onClick={() => resolve("admin_dismissed")}
+            disabled={submitting}
+            loading={pending === "admin_dismissed"}
+            aria-describedby="dismiss-hint"
+          >
+            {submitting ? "Submitting…" : "Dismiss"}
+          </Button>
+          <p id="dismiss-hint" className={styles.hint}>
+            Close this conflict without changing the roster.
+          </p>
+        </div>
       </div>
-    </main>
+    </Page>
   );
 }

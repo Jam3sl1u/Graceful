@@ -1,33 +1,21 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Link from "next/link";
-import { Button } from "@/components/ui/Button";
-import type { EventType, InvitationStatus } from "@/types/domain";
+import {
+  InvitationView,
+  type InvitationLookup,
+  type InvitationViewState,
+} from "@/components/invitations/InvitationView";
+import type { InvitationStatus } from "@/types/domain";
 import { notifyUnreadChanged } from "@/components/layout/NotificationBell";
-import styles from "./invitation-response.module.css";
 
 // Data shape returned by GET /api/invitations/:id, wrapped in { data }
 // (types/api.ts). Mirrors PublicInvitationLookup (app/api/invitations/
 // handler.ts) — the same contract the public, token-gated
 // app/(public)/invite/[token]/invite-response.tsx uses.
-type Lookup = {
-  invitationId: string;
-  status: InvitationStatus;
-  roleNote: string | null;
-  responseDeadline: string | null;
-  serviceWeek: { id: string; serviceDate: string; title: string | null };
-  events: Array<{
-    id: string;
-    type: EventType;
-    name: string;
-    location: string | null;
-    startTime: string;
-    endTime: string;
-  }>;
-};
+type Lookup = InvitationLookup;
 
-type ViewState = "loading" | "ready" | "unavailable" | "accepted-success" | "declined-success";
+type ViewState = InvitationViewState;
 
 // Terminal statuses the lookup/accept/deny calls can report, keyed to a
 // friendly message — never surfaced as a raw error/code/status (mirrors
@@ -69,23 +57,6 @@ function isInvitationActionResult(value: unknown): value is InvitationActionResu
   );
 }
 
-function formatServiceDate(dateStr: string): string {
-  const date = new Date(`${dateStr}T00:00:00`);
-  return date.toLocaleDateString(undefined, {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-}
-
-function formatTimeRange(startTime: string, endTime: string): string {
-  const timeOpts: Intl.DateTimeFormatOptions = { hour: "numeric", minute: "2-digit" };
-  const start = new Date(startTime).toLocaleTimeString(undefined, timeOpts);
-  const end = new Date(endTime).toLocaleTimeString(undefined, timeOpts);
-  return `${start}–${end}`;
-}
-
 export default function InvitationResponse({ invitationId }: { invitationId: string }) {
   const [view, setView] = useState<ViewState>("loading");
   const [unavailableReason, setUnavailableReason] = useState<UnavailableReason>("not-found");
@@ -95,11 +66,15 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
   const [actionError, setActionError] = useState<string | null>(null);
   const [showDeclineForm, setShowDeclineForm] = useState(false);
   const [reason, setReason] = useState("");
+  // Bumped by "Try again" to re-run the lookup effect.
+  const [reloadKey, setReloadKey] = useState(0);
+  const [lookupFailed, setLookupFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
+      setLookupFailed(false);
       try {
         const res = await fetch(`/api/invitations/${invitationId}`);
         const body = await res.json();
@@ -123,6 +98,7 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
         setView("ready");
       } catch {
         if (!cancelled) {
+          setLookupFailed(true);
           setUnavailableReason("not-found");
           setView("unavailable");
         }
@@ -133,7 +109,7 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
     return () => {
       cancelled = true;
     };
-  }, [invitationId]);
+  }, [invitationId, reloadKey]);
 
   async function handleAccept() {
     if (!invitation || submitting) return;
@@ -251,115 +227,32 @@ export default function InvitationResponse({ invitationId }: { invitationId: str
 
   const appLink = serviceWeekId ? `/member-week/${serviceWeekId}` : "/notifications";
 
-  if (view === "loading") {
-    return (
-      <main className={styles.container}>
-        <p>Loading…</p>
-      </main>
-    );
-  }
-
-  if (view === "unavailable") {
-    return (
-      <main className={styles.container}>
-        <h1>{UNAVAILABLE_MESSAGES[unavailableReason]}</h1>
-        <Link className={styles.appLink} href={appLink}>
-          Go to the app
-        </Link>
-      </main>
-    );
-  }
-
-  if (view === "accepted-success" || view === "declined-success") {
-    return (
-      <main className={styles.container}>
-        <p className={styles.checkmark} aria-hidden="true">
-          ✓
-        </p>
-        <h1>{view === "accepted-success" ? "You're on the schedule" : "Response recorded"}</h1>
-        <Link className={styles.appLink} href={appLink}>
-          Go to the app
-        </Link>
-      </main>
-    );
-  }
-
-  // ready
-  if (!invitation) return null;
-
   return (
-    <main className={styles.container}>
-      <div className={styles.card}>
-        <h1>{invitation.serviceWeek.title ?? "Service"}</h1>
-        <p className={styles.date}>{formatServiceDate(invitation.serviceWeek.serviceDate)}</p>
-        {invitation.roleNote ? (
-          <p className={styles.roleNote}>
-            <strong>Your role:</strong> {invitation.roleNote}
-          </p>
-        ) : null}
-
-        <div className={styles.events}>
-          {invitation.events.length === 0 ? (
-            <p>Details coming soon</p>
-          ) : (
-            invitation.events.map((event) => (
-              <div key={event.id} className={styles.eventRow}>
-                <p className={styles.eventName}>{event.name}</p>
-                <p className={styles.eventTime}>{formatTimeRange(event.startTime, event.endTime)}</p>
-                {event.location ? <p className={styles.eventLocation}>{event.location}</p> : null}
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-
-      {actionError ? (
-        <p role="alert" className={styles.error}>
-          {actionError}
-        </p>
-      ) : null}
-
-      {!showDeclineForm ? (
-        <div className={styles.buttonRow}>
-          <Button
-            variant="primary"
-            className={styles.acceptButton}
-            onClick={handleAccept}
-            disabled={submitting}
-          >
-            {submitting ? "Accepting…" : "Accept"}
-          </Button>
-          <Button variant="secondary" onClick={() => setShowDeclineForm(true)} disabled={submitting}>
-            Decline
-          </Button>
-        </div>
-      ) : (
-        <div className={styles.declineForm}>
-          <label htmlFor="decline-reason">Reason (optional)</label>
-          <textarea
-            id="decline-reason"
-            maxLength={200}
-            value={reason}
-            onChange={(e) => setReason(e.target.value)}
-            disabled={submitting}
-          />
-          <div className={styles.buttonRow}>
-            <Button variant="primary" onClick={handleDeclineConfirm} disabled={submitting}>
-              {submitting ? "Submitting…" : "Confirm decline"}
-            </Button>
-            <Button
-              variant="secondary"
-              onClick={() => {
-                setShowDeclineForm(false);
-                setReason("");
-              }}
-              disabled={submitting}
-            >
-              Keep it
-            </Button>
-          </div>
-        </div>
-      )}
-    </main>
+    <InvitationView
+      view={view}
+      invitation={invitation}
+      unavailableMessage={UNAVAILABLE_MESSAGES[unavailableReason]}
+      onRetry={
+        lookupFailed
+          ? () => {
+              setView("loading");
+              setReloadKey((k) => k + 1);
+            }
+          : undefined
+      }
+      appLink={appLink}
+      actionError={actionError}
+      submitting={submitting}
+      showDeclineForm={showDeclineForm}
+      reason={reason}
+      onReasonChange={setReason}
+      onAccept={handleAccept}
+      onShowDecline={() => setShowDeclineForm(true)}
+      onCancelDecline={() => {
+        setShowDeclineForm(false);
+        setReason("");
+      }}
+      onConfirmDecline={handleDeclineConfirm}
+    />
   );
 }
