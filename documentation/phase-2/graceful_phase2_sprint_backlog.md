@@ -26,6 +26,7 @@ Status: **draft for approval.** Nothing has been created on GitHub.
 | PWA manifest + install prompt, but **no service worker** | `app/manifest.ts`, `lib/pwa/install.ts` | P2-23 adds the first service worker. |
 | No Supabase Realtime usage, no browser-side Supabase client, no push library | repo-wide grep | P2-06 and P2-17 introduce them. |
 | Multi-admin support (PRD §11.1 "Multiple admins", marked Ph.2) | Phase 1 issue 18 | **Already shipped — no Phase 2 issue.** |
+| No i18n string file (`en.json`) exists, although PRD §28.4 calls for one | repo-wide | Phase 2 screens follow the Phase 1 inline-string convention; extracting strings would be a Phase 1 refactor and is **not** in this backlog. |
 | Load runner is a custom Bun script, not k6 | `tests/load/` | P2-31 adds a scenario to it rather than a new tool. |
 
 ## Decisions I need from you before Step 2
@@ -74,7 +75,7 @@ Reuse the existing `type:feature`, `type:security`, `type:infra`, `type:chore`, 
 | P2-04 | @mention parsing and chat notifications | `type:feature` `area:chat` `area:notifications` | On send: resolve mentions against room members only, write `chat_mentions`, create a `chat_mention` inbox row for each mentioned user **regardless of `chat_preference`**; per D5 create `chat_message` rows for `all`-preference members (new enum value). Never notify the sender. Deep-link to the room. PRD §15.1, §14 "Chat mention", §20.7. |
 | P2-05 | Chat notification preference — all vs mentions only | `type:feature` `area:notifications` | Expose `chat_preference` in `GET/PUT /api/notifications/preferences` (currently deliberately omitted) with Zod enum validation, and add the control to the preferences UI. Default stays `mentions`. BR-14 logic untouched. PRD §14.1, §15.1. |
 | P2-06 | Realtime delivery | `type:feature` `area:chat` | Per D1: add `chat_messages` to the realtime publication, a browser Supabase client that carries the Clerk JWT (anon key only — `check:service-role` must still pass), and a `useChatMessages` hook with reconnect + gap backfill through the REST endpoint. CSP `connect-src` updated for `wss:`. PRD §26.6 (500 ms p95), §19. |
-| P2-07 | Week Chat screen | `type:screen` `area:chat` | Mobile-first room view: message list, composer with character counter and mention autocomplete, archived read-only state, empty state. New messages announced through an ARIA live region (A-07); icon buttons labelled (A-03); 44 px targets (A-08). Entry points from Week View and Member Week View. Strings in the i18n file. PRD §15.1, §28.3. |
+| P2-07 | Week Chat screen | `type:screen` `area:chat` | Mobile-first room view: message list, composer with character counter and mention autocomplete, archived read-only state, empty state. New messages announced through an ARIA live region (A-07); icon buttons labelled (A-03); 44 px targets (A-08). Entry points from Week View and Member Week View. PRD §15.1, §28.3. |
 | P2-08 | Admin broadcast pin | `type:feature` `area:chat` | `PUT`/`DELETE /api/chat-rooms/:id/pin` (admin / set leader only, message must belong to the room, audit-logged) and a pinned banner at the top of the chat screen. One pin per room. PRD §15.1 "Admin broadcast pin". |
 
 ---
@@ -170,7 +171,7 @@ Issues in the same batch are independent of each other and can run in parallel. 
 | 10 | P2-28, P2-29, P2-30 | |
 | 11 | P2-31, P2-32 | Gate closes here. |
 
-Shared-file hot spots that cause conflicts between parallel PRs: `lib/supabase/types.ts`, `types/domain`, `tests/support/admin-route-registry.ts`, `lib/security/csp.ts`, `.env.example`.
+Shared-file hot spots that cause conflicts between parallel PRs: `lib/supabase/types.ts`, `types/domain.ts`, `tests/support/admin-route-registry.ts`, `lib/security/csp.ts`, `.env.example`.
 
 If the usage budget runs short, the natural stopping points are after batch 5 (core collab features) and after batch 7 (everything except push, offline, polish and the gate).
 
