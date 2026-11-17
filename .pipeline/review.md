@@ -1,44 +1,92 @@
-# Review — Issue #82 (re-run after remediation b08a3e1 + doc fix e7d2a38)
+# Review — Issue #208 (P2-01 chat tables + RLS)
 
 VERDICT: NEEDS WORK
 
-## Scope reviewed
-- All four `.pipeline/` artifacts. `spec.md` and `test-results.md` are uncommitted working-tree edits from this run. That is expected.
-- The full branch diff `git diff main...HEAD` covers ci.yml, staging-environment.md, the three new specs, and support/{auth,env,fixtures}.ts. I reviewed all of it, not only this run's one doc edit.
-- I re-ran these myself: `bun run typecheck` and `bun run lint` are clean, and `bunx playwright test --list` finds 15 tests in 11 files. The testing stage reports Jest at 147 suites. I did not re-run Jest.
+## Scope of what was reviewed
+- Real PR diff = `origin/main...HEAD` = single commit fd1484f (10 files). NOTE: local `main` in this
+  repo is stale (b0ac73c, behind origin/main), so `git diff main...HEAD` shows 44 files, most of them
+  already-merged #82/#69/etc. work. Those are NOT part of this PR. Reviewers should diff against
+  `origin/main`.
+- Read: spec.md, changes.md, test-results.md, the new migration, types, seed/setup, both RLS test
+  files, the static unit test; cross-checked against `20260704000001_rls_policies.sql`,
+  cluster 1/3 DDL, and PRD v10 §20.7 / feature tables.
+- Re-ran myself: `bun run typecheck` (pass), `bun run lint` (pass), the new static unit test (15/15 pass).
 
-## This run's change (doc edit, e7d2a38): correct
-The new text in `documentation/staging-environment.md` §7.1 item 1 matches `resetDisposablePersona` in `tests/e2e/support/fixtures.ts`:
-- It throws on `FIXTURE.adminUserId` / `FIXTURE.memberUserId`.
-- It throws on an admin of `FIXTURE.churchGroupId`.
-- Otherwise it deletes the owned group, or just the member/guest `users` row.
+## What is good
+- Migration matches the spec almost line for line: enum, 3 tables, named char_length CHECK, circular
+  pin FK (ON DELETE SET NULL, added after both tables), both indexes, `is_chat_room_member`
+  (SECURITY DEFINER, `search_path = ''`, STABLE, COALESCE→false), RLS enabled, every policy as
+  specified, no DELETE policies, fully commented DOWN block, no `create table` phrase in comments.
+- No unqualified-column capture in correlated subqueries (checked `service_weeks`, `chat_messages`,
+  `chat_rooms`, `users` columns). No policy recursion cycle: the only cross-table policy references go
+  through the SECURITY DEFINER helper (owner bypasses RLS), consistent with the auth_* helpers.
+- Types/seed/setup changes are correct and in sync; no existing seed rows/IDs changed; applied
+  migrations untouched. Pipeline reporting is honest about what was NOT RUN.
 
-The edit stays in scope, and the OQ1 record is preserved. The previous BLOCK findings B1, B2, N1 and N2 are confirmed fixed in the code.
+## What must be fixed before SHIP
 
-## Must fix
+1. **The SQL has never been executed. Not once.** No `psql`/Postgres, `bun run test:rls` skipped all
+   12 suites, and none of the 14 chat RLS cases or the 22 cross-tenant chat cases have run. For an
+   issue whose whole deliverable is DDL + RLS behavior, "typecheck + static regex test passes" is not
+   verification. Fix: `supabase start` (CLI is at /opt/homebrew/bin/supabase, Docker is installed),
+   apply all migrations, run `bun run test:rls` with the SUPABASE_TEST_* vars, and record actual
+   pass/fail per chat case in test-results.md (keep N3 separate). If anything fails, fix the migration.
 
-### 1. `tests/e2e/guest-invitation.spec.ts` leaks `invitation_accepted` notifications into the stable admin's inbox on every run
-Both tests accept the invitation through `/invite/:token`. Test A does it at line ~203. Test B does it at line ~289 via "View your invitation" -> Accept.
+2. **The D2 membership gate can be bypassed via pre-existing `invitations_update_own`.**
+   `20260704000001_rls_policies.sql:284-287` lets an invitee UPDATE *any column* of their own
+   invitation row. WITH CHECK only pins `church_group_id` and `user_id`. Because
+   `is_chat_room_member` trusts `invitations.status = 'accepted'` and `service_week_id`, any
+   same-church user who holds any invitation row, even a denied or withdrawn one, can PATCH it
+   directly through PostgREST (URL and anon key are NEXT_PUBLIC, and the user's Clerk JWT is
+   accepted) to
+   `{status:'accepted', service_week_id:<any week>}` and read/write that week's chat. This directly
+   falsifies the spec's edge case "withdrawn invitation revokes access immediately" and the header's
+   "pending, denied and withdrawn invitees are not members". The root cause predates this PR, but
+   this PR is what turns it into a chat-confidentiality hole (same tenant only, no cross-church
+   leak). Fix (one of these; it needs an operator call because it touches the invitations table):
+   (a) in this migration, constrain invitee-side updates (for example, a BEFORE UPDATE trigger that,
+   when the caller is not leader/admin, forbids changing service_week_id/church_group_id/user_id and
+   only allows pending→accepted/denied), with RLS tests for both the withdrawn→accepted and
+   re-pointed-week attacks; or (b) have the operator explicitly accept the risk, open a tracked
+   follow-up issue, and state it in the PR body. Do not ship silently.
 
-That accept path, `supabase/migrations/20260805000001_guest_invitation_flow.sql:289-307`, inserts an `invitation_accepted` notification for `v_inv.invited_by`, which is `FIXTURE.adminUserId` in both tests. The notification has `link_entity_id = invitationId`.
+3. **`chat_messages_update_own` lets the author rewrite any column, not just soft-delete.** The spec
+   calls it "the soft-delete path", and the PRD says "Soft-delete only" and "chat messages retained
+   indefinitely". As written, an author can:
+   - overwrite `content` (for example with `''`), which destroys retained data without `is_deleted`
+   - backdate `created_at`
+   - change `kind`/`metadata`
+   - move a message to another room they belong to by changing `chat_room_id`. If that message is
+     pinned, the source room's `pinned_message_id` then points at another room's message, which
+     breaks the same-room pin invariant that `chat_rooms_update_leader_admin` enforces.
 
-`notifications.link_entity_id` has no FK. The `user_id` / `church_group_id` cascades never fire, because both rows belong to the stable fixture. Deleting the invitation or the service week does not remove the notification. So each staging run permanently adds 2 unread rows to the stable admin's inbox.
+   Fix: in the migration add
+   `REVOKE UPDATE ON public.chat_messages FROM authenticated, anon;` then
+   `GRANT UPDATE (is_deleted) ON public.chat_messages TO authenticated;`. This uses column privileges;
+   the existing repo precedent is the audit_logs REVOKE in cluster6. Add an RLS test that an author
+   UPDATE of `content` / `chat_room_id` errors or is a no-op, and a static assertion for the grant. If
+   the operator wants message editing, that is a spec change, not a default.
 
-The existing pattern already handles this. `tests/e2e/invitation-accept.spec.ts:69-73` passes `notificationLinkEntityIds: [invitationId]` for this exact reason. `notification-inbox.spec.ts` in this same diff does it too.
+4. **Test assertions that can pass without proving anything** (`tests/integration/rls/tables/chat.test.ts`):
+   - Case 12, last block: the service-client mention insert's error is ignored, and the check is
+     `expect(data ?? []).toHaveLength(0)` with no positive control. If the insert failed or the query
+     errored, it passes anyway. Assert the svc insert succeeded, and assert memberA *can* see that
+     mention before asserting memberA2 sees zero.
+   - Case 14: the errors from the pin update and the mention upsert are ignored. If either fails, the
+     circular-FK cascade (the whole point of the case) is never exercised. Assert both succeeded, and
+     read back that R5.pinned_message_id = M5 before deleting W5.
+   - Case 8 / 11: assert `error` is null on memberA's soft-delete and leaderA's first pin (11 does
+     this; 8 does not).
+   - Add the spec edge cases that are untested: a `withdrawn` invitee is not a member, and a user with
+     multiple invitations for one week (one accepted) is a member.
 
-Fix: in both `finally` blocks of `guest-invitation.spec.ts`, add `notificationLinkEntityIds: invitationId ? [invitationId] : []` to the `teardownFixtures` call:
-- Test A, line ~213
-- Test B, line ~329
-
-This is a test-only change of about two lines. Re-run lint, typecheck and `playwright test --list` afterwards.
-
-## Non-blocking notes (no action required)
-- `notification-inbox.spec.ts` uses `futureDateString(11)` in the fixture group, the same offset as `calendar-sync.spec.ts`. The suite runs with `workers: 1` and every spec tears down in `finally`. The repo already reuses offsets (accept and deny both use 3), so this is consistent with existing practice.
-- `[class*="rosterSlot"]` matches only the two `styles.rosterSlot` divs in `week-view.tsx` (lines 522 and 560). No other class contains that substring, so the `toHaveCount(1)` guard is sound.
-
-## AC 5: still unverified (human action)
-No issue #82 E2E assertion has run against staging. The new-user and week-setup tests skip until a human:
-- provisions the `E2E_SETUP_ADMIN_EMAIL` / `E2E_GUEST_EMAIL` Clerk test users, and
-- adds them as GitHub Actions secrets.
-
-The remaining tests still need a real staging run. Do not treat this branch as having met "all tests pass against staging in a single CI run" until a green CI `e2e` job with those secrets present has been observed.
+## Non-blocking notes (no change required)
+- Mentions: an author can mention a same-church user who is not a member of the room. The mention row
+  is invisible to them via RLS, but the later `chat_mention` notification dispatch must re-check
+  membership, or it will leak message content. Carry this into that issue.
+- D2 makes every admin/set_leader a member of every room. PRD §"Per-week group chat" says "all
+  confirmed members and the worship leader". This is an operator decision, so it is accepted, but it
+  is broader than the PRD's wording.
+- N3 (pre-existing PHASE1_TABLES coverage-pin failure) now drifts by 3 more tables; worth a
+  follow-up issue.
+- `.pipeline/test-results.md` is modified but uncommitted in the worktree.
