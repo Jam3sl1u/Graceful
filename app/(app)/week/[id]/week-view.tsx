@@ -1,8 +1,24 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Badge } from "@/components/ui/Badge";
-import { Button } from "@/components/ui/Button";
+import Link from "next/link";
+import { Avatar } from "@/components/ui/Avatar";
+import { Badge, type BadgeTone } from "@/components/ui/Badge";
+import { Button, ButtonLink } from "@/components/ui/Button";
+import { Card, CardHeader } from "@/components/ui/Card";
+import { InputField } from "@/components/ui/Field";
+import { Icon } from "@/components/ui/Icon";
+import { Page } from "@/components/ui/Page";
+import {
+  EmptyState,
+  ErrorAlert,
+  ErrorState,
+  LoadingState,
+  NoAccessState,
+  NoticeState,
+} from "@/components/ui/States";
+import { useToast } from "@/components/ui/Toast";
+import { formatServiceDate } from "@/lib/format/dates";
 import type { InvitationStatus } from "@/types/domain";
 import styles from "./week-view.module.css";
 
@@ -55,21 +71,9 @@ type ViewState = "loading" | "ready" | "forbidden" | "not-found" | "error";
 
 type RosterStatus = {
   label: string;
-  tone: "neutral" | "success" | "warning" | "danger";
+  tone: BadgeTone;
   showInvite: boolean;
 };
-
-// Matches formatServiceDate in invite-response.tsx exactly (local-time
-// interpretation of the YYYY-MM-DD string).
-function formatServiceDate(dateStr: string): string {
-  const date = new Date(`${dateStr}T00:00:00`);
-  return date.toLocaleDateString(undefined, {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-}
 
 // Short label for an availability-grid column header, e.g. "Mon 7/13".
 function formatShortDate(dateStr: string): string {
@@ -97,14 +101,6 @@ function getAvailabilityWindow(serviceDate: string): string[] {
     dates.push(addDaysUTC(serviceDate, n));
   }
   return dates;
-}
-
-function getInitials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return "";
-  const first = parts[0]?.[0] ?? "";
-  const last = parts.length > 1 ? (parts[parts.length - 1]?.[0] ?? "") : "";
-  return (first + last).toUpperCase();
 }
 
 // Picks the "current" invitation for a member: the WeekInvitation with the
@@ -148,7 +144,7 @@ function getRosterStatus(
 // this guest's invitation in").
 function getGuestStatusLabel(
   status: InvitationStatus,
-): { label: string; tone: "neutral" | "success" | "warning" | "danger" } {
+): { label: string; tone: BadgeTone } {
   switch (status) {
     case "accepted":
       return { label: "Confirmed", tone: "success" };
@@ -200,6 +196,8 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
   const [invitingGuest, setInvitingGuest] = useState(false);
   const [guestInviteError, setGuestInviteError] = useState<string | null>(null);
   const [guestAccountSetupUrl, setGuestAccountSetupUrl] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const { toast } = useToast();
 
   useEffect(() => {
     let cancelled = false;
@@ -294,7 +292,7 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [serviceWeekId]);
+  }, [serviceWeekId, reloadKey]);
 
   // Sends a set invitation for a roster member with no invitation yet (#40).
   // On the BR-05 double-booking 409, offers to acknowledge and retry once —
@@ -341,6 +339,7 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
           createdAt: created.createdAt,
         },
       ]);
+      toast("Invitation sent");
     } catch {
       setInviteError("Something went wrong sending the invitation. Please try again.");
     } finally {
@@ -410,6 +409,7 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
 
       setGuestEmail("");
       setGuestRoleNote("");
+      toast("Guest invited");
     } catch {
       setGuestInviteError("Something went wrong inviting the guest. Please try again.");
     } finally {
@@ -417,37 +417,57 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
     }
   }
 
+  const scheduleLink = (
+    <ButtonLink href="/dashboard" variant="secondary">
+      Back to schedule
+    </ButtonLink>
+  );
+
   if (view === "loading") {
     return (
-      <main className={styles.container}>
-        <p>Loading…</p>
-      </main>
+      <Page width="wide">
+        <LoadingState cards={3} />
+      </Page>
     );
   }
 
   if (view === "forbidden") {
     return (
-      <main className={styles.container}>
-        <h1>You don&apos;t have access to this page</h1>
-        <p>This screen is available to Set Leaders and Admins only.</p>
-      </main>
+      <Page width="wide">
+        <NoAccessState
+          actions={
+            <ButtonLink href="/notifications" variant="secondary">
+              Go to notifications
+            </ButtonLink>
+          }
+        >
+          This screen is available to Set Leaders and Admins only.
+        </NoAccessState>
+      </Page>
     );
   }
 
   if (view === "not-found") {
     return (
-      <main className={styles.container}>
-        <h1>Service week not found</h1>
-      </main>
+      <Page width="wide">
+        <NoticeState icon="calendar" tone="info" title="Service week not found" actions={scheduleLink}>
+          It may have been removed, or the link may be incomplete.
+        </NoticeState>
+      </Page>
     );
   }
 
   if (view === "error") {
     return (
-      <main className={styles.container}>
-        <h1>Something went wrong</h1>
-        <p>Please try again later.</p>
-      </main>
+      <Page width="wide">
+        <ErrorState
+          onRetry={() => {
+            setView("loading");
+            setReloadKey((k) => k + 1);
+          }}
+          actions={scheduleLink}
+        />
+      </Page>
     );
   }
 
@@ -467,18 +487,27 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
       (entry): entry is { member: DirectoryMember; invitation: WeekInvitation } =>
         entry.invitation !== undefined,
     );
+  const rosterStatuses = rosterMembers.map((member) => ({
+    member,
+    status: getRosterStatus(member.id, invitations, conflictInvitationIds),
+  }));
+  const confirmedTotal = rosterStatuses.filter((r) => r.status.label === "Confirmed").length;
 
   return (
-    <main className={styles.container}>
+    <Page width="wide">
       <header className={styles.header}>
         <div className={styles.nav}>
           {neighbors.prevId ? (
-            <a href={`/week/${neighbors.prevId}`} aria-label="Previous week">
-              ←
-            </a>
+            <Link
+              href={`/week/${neighbors.prevId}`}
+              aria-label="Previous week"
+              className={styles.navButton}
+            >
+              <Icon name="chevronLeft" />
+            </Link>
           ) : (
-            <span aria-disabled="true" className={styles.navDisabled}>
-              ←
+            <span className={`${styles.navButton} ${styles.navDisabled}`} aria-hidden="true">
+              <Icon name="chevronLeft" />
             </span>
           )}
           <div className={styles.headerTitle}>
@@ -486,12 +515,16 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
             <p className={styles.date}>{formatServiceDate(week.serviceDate)}</p>
           </div>
           {neighbors.nextId ? (
-            <a href={`/week/${neighbors.nextId}`} aria-label="Next week">
-              →
-            </a>
+            <Link
+              href={`/week/${neighbors.nextId}`}
+              aria-label="Next week"
+              className={styles.navButton}
+            >
+              <Icon name="chevronRight" />
+            </Link>
           ) : (
-            <span aria-disabled="true" className={styles.navDisabled}>
-              →
+            <span className={`${styles.navButton} ${styles.navDisabled}`} aria-hidden="true">
+              <Icon name="chevronRight" />
             </span>
           )}
         </div>
@@ -505,62 +538,62 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
 
       <div className={styles.layout}>
         <div className={styles.main}>
-          <section className={styles.card}>
-            <h2>Roster</h2>
-            {inviteError ? (
-              <p role="alert" className={styles.error}>
-                {inviteError}
-              </p>
-            ) : null}
+          <Card as="section" aria-labelledby="week-roster">
+            <CardHeader>
+              <h2 id="week-roster">Roster</h2>
+              {rosterMembers.length > 0 ? (
+                <span className={styles.summary}>
+                  {confirmedTotal} of {rosterMembers.length} confirmed
+                </span>
+              ) : null}
+            </CardHeader>
+            {inviteError ? <ErrorAlert>{inviteError}</ErrorAlert> : null}
             {rosterMembers.length === 0 ? (
-              <p>No members yet</p>
+              <EmptyState icon="users" title="No members yet">
+                Share your group&apos;s invite code so people can join.
+              </EmptyState>
             ) : (
               <div className={styles.rosterGrid}>
-                {rosterMembers.map((member) => {
-                  const status = getRosterStatus(member.id, invitations, conflictInvitationIds);
-                  return (
-                    <div key={member.id} className={styles.rosterSlot}>
-                      <span className={styles.avatar} aria-hidden="true">
-                        {getInitials(member.name)}
-                      </span>
-                      <span className={styles.memberName}>{member.name}</span>
-                      <Badge tone={status.tone}>{status.label}</Badge>
-                      {status.showInvite ? (
-                        <Button
-                          variant="secondary"
-                          type="button"
-                          className={styles.inviteButton}
-                          disabled={invitingMemberId === member.id}
-                          onClick={() => handleInvite(member.id)}
-                        >
-                          {invitingMemberId === member.id ? "Inviting…" : "+ Invite"}
-                        </Button>
-                      ) : null}
-                    </div>
-                  );
-                })}
+                {rosterStatuses.map(({ member, status }) => (
+                  <div key={member.id} className={styles.rosterSlot}>
+                    <Avatar name={member.name} />
+                    <span className={styles.memberName}>{member.name}</span>
+                    <Badge tone={status.tone}>{status.label}</Badge>
+                    {status.showInvite ? (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        className={styles.inviteButton}
+                        disabled={invitingMemberId === member.id}
+                        loading={invitingMemberId === member.id}
+                        aria-label={
+                          invitingMemberId === member.id ? undefined : `+ Invite ${member.name}`
+                        }
+                        onClick={() => handleInvite(member.id)}
+                      >
+                        {invitingMemberId === member.id ? "Inviting…" : "+ Invite"}
+                      </Button>
+                    ) : null}
+                  </div>
+                ))}
               </div>
             )}
-          </section>
+          </Card>
 
-          <section className={styles.card}>
-            <h2>Guests</h2>
-            {guestInviteError ? (
-              <p role="alert" className={styles.error}>
-                {guestInviteError}
-              </p>
-            ) : null}
+          <Card as="section" aria-labelledby="week-guests">
+            <CardHeader>
+              <h2 id="week-guests">Guests</h2>
+            </CardHeader>
+            {guestInviteError ? <ErrorAlert>{guestInviteError}</ErrorAlert> : null}
             {guestEntries.length === 0 ? (
-              <p>No guests invited for this week yet</p>
+              <p className={styles.muted}>No guests invited for this week yet</p>
             ) : (
               <div className={styles.rosterGrid}>
                 {guestEntries.map(({ member: guest, invitation }) => {
                   const guestStatus = getGuestStatusLabel(invitation.status);
                   return (
                     <div key={guest.id} className={styles.rosterSlot}>
-                      <span className={styles.avatar} aria-hidden="true">
-                        {getInitials(guest.name)}
-                      </span>
+                      <Avatar name={guest.name} />
                       <span className={styles.memberName}>{guest.name}</span>
                       <Badge tone={guestStatus.tone}>{guestStatus.label}</Badge>
                     </div>
@@ -572,107 +605,172 @@ export default function WeekView({ serviceWeekId }: { serviceWeekId: string }) {
             <form className={styles.guestForm} onSubmit={handleInviteGuest}>
               <h3>Invite a guest</h3>
               <div className={styles.guestFormRow}>
-                <input
+                <InputField
+                  label="Guest email"
                   type="email"
                   required
-                  placeholder="Guest email"
+                  autoComplete="off"
+                  inputMode="email"
+                  placeholder="name@example.com"
                   value={guestEmail}
                   onChange={(e) => setGuestEmail(e.target.value)}
-                  aria-label="Guest email"
                 />
-                <input
+                <InputField
+                  label="Role note"
+                  optional
                   type="text"
-                  placeholder="Role note (optional)"
+                  placeholder="e.g. Drums"
                   value={guestRoleNote}
                   onChange={(e) => setGuestRoleNote(e.target.value)}
-                  aria-label="Role note"
                 />
-                <Button variant="secondary" type="submit" disabled={invitingGuest}>
+                <Button
+                  variant="primary"
+                  type="submit"
+                  disabled={invitingGuest}
+                  loading={invitingGuest}
+                >
                   {invitingGuest ? "Inviting…" : "Invite guest"}
                 </Button>
               </div>
             </form>
 
             {guestAccountSetupUrl ? (
-              <p>
-                This guest needs this link to create their account (until email delivery is
-                available, #68):
-                <br />
+              <div className={styles.guestSetup} role="status">
+                <p>
+                  <strong>Send this link to your guest.</strong> They need it to create their
+                  account — it isn&apos;t emailed automatically yet.
+                </p>
                 <span className={styles.guestSetupUrl}>{guestAccountSetupUrl}</span>
-              </p>
+              </div>
             ) : null}
-          </section>
+          </Card>
 
-          <section className={styles.card}>
-            <h2>Events</h2>
-            <p>No events yet</p>
-            {/* TODO(#59): wire to GET/POST /api/events */}
-            <Button variant="secondary" type="button">
-              + Add event
-            </Button>
-          </section>
+          <Card as="section" aria-labelledby="week-events">
+            <CardHeader>
+              <h2 id="week-events">Events</h2>
+              {/* TODO(#59): wire to GET/POST /api/events */}
+              <Button variant="secondary" size="sm" disabled aria-describedby="week-events-soon">
+                + Add event
+              </Button>
+            </CardHeader>
+            <p className={styles.muted}>No events yet</p>
+            <p id="week-events-soon" className={styles.soon}>
+              Adding events from this screen isn&apos;t available yet.
+            </p>
+          </Card>
 
-          <section className={styles.card}>
-            <h2>Setlist</h2>
-            <p>0 songs</p>
-            {/* TODO(Sprint 3 #64): wire to setlist */}
-            <Button variant="secondary" type="button">
-              Edit setlist
-            </Button>
-          </section>
+          <Card as="section" aria-labelledby="week-setlist">
+            <CardHeader>
+              <h2 id="week-setlist">Setlist</h2>
+              {/* TODO(Sprint 3 #64): wire to setlist */}
+              <Button variant="secondary" size="sm" disabled aria-describedby="week-setlist-soon">
+                Edit setlist
+              </Button>
+            </CardHeader>
+            <p className={styles.muted}>0 songs</p>
+            <p id="week-setlist-soon" className={styles.soon}>
+              Opening the setlist from this screen isn&apos;t available yet.
+            </p>
+          </Card>
         </div>
 
-        <aside className={sidebarCollapsed ? styles.sidebarCollapsed : styles.sidebar}>
+        <Card
+          as="section"
+          aria-labelledby="week-availability"
+          className={sidebarCollapsed ? styles.sidebarCollapsed : styles.sidebar}
+        >
           <div className={styles.sidebarHeader}>
-            <h2>Availability</h2>
-            <button
-              type="button"
+            <h2 id="week-availability">Availability</h2>
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={() => setSidebarCollapsed((c) => !c)}
-              aria-label={sidebarCollapsed ? "Expand availability sidebar" : "Collapse availability sidebar"}
+              aria-expanded={!sidebarCollapsed}
+              aria-label={
+                sidebarCollapsed ? "Expand availability sidebar" : "Collapse availability sidebar"
+              }
             >
               {sidebarCollapsed ? "Expand" : "Collapse"}
-            </button>
+            </Button>
           </div>
           {!sidebarCollapsed ? (
             availability.length === 0 ? (
-              <p>No availability data</p>
+              <p className={styles.muted}>No availability data</p>
             ) : (
-              <div className={styles.availabilityGrid}>
-                <div className={styles.availabilityRow}>
-                  <span className={styles.availabilityMemberCell} />
-                  {availabilityWindow.map((date) => (
-                    <span key={date} className={styles.availabilityDateCell}>
-                      {formatShortDate(date)}
-                    </span>
-                  ))}
-                </div>
-                {availability.map((member) => {
-                  const entryByDate = new Map(member.entries.map((e) => [e.date, e]));
-                  return (
-                    <div key={member.userId} className={styles.availabilityRow}>
-                      <span className={styles.availabilityMemberCell}>
-                        {memberNameById.get(member.userId) ?? "Unknown"}
-                      </span>
-                      {availabilityWindow.map((date) => {
-                        const entry = entryByDate.get(date);
-                        const cellClass =
-                          entry === undefined
-                            ? styles.availabilityUnknown
-                            : entry.isAvailable
-                              ? styles.availabilityAvailable
-                              : styles.availabilityUnavailable;
+              <>
+                <div className={styles.availabilityScroll}>
+                  <table className={styles.availabilityTable}>
+                    <caption className="sr-only">
+                      Team availability for the seven days up to this service
+                    </caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">
+                          <span className="sr-only">Member</span>
+                        </th>
+                        {availabilityWindow.map((date) => (
+                          <th key={date} scope="col" className={styles.availabilityDate}>
+                            {formatShortDate(date)}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {availability.map((member) => {
+                        const entryByDate = new Map(member.entries.map((e) => [e.date, e]));
                         return (
-                          <span key={date} className={`${styles.availabilityDateCell} ${cellClass}`} />
+                          <tr key={member.userId}>
+                            <th scope="row" className={styles.availabilityMember}>
+                              {memberNameById.get(member.userId) ?? "Unknown"}
+                            </th>
+                            {availabilityWindow.map((date) => {
+                              const entry = entryByDate.get(date);
+                              const state =
+                                entry === undefined
+                                  ? { cls: styles.availabilityUnknown, label: "No answer" }
+                                  : entry.isAvailable
+                                    ? { cls: styles.availabilityAvailable, label: "Available" }
+                                    : { cls: styles.availabilityUnavailable, label: "Unavailable" };
+                              return (
+                                <td key={date}>
+                                  <span className={`${styles.availabilityCell} ${state.cls}`}>
+                                    {entry === undefined ? null : (
+                                      <Icon name={entry.isAvailable ? "check" : "x"} size={14} />
+                                    )}
+                                    <span className="sr-only">{state.label}</span>
+                                  </span>
+                                </td>
+                              );
+                            })}
+                          </tr>
                         );
                       })}
-                    </div>
-                  );
-                })}
-              </div>
+                    </tbody>
+                  </table>
+                </div>
+                <ul className={styles.legend} aria-hidden="true">
+                  <li>
+                    <span className={`${styles.availabilityCell} ${styles.availabilityAvailable}`}>
+                      <Icon name="check" size={14} />
+                    </span>
+                    Available
+                  </li>
+                  <li>
+                    <span className={`${styles.availabilityCell} ${styles.availabilityUnavailable}`}>
+                      <Icon name="x" size={14} />
+                    </span>
+                    Unavailable
+                  </li>
+                  <li>
+                    <span className={`${styles.availabilityCell} ${styles.availabilityUnknown}`} />
+                    No answer
+                  </li>
+                </ul>
+              </>
             )
           ) : null}
-        </aside>
+        </Card>
       </div>
-    </main>
+    </Page>
   );
 }
