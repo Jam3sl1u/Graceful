@@ -1,6 +1,11 @@
 "use client";
 
 import { useState } from "react";
+import { Button, ButtonLink } from "@/components/ui/Button";
+import { Card } from "@/components/ui/Card";
+import { Page } from "@/components/ui/Page";
+import { ErrorAlert, SuccessState } from "@/components/ui/States";
+import styles from "../../public-entry.module.css";
 
 // Invite-code join form (issue #25). POSTs to /api/church-group/join.
 //
@@ -38,21 +43,44 @@ export default function JoinForm({ code }: { code: string }) {
 
   if (status === "success") {
     return (
-      <main style={{ padding: "3rem 1.5rem" }}>
-        <h1>You&apos;re in!</h1>
-        <p>You have joined the church group.</p>
-      </main>
+      <Page width="narrow">
+        <SuccessState
+          title="You're in!"
+          actions={
+            <ButtonLink href="/notifications" variant="primary">
+              Open Graceful
+            </ButtonLink>
+          }
+        >
+          You have joined the church group.
+        </SuccessState>
+      </Page>
     );
   }
 
   return (
-    <main style={{ padding: "3rem 1.5rem" }}>
-      <h1>Join church group</h1>
-      <p>Invite code: {code}</p>
-      <button onClick={handleJoin} disabled={status === "submitting"}>
-        {status === "submitting" ? "Joining…" : "Join group"}
-      </button>
-      {status === "error" && error ? <p role="alert">{error}</p> : null}
-    </main>
+    <Page width="narrow">
+      <Card className={styles.card}>
+        <span className={styles.eyebrow}>You&apos;ve been invited</span>
+        <h1>Join church group</h1>
+        <p className={styles.lead}>
+          Joining lets your leaders schedule you and share setlists with you.
+        </p>
+        <p className={styles.code}>
+          Invite code: <strong>{code}</strong>
+        </p>
+        {status === "error" && error ? <ErrorAlert>{error}</ErrorAlert> : null}
+        <Button
+          variant="accent"
+          size="lg"
+          fullWidth
+          onClick={handleJoin}
+          disabled={status === "submitting"}
+          loading={status === "submitting"}
+        >
+          {status === "submitting" ? "Joining…" : "Join group"}
+        </Button>
+      </Card>
+    </Page>
   );
 }

@@ -1,6 +1,11 @@
 "use client";
 
 import { useState } from "react";
+import { Button, ButtonLink } from "@/components/ui/Button";
+import { Card } from "@/components/ui/Card";
+import { Page } from "@/components/ui/Page";
+import { ErrorAlert, SuccessState } from "@/components/ui/States";
+import styles from "../../public-entry.module.css";
 
 // Guest account-claim form (#72). POSTs to /api/invitations/guest/claim.
 // Copied almost verbatim from app/(public)/join/[code]/join-form.tsx (same
@@ -36,24 +41,41 @@ export default function GuestClaimForm({ token }: { token: string }): React.Reac
 
   if (status === "success") {
     return (
-      <main style={{ padding: "3rem 1.5rem" }}>
-        <h1>You&apos;re all set!</h1>
-        <p>Your account has been created.</p>
-        <p>
-          <a href={`/invite/${token}`}>View your invitation</a>
-        </p>
-      </main>
+      <Page width="narrow">
+        <SuccessState
+          title="You're all set!"
+          actions={
+            <ButtonLink href={`/invite/${token}`} variant="accent">
+              View your invitation
+            </ButtonLink>
+          }
+        >
+          Your account has been created.
+        </SuccessState>
+      </Page>
     );
   }
 
   return (
-    <main style={{ padding: "3rem 1.5rem" }}>
-      <h1>Finish setting up your account</h1>
-      <p>Confirm to finish creating your guest account for this invitation.</p>
-      <button onClick={handleClaim} disabled={status === "submitting"}>
-        {status === "submitting" ? "Setting up…" : "Finish setting up your account"}
-      </button>
-      {status === "error" && error ? <p role="alert">{error}</p> : null}
-    </main>
+    <Page width="narrow">
+      <Card className={styles.card}>
+        <span className={styles.eyebrow}>Guest invitation</span>
+        <h1>Finish setting up your account</h1>
+        <p className={styles.lead}>
+          Confirm to finish creating your guest account for this invitation.
+        </p>
+        {status === "error" && error ? <ErrorAlert>{error}</ErrorAlert> : null}
+        <Button
+          variant="accent"
+          size="lg"
+          fullWidth
+          onClick={handleClaim}
+          disabled={status === "submitting"}
+          loading={status === "submitting"}
+        >
+          {status === "submitting" ? "Setting up…" : "Finish setting up your account"}
+        </Button>
+      </Card>
+    </Page>
   );
 }

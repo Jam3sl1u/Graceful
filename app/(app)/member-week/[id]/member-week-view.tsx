@@ -1,7 +1,20 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Badge } from "@/components/ui/Badge";
+import { Avatar } from "@/components/ui/Avatar";
+import { Badge, type BadgeTone } from "@/components/ui/Badge";
+import { Button, ButtonLink } from "@/components/ui/Button";
+import { Card } from "@/components/ui/Card";
+import { Icon } from "@/components/ui/Icon";
+import { Modal } from "@/components/ui/Modal";
+import { Page, PageHeader } from "@/components/ui/Page";
+import { EmptyState, ErrorState, LoadingState, NoAccessState, NoticeState } from "@/components/ui/States";
+import {
+  formatEventType,
+  formatEventWhen,
+  formatFileSize,
+  formatServiceDate,
+} from "@/lib/format/dates";
 import type { EventType, InvitationStatus, VocalCapability } from "@/types/domain";
 import styles from "./member-week-view.module.css";
 
@@ -65,35 +78,16 @@ type MemberWeekViewData = {
 
 type ViewState = "loading" | "ready" | "forbidden" | "not-found" | "error";
 
-// Matches formatServiceDate in week-view.tsx exactly (local-time
-// interpretation of the YYYY-MM-DD string).
-function formatServiceDate(dateStr: string): string {
-  const date = new Date(`${dateStr}T00:00:00`);
-  return date.toLocaleDateString(undefined, {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-}
-
-function getInitials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return "";
-  const first = parts[0]?.[0] ?? "";
-  const last = parts.length > 1 ? (parts[parts.length - 1]?.[0] ?? "") : "";
-  return (first + last).toUpperCase();
-}
-
-function formatEventTime(startTime: string, endTime: string): string {
-  const start = new Date(startTime).toLocaleString();
-  const end = new Date(endTime).toLocaleString();
-  return `${start} – ${end}`;
-}
+const VOCAL_LABELS: Record<VocalCapability, string | null> = {
+  lead: "Lead vocals",
+  harmony: "Harmony vocals",
+  both: "Lead & harmony vocals",
+  none: null,
+};
 
 function confirmationBadge(status: InvitationStatus | null): {
   label: string;
-  tone: "neutral" | "success" | "warning" | "danger";
+  tone: BadgeTone;
 } {
   switch (status) {
     case "accepted":
@@ -118,6 +112,7 @@ export default function MemberWeekView({ serviceWeekId }: { serviceWeekId: strin
   const [view, setView] = useState<ViewState>("loading");
   const [data, setData] = useState<MemberWeekViewData | null>(null);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -154,39 +149,52 @@ export default function MemberWeekView({ serviceWeekId }: { serviceWeekId: strin
     return () => {
       cancelled = true;
     };
-  }, [serviceWeekId]);
+  }, [serviceWeekId, reloadKey]);
+
+  function retry() {
+    setView("loading");
+    setReloadKey((k) => k + 1);
+  }
+
+  const inboxLink = (
+    <ButtonLink href="/notifications" variant="secondary">
+      Go to notifications
+    </ButtonLink>
+  );
 
   if (view === "loading") {
     return (
-      <main className={styles.container}>
-        <p>Loading…</p>
-      </main>
+      <Page>
+        <LoadingState cards={3} />
+      </Page>
     );
   }
 
   if (view === "forbidden") {
     return (
-      <main className={styles.container}>
-        <h1>You don&apos;t have access to this week</h1>
-        <p>This screen is available to members of this church group only.</p>
-      </main>
+      <Page>
+        <NoAccessState title="You don't have access to this week" actions={inboxLink}>
+          This week belongs to a church group you&apos;re not a member of.
+        </NoAccessState>
+      </Page>
     );
   }
 
   if (view === "not-found") {
     return (
-      <main className={styles.container}>
-        <h1>Service week not found</h1>
-      </main>
+      <Page>
+        <NoticeState icon="calendar" tone="info" title="Service week not found" actions={inboxLink}>
+          It may have been removed, or the link may be incomplete.
+        </NoticeState>
+      </Page>
     );
   }
 
   if (view === "error") {
     return (
-      <main className={styles.container}>
-        <h1>Something went wrong</h1>
-        <p>Please try again later.</p>
-      </main>
+      <Page>
+        <ErrorState onRetry={retry} />
+      </Page>
     );
   }
 
@@ -201,41 +209,53 @@ export default function MemberWeekView({ serviceWeekId }: { serviceWeekId: strin
     : null;
 
   return (
-    <main className={styles.container}>
-      <header className={styles.header}>
-        <h1>{serviceWeek.title ?? "Untitled service"}</h1>
-        <p className={styles.date}>{formatServiceDate(serviceWeek.serviceDate)}</p>
-        <div className={styles.badges}>
-          <Badge tone={badge.tone}>{badge.label}</Badge>
-          {serviceWeek.isCancelled ? <Badge tone="danger">Cancelled</Badge> : null}
-        </div>
-      </header>
+    <Page>
+      <PageHeader
+        eyebrow="Your week"
+        title={serviceWeek.title ?? "Untitled service"}
+        subtitle={formatServiceDate(serviceWeek.serviceDate)}
+      >
+        <Badge tone={badge.tone}>{badge.label}</Badge>
+        {serviceWeek.isCancelled ? <Badge tone="danger">Cancelled</Badge> : null}
+      </PageHeader>
 
-      <section className={styles.card}>
-        <h2>Setlist</h2>
+      <Card as="section" aria-labelledby="mw-setlist">
+        <h2 id="mw-setlist" className={styles.cardTitle}>
+          Setlist
+        </h2>
         {setlist === null ? (
-          <p>Setlist not yet released</p>
+          <EmptyState icon="music" title="Setlist not yet released">
+            You&apos;ll get a notification as soon as it&apos;s published.
+          </EmptyState>
         ) : setlist.songs.length === 0 ? (
-          <p>No songs added yet</p>
+          <EmptyState icon="music" title="No songs added yet" />
         ) : (
           <ol className={styles.songList}>
-            {setlist.songs.map((song) => (
-              <li key={song.songId}>
-                <span className={styles.songTitle}>
-                  {song.title}
-                  {song.artist ? ` — ${song.artist}` : ""}
+            {setlist.songs.map((song, index) => (
+              <li key={song.songId} className={styles.songRow}>
+                <span className={styles.songNumber} aria-hidden="true">
+                  {index + 1}
                 </span>
-                <span className={styles.songKey}>{song.effectiveKey ?? "—"}</span>
+                <span className={styles.songText}>
+                  <span className={styles.songTitle}>{song.title}</span>
+                  {song.artist ? <span className={styles.muted}>{song.artist}</span> : null}
+                </span>
+                <span className={styles.songKey}>
+                  <span className="sr-only">Key: </span>
+                  <span>{song.effectiveKey ?? "—"}</span>
+                </span>
               </li>
             ))}
           </ol>
         )}
-      </section>
+      </Card>
 
-      <section className={styles.card}>
-        <h2>Events</h2>
+      <Card as="section" aria-labelledby="mw-events">
+        <h2 id="mw-events" className={styles.cardTitle}>
+          Events
+        </h2>
         {assignedEvents.length === 0 ? (
-          <p>You&apos;re not assigned to any events this week</p>
+          <EmptyState icon="calendar" title="You're not assigned to any events this week" />
         ) : (
           <ul className={styles.eventList}>
             {assignedEvents.map((event) => (
@@ -245,44 +265,57 @@ export default function MemberWeekView({ serviceWeekId }: { serviceWeekId: strin
                   className={styles.eventRow}
                   onClick={() => setSelectedEventId(event.id)}
                 >
-                  <span className={styles.eventName}>{event.name}</span>
-                  <span className={styles.eventTime}>
-                    {new Date(event.startTime).toLocaleString()}
+                  <span className={styles.eventText}>
+                    <span className={styles.eventName}>{event.name}</span>
+                    <span className={styles.muted}>
+                      {formatEventWhen(event.startTime, event.endTime)}
+                    </span>
                   </span>
+                  <Icon name="chevronRight" />
                 </button>
               </li>
             ))}
           </ul>
         )}
-      </section>
+      </Card>
 
-      <section className={styles.card}>
-        <h2>Team</h2>
+      <Card as="section" aria-labelledby="mw-team">
+        <h2 id="mw-team" className={styles.cardTitle}>
+          Team
+        </h2>
         {team.length === 0 ? (
-          <p>No confirmed team yet</p>
+          <EmptyState icon="users" title="No confirmed team yet">
+            Teammates appear here as they accept.
+          </EmptyState>
         ) : (
           <ul className={styles.teamList}>
-            {team.map((member) => (
-              <li key={member.userId} className={styles.teamMember}>
-                <span className={styles.avatar} aria-hidden="true">
-                  {getInitials(member.name)}
-                </span>
-                <span className={styles.memberName}>{member.name}</span>
-                <span className={styles.memberInstruments}>
-                  {member.instruments.length > 0
-                    ? member.instruments.map((i) => i.name).join(", ")
-                    : "—"}
-                </span>
-              </li>
-            ))}
+            {team.map((member) => {
+              const vocals = VOCAL_LABELS[member.vocalCapability] ?? null;
+              return (
+                <li key={member.userId} className={styles.teamMember}>
+                  <Avatar name={member.name} />
+                  <span className={styles.memberText}>
+                    <span className={styles.memberName}>{member.name}</span>
+                    {vocals ? <span className={styles.muted}>{vocals}</span> : null}
+                  </span>
+                  <span className={styles.memberInstruments}>
+                    {member.instruments.length > 0
+                      ? member.instruments.map((i) => i.name).join(", ")
+                      : "—"}
+                  </span>
+                </li>
+              );
+            })}
           </ul>
         )}
-      </section>
+      </Card>
 
-      <section className={styles.card}>
-        <h2>Documents</h2>
+      <Card as="section" aria-labelledby="mw-documents">
+        <h2 id="mw-documents" className={styles.cardTitle}>
+          Documents
+        </h2>
         {documents.length === 0 ? (
-          <p>No documents for this week&apos;s songs</p>
+          <EmptyState icon="file" title="No documents for this week's songs" />
         ) : (
           documents.map((group) => (
             <div key={group.songId} className={styles.documentGroup}>
@@ -290,8 +323,18 @@ export default function MemberWeekView({ serviceWeekId }: { serviceWeekId: strin
               <ul className={styles.fileList}>
                 {group.files.map((file) => (
                   <li key={file.id}>
-                    <a href={file.downloadUrl} target="_blank" rel="noopener noreferrer">
-                      {file.name}
+                    <a
+                      href={file.downloadUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={styles.fileLink}
+                    >
+                      <Icon name="file" size={18} />
+                      <span className={styles.fileName}>{file.name}</span>
+                      <span className={styles.fileMeta}>
+                        {formatFileSize(file.fileSizeBytes)}
+                        <span className="sr-only"> (opens in a new tab)</span>
+                      </span>
                     </a>
                   </li>
                 ))}
@@ -299,44 +342,56 @@ export default function MemberWeekView({ serviceWeekId }: { serviceWeekId: strin
             </div>
           ))
         )}
-      </section>
+      </Card>
 
-      {selectedEvent ? (
-        <div className={styles.detailOverlay}>
-          <div className={styles.detail} role="dialog" aria-label={selectedEvent.name}>
-            <button
-              type="button"
-              className={styles.detailClose}
-              aria-label="Close"
-              onClick={() => setSelectedEventId(null)}
-            >
-              ×
-            </button>
-            <h2>{selectedEvent.name}</h2>
-            <p className={styles.detailType}>{selectedEvent.type}</p>
-            <p>{formatEventTime(selectedEvent.startTime, selectedEvent.endTime)}</p>
-            {selectedEvent.notes ? <p>{selectedEvent.notes}</p> : null}
-            {selectedEvent.location ? (
-              <a
-                href={mapsUrl(selectedEvent.location)}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Open in Maps
-              </a>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-
-      <button
-        type="button"
+      <Button
+        variant="secondary"
         className={styles.chatButton}
         aria-label="Week chat (coming soon)"
         disabled
       >
-        💬
-      </button>
-    </main>
+        <Icon name="chat" size={18} />
+        <span aria-hidden="true">Week chat</span>
+        <Badge>Coming soon</Badge>
+      </Button>
+
+      <Modal
+        open={selectedEvent !== null}
+        onClose={() => setSelectedEventId(null)}
+        title={selectedEvent?.name}
+      >
+        {selectedEvent ? (
+          <div className={styles.detail}>
+            <p>
+              <Badge tone="info">{formatEventType(selectedEvent.type)}</Badge>
+            </p>
+            <p className={styles.detailRow}>
+              <Icon name="clock" size={18} />
+              {formatEventWhen(selectedEvent.startTime, selectedEvent.endTime)}
+            </p>
+            {selectedEvent.location ? (
+              <p className={styles.detailRow}>
+                <Icon name="mapPin" size={18} />
+                {selectedEvent.location}
+              </p>
+            ) : null}
+            {selectedEvent.notes ? <p className={styles.notes}>{selectedEvent.notes}</p> : null}
+            {selectedEvent.location ? (
+              <ButtonLink
+                href={mapsUrl(selectedEvent.location)}
+                target="_blank"
+                rel="noopener noreferrer"
+                variant="secondary"
+                fullWidth
+              >
+                <Icon name="external" size={18} />
+                Open in Maps
+                <span className="sr-only"> (opens in a new tab)</span>
+              </ButtonLink>
+            ) : null}
+          </div>
+        ) : null}
+      </Modal>
+    </Page>
   );
 }

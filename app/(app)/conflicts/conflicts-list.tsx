@@ -2,6 +2,13 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { Badge } from "@/components/ui/Badge";
+import { ButtonLink } from "@/components/ui/Button";
+import { interactiveCardClassName } from "@/components/ui/Card";
+import { Icon } from "@/components/ui/Icon";
+import { Page, PageHeader } from "@/components/ui/Page";
+import { EmptyState, ErrorState, LoadingState, NoAccessState } from "@/components/ui/States";
+import { formatServiceDate } from "@/lib/format/dates";
 import styles from "./conflicts-list.module.css";
 
 // Data shape returned by GET /api/conflicts, wrapped in { data } (types/api.ts).
@@ -17,21 +24,10 @@ type Conflict = {
 
 type ViewState = "loading" | "ready" | "forbidden" | "error";
 
-// Matches formatServiceDate in conflict-resolution.tsx / week-view.tsx exactly
-// (local-time interpretation of the YYYY-MM-DD string).
-function formatServiceDate(dateStr: string): string {
-  const date = new Date(`${dateStr}T00:00:00`);
-  return date.toLocaleDateString(undefined, {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-}
-
 export default function ConflictsList() {
   const [view, setView] = useState<ViewState>("loading");
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -64,58 +60,83 @@ export default function ConflictsList() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [reloadKey]);
 
   if (view === "loading") {
     return (
-      <main className={styles.container}>
-        <p>Loading…</p>
-      </main>
+      <Page>
+        <LoadingState cards={2} />
+      </Page>
     );
   }
 
   if (view === "forbidden") {
     return (
-      <main className={styles.container}>
-        <h1>You don&apos;t have access to this page</h1>
-        <p>This screen is available to Set Leaders and Admins only.</p>
-      </main>
+      <Page>
+        <NoAccessState
+          actions={
+            <ButtonLink href="/notifications" variant="secondary">
+              Go to notifications
+            </ButtonLink>
+          }
+        >
+          This screen is available to Set Leaders and Admins only.
+        </NoAccessState>
+      </Page>
     );
   }
 
   if (view === "error") {
     return (
-      <main className={styles.container}>
-        <h1>Something went wrong</h1>
-        <p>Please try again later.</p>
-      </main>
+      <Page>
+        <ErrorState
+          onRetry={() => {
+            setView("loading");
+            setReloadKey((k) => k + 1);
+          }}
+        />
+      </Page>
     );
   }
 
   // ready
   return (
-    <main className={styles.container}>
-      <h1>Conflicts</h1>
+    <Page>
+      <PageHeader
+        title="Conflicts"
+        subtitle="Confirmed members who can no longer serve on their date"
+      >
+        {conflicts.length > 0 ? <Badge tone="danger">{`${conflicts.length} open`}</Badge> : null}
+      </PageHeader>
       {conflicts.length === 0 ? (
-        <p>No open conflicts. Everything&apos;s resolved.</p>
+        <EmptyState icon="checkCircle" compact={false} title="No open conflicts. Everything's resolved." />
       ) : (
         <ul className={styles.list}>
           {conflicts.map((conflict) => (
             <li key={conflict.id}>
-              <Link href={`/conflicts/${conflict.id}`} className={styles.card}>
-                <div className={styles.cardHeader}>
-                  <span className={styles.weekTitle}>{conflict.serviceWeekTitle ?? "Service"}</span>
-                  <span className={styles.date}>{formatServiceDate(conflict.serviceDate)}</span>
+              <Link
+                href={`/conflicts/${conflict.id}`}
+                className={`${interactiveCardClassName} ${styles.card}`}
+              >
+                <span className={styles.icon}>
+                  <Icon name="alert" />
+                </span>
+                <div className={styles.cardBody}>
+                  <p className={styles.memberName}>{conflict.memberName}</p>
+                  <div className={styles.cardHeader}>
+                    <span className={styles.weekTitle}>{conflict.serviceWeekTitle ?? "Service"}</span>
+                    <span className={styles.date}>{formatServiceDate(conflict.serviceDate)}</span>
+                  </div>
+                  {conflict.triggerReason ? (
+                    <p className={styles.reason}>{conflict.triggerReason}</p>
+                  ) : null}
                 </div>
-                <p className={styles.memberName}>{conflict.memberName}</p>
-                {conflict.triggerReason ? (
-                  <p className={styles.reason}>{conflict.triggerReason}</p>
-                ) : null}
+                <Icon name="chevronRight" className={styles.chevron} />
               </Link>
             </li>
           ))}
         </ul>
       )}
-    </main>
+    </Page>
   );
 }

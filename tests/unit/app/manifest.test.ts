@@ -23,7 +23,7 @@ describe("manifest", () => {
   it("has the expected display/theme fields", () => {
     expect(result.display).toBe("standalone");
     expect(result.background_color).toBe("#ffffff");
-    expect(result.theme_color).toBe("#4f46e5");
+    expect(result.theme_color).toBe("#0b1f4b");
   });
 
   it("has all four icons, including an any-purpose SVG Chrome accepts for installability", () => {

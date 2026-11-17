@@ -2,8 +2,21 @@
 
 import { useEffect, useState, type DragEvent, type FormEvent } from "react";
 import { Badge } from "@/components/ui/Badge";
-import { Button } from "@/components/ui/Button";
+import { Button, ButtonLink } from "@/components/ui/Button";
+import { Card } from "@/components/ui/Card";
+import { InputField, SelectField, controlClassName } from "@/components/ui/Field";
+import { Icon } from "@/components/ui/Icon";
 import { Modal } from "@/components/ui/Modal";
+import { Page } from "@/components/ui/Page";
+import {
+  EmptyState,
+  ErrorAlert,
+  ErrorState,
+  LoadingState,
+  NoAccessState,
+  NoticeState,
+} from "@/components/ui/States";
+import { useToast } from "@/components/ui/Toast";
 import { SONG_KEY_OPTIONS } from "@/schemas/songs";
 import styles from "./setlist-builder.module.css";
 
@@ -63,6 +76,12 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
   const [publishModalOpen, setPublishModalOpen] = useState(false);
   const [publishError, setPublishError] = useState<string | null>(null);
   const [unlockError, setUnlockError] = useState<string | null>(null);
+  const [publishing, setPublishing] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  // Announced to screen readers after a keyboard reorder.
+  const [reorderMessage, setReorderMessage] = useState("");
+  const { toast } = useToast();
 
   useEffect(() => {
     let cancelled = false;
@@ -125,7 +144,7 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [setlistId]);
+  }, [setlistId, reloadKey]);
 
   useEffect(() => {
     const term = searchTerm.trim().toLowerCase();
@@ -313,7 +332,23 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
     void persistSongs(next);
   }
 
+  // Keyboard- and touch-accessible alternative to drag-and-drop: same
+  // persistence path (persistSongs), just a one-step move.
+  function handleMove(songId: string, direction: -1 | 1) {
+    const fromIndex = songs.findIndex((s) => s.songId === songId);
+    const toIndex = fromIndex + direction;
+    if (fromIndex === -1 || toIndex < 0 || toIndex >= songs.length) return;
+    const next = [...songs];
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, moved!);
+    const title = catalogById.get(songId)?.title ?? "Song";
+    setReorderMessage(`${title} moved to position ${toIndex + 1} of ${songs.length}`);
+    void persistSongs(next);
+  }
+
   async function handlePublish() {
+    if (publishing) return;
+    setPublishing(true);
     setPublishError(null);
     try {
       const res = await fetch(`/api/setlists/${setlistId}/publish`, { method: "POST" });
@@ -328,12 +363,17 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
       const body = await res.json();
       setMeta({ id: body.data.setlist.id, status: body.data.setlist.status });
       setPublishModalOpen(false);
+      toast("Setlist published");
     } catch {
       setPublishError("Something went wrong publishing the setlist.");
+    } finally {
+      setPublishing(false);
     }
   }
 
   async function handleUnlock() {
+    if (unlocking) return;
+    setUnlocking(true);
     setUnlockError(null);
     try {
       const res = await fetch(`/api/setlists/${setlistId}/unlock`, { method: "POST" });
@@ -345,40 +385,62 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
       setMeta({ id: body.data.setlist.id, status: body.data.setlist.status });
     } catch {
       setUnlockError("Something went wrong unlocking the setlist.");
+    } finally {
+      setUnlocking(false);
     }
   }
 
+  const scheduleLink = (
+    <ButtonLink href="/dashboard" variant="secondary">
+      Back to schedule
+    </ButtonLink>
+  );
+
   if (view === "loading") {
     return (
-      <main className={styles.container}>
-        <p>Loading…</p>
-      </main>
+      <Page width="wide">
+        <LoadingState cards={2} />
+      </Page>
     );
   }
 
   if (view === "forbidden") {
     return (
-      <main className={styles.container}>
-        <h1>You don&apos;t have access to this page</h1>
-        <p>This screen is available to Set Leaders and Admins only.</p>
-      </main>
+      <Page width="wide">
+        <NoAccessState
+          actions={
+            <ButtonLink href="/notifications" variant="secondary">
+              Go to notifications
+            </ButtonLink>
+          }
+        >
+          This screen is available to Set Leaders and Admins only.
+        </NoAccessState>
+      </Page>
     );
   }
 
   if (view === "not-found") {
     return (
-      <main className={styles.container}>
-        <h1>Setlist not found</h1>
-      </main>
+      <Page width="wide">
+        <NoticeState icon="music" tone="info" title="Setlist not found" actions={scheduleLink}>
+          It may have been removed, or the link may be incomplete.
+        </NoticeState>
+      </Page>
     );
   }
 
   if (view === "error") {
     return (
-      <main className={styles.container}>
-        <h1>Something went wrong</h1>
-        <p>Please try again later.</p>
-      </main>
+      <Page width="wide">
+        <ErrorState
+          onRetry={() => {
+            setView("loading");
+            setReloadKey((k) => k + 1);
+          }}
+          actions={scheduleLink}
+        />
+      </Page>
     );
   }
 
@@ -391,7 +453,7 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
   const songIds = new Set(songs.map((s) => s.songId));
 
   return (
-    <main className={styles.container}>
+    <Page width="wide" className={styles.page}>
       <header className={styles.header}>
         <h1>Setlist Builder</h1>
         <Badge tone={isLocked ? "success" : "neutral"}>
@@ -401,46 +463,54 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
 
       {isLocked ? (
         <div className={styles.lockedBanner}>
-          <p>This setlist is published and locked for editing.</p>
-          {unlockError ? (
-            <p role="alert" className={styles.error}>
-              {unlockError}
-            </p>
-          ) : null}
-          <Button variant="secondary" type="button" onClick={handleUnlock}>
+          <Icon name="lock" />
+          <div className={styles.lockedText}>
+            <p>This setlist is published and locked for editing.</p>
+            {unlockError ? <ErrorAlert>{unlockError}</ErrorAlert> : null}
+          </div>
+          <Button variant="secondary" onClick={handleUnlock} disabled={unlocking} loading={unlocking}>
             Unlock to edit
           </Button>
         </div>
       ) : null}
 
       <div className={styles.layout}>
-        <section className={styles.searchPanel}>
-          <h2>Song catalog</h2>
-          <input
-            type="text"
-            className={styles.searchInput}
-            placeholder="Search songs…"
-            value={searchTerm}
-            disabled={isLocked}
-            onChange={(e) => setSearchTerm(e.target.value)}
-          />
-          {addError ? (
-            <p role="alert" className={styles.error}>
-              {addError}
-            </p>
+        <Card as="section" className={styles.searchPanel} aria-labelledby="sb-catalog">
+          <h2 id="sb-catalog">Song catalog</h2>
+          <label htmlFor="sb-search" className="sr-only">
+            Search the song catalog
+          </label>
+          <div className={styles.searchWrap}>
+            <Icon name="search" size={18} className={styles.searchIcon} />
+            <input
+              id="sb-search"
+              type="search"
+              className={`${controlClassName} ${styles.searchInput}`}
+              placeholder="Search songs…"
+              value={searchTerm}
+              disabled={isLocked}
+              onChange={(e) => setSearchTerm(e.target.value)}
+            />
+          </div>
+          {addError ? <ErrorAlert>{addError}</ErrorAlert> : null}
+          {catalog.length === 0 ? (
+            <EmptyState icon="music" title="Your catalog is empty">
+              Search for a title to add your first song.
+            </EmptyState>
           ) : null}
           <ul className={styles.resultList}>
             {filteredCatalog.map((song) => (
               <li key={song.id} className={styles.resultRow}>
-                <div>
+                <div className={styles.resultText} id={`sb-catalog-${song.id}`}>
                   <span className={styles.resultTitle}>{song.title}</span>
                   {song.artist ? <span className={styles.resultArtist}> — {song.artist}</span> : null}
                   {song.defaultKey ? <span className={styles.resultKey}> ({song.defaultKey})</span> : null}
                 </div>
                 <Button
                   variant="secondary"
-                  type="button"
+                  size="sm"
                   disabled={isLocked || songIds.has(song.id)}
+                  aria-describedby={`sb-catalog-${song.id}`}
                   onClick={() => handleAdd(song.id)}
                 >
                   {songIds.has(song.id) ? "Added" : "Add"}
@@ -452,157 +522,180 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
           {showQuickAdd ? (
             <form className={styles.quickAddForm} onSubmit={handleQuickAdd}>
               <h3>Add a new song</h3>
-              {quickAddError ? (
-                <p role="alert" className={styles.error}>
-                  {quickAddError}
-                </p>
-              ) : null}
-              <label>
-                Title
-                <input
-                  type="text"
-                  required
-                  value={quickAddTitle}
-                  disabled={isLocked}
-                  onChange={(e) => {
-                    setQuickAddTitle(e.target.value);
-                    setQuickAddTitleDirty(true);
-                  }}
-                />
-              </label>
-              <label>
-                Artist
-                <input
-                  type="text"
-                  value={quickAddArtist}
-                  disabled={isLocked}
-                  onChange={(e) => setQuickAddArtist(e.target.value)}
-                />
-              </label>
-              <label>
-                Key
-                <select
-                  value={quickAddKey}
-                  disabled={isLocked}
-                  onChange={(e) => setQuickAddKey(e.target.value)}
-                >
-                  <option value="">— none —</option>
-                  {SONG_KEY_OPTIONS.map((key) => (
-                    <option key={key} value={key}>
-                      {key}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <p className={styles.muted}>Nothing in the catalog matches. Create it here.</p>
+              {quickAddError ? <ErrorAlert>{quickAddError}</ErrorAlert> : null}
+              <InputField
+                label="Title"
+                type="text"
+                required
+                value={quickAddTitle}
+                disabled={isLocked}
+                onChange={(e) => {
+                  setQuickAddTitle(e.target.value);
+                  setQuickAddTitleDirty(true);
+                }}
+              />
+              <InputField
+                label="Artist"
+                optional
+                type="text"
+                value={quickAddArtist}
+                disabled={isLocked}
+                onChange={(e) => setQuickAddArtist(e.target.value)}
+              />
+              <SelectField
+                label="Key"
+                optional
+                value={quickAddKey}
+                disabled={isLocked}
+                onChange={(e) => setQuickAddKey(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {SONG_KEY_OPTIONS.map((key) => (
+                  <option key={key} value={key}>
+                    {key}
+                  </option>
+                ))}
+              </SelectField>
               <Button variant="primary" type="submit" disabled={isLocked}>
                 Add song
               </Button>
             </form>
           ) : null}
-        </section>
+        </Card>
 
-        <section className={styles.setlistPanel}>
-          <h2>Setlist</h2>
-          {persistError ? (
-            <p role="alert" className={styles.error}>
-              {persistError}
-            </p>
-          ) : null}
+        <Card as="section" className={styles.setlistPanel} aria-labelledby="sb-setlist">
+          <h2 id="sb-setlist">Setlist</h2>
+          {persistError ? <ErrorAlert>{persistError}</ErrorAlert> : null}
+          <span className="sr-only" role="status">
+            {reorderMessage}
+          </span>
           {songs.length === 0 ? (
-            <p>No songs yet — add some from the catalog.</p>
+            <EmptyState icon="music" title="No songs yet — add some from the catalog." />
           ) : (
             <ol className={styles.setlistRows}>
-              {songs.map((song) => {
+              {songs.map((song, index) => {
                 const catalogSong = catalogById.get(song.songId);
+                const title = catalogSong?.title ?? "Unknown song";
                 return (
                   <li
                     key={song.songId}
-                    className={styles.setlistRow}
+                    className={`${styles.setlistRow} ${
+                      draggedSongId === song.songId ? styles.dragging : ""
+                    }`}
                     draggable={!isLocked}
                     onDragStart={(e) => handleDragStart(e, song.songId)}
                     onDragOver={handleDragOver}
                     onDrop={(e) => handleDrop(e, song.songId)}
                   >
-                    <span className={styles.dragHandle} aria-hidden="true">
-                      ⠿
-                    </span>
-                    <span className={styles.position}>{song.position}</span>
-                    <div className={styles.songInfo}>
-                      <span className={styles.resultTitle}>{catalogSong?.title ?? "Unknown song"}</span>
-                      {catalogSong?.artist ? (
-                        <span className={styles.resultArtist}> — {catalogSong.artist}</span>
-                      ) : null}
+                    <div className={styles.rowTop}>
+                      <span className={styles.dragHandle} aria-hidden="true">
+                        <Icon name="grip" size={18} />
+                      </span>
+                      <span className={styles.position}>{song.position}</span>
+                      <div className={styles.songInfo} id={`sb-song-${song.songId}`}>
+                        <span className={styles.resultTitle}>{title}</span>
+                        {catalogSong?.artist ? (
+                          <span className={styles.resultArtist}> — {catalogSong.artist}</span>
+                        ) : null}
+                      </div>
+                      <div className={styles.moveButtons}>
+                        <button
+                          type="button"
+                          className={styles.iconButton}
+                          aria-label={`Move ${title} up`}
+                          disabled={isLocked || index === 0}
+                          onClick={() => handleMove(song.songId, -1)}
+                        >
+                          <Icon name="arrowUp" size={18} />
+                        </button>
+                        <button
+                          type="button"
+                          className={styles.iconButton}
+                          aria-label={`Move ${title} down`}
+                          disabled={isLocked || index === songs.length - 1}
+                          onClick={() => handleMove(song.songId, 1)}
+                        >
+                          <Icon name="arrowDown" size={18} />
+                        </button>
+                      </div>
                     </div>
-                    <select
-                      value={song.effectiveKey ?? ""}
-                      disabled={isLocked}
-                      onChange={(e) => handleKeyChange(song.songId, e.target.value)}
-                    >
-                      <option value="">— none —</option>
-                      {SONG_KEY_OPTIONS.map((key) => (
-                        <option key={key} value={key}>
-                          {key}
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      key={song.songId}
-                      type="text"
-                      className={styles.notesInput}
-                      placeholder="Notes"
-                      defaultValue={song.notes ?? ""}
-                      disabled={isLocked}
-                      onBlur={(e) => handleNotesBlur(song.songId, e.target.value)}
-                    />
-                    <Button
-                      variant="secondary"
-                      type="button"
-                      disabled={isLocked}
-                      onClick={() => handleRemove(song.songId)}
-                    >
-                      Remove
-                    </Button>
+                    <div className={styles.rowControls}>
+                      <select
+                        className={`${controlClassName} ${styles.keySelect}`}
+                        aria-label={`Key for ${title}`}
+                        value={song.effectiveKey ?? ""}
+                        disabled={isLocked}
+                        onChange={(e) => handleKeyChange(song.songId, e.target.value)}
+                      >
+                        <option value="">— none —</option>
+                        {SONG_KEY_OPTIONS.map((key) => (
+                          <option key={key} value={key}>
+                            {key}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        key={song.songId}
+                        type="text"
+                        className={`${controlClassName} ${styles.notesInput}`}
+                        placeholder="Notes"
+                        aria-label={`Notes for ${title}`}
+                        defaultValue={song.notes ?? ""}
+                        disabled={isLocked}
+                        onBlur={(e) => handleNotesBlur(song.songId, e.target.value)}
+                      />
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        disabled={isLocked}
+                        aria-describedby={`sb-song-${song.songId}`}
+                        onClick={() => handleRemove(song.songId)}
+                      >
+                        Remove
+                      </Button>
+                    </div>
                   </li>
                 );
               })}
             </ol>
           )}
-        </section>
+        </Card>
       </div>
 
       <div className={styles.bottomBar}>
-        <span>{songs.length === 1 ? "1 song" : `${songs.length} songs`}</span>
-        <Button
-          variant="primary"
-          type="button"
-          disabled={isLocked}
-          onClick={() => setPublishModalOpen(true)}
-        >
+        <span className={styles.count}>
+          {songs.length === 1 ? "1 song" : `${songs.length} songs`}
+        </span>
+        <Button variant="accent" disabled={isLocked} onClick={() => setPublishModalOpen(true)}>
           Publish
         </Button>
       </div>
 
-      <Modal open={publishModalOpen} onClose={() => setPublishModalOpen(false)}>
-        <h2>Publish this setlist?</h2>
+      <Modal
+        open={publishModalOpen}
+        onClose={() => setPublishModalOpen(false)}
+        title="Publish this setlist?"
+      >
         {songs.length === 0 ? (
           <p>This setlist has no songs yet. It will be published with no songs.</p>
         ) : (
           <p>Confirmed members will be notified once you publish.</p>
         )}
         {publishError ? (
-          <p role="alert" className={styles.error}>
-            {publishError}
-          </p>
+          <div className={styles.modalError}>
+            <ErrorAlert>{publishError}</ErrorAlert>
+          </div>
         ) : null}
         <div className={styles.modalActions}>
-          <Button variant="secondary" type="button" onClick={() => setPublishModalOpen(false)}>
+          <Button variant="secondary" onClick={() => setPublishModalOpen(false)}>
             Cancel
           </Button>
-          <Button variant="primary" type="button" onClick={handlePublish}>
+          <Button variant="accent" onClick={handlePublish} disabled={publishing} loading={publishing}>
             Publish
           </Button>
         </div>
       </Modal>
-    </main>
+    </Page>
   );
 }

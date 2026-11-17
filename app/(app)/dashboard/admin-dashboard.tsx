@@ -3,6 +3,13 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Badge } from "@/components/ui/Badge";
+import { ButtonLink } from "@/components/ui/Button";
+import { interactiveCardClassName } from "@/components/ui/Card";
+import { InputField, SelectField } from "@/components/ui/Field";
+import { Icon } from "@/components/ui/Icon";
+import { Page, PageHeader } from "@/components/ui/Page";
+import { EmptyState, ErrorState, LoadingState, NoAccessState } from "@/components/ui/States";
+import { formatServiceDate } from "@/lib/format/dates";
 import styles from "./admin-dashboard.module.css";
 
 // Data shape returned by GET /api/service-weeks/overview, wrapped in { data }
@@ -23,18 +30,6 @@ type StatusFilter = "all" | "active" | "cancelled";
 
 type ViewState = "loading" | "ready" | "forbidden" | "error";
 
-// Matches formatServiceDate in conflicts-list.tsx / week-view.tsx exactly
-// (local-time interpretation of the YYYY-MM-DD string).
-function formatServiceDate(dateStr: string): string {
-  const date = new Date(`${dateStr}T00:00:00`);
-  return date.toLocaleDateString(undefined, {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-}
-
 export default function AdminDashboard() {
   const [view, setView] = useState<ViewState>("loading");
   const [weeks, setWeeks] = useState<OverviewWeek[]>([]);
@@ -42,6 +37,7 @@ export default function AdminDashboard() {
   const [endDate, setEndDate] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
   const [filterError, setFilterError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -89,76 +85,81 @@ export default function AdminDashboard() {
     return () => {
       cancelled = true;
     };
-  }, [startDate, endDate, status]);
-
-  if (view === "loading") {
-    return (
-      <main className={styles.container}>
-        <p>Loading…</p>
-      </main>
-    );
-  }
+  }, [startDate, endDate, status, reloadKey]);
 
   if (view === "forbidden") {
     return (
-      <main className={styles.container}>
-        <h1>You don&apos;t have access to this page</h1>
-        <p>This screen is available to Set Leaders and Admins only.</p>
-      </main>
+      <Page>
+        <NoAccessState
+          actions={
+            <ButtonLink href="/notifications" variant="secondary">
+              Go to notifications
+            </ButtonLink>
+          }
+        >
+          This screen is available to Set Leaders and Admins only.
+        </NoAccessState>
+      </Page>
     );
   }
 
   if (view === "error") {
     return (
-      <main className={styles.container}>
-        <h1>Something went wrong</h1>
-        <p>Please try again later.</p>
-      </main>
+      <Page>
+        <ErrorState onRetry={() => setReloadKey((k) => k + 1)} />
+      </Page>
     );
   }
 
-  // ready
+  // loading | ready — the filters stay mounted while a new result loads, so
+  // changing one never drops keyboard focus.
   return (
-    <main className={styles.container}>
-      <h1>Global dashboard</h1>
+    <Page>
+      <PageHeader title="Schedule" subtitle="Every service week for your church group" />
 
-      <div className={styles.filters}>
-        <div className={styles.filterField}>
-          <label htmlFor="dashboard-from">From</label>
-          <input
-            id="dashboard-from"
-            type="date"
-            value={startDate}
-            onChange={(e) => setStartDate(e.target.value)}
-          />
-        </div>
-        <div className={styles.filterField}>
-          <label htmlFor="dashboard-to">To</label>
-          <input
-            id="dashboard-to"
-            type="date"
-            value={endDate}
-            onChange={(e) => setEndDate(e.target.value)}
-          />
-        </div>
-        <div className={styles.filterField}>
-          <label htmlFor="dashboard-status">Status</label>
-          <select
-            id="dashboard-status"
-            value={status}
-            onChange={(e) => setStatus(e.target.value as StatusFilter)}
-          >
-            <option value="all">All</option>
-            <option value="active">Active</option>
-            <option value="cancelled">Cancelled</option>
-          </select>
-        </div>
+      <div className={styles.filters} role="group" aria-label="Filter service weeks">
+        <InputField
+          id="dashboard-from"
+          label="From"
+          type="date"
+          value={startDate}
+          aria-invalid={filterError ? true : undefined}
+          aria-describedby={filterError ? "dashboard-filter-error" : undefined}
+          onChange={(e) => setStartDate(e.target.value)}
+        />
+        <InputField
+          id="dashboard-to"
+          label="To"
+          type="date"
+          value={endDate}
+          aria-invalid={filterError ? true : undefined}
+          aria-describedby={filterError ? "dashboard-filter-error" : undefined}
+          onChange={(e) => setEndDate(e.target.value)}
+        />
+        <SelectField
+          id="dashboard-status"
+          label="Status"
+          value={status}
+          onChange={(e) => setStatus(e.target.value as StatusFilter)}
+        >
+          <option value="all">All</option>
+          <option value="active">Active</option>
+          <option value="cancelled">Cancelled</option>
+        </SelectField>
       </div>
 
-      {filterError ? <p role="alert">{filterError}</p> : null}
+      {filterError ? (
+        <p id="dashboard-filter-error" role="alert" className={styles.filterError}>
+          {filterError}
+        </p>
+      ) : null}
 
-      {weeks.length === 0 ? (
-        <p>No service weeks match these filters.</p>
+      {view === "loading" ? (
+        <LoadingState cards={3} />
+      ) : weeks.length === 0 ? (
+        <EmptyState icon="calendar" compact={false} title="No service weeks match these filters.">
+          Try a wider date range or a different status.
+        </EmptyState>
       ) : (
         <ul className={styles.list}>
           {weeks.map((week) => {
@@ -171,33 +172,44 @@ export default function AdminDashboard() {
 
             return (
               <li key={week.id}>
-                <Link href={`/week/${week.id}`} className={styles.card}>
-                  <div className={styles.cardHeader}>
-                    <span className={styles.weekTitle}>{week.title ?? "Untitled service"}</span>
-                    <span className={styles.date}>{formatServiceDate(week.serviceDate)}</span>
+                <Link
+                  href={`/week/${week.id}`}
+                  className={`${interactiveCardClassName} ${styles.card} ${
+                    week.isCancelled ? styles.cancelled : ""
+                  }`}
+                >
+                  <div className={styles.cardBody}>
+                    <div className={styles.cardHeader}>
+                      <span className={styles.weekTitle}>{week.title ?? "Untitled service"}</span>
+                      <span className={styles.date}>{formatServiceDate(week.serviceDate)}</span>
+                    </div>
+                    <div className={styles.cardMeta}>
+                      <Badge tone={publishBadge.tone}>{publishBadge.text}</Badge>
+                      {week.isCancelled ? <Badge tone="danger">Cancelled</Badge> : null}
+                      <span className={styles.count}>
+                        <Icon name="users" size={16} />
+                        <span>
+                          {week.rosterSize === 0
+                            ? "No one invited yet"
+                            : `${week.confirmedCount} of ${week.rosterSize} confirmed`}
+                        </span>
+                      </span>
+                      {week.openConflictCount > 0 ? (
+                        <Badge tone="danger">
+                          {`${week.openConflictCount} open conflict${
+                            week.openConflictCount === 1 ? "" : "s"
+                          }`}
+                        </Badge>
+                      ) : null}
+                    </div>
                   </div>
-                  <div className={styles.cardMeta}>
-                    <Badge tone={publishBadge.tone}>{publishBadge.text}</Badge>
-                    {week.isCancelled ? <Badge tone="danger">Cancelled</Badge> : null}
-                    <span>
-                      {week.rosterSize === 0
-                        ? "No one invited yet"
-                        : `${week.confirmedCount} of ${week.rosterSize} confirmed`}
-                    </span>
-                    {week.openConflictCount > 0 ? (
-                      <Badge tone="danger">
-                        {`${week.openConflictCount} open conflict${
-                          week.openConflictCount === 1 ? "" : "s"
-                        }`}
-                      </Badge>
-                    ) : null}
-                  </div>
+                  <Icon name="chevronRight" className={styles.chevron} />
                 </Link>
               </li>
             );
           })}
         </ul>
       )}
-    </main>
+    </Page>
   );
 }

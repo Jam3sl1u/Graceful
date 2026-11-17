@@ -3,27 +3,29 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 44px;
-  height: 44px;
-  color: var(--color-fg);
+  min-width: var(--tap-target);
+  min-height: var(--tap-target);
+  color: inherit;
   text-decoration: none;
 }
 
-.icon {
-  font-size: 1.25rem;
+.iconWrap {
+  position: relative;
+  display: inline-flex;
 }
 
 .badge {
   position: absolute;
-  top: 2px;
-  right: 2px;
+  top: -6px;
+  left: 12px;
   min-width: 18px;
   height: 18px;
-  padding: 0 4px;
-  border-radius: 9px;
-  background: var(--color-accent);
-  color: #fff;
-  font-size: 0.7rem;
+  padding: 0 5px;
+  border-radius: var(--radius-full);
+  background: var(--yellow-500);
+  color: var(--navy-950);
+  font-size: 0.6875rem;
+  font-weight: 800;
   line-height: 18px;
   text-align: center;
 }
