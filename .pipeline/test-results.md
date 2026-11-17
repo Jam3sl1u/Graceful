@@ -27,3 +27,8 @@ It matches the spec. Verified by reading:
 ## Reviewer action
 - A human should run `bun run test:rls` against a real Supabase, with the migration applied, before merge.
 - Applying the migration to staging/production is a human step.
+
+## Remediation round 1 addendum (2026-11-16)
+- Re-run after the fixes described in `changes.md`: `bun run lint` pass, `bun run typecheck` pass, `bun run test` pass (154 suites / 3254 tests; the static migration suite is now 21 tests).
+- STILL NOT RUN: every RLS integration case, now 18 in `chat.test.ts` (new: 15 soft-delete-only, 16 membership edge cases, 17 and 18 invitee update guard), and both migrations against a live Postgres. The trigger's plpgsql and the column-privilege behaviour are unproven until a human runs `bun run test:rls` with the SUPABASE_TEST_* secrets.
+- Pre-existing N3 failure unchanged.

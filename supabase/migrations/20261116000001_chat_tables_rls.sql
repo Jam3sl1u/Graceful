@@ -175,7 +175,15 @@ CREATE POLICY chat_messages_insert_member
     )
   );
 
--- Author-only UPDATE: the soft-delete path.
+-- Author-only UPDATE: the soft-delete path, and nothing else. PRD §20.7 is
+-- "soft-delete only", so authenticated callers may write a single column
+-- (is_deleted) and the policy's WITH CHECK only accepts is_deleted = true:
+-- content, kind, metadata, created_at, user_id and chat_room_id cannot be
+-- rewritten, and a message cannot be un-deleted or moved to another room.
+-- Column privileges, same idea as the audit_logs REVOKE in cluster 6.
+REVOKE UPDATE ON public.chat_messages FROM authenticated, anon;
+GRANT UPDATE (is_deleted) ON public.chat_messages TO authenticated;
+
 CREATE POLICY chat_messages_update_own
   ON public.chat_messages FOR UPDATE TO authenticated
   USING (
@@ -190,7 +198,8 @@ CREATE POLICY chat_messages_update_own
     )
   )
   WITH CHECK (
-    user_id = public.auth_user_id()
+    is_deleted = true
+    AND user_id = public.auth_user_id()
     AND church_group_id = public.auth_church_group_id()
     AND public.is_chat_room_member(chat_room_id)
     AND EXISTS (

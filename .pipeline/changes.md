@@ -21,3 +21,21 @@
 
 ## Tester focus
 - Run `bun run test:rls` against a real Supabase: policy recursion, pin UPDATE WITH CHECK, mention insert policy, cascade with circular pin FK.
+
+## Remediation round 1 (2026-11-16, after reviewer NEEDS WORK)
+
+Operator decision in chat: fix review finding 2 in this PR rather than a separate issue.
+
+- **Finding 2 — membership bypass via `invitations_update_own`.** New migration `supabase/migrations/20261116000002_invitations_invitee_update_guard.sql`: BEFORE UPDATE trigger on `invitations`. For a direct update by a non-leader `authenticated` caller, only `status`, `denial_reason`, `denial_count`, `responded_at` may change, and status may only go pending -> accepted or pending -> denied. Leaders/admins, the service role and the SECURITY DEFINER RPCs are unaffected. No applied Phase 1 migration edited; the Phase 1 test "member_a can UPDATE their own invitation (respond)" (pending -> accepted) is still a legal path.
+- **Finding 3 — author could rewrite any message column.** In the chat migration: `REVOKE UPDATE ... FROM authenticated, anon` + `GRANT UPDATE (is_deleted) ... TO authenticated`, and `chat_messages_update_own` WITH CHECK now requires `is_deleted = true` (soft-delete is one-way).
+- **Finding 4 — weak assertions.** `chat.test.ts` cases 8, 12, 14 now assert their setup writes succeeded and have positive controls. New cases 15 (soft-delete only), 16 (withdrawn invitee; several invitations with one accepted), 17 (guard blocks withdrawn/denied -> accepted, re-pointed week, forged columns), 18 (legal invitee, leader and service-role paths still work).
+- Static test extended: column grant, WITH CHECK, and the guard migration's shape.
+
+### Verification after round 1
+- `bun run lint`, `bun run typecheck`, `bun run test` (154 suites, 3254 tests) pass.
+- **Finding 1 is NOT resolved: the SQL has still never been executed.** No `psql`/Postgres on this machine; Docker is running but has no images, and pulling a Supabase stack was not authorised. `bun run test:rls`: 12 suites skipped (no SUPABASE_TEST_* vars), so all 18 chat cases and the cross-tenant chat blocks are NOT RUN. This is not a pass.
+- `bun run test:rls` still shows the 1 pre-existing N3 failure, unchanged.
+
+### Human steps
+- Run `bun run test:rls` against a real Supabase with both migrations applied before merge.
+- Apply both migrations to staging/production.

@@ -34,6 +34,49 @@ function policyBlock(name: string): string {
   return upN.slice(start, end === -1 ? undefined : end);
 }
 
+describe("invitee invitation update guard migration (static)", () => {
+  const guardSql = readFileSync(
+    join(MIGRATIONS_DIR, "20261116000002_invitations_invitee_update_guard.sql"),
+    "utf8",
+  );
+  const guardDownIdx = guardSql.indexOf(DOWN_MARKER);
+  const guardUp = norm(stripComments(guardSql.slice(0, guardDownIdx)));
+
+  it("installs a BEFORE UPDATE row trigger on invitations", () => {
+    expect(guardUp).toContain(
+      "create trigger invitations_guard_invitee_update before update on public.invitations for each row execute function public.invitations_guard_invitee_update();",
+    );
+  });
+
+  it("is SECURITY INVOKER so current_user identifies a direct update", () => {
+    expect(guardUp).not.toContain("security definer");
+    expect(guardUp).toContain("if current_user <> 'authenticated' then return new;");
+    expect(guardUp).toContain("set search_path = ''");
+  });
+
+  it("exempts leaders and admins", () => {
+    expect(guardUp).toContain("public.auth_is_leader_or_admin()");
+  });
+
+  it("whitelists exactly the response columns and only pending -> accepted/denied", () => {
+    expect(guardUp).toContain("array['status', 'denial_reason', 'denial_count', 'responded_at']");
+    expect(guardUp).toContain("old.status <> 'pending' or new.status not in ('accepted', 'denied')");
+    expect(guardUp).toContain("using errcode = '42501'");
+  });
+
+  it("has a fully commented DOWN block that drops the trigger and function", () => {
+    expect(guardDownIdx).toBeGreaterThan(0);
+    const lines = guardSql
+      .slice(guardDownIdx + DOWN_MARKER.length)
+      .split("\n")
+      .filter((l) => l.trim() !== "");
+    expect(lines.length).toBe(2);
+    for (const l of lines) expect(l.trimStart().startsWith("--")).toBe(true);
+    expect(lines.join(" ")).toContain("DROP TRIGGER IF EXISTS invitations_guard_invitee_update");
+    expect(lines.join(" ")).toContain("DROP FUNCTION IF EXISTS public.invitations_guard_invitee_update()");
+  });
+});
+
 describe("chat tables migration (static)", () => {
   it.each(["chat_rooms", "chat_messages", "chat_mentions"])("creates table %s", (t) => {
     expect(upN).toMatch(new RegExp(`create table (public\\.)?${t}\\b`));
@@ -71,6 +114,16 @@ describe("chat tables migration (static)", () => {
 
   it("chat_messages INSERT policy refuses archived rooms", () => {
     expect(policyBlock("chat_messages_insert_member")).toContain("is_archived = false");
+  });
+
+  it("authenticated callers may only UPDATE chat_messages.is_deleted (soft-delete only)", () => {
+    expect(upN).toContain("revoke update on public.chat_messages from authenticated, anon;");
+    expect(upN).toContain("grant update (is_deleted) on public.chat_messages to authenticated;");
+    // No broader re-grant sneaks back in.
+    expect(upN).not.toMatch(/grant (all|update) on public\.chat_messages/);
+    const block = policyBlock("chat_messages_update_own");
+    const withCheck = block.slice(block.indexOf("with check"));
+    expect(withCheck).toContain("is_deleted = true");
   });
 
   it("has no DELETE policy on any chat table", () => {
