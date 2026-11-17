@@ -1,12 +1,19 @@
-# Changes — issue #82 (remediation of review BLOCK)
+# Changes — Issue #82 (remediation re-run)
 
-Operator decision applied (passed by orchestrator): Option A, disposable test users; operator creates two throwaway staging sign-in accounts and adds E2E_SETUP_ADMIN_EMAIL / E2E_GUEST_EMAIL as GitHub Actions secrets.
+## Single doc edit
+`documentation/staging-environment.md`, §7.1 item 1 (formerly lines 163-164, now 163-169): replaced the stale sentence "`resetDisposablePersona` hard-guards against ever touching `FIXTURE.churchGroupId`" with the actual guards, matching `tests/e2e/support/fixtures.ts` `resetDisposablePersona`:
+- throws if the persona resolves to `FIXTURE.adminUserId` / `FIXTURE.memberUserId`;
+- throws if the persona is an admin of `FIXTURE.churchGroupId`;
+- a disposable persona's member/guest row inside the fixture group is deleted.
 
-NOT executed against staging: none of these assertions has been run against staging (no secrets locally). Verified only via lint, typecheck, Jest (147 suites), and `playwright test --list` (15 tests / 11 files).
+## Not changed
+No test, fixture, CI, config, or product code changed in this run.
 
-## Files
-- `tests/e2e/guest-invitation.spec.ts` (B1): re-claim from same session now asserts 201 + `alreadyClaimed`, `invitationId`, `guest.userId`. Relied on migration `20260805000001_guest_invitation_flow.sql` step 4 (~lines 131-139, idempotent already_claimed return) before the step-6 ALREADY_CLAIMED raise, and step 9 (~line 170, clerk_id set); handler `app/api/invitations/handler.ts:658-666` returns 201. Added failure case: schema-valid unknown token (`generateResponseToken()`) -> exactly 404 (migration step 2 NOT_FOUND).
-- `tests/e2e/support/fixtures.ts` (N1): `resetDisposablePersona` guard now throws only for the stable fixture users (adminUserId/memberUserId) or an admin of FIXTURE.churchGroupId; member/guest rows in the fixture group are deleted, so a crashed Test B does not poison the next run. Comment updated.
-- `tests/e2e/week-setup-flow.spec.ts` (N2, B2): `expect(joinerName).toBeTruthy()`; roster slot located via `[class*="rosterSlot"]` filtered by `has:` exact-name child, with `toHaveCount(1)`. Header comment reworded to state only the dependency.
+## Verification
+lint, typecheck clean; Jest 147 suites / 3144 tests pass; `playwright test --list` = 15 tests in 11 files.
 
-Tester focus: guard ordering in resetDisposablePersona; unknown-token 404.
+## Status of AC 5
+None of the issue #82 E2E assertions has run against staging. AC 5 is still pending the human provisioning `E2E_SETUP_ADMIN_EMAIL` / `E2E_GUEST_EMAIL` (Clerk test users + GitHub secrets).
+
+## Found but not fixed
+Nothing.

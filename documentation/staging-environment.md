@@ -160,8 +160,13 @@ cover:
    (`tests/e2e/support/fixtures.ts`): it deletes the church group the
    persona owns (if it created one; cascades its `users` row) or just its
    `users` row (if it only joined one), so the next run can create/join a
-   group again. `resetDisposablePersona` hard-guards against ever touching
-   `FIXTURE.churchGroupId`.
+   group again. `resetDisposablePersona` throws, rather than deleting
+   anything, if a persona email resolves to one of the two stable fixture
+   users (`FIXTURE.adminUserId` / `FIXTURE.memberUserId`), and also if the
+   persona is an **admin** of `FIXTURE.churchGroupId`, so the stable fixture
+   group is never cascade-deleted. A disposable persona's member/guest row
+   inside the fixture group *is* deleted (e.g. one left over from a crashed
+   guest Test B), so a crashed run doesn't block the next one.
 2. **Service-role seed/teardown access to the staging Supabase project.**
    `tests/e2e/support/fixtures.ts` seeds a stable admin/member/church-group
    fixture (once, idempotently) plus per-test service weeks/invitations,
