@@ -213,3 +213,40 @@ Nothing here is skipped silently; issues that depend on these say so, and a test
 | 8. Invitation deadline + auto-escalation | P2-19, P2-20 |
 | 9. Mobile-responsive polish | P2-25, P2-26 |
 | 10. Security and test gate | P2-27 – P2-32 |
+
+## GitHub issue numbers (created 2026-11-16)
+
+| Backlog ID | Issue |
+|---|---|
+| P2-01 | #208 |
+| P2-02 | #209 |
+| P2-03 | #210 |
+| P2-04 | #211 |
+| P2-05 | #212 |
+| P2-06 | #213 |
+| P2-07 | #214 |
+| P2-08 | #215 |
+| P2-09 | #216 |
+| P2-10 | #217 |
+| P2-11 | #218 |
+| P2-12 | #219 |
+| P2-13 | #220 |
+| P2-14 | #221 |
+| P2-15 | #222 |
+| P2-16 | #223 |
+| P2-17 | #228 |
+| P2-18 | #229 |
+| P2-19 | #224 |
+| P2-20 | #225 |
+| P2-21 | #226 |
+| P2-22 | #227 |
+| P2-23 | #230 |
+| P2-24 | #231 |
+| P2-25 | #232 |
+| P2-26 | #233 |
+| P2-27 | #234 |
+| P2-28 | #235 |
+| P2-29 | #236 |
+| P2-30 | #237 |
+| P2-31 | #238 |
+| P2-32 | #239 |
