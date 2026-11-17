@@ -1,8 +1,156 @@
+/*
+ * Design tokens — the single source of truth for colour, type, spacing,
+ * radius, shadow and motion. Documented in documentation/design-system.md.
+ * Components consume the semantic tokens (--surface, --text, --primary …),
+ * never the raw palette, so the dark theme is a token swap.
+ */
 :root {
-  --color-bg: #ffffff;
-  --color-fg: #1a1a1a;
-  --color-border: #e2e2e2;
-  --color-accent: #4f46e5;
+  /* Raw palette: navy, white, yellow */
+  --navy-950: #071433;
+  --navy-900: #0b1f4b;
+  --navy-800: #12295f;
+  --navy-700: #1a3678;
+  --navy-600: #24479b;
+  --navy-300: #a9bbe6;
+  --navy-100: #e3eaf8;
+  --navy-50: #f3f6fc;
+  --yellow-500: #f7b500;
+  --yellow-400: #ffc933;
+  --yellow-100: #fff3cc;
+  --white: #ffffff;
+
+  /* Semantic colour */
+  --bg: var(--navy-50);
+  --surface: var(--white);
+  --surface-sunken: #eaeff8;
+  --text: var(--navy-900);
+  --text-muted: #4a5878;
+  --border: #d5dcec;
+  --border-strong: #8793b0;
+  --primary: var(--navy-900);
+  --primary-hover: var(--navy-700);
+  --on-primary: var(--white);
+  --accent: var(--yellow-500);
+  --accent-hover: var(--yellow-400);
+  --on-accent: var(--navy-950);
+  --link: var(--navy-600);
+  --focus-ring: var(--yellow-500);
+  --focus-ring-inner: var(--navy-900);
+  --overlay: rgba(7, 20, 51, 0.55);
+  --shell-bg: var(--navy-900);
+  --shell-text: #dbe4f7;
+  --shell-active: rgba(255, 255, 255, 0.12);
+
+  /* Status tones (background / foreground pairs, all ≥ 4.5:1) */
+  --tone-neutral-bg: #e8ecf5;
+  --tone-neutral-fg: #36425f;
+  --tone-info-bg: var(--navy-100);
+  --tone-info-fg: var(--navy-700);
+  --tone-success-bg: #dcf5e6;
+  --tone-success-fg: #0f5a31;
+  --tone-warning-bg: var(--yellow-100);
+  --tone-warning-fg: #6b4a00;
+  --tone-danger-bg: #fde4e1;
+  --tone-danger-fg: #9c1c12;
+  --danger: #b42318;
+  --danger-hover: #951b12;
+  --success: #17794a;
+
+  /* Type */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-md: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+  --text-3xl: 2.25rem;
+  --leading-tight: 1.2;
+  --leading-normal: 1.5;
+
+  /* Spacing (4 px base) */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
+
+  /* Shape, elevation, motion */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-full: 999px;
+  --shadow-sm: 0 1px 2px rgba(11, 31, 75, 0.06), 0 1px 3px rgba(11, 31, 75, 0.08);
+  --shadow-md: 0 4px 12px rgba(11, 31, 75, 0.1), 0 2px 4px rgba(11, 31, 75, 0.06);
+  --shadow-lg: 0 16px 40px rgba(7, 20, 51, 0.22);
+  --duration-fast: 120ms;
+  --duration-base: 200ms;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* Layout */
+  --tap-target: 44px;
+  --page-gutter: var(--space-4);
+  /* Height reserved at the bottom of the viewport by the mobile tab bar. */
+  --shell-bottom: 0px;
+
+  /* Legacy aliases (pre-token modules). Do not use in new code. */
+  --color-bg: var(--surface);
+  --color-fg: var(--text);
+  --color-border: var(--border);
+  --color-accent: var(--primary);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #060f26;
+    --surface: #0e1c40;
+    --surface-sunken: #0a1633;
+    --text: #edf1fb;
+    --text-muted: #a9b5d3;
+    --border: #25376a;
+    --border-strong: #6f80ad;
+    --primary: var(--yellow-500);
+    --primary-hover: var(--yellow-400);
+    --on-primary: var(--navy-950);
+    --link: #9fb9ff;
+    --focus-ring-inner: var(--navy-950);
+    --overlay: rgba(0, 0, 0, 0.65);
+    --shell-bg: #091631;
+    --shell-active: rgba(255, 255, 255, 0.1);
+
+    --tone-neutral-bg: #1b2a52;
+    --tone-neutral-fg: #c9d3ec;
+    --tone-info-bg: #1a2f66;
+    --tone-info-fg: #c3d3ff;
+    --tone-success-bg: #0f3a26;
+    --tone-success-fg: #8fe3b4;
+    --tone-warning-bg: #4a3600;
+    --tone-warning-fg: #ffd966;
+    --tone-danger-bg: #4a1410;
+    --tone-danger-fg: #ffb4ab;
+    --danger: #ff8a7d;
+    --danger-hover: #ffa399;
+    --success: #6fd69f;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45);
+    --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.6);
+
+    color-scheme: dark;
+  }
+}
+
+@media (min-width: 640px) {
+  :root {
+    --page-gutter: var(--space-5);
+  }
 }
 
 * {
@@ -13,12 +161,94 @@ html,
 body {
   padding: 0;
   margin: 0;
-  background: var(--color-bg);
-  color: var(--color-fg);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 100%;
+  line-height: var(--leading-normal);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  min-height: 100dvh;
+  overflow-wrap: anywhere;
+}
+
+h1,
+h2,
+h3 {
+  line-height: var(--leading-tight);
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+h1 {
+  font-size: var(--text-2xl);
+  font-weight: 700;
+}
+
+h2 {
+  font-size: var(--text-lg);
+  font-weight: 700;
+}
+
+h3 {
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+
+p {
+  margin: 0;
 }
 
 a {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
   color: inherit;
-  text-decoration: none;
+}
+
+/* One focus treatment for everything: yellow ring with a navy inner edge, so
+   it is visible on white, navy and yellow surfaces alike. */
+:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--focus-ring-inner);
+  border-radius: var(--radius-sm);
+}
+
+::selection {
+  background: var(--yellow-400);
+  color: var(--navy-950);
+}
+
+/* Visually hidden, still announced. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

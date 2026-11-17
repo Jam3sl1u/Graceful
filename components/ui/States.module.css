@@ -1,0 +1,123 @@
+.state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-7) var(--space-4);
+  text-align: center;
+}
+
+.compact {
+  padding: var(--space-5) var(--space-3);
+  gap: var(--space-2);
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-full);
+  background: var(--tone-info-bg);
+  color: var(--tone-info-fg);
+}
+
+.compact .icon {
+  width: 40px;
+  height: 40px;
+}
+
+.iconDanger {
+  background: var(--tone-danger-bg);
+  color: var(--tone-danger-fg);
+}
+
+.iconSuccess {
+  background: var(--tone-success-bg);
+  color: var(--tone-success-fg);
+}
+
+.iconWarning {
+  background: var(--tone-warning-bg);
+  color: var(--tone-warning-fg);
+}
+
+.title {
+  font-size: var(--text-xl);
+  font-weight: 700;
+  line-height: var(--leading-tight);
+  margin: 0;
+}
+
+.compact .title {
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+
+.message {
+  max-width: 44ch;
+  color: var(--text-muted);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+.alert {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--tone-danger-bg);
+  color: var(--tone-danger-fg);
+  font-weight: 600;
+  font-size: var(--text-sm);
+}
+
+.alert svg {
+  margin-top: 2px;
+}
+
+.skeleton {
+  display: block;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(
+    90deg,
+    var(--surface-sunken) 0%,
+    var(--border) 50%,
+    var(--surface-sunken) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+.skeletonStack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.skeletonCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
