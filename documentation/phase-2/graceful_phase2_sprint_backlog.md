@@ -2,7 +2,7 @@
 
 Source: `documentation/prd/graceful_requirements_v10.md` — rows marked **Ph.2**, the §27 "Phase 2 — Collab" build order, and the §31 Phase 2 roadmap row. Nothing marked Ph.3, Ph.4 or later is included: no audio pipeline, no Modal/Python worker, no AI model, no transcribed-sheet-music library section.
 
-Status: **draft for approval.** Nothing has been created on GitHub.
+Status: **approved by the operator in chat on 2026-11-16 ("Approve as written").** Decisions D1–D8 below are resolved as recommended.
 
 ## Assumptions
 
@@ -29,9 +29,9 @@ Status: **draft for approval.** Nothing has been created on GitHub.
 | No i18n string file (`en.json`) exists, although PRD §28.4 calls for one | repo-wide | Phase 2 screens follow the Phase 1 inline-string convention; extracting strings would be a Phase 1 refactor and is **not** in this backlog. |
 | Load runner is a custom Bun script, not k6 | `tests/load/` | P2-31 adds a scenario to it rather than a new tool. |
 
-## Decisions I need from you before Step 2
+## Decisions (resolved 2026-11-16 — operator accepted every recommendation)
 
-These would otherwise surface as OPEN QUESTIONS mid-run and stop a batch. Each has a recommendation; none is assumed.
+The "Recommendation" column is the decision in force. Anything not covered here is still an OPEN QUESTION for the operator, not something to infer from this table.
 
 | # | Question | Recommendation |
 |---|---|---|
