@@ -10,7 +10,8 @@
 // Usage: node scripts/check-workflows.mjs   (exit 0 = clean, exit 1 = violation)
 
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -30,11 +31,27 @@ function listWorkflowScripts(dir) {
 }
 
 function checkSyntax(filePath) {
+  // Workflow scripts are a DSL: `export const meta`, top-level await, and
+  // top-level return. The workflow runtime accepts that mix. Standard JS does
+  // not — a script rejects top-level await, and a module rejects top-level
+  // return. Node 24 (the current GitHub-hosted runner) detects `export` and
+  // syntax-checks the file as a module, so `node --check` fails on every
+  // early return in handle-issues.js. Node 20 and Node 26 do not. Wrap the
+  // body in an async function, the only standard context that allows both
+  // await and return, so this check stays stable across runner Node versions
+  // and still rejects real syntax errors.
+  const source = readFileSync(filePath, "utf8").replace(/^export\s+/gm, "");
+  const wrapped = `async function __workflowSyntaxCheck() {\n${source}\n}\n`;
+  const dir = mkdtempSync(join(tmpdir(), "check-workflows-"));
+  const tmpFile = join(dir, "workflow.js");
   try {
-    execFileSync(process.execPath, ["--check", filePath], { stdio: "pipe" });
+    writeFileSync(tmpFile, wrapped);
+    execFileSync(process.execPath, ["--check", tmpFile], { stdio: "pipe" });
     return null;
   } catch (error) {
     return error.stderr?.toString().trim() || error.message;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 

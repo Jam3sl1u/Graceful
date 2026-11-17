@@ -56,6 +56,16 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
   const [quickAddKey, setQuickAddKey] = useState("");
   const [quickAddError, setQuickAddError] = useState<string | null>(null);
   const [quickAddTitleDirty, setQuickAddTitleDirty] = useState(false);
+  const quickAddTerm = searchTerm.trim().toLowerCase();
+  const quickAddOpen =
+    quickAddTerm !== "" && filterCatalog(catalog, quickAddTerm).length === 0;
+  // Closing the quick-add form forgets an in-progress title edit so the next
+  // search tracks the search box again. Done during render so it stays in
+  // lockstep with searchTerm without an effect.
+  if (!quickAddOpen && quickAddTitleDirty) {
+    setQuickAddTitleDirty(false);
+  }
+  const quickAddTitleValue = quickAddTitleDirty ? quickAddTitle : searchTerm;
 
   const [persistError, setPersistError] = useState<string | null>(null);
   const [draggedSongId, setDraggedSongId] = useState<string | null>(null);
@@ -126,19 +136,6 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
       cancelled = true;
     };
   }, [setlistId]);
-
-  useEffect(() => {
-    const term = searchTerm.trim().toLowerCase();
-    const showQuickAdd = term !== "" && filterCatalog(catalog, term).length === 0;
-
-    if (showQuickAdd) {
-      if (!quickAddTitleDirty) {
-        setQuickAddTitle(searchTerm);
-      }
-    } else {
-      setQuickAddTitleDirty(false);
-    }
-  }, [searchTerm, catalog, quickAddTitleDirty]);
 
   const isLocked = meta?.status === "published";
   const catalogById = new Map(catalog.map((c) => [c.id, c]));
@@ -217,7 +214,7 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
   async function handleQuickAdd(e: FormEvent) {
     e.preventDefault();
     setQuickAddError(null);
-    const title = quickAddTitle.trim();
+    const title = quickAddTitleValue.trim();
     if (title === "") {
       setQuickAddError("Title is required.");
       return;
@@ -462,7 +459,7 @@ export default function SetlistBuilder({ setlistId }: { setlistId: string }) {
                 <input
                   type="text"
                   required
-                  value={quickAddTitle}
+                  value={quickAddTitleValue}
                   disabled={isLocked}
                   onChange={(e) => {
                     setQuickAddTitle(e.target.value);

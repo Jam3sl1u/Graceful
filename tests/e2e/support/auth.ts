@@ -23,3 +23,11 @@ export async function signInAs(page: Page, role: TestRole): Promise<void> {
   const emailVar = role === "admin" ? "E2E_ADMIN_EMAIL" : "E2E_MEMBER_EMAIL";
   await clerk.signIn({ page, emailAddress: requireEnv(emailVar) });
 }
+
+// Same contract as signInAs, but keyed by email directly — for the
+// disposable Clerk personas (issue #82, tests/e2e/support/env.ts:
+// E2E_SETUP_ADMIN_EMAIL / E2E_GUEST_EMAIL) that don't fit the admin/member
+// TestRole shape.
+export async function signInAsEmail(page: Page, emailAddress: string): Promise<void> {
+  await clerk.signIn({ page, emailAddress });
+}

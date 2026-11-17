@@ -1,283 +1,146 @@
-# Spec — Issue #71: In-app notification inbox endpoints
+# Spec — Issue #82: [Sprint 4] Full E2E regression pass across all Phase 1 critical paths (re-run after remediation commit b08a3e1)
 
-Branch: issue-69 worktree. PRD trigger table = `documentation/prd/graceful_requirements_v10.md`
-§14 (lines 435-447; the issue calls it "§6.9"). Copy templates = §30 (lines 1696-1707).
+## RESOLVED OPEN QUESTION — OQ1 (operator decision, 2026-11-16)
 
-None. Everything below is resolved against the current code; the judgement
-calls are recorded under "Decisions" with their rationale.
+*Carried forward verbatim from the previous spec (commit 17f0988). Do not
+delete this section.*
 
-## Current state (verified in this worktree)
+The human operator answered OQ1 in chat on 2026-11-16 by picking an option in
+an interactive question. They chose **Option A (Recommended)**: disposable test
+users.
 
-- The 4 route files already exist but return `notImplemented(...)` 501 stubs:
-  - `app/api/notifications/route.ts`
-  - `app/api/notifications/unread-count/route.ts`
-  - `app/api/notifications/[id]/read/route.ts`
-  - `app/api/notifications/mark-all-read/route.ts`
-- `app/api/notifications/preferences/{handler,route}.ts` are fully implemented
-  (#70) — same directory, different feature. Do not touch them.
-- The `notifications` table exists (`supabase/migrations/20260702000005_cluster_5_partial.sql`):
-  `id, church_group_id, user_id, type, title, body, link_entity_type,
-  link_entity_id, is_read, created_at`. Indexes already cover
-  `(user_id, is_read)` and `(user_id, created_at desc)`.
-- RLS (`supabase/migrations/20260704000001_rls_policies.sql`) already restricts
-  SELECT and UPDATE on `notifications` to `church_group_id = auth_church_group_id()
-  AND user_id = auth_user_id()`. **No migration is needed for this issue.**
-- `lib/supabase/types.ts` already has `NotificationsRow` + the `notifications`
-  table entry (Row/Insert/Update). **No changes needed there.**
-- Producers (#69) already write rows with these `link_entity_type` values:
-  `"invitation"`, `"service_week"`, `"setlist"`, `"conflict"`,
-  `"google_calendar"` (the last with `link_entity_id = NULL`).
-- `lib/invitations/guest-access.ts` (`guestHasWeekAccess`) is the existing guest
-  scoping helper for single-week reads.
+- The operator will create two throwaway staging sign-in accounts.
+- The operator will add `E2E_SETUP_ADMIN_EMAIL` / `E2E_GUEST_EMAIL` as GitHub
+  Actions secrets.
+- Until then, the two tests that need them skip themselves.
 
-## RESOLVED OPEN QUESTIONS (operator decision, 2026-08-31)
+Option B, simulating create-group/join/guest-claim with service-role writes,
+was not chosen.
 
-Implement the 4 inbox endpoints only. No migration, no UI, no SMS/email, no
-type filter, no audit-log writes, no rate limiting.
+**There are no new OPEN QUESTIONS.** The pipeline may proceed.
 
-## Files to create
+## Current state (verified in this worktree, not assumed)
 
-### 1. `lib/notifications/guest-inbox-scope.ts` (new)
+Every acceptance criterion that code can satisfy is already implemented in
+ef31bd1 + b08a3e1. **Do not recreate or rewrite any of the following.**
 
-Pattern to copy: `lib/invitations/guest-access.ts` (same shape — `"server-only"`
-import, typed `SupabaseClient<Database>` param, never throws, returns a
-`dbError` flag instead of throwing).
+| AC | Where it lives | Status |
+| --- | --- | --- |
+| 1. #52 and #66 suites run together against one staging deploy | `playwright.config.ts` (`testDir: ./tests/e2e`, `workers: 1`); `.github/workflows/ci.yml` `e2e` job makes a single `bun run test:e2e` call; `documentation/staging-environment.md` §7.2 | Done |
+| 2. Continuous admin week-setup flow | `tests/e2e/week-setup-flow.spec.ts` | Done |
+| 3. Notification + inbox flow | `tests/e2e/notification-inbox.spec.ts` | Done |
+| 4. Guest invitation, existing-user and new-user paths | `tests/e2e/guest-invitation.spec.ts`, Test A and Test B | Done |
+| 5. All tests pass against staging in a single CI run | Blocked on the human provisioning the two Clerk personas and secrets (OQ1). The pipeline cannot verify this. | Pending human action |
 
-```ts
-export type GuestInboxScope = { linkEntityIds: string[]; dbError: boolean };
+### Previous review findings (`.pipeline/review.md`, BLOCK on ef31bd1) are all fixed in b08a3e1 / 17f0988
 
-export async function getGuestInboxLinkEntityIds(
-  supabase: SupabaseClient<Database>,
-  userId: string,
-): Promise<GuestInboxScope>;
-```
+I checked each fix against the source:
 
-Behaviour:
+- **B1.** `guest-invitation.spec.ts:162-180`: the same-session re-claim now
+  asserts 201 + `alreadyClaimed` / `invitationId` / `guest.userId`, and an
+  unknown but schema-valid token asserts exactly 404. Verified against:
+  - `supabase/migrations/20260805000001_guest_invitation_flow.sql`: step 2
+    NOT_FOUND at line 122; step 4 idempotent return at lines 128-139, which
+    runs before the step-6 ALREADY_CLAIMED raise at line 151 and the step-7
+    NOT_CLAIMABLE check.
+  - `app/api/invitations/handler.ts:643-666`: NOT_FOUND maps to 404, and
+    success returns 201.
+  - This is the only migration that defines `claim_guest_invitation`.
+- **B2.** The OQ1 resolution is recorded above. The
+  `week-setup-flow.spec.ts` header (lines 16-22) states only the dependency.
+- **N1.** `fixtures.ts` `resetDisposablePersona` (lines 292-338) guards in
+  this order:
+  1. Throws if the persona is a stable fixture user.
+  2. Throws if the persona is an admin of `FIXTURE.churchGroupId`.
+  3. Otherwise deletes the group the persona owns, or just its `users` row.
+- **N2.** `week-setup-flow.spec.ts:95, 167-172`: asserts `joinerName` is
+  truthy, uses the `[class*="rosterSlot"]` + `has:` exact-name filter, and
+  checks `toHaveCount(1)`.
 
-1. `supabase.from("invitations").select("id, service_week_id").eq("user_id", userId)`
-   — **all statuses**, no status filter (see Decisions). On error return
-   `{ linkEntityIds: [], dbError: true }`.
-2. `invitationIds` = the returned `id`s; `weekIds` = unique `service_week_id`s.
-3. If `weekIds.length === 0`, return `{ linkEntityIds: [], dbError: false }`.
-4. `supabase.from("setlists").select("id").in("service_week_id", weekIds)`.
-   On error return `{ linkEntityIds: [], dbError: true }`.
-5. Return `{ linkEntityIds: [...new Set([...invitationIds, ...weekIds, ...setlistIds])], dbError: false }`.
+No duplicate or stray files exist (glob for `* N.{ts,tsx,md,yml,sql}` is empty).
 
-Add a comment explaining that ids from different tables can be mixed in one
-`.in("link_entity_id", ...)` filter because they are all UUID primary keys and
-therefore globally unique — that is why no per-`link_entity_type` `.or()` group
-is needed.
+## Changes required
 
-### 2. `app/api/notifications/handler.ts` (new)
+### 1. `documentation/staging-environment.md`: fix the stale guard description (lines 159-164)
 
-Pattern to copy: `app/api/church-group/audit-log/handler.ts` for the paginated
-query (`page`/`pageSize` -> `range(from, to)` + `count: "exact"` + `created_at`
-desc with `id` desc tiebreak), and `app/api/notifications/preferences/handler.ts`
-for the auth/JWT/error-envelope boilerplate.
+**The problem.** The sentence at lines 163-164 reads:
 
-Shared, module-level:
+> `resetDisposablePersona` hard-guards against ever touching
+> `FIXTURE.churchGroupId`.
 
-```ts
-const COLUMNS = "id, type, title, body, link_entity_type, link_entity_id, is_read, created_at";
+That described the pre-N1 behaviour and is now wrong. Since b08a3e1, the helper
+**intentionally deletes** a disposable persona's member/guest `users` row
+*inside* `FIXTURE.churchGroupId`, for example one left over from a crashed
+guest Test B. The previous spec put this file off-limits, so the doc fell out
+of sync.
 
-export type NotificationItem = {
-  id: string;
-  type: NotificationType;          // from "@/types/domain"
-  title: string;
-  body: string | null;
-  linkEntityType: string | null;
-  linkEntityId: string | null;
-  isRead: boolean;
-  createdAt: string;               // ISO timestamp
-};
-```
+**The fix.** Replace only that final sentence (keep lines 148-162 as they are)
+with text that states the actual guards:
 
-plus a private `mapRow(row): NotificationItem` (snake_case -> camelCase), and a
-private helper that resolves the guest scope once per request, e.g.
+- It throws, rather than deleting anything, if a persona email resolves to one
+  of the two stable fixture users (`FIXTURE.adminUserId` /
+  `FIXTURE.memberUserId`).
+- It throws if the persona is an **admin** of `FIXTURE.churchGroupId`, so the
+  stable fixture group is never cascade-deleted.
+- A disposable persona's member/guest row inside the fixture group *is*
+  deleted, so a crashed run doesn't block the next one.
 
-```ts
-// Returns null for non-guest callers (no extra filtering), the scoped id list
-// for guests. Callers must handle the dbError case as a 500.
-async function resolveGuestScope(
-  supabase: SupabaseClient<Database>,
-  ctx: AuthContext,
-): Promise<{ ids: string[] | null; dbError: boolean }>;
-```
+Match the surrounding prose style. Do not touch any other part of this file.
 
-Exported handlers (every one wrapped in the repo's standard
-`try { ... } catch (err) { if (err instanceof ApiException) return fail(err.message, err.code, err.status); return fail("Internal error", ErrorCode.INTERNAL, 500); }`):
+### 2. No test, fixture, CI, or config changes
 
-```ts
-export async function listNotifications(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-export async function getUnreadNotificationCount(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-export async function markNotificationRead(req: NextRequest, id: string, lookup?: UserLookup): Promise<Response>;
-export async function markAllNotificationsRead(req: NextRequest, lookup?: UserLookup): Promise<Response>;
-```
+Do not edit any of these:
 
-Common to all four: `await requireAuth(req, lookup)`; **no `requireRole` call**
-— PRD §22.12 auth is "Any", and all 4 roles including `guest` must work. Then
-`const { getToken } = await auth(); const jwt = await getToken();` -> 401
-`UNAUTHENTICATED` if falsy -> `getSupabaseClient(jwt)`. Every query additionally
-filters `.eq("user_id", ctx.userId).eq("church_group_id", ctx.churchGroupId)` as
-defense in depth on top of RLS.
+- `tests/e2e/**`
+- `.github/workflows/ci.yml`
+- `playwright.config.ts`
+- `package.json`
+- any product code (`app/**`, `lib/**`, `schemas/**`, `supabase/**`)
 
-**`listNotifications`** — `GET /api/notifications`
+If you find a real defect in them while verifying, **do not fix it**. Write it
+up in `changes.md` under a "Found but not fixed" heading so the reviewer can
+judge it.
 
-- Parse `listNotificationsQuerySchema.safeParse(Object.fromEntries(req.nextUrl.searchParams))`;
-  invalid -> 400 `VALIDATION_FAILED`.
-- Guest with an empty scope -> return the empty page without querying:
-  `ok({ notifications: [], pagination: { page, pageSize, total: 0 } })`.
-- Query: `.from("notifications").select(COLUMNS, { count: "exact" })`, the two
-  `.eq` scope filters, `.in("link_entity_id", scopeIds)` when the caller is a
-  guest, `.order("created_at", { ascending: false }).order("id", { ascending: false })`,
-  `.range((page - 1) * pageSize, (page - 1) * pageSize + pageSize - 1)`.
-- Response: `ok({ notifications: NotificationItem[], pagination: { page, pageSize, total: count ?? 0 } })`.
+## Edge cases the implementation (and the downstream stages) must respect
 
-**`getUnreadNotificationCount`** — `GET /api/notifications/unread-count`
+- **The doc must match the code exactly.** The wording in change 1 must agree
+  with the guard order in `tests/e2e/support/fixtures.ts:311-337`. Re-read that
+  function before writing. Don't paraphrase from this spec alone.
+- **Do not claim AC 5 is met.** Nothing in this pipeline can run the suite
+  against staging: the secrets aren't available locally, and the two
+  disposable personas aren't provisioned yet. Without staging secrets, every
+  affected test skips, so `bun run test:e2e` proves nothing. Do not run it as
+  evidence.
+- **Keep the OQ1 resolution record.** Do not edit `.pipeline/spec.md`.
 
-- No query params.
-- Guest with empty scope -> `ok({ unreadCount: 0 })`.
-- Query: `.select("id", { count: "exact", head: true })` + scope filters +
-  `.eq("is_read", false)` (+ guest `.in`).
-- Response: `ok({ unreadCount: count ?? 0 })`.
+## Patterns to copy
 
-**`markNotificationRead`** — `PATCH /api/notifications/:id/read`
+- Doc prose style: the existing paragraph at
+  `documentation/staging-environment.md:148-164` and the "optional — ... skip
+  when absent" phrasing in its secrets table (lines 179-180).
 
-- After `requireAuth`, validate the path param with
-  `notificationIdParamSchema.safeParse(id)`; invalid -> 400 `VALIDATION_FAILED`
-  (same auth-then-validate order as `withdrawInvitation` in
-  `app/api/invitations/handler.ts`).
-- Ignore the request body entirely (do not call `req.json()`).
-- Fetch the row first: `.select(COLUMNS).eq("id", id)` + scope filters +
-  `.maybeSingle()`. DB error -> 500; no row -> 404 `NOT_FOUND`.
-- Guest: if the row's `link_entity_id` is null or not in the scoped id list ->
-  404 `NOT_FOUND` (never 403 — matches the anti-enumeration rule in
-  `app/api/service-weeks/[id]/handler.ts`).
-- If already `is_read === true`, skip the write and return the row as-is
-  (idempotent 200, not 409).
-- Otherwise `.update(patch).eq("id", id)` + scope filters + `.select(COLUMNS).maybeSingle()`,
-  where `const patch: Database["public"]["Tables"]["notifications"]["Update"] = { is_read: true };`
-  (typed-patch pattern from `app/api/conflicts/handler.ts`). DB error or missing
-  row -> 500 / 404 respectively.
-- Response: `ok({ notification: NotificationItem })`.
-
-**`markAllNotificationsRead`** — `POST /api/notifications/mark-all-read`
-
-- No body parsing, no query params.
-- Guest with empty scope -> `ok({ updatedCount: 0 })`.
-- `.update({ is_read: true })` (typed patch as above) + scope filters +
-  `.eq("is_read", false)` (+ guest `.in`) + `.select("id")`. DB error -> 500.
-- Response: `ok({ updatedCount: (data ?? []).length })`.
-
-## Files to modify
-
-### 3. `schemas/notifications.ts`
-
-Add (keep the existing exports untouched, including the placeholder
-`notificationsSchema`):
-
-```ts
-export const listNotificationsQuerySchema = z.object({
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(100).default(20),
-});
-export type ListNotificationsQuery = z.infer<typeof listNotificationsQuerySchema>;
-
-export const notificationIdParamSchema = z.string().uuid();
-```
-
-Copy the pagination schema shape verbatim from `schemas/audit-log.ts` (only the
-`pageSize` default differs: 20 for an inbox feed).
-
-### 4-7. The four route files
-
-Replace the `notImplemented` bodies with thin delegations. Pattern to copy:
-`app/api/notifications/preferences/route.ts`, and
-`app/api/conflicts/[id]/resolve/route.ts` for the dynamic-param route.
-
-- `app/api/notifications/route.ts`:
-  `export async function GET(req: NextRequest): Promise<Response> { return listNotifications(req); }`
-- `app/api/notifications/unread-count/route.ts`:
-  `export async function GET(req: NextRequest): Promise<Response> { return getUnreadNotificationCount(req); }`
-- `app/api/notifications/mark-all-read/route.ts`:
-  `export async function POST(req: NextRequest): Promise<Response> { return markAllNotificationsRead(req); }`
-- `app/api/notifications/[id]/read/route.ts`:
-  ```ts
-  type Ctx = { params: Promise<{ id: string }> };
-  export async function PATCH(req: NextRequest, { params }: Ctx): Promise<Response> {
-    const { id } = await params;
-    return markNotificationRead(req, id);
-  }
-  ```
-
-All four import from `@/app/api/notifications/handler`. Remove the now-unused
-`notImplemented` imports.
-
-## Edge cases the implementation must handle
-
-1. **Guest scoping (AC bullet 5)**: a guest sees only notifications whose
-   `link_entity_id` is one of their own invitation ids, one of the service-week
-   ids they were invited to, or a setlist id belonging to one of those weeks.
-   This matters for a user demoted from `member` to `guest`, who still owns rows
-   for weeks they were never invited to.
-2. **Guest with zero invitations**: empty inbox, `unreadCount: 0`,
-   `updatedCount: 0`, and 404 on any PATCH — no crash, no unfiltered query.
-3. **Notifications with `link_entity_id = NULL`** (e.g. the
-   `google_calendar_reauth_required` row written by
-   `supabase/migrations/20260716000001_google_calendar_sync.sql`) are excluded
-   for guests by the `.in(...)` filter, and always visible to the other 3 roles.
-4. **Already-read PATCH** is idempotent: 200 with the unchanged item, never 409.
-5. **PATCH on an id that does not exist, belongs to another user, or is outside
-   a guest's scope**: 404 `NOT_FOUND` — never 403, never a distinguishable
-   message between those cases.
-6. **PATCH with a non-UUID id**: 400 `VALIDATION_FAILED`.
-7. **Invalid pagination** (`page=0`, `page=abc`, `pageSize=0`, `pageSize=101`):
-   400 `VALIDATION_FAILED`. Missing params fall back to `page=1`, `pageSize=20`.
-8. **Page past the end**: 200 with `notifications: []` and the real `total`.
-9. **`mark-all-read` with nothing unread**: 200 `{ updatedCount: 0 }`.
-10. **Missing Supabase JWT** (`getToken()` returns null): 401 `UNAUTHENTICATED`,
-    on all four endpoints.
-11. **Any Supabase error**, including an error from the guest-scope lookup:
-    500 `INTERNAL` with the generic `"Internal error"` message — never leak the
-    driver error.
-12. **`count` returned as `null`** by PostgREST: coerce to `0`.
-13. **Ordering stability**: `created_at desc, id desc` so pagination cannot skip
-    or duplicate rows sharing a timestamp (bulk inserts write identical
-    `created_at` values — see the fan-out inserts in
-    `app/api/setlists/[id]/handler.ts`).
-
-## Decisions (recorded so the reviewer does not re-litigate them)
-
-- **"Invited weeks" means any invitation row, regardless of status.** This
-  deliberately differs from `guestHasWeekAccess`/`GUEST_ACCESS_STATUSES`
-  (`pending`/`accepted`), which gates *content* access. Using live statuses here
-  would make the `invitation_withdrawn` notification vanish at the exact moment
-  it is written (the withdraw path in `app/api/invitations/handler.ts` sets
-  `status = 'withdrawn'` immediately before inserting it), so the guest could
-  never learn they were withdrawn — which contradicts the issue's "source of
-  truth for did I get notified about this". Add a comment saying so.
-- **No type filter.** PRD §22.12 mentions "filterable by type", but §13.2 marks
-  "Filter by type" as Phase 2 and the issue's ACs do not ask for it. Out of
-  scope.
-- **No `requireRole`.** Auth is "Any" (all 4 roles); guest access is narrowed by
-  the scope filter, not by a role gate.
-- **No audit-log writes.** Reading and marking one's own inbox is not an audited
-  admin action; `writeAuditLog` is not used here.
-- **No new migration.** The table, indexes, RLS policies, and TypeScript row
-  types all already exist.
-
-### OQ1 — "Practice reminder" has no scheduling infrastructure at all
-
-Run from the worktree root with Bun (never npm/npx):
+## Verification before finishing
 
 - `bun run lint`
 - `bun run typecheck`
-- `bun run test`
+- `bun run test`: Jest. It must stay at 147 suites, all passing; `tests/e2e/`
+  is ignored.
+- `bunx playwright test --list`: it must still discover 15 tests in 11 files.
 
-Unit tests belong in `tests/unit/app/api/notifications-inbox-route.test.ts`;
-copy the Clerk/Supabase mocking harness from
-`tests/unit/app/api/audit-log-route.test.ts` (it already models
-`select -> order -> order -> range` with `count`), extending the fake client
-with `in`, `update`, `maybeSingle`, and `head: true` count support. Handlers
-take an injectable `lookup?: UserLookup` precisely so tests can vary
-`ctx.role` across `admin` / `set_leader` / `member` / `guest`.
+## What `changes.md` must state
+
+- The single doc edit, with before/after line numbers.
+- That no test, fixture, CI, or product code changed in this run.
+- In plain words: none of the issue #82 E2E assertions has run against
+  staging. AC 5 is still pending the human provisioning of
+  `E2E_SETUP_ADMIN_EMAIL` / `E2E_GUEST_EMAIL` (Clerk test users + GitHub
+  secrets).
+- A "Found but not fixed" heading, if anything turned up.
+
+## Out of scope
+
+- Provisioning Clerk personas or GitHub secrets. Those are human actions.
+- Adding a third-party-identity `ALREADY_CLAIMED` 409 test.
+- Rewording other pre-existing comments, for example `seedSyntheticUser`'s
+  "only two real Clerk personas" note in `fixtures.ts`.
+- Phase 2+ flows (chat, document library).
