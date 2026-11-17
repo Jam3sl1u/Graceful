@@ -1,286 +1,146 @@
-# Spec — Issue #73: [Sprint 4] Build Notification Inbox screen
+# Spec — Issue #82: [Sprint 4] Full E2E regression pass across all Phase 1 critical paths (re-run after remediation commit b08a3e1)
 
-PRD: `documentation/prd/graceful_requirements_v10.md` §13 Screen 6 (line 1320) and §13.2 (line 392).
-Backend (#71) is already shipped. The original Screen-6 work is UI-only; the approved
-option-C decision below adds the tightly scoped in-app invitation response surface. No
-schema or migration changes are authorized.
+## RESOLVED OPEN QUESTION — OQ1 (operator decision, 2026-11-16)
 
----
+*Carried forward verbatim from the previous spec (commit 17f0988). Do not
+delete this section.*
 
-## RESOLVED DECISION — invitation notification deep link (option C)
+The human operator answered OQ1 in chat on 2026-11-16 by picking an option in
+an interactive question. They chose **Option A (Recommended)**: disposable test
+users.
 
-**Resolution:** The human operator approved **option C** in this conversation on
-**2026-09-15**. Invitation notifications deep-link to `/invitations/:id`, where an
-authenticated member can view and respond to their own invitation. This explicitly
-authorizes the companion PRD Screen-3 UI, member-scoped `GET /api/invitations/:id`, and
-the existing authenticated accept/deny endpoints required by that flow.
+- The operator will create two throwaway staging sign-in accounts.
+- The operator will add `E2E_SETUP_ADMIN_EMAIL` / `E2E_GUEST_EMAIL` as GitHub
+  Actions secrets.
+- Until then, the two tests that need them skip themselves.
 
-**Where should an `invitation` notification deep-link to?**
+Option B, simulating create-group/join/guest-claim with service-role writes,
+was not chosen.
 
-The acceptance criterion says "invitation → accept/deny flow", but verified current state:
+**There are no new OPEN QUESTIONS.** The pipeline may proceed.
 
-- Invitation notifications are written with `link_entity_type: "invitation"`,
-  `link_entity_id = <invitation id>`
-  (`app/api/invitations/handler.ts:980`, `app/api/conflicts/handler.ts:247`, and the
-  accept/deny RPC migrations).
-- **There is no in-app accept/deny screen.** The only response UI is the public,
-  token-gated `app/(public)/invite/[token]/invite-response.tsx`, and its URL needs
-  `response_token`, which `GET /api/notifications` deliberately does not return and
-  which `app/api/invitations/handler.ts:61-63` calls "the no-session credential —
-  never expose".
-- There is also no member-accessible endpoint that maps an invitation id to its
-  `service_week_id` (`GET /api/invitations` is admin/set_leader-only and requires a
-  `serviceWeekId` query param).
+## Current state (verified in this worktree, not assumed)
 
-So a working deep link for `invitation` rows cannot be built from what exists. Options:
+Every acceptance criterion that code can satisfy is already implemented in
+ef31bd1 + b08a3e1. **Do not recreate or rewrite any of the following.**
 
-- **(A) Recommended:** render `invitation` rows as non-clickable (same treatment as any
-  unresolvable target — see "Deep-link resolution" below); tapping still marks read.
-  No new endpoints, nothing dead-links to a 404.
-- (B) Link to `/invitations/${linkEntityId}` and accept that it 404s today (precedent:
-  `app/(app)/conflicts/[id]/conflict-resolution.tsx:171` already links to a
-  not-yet-built `/invitations/new`).
-- (C) Build the in-app accept/deny screen in this issue (scope creep — that is PRD
-  Screen 3 / "In-app response" work, not Screen 6).
+| AC | Where it lives | Status |
+| --- | --- | --- |
+| 1. #52 and #66 suites run together against one staging deploy | `playwright.config.ts` (`testDir: ./tests/e2e`, `workers: 1`); `.github/workflows/ci.yml` `e2e` job makes a single `bun run test:e2e` call; `documentation/staging-environment.md` §7.2 | Done |
+| 2. Continuous admin week-setup flow | `tests/e2e/week-setup-flow.spec.ts` | Done |
+| 3. Notification + inbox flow | `tests/e2e/notification-inbox.spec.ts` | Done |
+| 4. Guest invitation, existing-user and new-user paths | `tests/e2e/guest-invitation.spec.ts`, Test A and Test B | Done |
+| 5. All tests pass against staging in a single CI run | Blocked on the human provisioning the two Clerk personas and secrets (OQ1). The pipeline cannot verify this. | Pending human action |
 
-Everything else in this spec is unambiguous and unaffected by the answer. The scope
-expansion is limited to the option-C invitation response flow described above.
+### Previous review findings (`.pipeline/review.md`, BLOCK on ef31bd1) are all fixed in b08a3e1 / 17f0988
 
----
+I checked each fix against the source:
 
-## Current state (verified in this worktree)
+- **B1.** `guest-invitation.spec.ts:162-180`: the same-session re-claim now
+  asserts 201 + `alreadyClaimed` / `invitationId` / `guest.userId`, and an
+  unknown but schema-valid token asserts exactly 404. Verified against:
+  - `supabase/migrations/20260805000001_guest_invitation_flow.sql`: step 2
+    NOT_FOUND at line 122; step 4 idempotent return at lines 128-139, which
+    runs before the step-6 ALREADY_CLAIMED raise at line 151 and the step-7
+    NOT_CLAIMABLE check.
+  - `app/api/invitations/handler.ts:643-666`: NOT_FOUND maps to 404, and
+    success returns 201.
+  - This is the only migration that defines `claim_guest_invitation`.
+- **B2.** The OQ1 resolution is recorded above. The
+  `week-setup-flow.spec.ts` header (lines 16-22) states only the dependency.
+- **N1.** `fixtures.ts` `resetDisposablePersona` (lines 292-338) guards in
+  this order:
+  1. Throws if the persona is a stable fixture user.
+  2. Throws if the persona is an admin of `FIXTURE.churchGroupId`.
+  3. Otherwise deletes the group the persona owns, or just its `users` row.
+- **N2.** `week-setup-flow.spec.ts:95, 167-172`: asserts `joinerName` is
+  truthy, uses the `[class*="rosterSlot"]` + `has:` exact-name filter, and
+  checks `toHaveCount(1)`.
 
-- `app/(app)/notifications/page.tsx` is a 4-line "coming soon" stub.
-- `components/layout/AppShell.tsx` renders a sidebar containing the literal string
-  "Graceful" and **no nav links at all** (its TODO comment names this exact gap).
-- Endpoints already implemented in `app/api/notifications/handler.ts`:
-  - `GET /api/notifications?page=&pageSize=` → `{ data: { notifications: NotificationItem[],
-    pagination: { page, pageSize, total } } }`; `pageSize` max 100, default 20.
-  - `GET /api/notifications/unread-count` → `{ data: { unreadCount: number } }`
-  - `PATCH /api/notifications/:id/read` → `{ data: { notification } }` (idempotent)
-  - `POST /api/notifications/mark-all-read` → `{ data: { updatedCount: number } }`
-- `NotificationItem` (exported from `app/api/notifications/handler.ts`):
-  `{ id, type: NotificationType, title, body: string | null, linkEntityType: string | null,
-  linkEntityId: string | null, isRead: boolean, createdAt: string /* ISO */ }`
-- `NotificationType` union: `types/domain.ts:22-37`.
-- `link_entity_type` values actually produced today: `"invitation"`, `"service_week"`,
-  `"setlist"`, `"conflict"`, `"google_calendar"` (the last with `link_entity_id = null`).
-- Existing app routes available as link targets: `/week/[id]`, `/member-week/[id]`,
-  `/conflicts/[id]`, `/setlists/[id]`, `/dashboard`, `/documents`, `/profile`,
-  `/notifications`.
-- CSS variables available (`app/globals.css`): `--color-bg`, `--color-fg`,
-  `--color-border`, `--color-accent`.
+No duplicate or stray files exist (glob for `* N.{ts,tsx,md,yml,sql}` is empty).
 
-## Pattern to copy
+## Changes required
 
-`app/(app)/conflicts/` is the model for this screen — copy its structure exactly:
+### 1. `documentation/staging-environment.md`: fix the stale guard description (lines 159-164)
 
-- `page.tsx`: tiny server component that renders the `"use client"` child, no shell.
-- `conflicts-list.tsx`: `"use client"`, `ViewState = "loading" | "ready" | "error"`,
-  `useEffect` + `fetch` with a `cancelled` flag, reads `body.data.<key>`, a CSS module.
-- `conflicts-list.module.css`: `.container` / `.list` / `.card` conventions.
-- Test pattern (for the tester stage): `tests/unit/app/conflicts-list.test.tsx`
-  (`/** @jest-environment jsdom */`, `global.fetch` mocked with a `jsonResponse` helper).
+**The problem.** The sentence at lines 163-164 reads:
 
----
+> `resetDisposablePersona` hard-guards against ever touching
+> `FIXTURE.churchGroupId`.
 
-## Files to create
+That described the pre-N1 behaviour and is now wrong. Since b08a3e1, the helper
+**intentionally deletes** a disposable persona's member/guest `users` row
+*inside* `FIXTURE.churchGroupId`, for example one left over from a crashed
+guest Test B. The previous spec put this file off-limits, so the doc fell out
+of sync.
 
-### 1. `lib/notifications/inbox-links.ts` (new, pure, no React, no `"server-only"`)
+**The fix.** Replace only that final sentence (keep lines 148-162 as they are)
+with text that states the actual guards:
 
-```ts
-import type { NotificationType } from "@/types/domain";
+- It throws, rather than deleting anything, if a persona email resolves to one
+  of the two stable fixture users (`FIXTURE.adminUserId` /
+  `FIXTURE.memberUserId`).
+- It throws if the persona is an **admin** of `FIXTURE.churchGroupId`, so the
+  stable fixture group is never cascade-deleted.
+- A disposable persona's member/guest row inside the fixture group *is*
+  deleted, so a crashed run doesn't block the next one.
 
-export type NotificationFilter = "all" | "invitations" | "setlists" | "events" | "chat";
+Match the surrounding prose style. Do not touch any other part of this file.
 
-export const NOTIFICATION_FILTERS: { id: NotificationFilter; label: string }[];
-// exactly: all → "All", invitations → "Invitations", setlists → "Setlists",
-// events → "Events", chat → "Chat" (in that order)
+### 2. No test, fixture, CI, or config changes
 
-export function filterForType(type: NotificationType): NotificationFilter | null;
+Do not edit any of these:
 
-export function matchesFilter(type: NotificationType, filter: NotificationFilter): boolean;
+- `tests/e2e/**`
+- `.github/workflows/ci.yml`
+- `playwright.config.ts`
+- `package.json`
+- any product code (`app/**`, `lib/**`, `schemas/**`, `supabase/**`)
 
-export function resolveNotificationHref(
-  linkEntityType: string | null,
-  linkEntityId: string | null,
-): string | null;
+If you find a real defect in them while verifying, **do not fix it**. Write it
+up in `changes.md` under a "Found but not fixed" heading so the reviewer can
+judge it.
 
-export function formatRelativeTime(iso: string, now?: Date): string;
-```
+## Edge cases the implementation (and the downstream stages) must respect
 
-`filterForType` mapping (anything not listed returns `null` → only visible under "All"):
+- **The doc must match the code exactly.** The wording in change 1 must agree
+  with the guard order in `tests/e2e/support/fixtures.ts:311-337`. Re-read that
+  function before writing. Don't paraphrase from this spec alone.
+- **Do not claim AC 5 is met.** Nothing in this pipeline can run the suite
+  against staging: the secrets aren't available locally, and the two
+  disposable personas aren't provisioned yet. Without staging secrets, every
+  affected test skips, so `bun run test:e2e` proves nothing. Do not run it as
+  evidence.
+- **Keep the OQ1 resolution record.** Do not edit `.pipeline/spec.md`.
 
-| filter        | types |
-| ------------- | ----- |
-| `invitations` | `set_invitation`, `invitation_reminder`, `invitation_accepted`, `invitation_denied`, `invitation_withdrawn` |
-| `setlists`    | `setlist_released` |
-| `events`      | `practice_reminder`, `scheduling_conflict`, `google_calendar_event`, `service_week_cancelled`, `service_week_reactivated` |
-| `chat`        | `chat_mention` |
-| `null`        | `devotion_shared`, `new_church_document`, `google_calendar_reauth_required` |
+## Patterns to copy
 
-`matchesFilter(type, "all")` is always `true`; otherwise `filterForType(type) === filter`.
+- Doc prose style: the existing paragraph at
+  `documentation/staging-environment.md:148-164` and the "optional — ... skip
+  when absent" phrasing in its secrets table (lines 179-180).
 
-`resolveNotificationHref` — returns `null` (row not clickable) whenever `linkEntityId`
-is `null`/empty, `linkEntityType` is `null`, or the type is unknown:
+## Verification before finishing
 
-| `linkEntityType` | href |
-| ---------------- | ---- |
-| `"setlist"`      | `/setlists/${linkEntityId}` |
-| `"conflict"`     | `/conflicts/${linkEntityId}` |
-| `"service_week"` | `/member-week/${linkEntityId}` |
-| `"invitation"`   | `/invitations/${linkEntityId}` (approved option C) |
-| anything else (incl. `"google_calendar"`) | `null` |
+- `bun run lint`
+- `bun run typecheck`
+- `bun run test`: Jest. It must stay at 147 suites, all passing; `tests/e2e/`
+  is ignored.
+- `bunx playwright test --list`: it must still discover 15 tests in 11 files.
 
-`formatRelativeTime(iso, now = new Date())` — plain English, no new dependency
-(use `Intl.RelativeTimeFormat` or manual arithmetic, coder's choice):
-`< 60s` → `"just now"`; `< 60m` → `"Nm ago"`; `< 24h` → `"Nh ago"`; `< 7d` → `"Nd ago"`;
-otherwise the absolute date via `toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })`.
-A future timestamp (clock skew) must render `"just now"`, never a negative value.
-An unparseable `iso` must return `""` and must not throw.
+## What `changes.md` must state
 
-### 2. `app/(app)/notifications/notification-inbox.tsx` (new, `"use client"`)
+- The single doc edit, with before/after line numbers.
+- That no test, fixture, CI, or product code changed in this run.
+- In plain words: none of the issue #82 E2E assertions has run against
+  staging. AC 5 is still pending the human provisioning of
+  `E2E_SETUP_ADMIN_EMAIL` / `E2E_GUEST_EMAIL` (Clerk test users + GitHub
+  secrets).
+- A "Found but not fixed" heading, if anything turned up.
 
-Default export `NotificationInbox()`. No props.
+## Out of scope
 
-State: `view: "loading" | "ready" | "error"`, `notifications: NotificationItem[]`
-(declare the row type locally in this file, mirroring how `conflicts-list.tsx` declares
-its own `Conflict` type — do not import from `app/api/**` into a client component),
-`total: number`, `filter: NotificationFilter` (default `"all"`),
-`markingAll: boolean`.
-
-Behaviour:
-
-- On mount, `fetch("/api/notifications?page=1&pageSize=50")`; on non-ok or throw →
-  `view = "error"` with the same copy as `conflicts-list.tsx` ("Something went wrong" /
-  "Please try again later."). Use the `cancelled` cleanup flag pattern.
-- Header: `<h1>Notifications</h1>` plus a **"Mark all read"** `<button>`. Disabled when
-  `markingAll` is true or when no loaded notification is unread. On click:
-  `POST /api/notifications/mark-all-read` → on ok, set every loaded row's `isRead` to
-  `true` in local state and dispatch the unread-count refresh event (below). On failure,
-  leave state untouched and show an inline error message near the button; do not flip
-  the whole screen to the error view.
-- Filter row: a `<nav>`/`<div>` of buttons built from `NOTIFICATION_FILTERS`, the active
-  one marked with `aria-pressed={true}` (or `aria-current`). Selecting a filter only
-  changes local state — **no refetch**.
-- List: `<ul>` of `<li>`, one per notification passing `matchesFilter`. Each row shows,
-  in order: a type icon (a plain text/emoji glyph via a local
-  `iconForType(type: NotificationType): string` map with a sensible default — no icon
-  library, no new dependency), `title`, `body` (omit the element entirely when `null`),
-  and `formatRelativeTime(createdAt)` rendered inside a
-  `<time dateTime={createdAt}>` element.
-- Unread rows get an extra CSS class (`styles.unread`) **and** a visually-hidden
-  `"Unread"` text marker (e.g. `<span className={styles.srOnly}>Unread</span>`) so the
-  distinction is assertable in tests and available to screen readers.
-- Row interaction: when `resolveNotificationHref` returns a string, the row content is a
-  `next/link` `<Link href={...}>`; when it returns `null`, render the same content inside
-  a `<button type="button">` styled as the card. In **both** cases, activating the row
-  first fires `PATCH /api/notifications/${id}/read` (fire-and-forget: do not await before
-  navigating, do not block navigation on failure) and optimistically sets that row's
-  `isRead` to `true`, then dispatches the unread-count refresh event. Already-read rows
-  must **not** issue the PATCH.
-- Empty states (all rendered inside the same `.container`, never a blank screen):
-  - `total === 0` → "No notifications yet."
-  - loaded rows exist but none match the active filter → "No <label> notifications."
-    (this is what the inert **Chat** filter hits today — it must render this empty state,
-    not break the layout).
-- If `total > notifications.length`, render one line of muted text below the list:
-  `Showing the {notifications.length} most recent of {total} notifications.`
-  No pagination controls (out of scope).
-
-### 3. `app/(app)/notifications/notification-inbox.module.css` (new)
-
-Copy `app/(app)/conflicts/conflicts-list.module.css` conventions
-(`.container`, `.list`, `.card`) and add: `.header` (flex row, space-between),
-`.filters`, `.filterButton`, `.filterButtonActive`, `.unread`
-(e.g. `border-left: 3px solid var(--color-accent)` + `font-weight: 600` on the title),
-`.icon`, `.timestamp` (muted), `.empty`, `.footnote`, `.srOnly` (standard
-clip/1px visually-hidden rule). Only `var(--color-*)` tokens listed above.
-
-### 4. `components/layout/NotificationBell.tsx` (new, `"use client"`)
-
-```tsx
-export function NotificationBell(): React.JSX.Element;
-```
-
-- Renders `<Link href="/notifications" aria-label="Notifications">` containing a bell
-  glyph and, when `unreadCount > 0`, a badge element showing the count
-  (`unreadCount > 99` → the string `"99+"`).
-- Fetches `GET /api/notifications/unread-count` on mount; reads `body.data.unreadCount`.
-  On any failure, render the icon with no badge and no error UI (`unreadCount = 0`).
-- Refreshes on the custom event `notifications:unread-changed`:
-  add a `window.addEventListener` in a `useEffect` and remove it on cleanup. Export the
-  event name and a dispatch helper **from this file** so the inbox screen imports them:
-  ```ts
-  export const UNREAD_CHANGED_EVENT = "notifications:unread-changed";
-  export function notifyUnreadChanged(): void; // no-op when `typeof window === "undefined"`
-  ```
-  (`notification-inbox.tsx` calls `notifyUnreadChanged()` after mark-all-read and after
-  each per-row PATCH is issued.)
-- The badge must be exposed accessibly: `aria-label={`${unreadCount} unread notifications`}`
-  on the badge element.
-
-### 5. `components/layout/NotificationBell.module.css` (new)
-
-`.link`, `.icon`, `.badge` (small pill, `background: var(--color-accent)`, white text,
-positioned relative to `.link`).
-
-## Files to modify
-
-### 6. `app/(app)/notifications/page.tsx` (replace whole file)
-
-Mirror `app/(app)/conflicts/page.tsx`: a comment naming PRD Screen 6 / issue #73, then
-a default-export server component returning `<NotificationInbox />`. No shell wrapper
-(the `(app)` layout already supplies `AppShell`).
-
-### 7. `components/layout/AppShell.tsx` (modify)
-
-Keep it a server component. Inside `.sidebar`, keep the "Graceful" wordmark and add a
-persistent nav containing `<NotificationBell />`. Scope: **only** the notifications
-entry — do not add dashboard/week/setlist/profile links, and do not delete the existing
-`TODO(Sprint 1+)` comment (amend it to note that notifications is now wired up).
-
-### 8. `components/layout/AppShell.module.css` (modify)
-
-Add only what the nav needs (e.g. `.sidebarHeader` / `.nav`); leave `.shell`,
-`.sidebar`, `.content` as they are.
-
----
-
-## Edge cases the implementation must handle
-
-1. `body === null` → no body element rendered (must not print "null").
-2. `linkEntityId === null` (e.g. `google_calendar` rows) → non-clickable row, still
-   markable as read.
-3. Unknown / future `linkEntityType` string → treated as non-clickable, never throws.
-4. Notification types with no filter category (`devotion_shared`,
-   `new_church_document`, `google_calendar_reauth_required`) → visible under "All" only.
-5. **Chat filter selected** → the "No Chat notifications." empty state; layout intact;
-   no fetch, no error.
-6. `unreadCount === 0` → bell renders with no badge at all.
-7. `unreadCount > 99` → badge shows `"99+"`.
-8. Mark-all-read when nothing is unread → button disabled, no request issued.
-9. Mark-all-read HTTP failure → list state unchanged, inline error shown, screen stays
-   usable.
-10. Per-row PATCH failure → navigation still happens; the optimistic unread flip is
-    allowed to stand (the next page load re-reads the truth).
-11. Tapping an already-read row → no PATCH request.
-12. Empty inbox (`total === 0`, `notifications: []`) → "No notifications yet.", and
-    mark-all-read disabled.
-13. Fetch rejects / non-2xx on the list endpoint → error view (no crash, no infinite
-    loading).
-14. Unmount before fetch resolves → no `setState` (use the `cancelled` flag).
-15. `createdAt` in the future or unparseable → `"just now"` / `""`, never `NaN` or a
-    negative duration.
-
-## Out of scope (do not build)
-
-Push/SMS/email delivery, pagination or infinite scroll, per-notification delete,
-notification preferences UI (already shipped as `/api/notifications/preferences`),
-any Chat functionality, a "System" filter, any other nav link in `AppShell`, any API
-change beyond the approved member-scoped invitation-response flow, or any change to
-`schemas/**`, `lib/supabase/**`, or `supabase/migrations/**`.
-
-## Verification
-
-`bun run lint`, `bun run typecheck`, `bun run test` must all pass.
+- Provisioning Clerk personas or GitHub secrets. Those are human actions.
+- Adding a third-party-identity `ALREADY_CLAIMED` 409 test.
+- Rewording other pre-existing comments, for example `seedSyntheticUser`'s
+  "only two real Clerk personas" note in `fixtures.ts`.
+- Phase 2+ flows (chat, document library).

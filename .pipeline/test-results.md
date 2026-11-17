@@ -1,123 +1,25 @@
-# Test Results — Issue #73: Notification Inbox screen (+ in-app invitation response, option C)
+# Test Results — Issue #82 (remediation re-run)
 
-## Verdict: ALL PASS
+Verdict: PASS (for everything verifiable locally). AC 5 is NOT verified.
 
-Independently re-ran and verified against the code in this worktree (not just
-trusting `changes.md`'s claims):
+## Independently re-run (Bun)
+- `bun run lint`: clean
+- `bun run typecheck`: clean
+- `bun run test` (Jest): 147 suites, 3144 tests, all pass (matches coder's claim and spec)
+- `bunx playwright test --list`: 15 tests in 11 files (matches spec)
 
-- `bun run lint` — pass, no warnings/errors.
-- `bun run typecheck` — pass.
-- `bun run test` — **153 suites / 3233 tests, all pass** (baseline before this
-  stage: 147 suites / 3144 tests; 6 new test files / 89 new tests added by
-  this stage; existing handler assertions were strengthened and no pre-existing
-  tests were broken).
+## Doc-vs-code check
+Compared `documentation/staging-environment.md` section 7.1 item 1 against `resetDisposablePersona` in `tests/e2e/support/fixtures.ts`. The doc now matches the code on all three behaviors:
+- throws if the persona resolves to `FIXTURE.adminUserId` / `FIXTURE.memberUserId`
+- throws if the persona is an admin of `FIXTURE.churchGroupId`
+- deletes a disposable member/guest row inside the fixture group, or the owned group otherwise
 
-## New test files (this stage)
+The stale "hard-guards against ever touching FIXTURE.churchGroupId" sentence is gone.
 
-1. `tests/unit/lib/notifications/inbox-links.test.ts` (40 tests)
-   - `NOTIFICATION_FILTERS` exact order/labels.
-   - `filterForType` full table (all 15 `NotificationType` values, incl. the
-     3 that map to `null`).
-   - `matchesFilter`: `"all"` always true, category match/mismatch, no-category
-     types never match a non-`"all"` filter.
-   - `resolveNotificationHref`: all 4 known `linkEntityType`s incl.
-     `"invitation"` → `/invitations/:id` (the option-C behavior), `null` for
-     `"google_calendar"` even with a non-null id, `null` for null id/empty
-     id/null type, `null` (no throw) for an unknown/future type.
-   - `formatRelativeTime`: all boundary values (60s/60m/24h/7d, both just
-     under and exactly at each boundary), the >=7d absolute-date format,
-     future-timestamp clock skew → `"just now"` (never negative), unparseable
-     and empty-string input → `""` without throwing.
+## Scope check
+`git status` shows only `.pipeline/spec.md` modified in the working tree. The doc edit is already committed (e7d2a38), and no test, fixture, CI, or product code changed in this run.
 
-2. `tests/unit/app/notification-bell.test.tsx` (7 tests)
-   - Happy path badge render + accessible label; `unreadCount === 0` → no
-     badge; `unreadCount > 99` → `"99+"`; refresh on
-     `UNREAD_CHANGED_EVENT`/`notifyUnreadChanged()`; silent failure on a
-     non-OK response and on a network error (no badge, no error UI).
+## Not verified
+No issue #82 E2E assertion has run against staging, because `E2E_SETUP_ADMIN_EMAIL` and `E2E_GUEST_EMAIL` and the matching secrets are not provisioned. `test:e2e` was deliberately not run, since the affected tests would skip and prove nothing. AC 5 remains pending human action.
 
-3. `tests/unit/app/notification-inbox.test.tsx` (16 tests)
-   - Loading state; happy-path row rendering (title/body/timestamp/link
-     href); `body === null` renders no body element (not the string
-     `"null"`); `linkEntityId === null` renders a non-clickable button row
-     that still issues the read PATCH on tap; unknown `linkEntityType` is
-     non-clickable and doesn't throw; unread rows get the visually-hidden
-     "Unread" marker and read rows don't; the Chat filter's empty state with
-     no refetch; empty-inbox state + disabled mark-all-read; the "Showing N
-     of Total" footnote (present/absent); mark-all-read disabled-when-nothing-
-     unread (no request issued), happy path (flips rows + dispatches the
-     event), and HTTP-failure path (inline error, list state unchanged,
-     screen stays usable); already-read row taps issue no PATCH; list-fetch
-     failure (non-OK and network-error) both show the error view.
-
-4. `tests/unit/app/api/invitations-get-own-route.test.ts` (8 tests) — new
-   `getOwnInvitation` handler.
-   - 401 when no JWT; 400 on a malformed id; happy path returns the exact
-     `PublicInvitationLookup` shape; computed `"expired"` for a pending
-     invitation past its deadline; an already-responded invitation is never
-     recomputed to `"expired"` even past its deadline; 404 for a nonexistent
-     invitation; **same 404 body for "not owned"/"nonexistent" cases — no
-     existence leak**; 500 on a Supabase query error.
-
-5. `tests/unit/app/invitation-response.test.tsx` (15 tests) — new in-app
-   accept/deny screen (`app/(app)/invitations/[id]/invitation-response.tsx`).
-   - Loading state; happy path fetches by id (`/api/invitations/:id`, no
-     token in the URL); accept posts an **empty body** (no `responseToken`)
-     and shows accepted-success; accept dispatches `notifyUnreadChanged()`
-     end-to-end; decline posts `{ reason }` (no `responseToken`) and shows
-     declined-success using the exact handler action-response body.
-   - Declining an already accepted or withdrawn invitation never shows the
-     false success state; action 404 maps to not-found, 410 to expired, and
-     an unexpected successful action status or malformed payload shows a
-     retryable error.
-   - Expired-on-load and already-responded-on-load both show the friendly
-     unavailable copy (never the raw status); a 404 lookup and a network error
-     on the lookup both show the not-found unavailable view, not a crash.
-
-6. `tests/unit/invitations-id-route-auth-gate.test.ts` (3 tests) — exercises
-   `middleware.ts`'s real (unmocked) `isPublicRoute` matcher.
-   - `GET /api/invitations/:id` is NOT public (protected by default —
-     `auth.protect()` runs, so an unauthenticated request is redirected/401'd,
-     never returning invitation data).
-   - `/invitations/:id` (the in-app response page) is NOT public.
-   - Contrast check: the existing public, token-gated `/accept`, `/deny`, and
-     `/respond/:token` endpoints remain public (regression guard against this
-     change accidentally widening or narrowing that allowlist).
-
-## Spec/edge-case coverage cross-check
-
-All items from spec.md's "Edge cases the implementation must handle" (1–15)
-and changes.md's "What the Tester should focus on" (1–5) are covered above,
-including the option-C-specific `resolveNotificationHref("invitation", id)`
-behavior and the `getOwnInvitation` no-existence-leak / expired-status-parity
-checks the coder flagged as needing independent verification.
-
-## Review-remediation verification
-
-- The authenticated deny handler returns exactly `{ invitationId, status,
-  alreadyResponded }` for both a new denial and an idempotent terminal result;
-  its tests assert that the response never includes `responseToken`.
-- The authenticated accept handler's exact response body is asserted, and the
-  in-app component tests consume real handler-shaped action bodies rather than
-  a fictional `{ status, alreadyResponded }` fixture.
-- The non-linkable notification card asserts a `span` body with no nested
-  paragraph inside its button.
-
-## Notes for the Reviewer
-
-- No failures encountered; nothing was patched around. The one hiccup during
-  authoring was in my own test fixture (an invitation `response_deadline` of
-  `2026-07-15` was in the past relative to today's actual date, 2026-09-12,
-  which made the "still pending" happy-path fixture spuriously compute as
-  `"expired"` — fixed by using a fixture deadline in 2099; not a code defect).
-- `console.error: Error: Not implemented: navigation (except hash changes)`
-  appears in jsdom output when clicking a `next/link` row in
-  `notification-inbox.test.tsx` and `invitation-response.test.tsx` — this is
-  jsdom's standard harmless noise for unmocked anchor navigation (same
-  pattern already present in this repo's other Link-based screens, e.g.
-  `conflicts-list.test.tsx`), not a test failure.
-- Manual code review (not just tests) confirms: `getOwnInvitation` scopes its
-  query by both `church_group_id` and `user_id` before falling back to a
-  uniform 404, matching `denyInvitation`'s existing in-app-branch precedent;
-  no `schemas/**`, `lib/supabase/**`, or `supabase/migrations/**` files were
-  touched, matching the spec's scope boundary; `AppShell.tsx`/`.module.css`
-  changes are additive only (`.sidebar`/`.shell`/`.content` untouched).
+No new tests were written. The change is documentation-only and the spec forbids test changes.
