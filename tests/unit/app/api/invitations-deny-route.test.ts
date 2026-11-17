@@ -13,7 +13,6 @@ import { getSupabaseClient } from "@/lib/supabase/client";
 import {
   createInvitation,
   denyInvitation,
-  type InvitationResponse,
 } from "@/app/api/invitations/handler";
 import type { AuthContext, UserLookup } from "@/lib/api/auth";
 import type { UserRole } from "@/types/domain";
@@ -243,8 +242,12 @@ describe("POST /api/invitations/:id/deny", () => {
     expect(res.status).toBe(200);
 
     const body = await res.json();
-    const invitation: InvitationResponse = body.data.invitation;
-    expect(invitation.status).toBe("denied");
+    expect(body.data).toEqual({
+      invitationId: INVITATION_ID,
+      status: "denied",
+      alreadyResponded: false,
+    });
+    expect(JSON.stringify(body)).not.toContain(pendingInvitationRow.response_token);
 
     expect(updatePayload).toMatchObject({
       status: "denied",
@@ -339,8 +342,12 @@ describe("POST /api/invitations/:id/deny", () => {
     expect(res.status).toBe(200);
 
     const body = await res.json();
-    const invitation: InvitationResponse = body.data.invitation;
-    expect(invitation.status).toBe("denied");
+    expect(body.data).toEqual({
+      invitationId: INVITATION_ID,
+      status: "denied",
+      alreadyResponded: true,
+    });
+    expect(JSON.stringify(body)).not.toContain(pendingInvitationRow.response_token);
     expect(updateCalled).toBe(false);
     expect(rpc).not.toHaveBeenCalled();
   });

@@ -9,6 +9,17 @@
   padding: 1rem;
 }
 
+.sidebarHeader {
+  font-weight: 600;
+}
+
+.nav {
+  margin-top: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
 .content {
   flex: 1;
   padding: 1.5rem;
