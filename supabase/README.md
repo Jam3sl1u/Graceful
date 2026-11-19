@@ -36,12 +36,18 @@ Each migration file (except Cluster 6's companion down file) contains an `-- ===
 
 ## Verified integration notes
 
+The paragraph below describes the original seven cluster migrations only.
+Later files in `supabase/migrations/` add row-level security on
+`church_groups`, the `setlist_songs.song_id` foreign key, guest invitations,
+Google Calendar helpers, and the reminder schedulers. `lib/supabase/types.ts`
+lists the tables the application client knows about.
+
 Independently verified on fresh Postgres 16 (Docker): all seven migration files apply in lex order with zero errors, producing 19 tables and 8 enums. Cross-cluster inserts (organization → instruments → scheduling → songs → availability → audit) succeed.
 
-**Intentional gaps (per-issue scope, not bugs):**
+**Gaps in those original clusters, since closed:**
 
-- `setlist_songs.song_id` has **no FK to `songs`** yet — Cluster 3 (#18) created the column before `songs` existed; Cluster 4 (#19) deliberately did not alter Cluster 3's migration. Referential integrity is application-layer until a follow-up migration adds the constraint.
-- `church_groups` has **no RLS** — `invite_code` defense relies on PostgREST lockdown (#23) until a follow-up adds an `id = auth_church_group_id()` policy.
+- `setlist_songs.song_id` had no foreign key to `songs`, because Cluster 3 created the column before `songs` existed and Cluster 4 left the constraint for a later migration. `20260714000001_setlist_songs_song_id_fkey.sql` adds `setlist_songs_song_id_fkey`.
+- `church_groups` had no row-level security. `20260704000002_church_groups_rls.sql` lets an authenticated user select their own group. There is still no authenticated insert, update, or delete policy on that table. Creation and join run through `SECURITY DEFINER` functions.
 
 ## Apply locally
 
@@ -85,11 +91,11 @@ Tests are skipped automatically when `SUPABASE_TEST_URL` or `SUPABASE_JWT_SECRET
 criteria — extend it (and add a Church B seed row) whenever a new table is
 added in later sprints, rather than starting a new file.
 
-In CI: set `vars.RLS_TESTS_ENABLED=true` and configure the four secrets above to enable the `rls-integration` job. Note the `rls-integration` job only *runs* when the `SUPABASE_TEST_URL` secret is set — if the secret is absent, GitHub reports the job as skipped, which counts as passing and does **not** block merge. Making `rls-integration` a required status check (and provisioning the four secrets in CI) is a repo-settings change outside this repo's code, tracked as a follow-up.
+In CI the `rls-integration` job runs only when the `SUPABASE_TEST_URL` secret is non-empty (`.github/workflows/ci.yml`). It does not read a `RLS_TESTS_ENABLED` variable. If that secret is absent, GitHub reports the job as skipped, which counts as passing and does not block merge. Making `rls-integration` a required status check, and provisioning the secrets, is a repo-settings change outside this repo's code.
 
 ## Roadmap (Phase 1 Sprint 0 backlog)
 
-- `#14`: confirm PostgREST auto-API is disabled; service-role key never used in user-callable code
-- `#23`: RLS on `church_groups` to protect `invite_code`
-- Deferred FK: `setlist_songs.song_id` → `songs.id` (after clusters 3+4 land)
-- Clerk custom claims (#5/#6): sync `church_group_id` + `role` into JWT session claims for production performance (RLS helpers prefer JWT claims via `COALESCE` already)
+- `#14`: local `supabase/config.toml` sets `[api] enabled = false`. The hosted Data API is a dashboard setting. Server handlers still call the Supabase client, which uses that API. `scripts/check-service-role.mjs` rejects a service-role reference in `app/` and `lib/`.
+- `#23`: select-own RLS on `church_groups` landed in `20260704000002_church_groups_rls.sql`. Writes stay on the create and join functions.
+- `setlist_songs.song_id` foreign key landed in `20260714000001_setlist_songs_song_id_fkey.sql`.
+- Clerk custom claims (#5/#6): the RLS helpers read `church_group_id` and `role` from the JWT when those claims exist, and fall back to `users`. `lib/clerk/server.ts` does not write the claims yet.

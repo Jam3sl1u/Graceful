@@ -1,5 +1,14 @@
 # Performance / Load Testing
 
+Current status, checked against the code on 2026-11-19: the results table in
+section 7 is still "Not run" or "Blocked". Section 8 says the SMS and email
+clients always throw and that the delivery webhooks return 501. Those clients
+and webhook verifiers now exist (`lib/pingram/client.ts`,
+`lib/resend/client.ts`, `app/api/webhooks/pingram/route.ts`,
+`app/api/webhooks/resend/route.ts`). `tests/load/scenarios.ts`
+`runNotificationLatency` still returns a blocked result and does not call
+them. No latency number from this pass is recorded below.
+
 ## 1. Purpose
 
 PRD §14.1 (Performance Requirements) requires a load-test pass against

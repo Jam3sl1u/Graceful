@@ -87,9 +87,9 @@ dedicated staging key. Production credentials are never used in staging (PRD
 
 Staging gets its own, separate Supabase project — never the production
 project. The schema must stay identical to production; the source of truth
-for that schema is the migration files under `supabase/migrations/` (currently
-empty scaffolding — see `supabase/README.md`). As those migrations are
-authored, they are applied to the staging project first, and only promoted to
+for that schema is the migration files under `supabase/migrations/`
+(see `supabase/README.md`). Apply new migrations to the staging project
+first, and only promote them to
 production after they succeed on staging (PRD §26.5 Migration safety). The
 staging project's `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
 and `SUPABASE_SERVICE_ROLE_KEY` are set as the staging (Preview) values in
