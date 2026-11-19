@@ -11,11 +11,16 @@ cited as §15.7 in issue #78):
 3. A repeatable git-history secret scan, wired into CI.
 4. Dependabot configuration.
 
-**Out of scope here** (tracked as separate issues):
+**Out of scope here** (tracked as separate issues when this note was written):
 
 - Rate limiting (#76).
 - Input validation (#77).
 - The broader OWASP security review (#79).
+
+Rate limiting and request validation have since landed in `middleware.ts`,
+`lib/api/rate-limit.ts`, and the Zod schemas under `schemas/`. This document
+still covers HTTPS, the content security policy, the git secret scan, and
+Dependabot. The OWASP review is `owasp-top-10-review.md`.
 
 ## 2. HTTPS enforcement
 
