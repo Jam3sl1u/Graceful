@@ -69,6 +69,10 @@ const defaultSongRows = [
 ];
 
 const DEFAULT_FIXTURES: Record<string, Required<TableFixture>> = {
+  song_familiarity: {
+    select: { data: [{ song_id: "song-1", level: "learning" }], error: null },
+    insert: { data: null, error: null },
+  },
   songs: {
     select: { data: defaultSongRows, error: null },
     insert: {
@@ -159,6 +163,7 @@ describe("GET /api/songs", () => {
         tags: ["hymn"],
         createdBy: "user-2",
         createdAt: "2026-07-01T00:00:00.000Z",
+        myFamiliarity: "learning",
       },
       {
         id: "song-2",
@@ -169,6 +174,7 @@ describe("GET /api/songs", () => {
         tags: [],
         createdBy: null,
         createdAt: "2026-07-02T00:00:00.000Z",
+        myFamiliarity: null,
       },
     ]);
   });

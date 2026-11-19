@@ -64,3 +64,13 @@ export const songSearchQuerySchema = z.object({
   q: z.string().trim().max(200).optional(),
 });
 export type SongSearchQuery = z.infer<typeof songSearchQuerySchema>;
+
+// PRD §13.4 "Song familiarity" (P2-14).
+export const SONG_FAMILIARITY_LEVELS = ["comfortable", "learning", "not_learned"] as const;
+export type SongFamiliarityLevel = (typeof SONG_FAMILIARITY_LEVELS)[number];
+
+// Body for PUT /api/songs/:id/familiarity.
+export const setSongFamiliaritySchema = z.object({
+  level: z.enum(SONG_FAMILIARITY_LEVELS),
+});
+export const songIdParamSchema = z.string().uuid();
