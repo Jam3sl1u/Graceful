@@ -118,6 +118,15 @@ export const IDS = {
     A: "00000000-0000-4000-8012-000000000001",
     B: "00000000-0000-4000-8012-000000000002",
   },
+  chatRooms: {
+    B: "00000000-0000-4000-8013-000000000001",
+  },
+  chatMessages: {
+    B: "00000000-0000-4000-8014-000000000001",
+  },
+  chatMentions: {
+    B: "00000000-0000-4000-8015-000000000001",
+  },
 } as const;
 
 const REQUIRED_VARS = [
@@ -170,6 +179,7 @@ export async function seedViaServiceClient(): Promise<void> {
 
   // Truncate in reverse FK order
   const tables = [
+    "chat_mentions", "chat_messages", "chat_rooms",
     "audit_logs", "google_calendar_tokens", "notification_preferences",
     "notifications", "availability", "song_documents", "songs",
     "conflicts", "event_attendees", "invitations", "events",
@@ -307,5 +317,16 @@ export async function seedViaServiceClient(): Promise<void> {
   await svc.from("event_attendees").insert([
     { id: IDS.eventAttendees.A, event_id: IDS.events.A, user_id: IDS.users.memberA },
     { id: IDS.eventAttendees.B, event_id: IDS.events.B, user_id: IDS.users.memberB },
+  ]);
+
+  // Chat (Church B). Must come after service_weeks and users.
+  await svc.from("chat_rooms").insert([
+    { id: IDS.chatRooms.B, church_group_id: IDS.churches.B, service_week_id: IDS.serviceWeeks.B1 },
+  ]);
+  await svc.from("chat_messages").insert([
+    { id: IDS.chatMessages.B, chat_room_id: IDS.chatRooms.B, church_group_id: IDS.churches.B, user_id: IDS.users.memberB, content: "Church B message" },
+  ]);
+  await svc.from("chat_mentions").insert([
+    { id: IDS.chatMentions.B, message_id: IDS.chatMessages.B, mentioned_user_id: IDS.users.adminB },
   ]);
 }

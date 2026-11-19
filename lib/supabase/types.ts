@@ -7,6 +7,7 @@
 // so that from().select().eq().maybeSingle() returns typed data.
 
 import type {
+  ChatMessageKind,
   EventType,
   InvitationStatus,
   NotificationType,
@@ -207,6 +208,34 @@ type NotificationsRow = {
   link_entity_id: string | null;
   is_read: boolean;
   created_at: string;
+};
+
+// Added for #208 (chat tables, P2-01).
+type ChatRoomsRow = {
+  id: string;
+  church_group_id: string;
+  service_week_id: string;
+  is_archived: boolean;
+  pinned_message_id: string | null;
+  created_at: string;
+};
+
+type ChatMessagesRow = {
+  id: string;
+  chat_room_id: string;
+  church_group_id: string;
+  user_id: string;
+  content: string;
+  kind: ChatMessageKind;
+  metadata: Record<string, unknown> | null;
+  is_deleted: boolean;
+  created_at: string;
+};
+
+type ChatMentionsRow = {
+  id: string;
+  message_id: string;
+  mentioned_user_id: string;
 };
 
 // Added for #69 (practice reminder scheduler). Internal idempotency ledger for
@@ -457,6 +486,37 @@ export type Database = {
         Update: Partial<NotificationsRow>;
         Relationships: [];
       };
+      chat_rooms: {
+        Row: ChatRoomsRow;
+        Insert: Omit<ChatRoomsRow, "id" | "created_at" | "is_archived" | "pinned_message_id"> & {
+          id?: string;
+          created_at?: string;
+          is_archived?: boolean;
+          pinned_message_id?: string | null;
+        };
+        Update: Partial<ChatRoomsRow>;
+        Relationships: [];
+      };
+      chat_messages: {
+        Row: ChatMessagesRow;
+        Insert: Omit<ChatMessagesRow, "id" | "created_at" | "kind" | "metadata" | "is_deleted"> & {
+          id?: string;
+          created_at?: string;
+          kind?: ChatMessageKind;
+          metadata?: Record<string, unknown> | null;
+          is_deleted?: boolean;
+        };
+        // Only is_deleted is writable with a user JWT (column-level grant in
+        // 20261116000001_chat_tables_rls.sql), and only to true.
+        Update: { is_deleted?: boolean };
+        Relationships: [];
+      };
+      chat_mentions: {
+        Row: ChatMentionsRow;
+        Insert: Omit<ChatMentionsRow, "id"> & { id?: string };
+        Update: Partial<ChatMentionsRow>;
+        Relationships: [];
+      };
       notification_preferences: {
         Row: NotificationPreferencesRow;
         Insert: Omit<NotificationPreferencesRow, "id"> & { id?: string };
@@ -498,6 +558,10 @@ export type Database = {
     };
     Views: Record<string, never>;
     Functions: {
+      is_chat_room_member: {
+        Args: { p_chat_room_id: string };
+        Returns: boolean;
+      };
       create_church_group: {
         Args: {
           p_name: string;
@@ -687,6 +751,7 @@ export type Database = {
     };
     Enums: {
       user_role: UserRole;
+      chat_message_kind: ChatMessageKind;
     };
     CompositeTypes: Record<string, never>;
   };

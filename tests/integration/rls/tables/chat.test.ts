@@ -1,0 +1,481 @@
+/**
+ * Chat tables RLS tests (issue #208, P2-01).
+ *
+ * Membership rule (D2): a user is a member of a week's chat room iff the room
+ * is in their church group and they are admin/set_leader OR hold an
+ * 'accepted' invitation for the room's service week.
+ *
+ * Private fixtures use the 00000000-0000-4000-8016-* ID range so they never
+ * collide with the shared seed. Mutating cases use their own messages/weeks.
+ */
+
+import { getUserClient, getServiceClient } from "../client";
+import { IDS, rlsTestsEnabled, seedViaServiceClient } from "../setup";
+import {
+  assertSelectAllowed,
+  assertSelectBlocked,
+  assertInsertDenied,
+  assertUpdateNoOp,
+  assertDeleteNoOp,
+} from "../helpers";
+
+const skip = !rlsTestsEnabled || !process.env.SUPABASE_TEST_URL;
+const describeRls = skip ? describe.skip : describe;
+
+const P = "00000000-0000-4000-8016-";
+const F = {
+  W1: `${P}000000000001`,
+  W2: `${P}000000000002`,
+  W3: `${P}000000000003`, // fresh week for room insert (leaderA)
+  W4: `${P}000000000004`, // fresh week for room insert (memberA, denied)
+  W5: `${P}000000000005`, // cascade test
+  W6: `${P}000000000006`, // soft-delete-only + membership edge cases
+  W7: `${P}000000000007`, // invitee update guard
+  R1: `${P}000000000011`,
+  R2: `${P}000000000012`,
+  R5: `${P}000000000015`,
+  R6: `${P}000000000016`,
+  R7: `${P}000000000017`,
+  M1: `${P}000000000021`,
+  M2: `${P}000000000022`,
+  M5: `${P}000000000025`,
+  M6: `${P}000000000026`,
+  M7: `${P}000000000027`,
+  I_W2_A2_DENIED: `${P}000000000041`,
+  I_W6_A2_WITHDRAWN: `${P}000000000042`,
+  I_W7_A2_PENDING: `${P}000000000043`,
+  I_W1_A2_PENDING: `${P}000000000044`,
+  I_W3_A2_PENDING: `${P}000000000045`,
+};
+
+describeRls("Chat tables — membership, archive, content and mention rules", () => {
+  let svc: ReturnType<typeof getServiceClient>;
+  let memberA: ReturnType<typeof getUserClient>;
+  let memberA2: ReturnType<typeof getUserClient>;
+  let guestA: ReturnType<typeof getUserClient>;
+  let leaderA: ReturnType<typeof getUserClient>;
+  let adminA: ReturnType<typeof getUserClient>;
+  let memberB: ReturnType<typeof getUserClient>;
+  let adminB: ReturnType<typeof getUserClient>;
+
+  const A = IDS.churches.A;
+  const U = IDS.users;
+
+  async function mustInsert(table: string, rows: Record<string, unknown>[]) {
+    const { error } = await svc.from(table).insert(rows);
+    if (error) throw new Error(`fixture insert into ${table} failed: ${error.message}`);
+  }
+
+  beforeAll(async () => {
+    await seedViaServiceClient();
+    svc = getServiceClient();
+    memberA = getUserClient({ clerkId: IDS.clerkIds.memberA });
+    memberA2 = getUserClient({ clerkId: IDS.clerkIds.memberA2 });
+    guestA = getUserClient({ clerkId: IDS.clerkIds.guestA });
+    leaderA = getUserClient({ clerkId: IDS.clerkIds.leaderA });
+    adminA = getUserClient({ clerkId: IDS.clerkIds.adminA });
+    memberB = getUserClient({ clerkId: IDS.clerkIds.memberB });
+    adminB = getUserClient({ clerkId: IDS.clerkIds.adminB });
+
+    await mustInsert("service_weeks", [
+      { id: F.W1, church_group_id: A, service_date: "2027-01-03", title: "Chat W1" },
+      { id: F.W2, church_group_id: A, service_date: "2027-01-10", title: "Chat W2" },
+      { id: F.W3, church_group_id: A, service_date: "2027-01-17", title: "Chat W3" },
+      { id: F.W4, church_group_id: A, service_date: "2027-01-24", title: "Chat W4" },
+      { id: F.W5, church_group_id: A, service_date: "2027-01-31", title: "Chat W5" },
+      { id: F.W6, church_group_id: A, service_date: "2027-02-07", title: "Chat W6" },
+      { id: F.W7, church_group_id: A, service_date: "2027-02-14", title: "Chat W7" },
+    ]);
+    await mustInsert("chat_rooms", [
+      { id: F.R1, church_group_id: A, service_week_id: F.W1, is_archived: false },
+      { id: F.R2, church_group_id: A, service_week_id: F.W2, is_archived: true },
+      { id: F.R5, church_group_id: A, service_week_id: F.W5, is_archived: false },
+      { id: F.R6, church_group_id: A, service_week_id: F.W6, is_archived: false },
+      { id: F.R7, church_group_id: A, service_week_id: F.W7, is_archived: false },
+    ]);
+    await mustInsert("invitations", [
+      { church_group_id: A, service_week_id: F.W1, user_id: U.memberA, status: "accepted", response_token: "chat-tok-w1-memberA" },
+      { church_group_id: A, service_week_id: F.W1, user_id: U.guestA, status: "accepted", response_token: "chat-tok-w1-guestA" },
+      { id: F.I_W1_A2_PENDING, church_group_id: A, service_week_id: F.W1, user_id: U.memberA2, status: "pending", response_token: "chat-tok-w1-memberA2" },
+      { church_group_id: A, service_week_id: F.W2, user_id: U.memberA, status: "accepted", response_token: "chat-tok-w2-memberA" },
+      { id: F.I_W2_A2_DENIED, church_group_id: A, service_week_id: F.W2, user_id: U.memberA2, status: "denied", response_token: "chat-tok-w2-memberA2" },
+      { church_group_id: A, service_week_id: F.W5, user_id: U.memberA, status: "accepted", response_token: "chat-tok-w5-memberA" },
+      { church_group_id: A, service_week_id: F.W6, user_id: U.memberA, status: "accepted", response_token: "chat-tok-w6-memberA" },
+      { id: F.I_W6_A2_WITHDRAWN, church_group_id: A, service_week_id: F.W6, user_id: U.memberA2, status: "withdrawn", response_token: "chat-tok-w6-memberA2" },
+      // guestA holds two invitations for W6: one denied, one accepted.
+      { church_group_id: A, service_week_id: F.W6, user_id: U.guestA, status: "denied", response_token: "chat-tok-w6-guestA-denied" },
+      { church_group_id: A, service_week_id: F.W6, user_id: U.guestA, status: "accepted", response_token: "chat-tok-w6-guestA-accepted" },
+      { id: F.I_W7_A2_PENDING, church_group_id: A, service_week_id: F.W7, user_id: U.memberA2, status: "pending", response_token: "chat-tok-w7-memberA2" },
+      { id: F.I_W3_A2_PENDING, church_group_id: A, service_week_id: F.W3, user_id: U.memberA2, status: "pending", response_token: "chat-tok-w3-memberA2" },
+    ]);
+    await mustInsert("chat_messages", [
+      { id: F.M1, chat_room_id: F.R1, church_group_id: A, user_id: U.memberA, content: "M1" },
+      { id: F.M2, chat_room_id: F.R2, church_group_id: A, user_id: U.memberA, content: "M2" },
+      { id: F.M5, chat_room_id: F.R5, church_group_id: A, user_id: U.memberA, content: "M5" },
+      { id: F.M6, chat_room_id: F.R6, church_group_id: A, user_id: U.memberA, content: "M6" },
+      { id: F.M7, chat_room_id: F.R7, church_group_id: A, user_id: U.leaderA, content: "M7" },
+    ]);
+  }, 60_000);
+
+  afterAll(async () => {
+    if (!svc) return;
+    await svc.from("service_weeks").delete().in("id", [F.W1, F.W2, F.W3, F.W4, F.W5, F.W6, F.W7]);
+  });
+
+  const msg = (over: Record<string, unknown> = {}) => ({
+    chat_room_id: F.R1,
+    church_group_id: A,
+    user_id: U.memberA,
+    content: "hello",
+    ...over,
+  });
+
+  it("1. SELECT room R1 / message M1: members, guests, leaders, admins allowed; pending and other churches blocked", async () => {
+    for (const c of [memberA, guestA, leaderA, adminA]) {
+      await assertSelectAllowed(c, "chat_rooms", { id: F.R1 });
+      await assertSelectAllowed(c, "chat_messages", { id: F.M1 });
+    }
+    for (const c of [memberA2, memberB, adminB]) {
+      await assertSelectBlocked(c, "chat_rooms", { id: F.R1 });
+      await assertSelectBlocked(c, "chat_messages", { id: F.M1 });
+    }
+  });
+
+  it("2. archived room R2 stays readable for accepted member, blocked for denied invitee", async () => {
+    await assertSelectAllowed(memberA, "chat_rooms", { id: F.R2 });
+    await assertSelectBlocked(memberA2, "chat_rooms", { id: F.R2 });
+  });
+
+  it("3. INSERT message: accepted member allowed, pending invitee denied", async () => {
+    const { error } = await memberA.from("chat_messages").insert(msg());
+    expect(error).toBeNull();
+    await assertInsertDenied(memberA2, "chat_messages", msg({ user_id: U.memberA2 }));
+  });
+
+  it("4. INSERT into archived room denied (member and leader)", async () => {
+    await assertInsertDenied(memberA, "chat_messages", msg({ chat_room_id: F.R2 }));
+    await assertInsertDenied(leaderA, "chat_messages", msg({ chat_room_id: F.R2, user_id: U.leaderA }));
+  });
+
+  it("5. INSERT impersonation and cross-group church_group_id denied", async () => {
+    await assertInsertDenied(memberA, "chat_messages", msg({ user_id: U.memberA2 }));
+    await assertInsertDenied(memberA, "chat_messages", msg({ church_group_id: IDS.churches.B }));
+  });
+
+  it("6. content CHECK: 2000 chars allowed, 2001 errors (also via service client)", async () => {
+    const { error: okErr } = await memberA.from("chat_messages").insert(msg({ content: "x".repeat(2000) }));
+    expect(okErr).toBeNull();
+    const { error: tooLong } = await memberA.from("chat_messages").insert(msg({ content: "x".repeat(2001) }));
+    expect(tooLong).not.toBeNull();
+    const { error: svcTooLong } = await svc.from("chat_messages").insert(msg({ content: "x".repeat(2001) }));
+    expect(svcTooLong).not.toBeNull();
+  });
+
+  it("7. kind / metadata: devotion allowed, bogus errors, defaults are text / null", async () => {
+    const { error: devErr } = await memberA
+      .from("chat_messages")
+      .insert(msg({ kind: "devotion", metadata: { ref: "x" } }));
+    expect(devErr).toBeNull();
+
+    const { error: bogusErr } = await memberA.from("chat_messages").insert(msg({ kind: "bogus" }));
+    expect(bogusErr).not.toBeNull();
+
+    const id = `${P}000000000031`;
+    const { error: defErr } = await memberA.from("chat_messages").insert(msg({ id }));
+    expect(defErr).toBeNull();
+    const { data } = await svc.from("chat_messages").select("kind, metadata").eq("id", id).single();
+    expect(data?.kind).toBe("text");
+    expect(data?.metadata).toBeNull();
+  });
+
+  it("8. UPDATE: author soft-delete works; guest, leader and archived-room updates are no-ops", async () => {
+    await assertUpdateNoOp(guestA, svc, "chat_messages", F.M1, { is_deleted: true });
+    await assertUpdateNoOp(leaderA, svc, "chat_messages", F.M1, { is_deleted: true });
+    await assertUpdateNoOp(memberA, svc, "chat_messages", F.M2, { is_deleted: true });
+
+    const { error } = await memberA.from("chat_messages").update({ is_deleted: true }).eq("id", F.M1);
+    expect(error).toBeNull();
+    const { data } = await svc.from("chat_messages").select("is_deleted").eq("id", F.M1).single();
+    expect(data?.is_deleted).toBe(true);
+  });
+
+  it("9. DELETE message is a no-op for its author", async () => {
+    await assertDeleteNoOp(memberA, svc, "chat_messages", F.M1);
+  });
+
+  it("10. rooms: only leaders/admins insert; members cannot update; nobody deletes", async () => {
+    await assertInsertDenied(memberA, "chat_rooms", { church_group_id: A, service_week_id: F.W4 });
+
+    const { error: leaderErr } = await leaderA
+      .from("chat_rooms")
+      .insert({ church_group_id: A, service_week_id: F.W3 });
+    expect(leaderErr).toBeNull();
+
+    await assertInsertDenied(leaderA, "chat_rooms", {
+      church_group_id: A,
+      service_week_id: IDS.serviceWeeks.B1,
+    });
+
+    const { error: dupErr } = await svc
+      .from("chat_rooms")
+      .insert({ church_group_id: A, service_week_id: F.W1 });
+    expect(dupErr).not.toBeNull();
+
+    await assertUpdateNoOp(memberA, svc, "chat_rooms", F.R1, { is_archived: true });
+    await assertDeleteNoOp(adminA, svc, "chat_rooms", F.R1);
+  });
+
+  it("11. pin: same-room message accepted, other room's message rejected", async () => {
+    const { error } = await leaderA.from("chat_rooms").update({ pinned_message_id: F.M1 }).eq("id", F.R1);
+    expect(error).toBeNull();
+    const { data: pinned } = await svc.from("chat_rooms").select("pinned_message_id").eq("id", F.R1).single();
+    expect(pinned?.pinned_message_id).toBe(F.M1);
+
+    await leaderA.from("chat_rooms").update({ pinned_message_id: F.M2 }).eq("id", F.R1);
+    const { data: after } = await svc.from("chat_rooms").select("pinned_message_id").eq("id", F.R1).single();
+    expect(after?.pinned_message_id).toBe(F.M1);
+  });
+
+  it("12. mentions: author may mention same-group users only; others denied", async () => {
+    const { error } = await memberA
+      .from("chat_mentions")
+      .insert({ message_id: F.M5, mentioned_user_id: U.memberA2 });
+    expect(error).toBeNull();
+
+    await assertInsertDenied(memberA, "chat_mentions", { message_id: F.M5, mentioned_user_id: U.memberB });
+    await assertInsertDenied(guestA, "chat_mentions", { message_id: F.M1, mentioned_user_id: U.memberA2 });
+    await assertInsertDenied(memberA, "chat_mentions", { message_id: F.M5, mentioned_user_id: U.memberA2 });
+    await assertInsertDenied(memberA, "chat_mentions", { message_id: F.M2, mentioned_user_id: U.memberA2 });
+
+    // Pending invitee cannot read mentions of M1's room.
+    const { error: svcErr } = await svc
+      .from("chat_mentions")
+      .insert({ message_id: F.M1, mentioned_user_id: U.adminA });
+    expect(svcErr).toBeNull();
+    // Positive control: a room member can read it, so an empty result below
+    // means "blocked", not "the row was never written".
+    const visible = await memberA.from("chat_mentions").select("id").eq("message_id", F.M1);
+    expect(visible.error).toBeNull();
+    expect(visible.data).toHaveLength(1);
+    const blocked = await memberA2.from("chat_mentions").select("id").eq("message_id", F.M1);
+    expect(blocked.error).toBeNull();
+    expect(blocked.data).toHaveLength(0);
+  });
+
+  it("13. is_chat_room_member rpc returns true / false / false (never null)", async () => {
+    const yes = await memberA.rpc("is_chat_room_member", { p_chat_room_id: F.R1 });
+    expect(yes.error).toBeNull();
+    expect(yes.data).toBe(true);
+
+    const no = await memberA2.rpc("is_chat_room_member", { p_chat_room_id: F.R1 });
+    expect(no.data).toBe(false);
+
+    const missing = await memberA.rpc("is_chat_room_member", {
+      p_chat_room_id: "00000000-0000-4000-8016-0000000000ff",
+    });
+    expect(missing.data).toBe(false);
+  });
+
+  it("14. cascade: deleting a week removes room, pinned message and mentions", async () => {
+    const { error: pinErr } = await svc.from("chat_rooms").update({ pinned_message_id: F.M5 }).eq("id", F.R5);
+    expect(pinErr).toBeNull();
+    const { error: mentionErr } = await svc.from("chat_mentions").upsert(
+      { message_id: F.M5, mentioned_user_id: U.memberA2 },
+      { onConflict: "message_id,mentioned_user_id" },
+    );
+    expect(mentionErr).toBeNull();
+    // The cascade is only exercised if the circular pin and the mention exist.
+    const { data: pinnedBefore } = await svc.from("chat_rooms").select("pinned_message_id").eq("id", F.R5).single();
+    expect(pinnedBefore?.pinned_message_id).toBe(F.M5);
+    const { data: mentsBefore } = await svc.from("chat_mentions").select("id").eq("message_id", F.M5);
+    expect(mentsBefore).toHaveLength(1);
+
+    const { error } = await svc.from("service_weeks").delete().eq("id", F.W5);
+    expect(error).toBeNull();
+
+    const { data: rooms } = await svc.from("chat_rooms").select("id").eq("id", F.R5);
+    const { data: msgs } = await svc.from("chat_messages").select("id").eq("id", F.M5);
+    const { data: ments } = await svc.from("chat_mentions").select("id").eq("message_id", F.M5);
+    expect(rooms).toHaveLength(0);
+    expect(msgs).toHaveLength(0);
+    expect(ments).toHaveLength(0);
+  });
+
+  it("15. author UPDATE is soft-delete only: content, room, kind, metadata, created_at and un-delete are refused", async () => {
+    await assertUpdateNoOp(memberA, svc, "chat_messages", F.M6, { content: "" });
+    await assertUpdateNoOp(memberA, svc, "chat_messages", F.M6, { chat_room_id: F.R1 });
+    await assertUpdateNoOp(memberA, svc, "chat_messages", F.M6, { kind: "devotion" });
+    await assertUpdateNoOp(memberA, svc, "chat_messages", F.M6, { metadata: { x: 1 } });
+    await assertUpdateNoOp(memberA, svc, "chat_messages", F.M6, { created_at: "2000-01-01T00:00:00Z" });
+    // A patch that mixes the allowed column with a forbidden one is refused whole.
+    await assertUpdateNoOp(memberA, svc, "chat_messages", F.M6, { is_deleted: true, content: "edited" });
+
+    const { error: contentErr } = await memberA.from("chat_messages").update({ content: "edited" }).eq("id", F.M6);
+    expect(contentErr).not.toBeNull();
+
+    // Positive control: the one allowed write still works on this row...
+    const { error: delErr } = await memberA.from("chat_messages").update({ is_deleted: true }).eq("id", F.M6);
+    expect(delErr).toBeNull();
+    const { data: deleted } = await svc.from("chat_messages").select("is_deleted, content").eq("id", F.M6).single();
+    expect(deleted).toEqual({ is_deleted: true, content: "M6" });
+
+    // ...and it is one-way.
+    await assertUpdateNoOp(memberA, svc, "chat_messages", F.M6, { is_deleted: false });
+  });
+
+  it("16. membership edge cases: withdrawn invitee is not a member; one accepted among several invitations is", async () => {
+    await assertSelectBlocked(memberA2, "chat_rooms", { id: F.R6 });
+    await assertSelectBlocked(memberA2, "chat_messages", { id: F.M6 });
+    const withdrawn = await memberA2.rpc("is_chat_room_member", { p_chat_room_id: F.R6 });
+    expect(withdrawn.error).toBeNull();
+    expect(withdrawn.data).toBe(false);
+
+    await assertSelectAllowed(guestA, "chat_rooms", { id: F.R6 });
+    const multi = await guestA.rpc("is_chat_room_member", { p_chat_room_id: F.R6 });
+    expect(multi.error).toBeNull();
+    expect(multi.data).toBe(true);
+  });
+
+  it("17. invitee update guard: an invitee cannot re-open, re-point or rewrite their own invitation to gain a chat", async () => {
+    // Withdrawn -> accepted (review finding 2, attack 1).
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W6_A2_WITHDRAWN, { status: "accepted" });
+    // Denied -> accepted.
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W2_A2_DENIED, { status: "accepted" });
+    // Denied -> pending (would re-open the legal accept path).
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W2_A2_DENIED, { status: "pending" });
+    // Re-point a pending invitation at another week (attack 2), alone and
+    // combined with an otherwise legal accept.
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W7_A2_PENDING, { service_week_id: F.W6 });
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W7_A2_PENDING, { status: "accepted", service_week_id: F.W6 });
+    // Columns an invitee has no business changing.
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W7_A2_PENDING, { role_note: "lead vocals" });
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W7_A2_PENDING, { response_token: "chat-tok-forged" });
+    // Self-withdraw is a leader action.
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W7_A2_PENDING, { status: "withdrawn" });
+    // Accepting by direct update would skip accept_invitation()'s checks.
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W7_A2_PENDING, {
+      status: "accepted",
+      responded_at: new Date().toISOString(),
+    });
+
+    const direct = await memberA2
+      .from("invitations")
+      .update({ status: "accepted" })
+      .eq("id", F.I_W6_A2_WITHDRAWN);
+    expect(direct.error).not.toBeNull();
+
+    // None of the above bought any chat access.
+    for (const room of [F.R2, F.R6, F.R7]) {
+      await assertSelectBlocked(memberA2, "chat_rooms", { id: room });
+    }
+    await assertSelectBlocked(memberA2, "chat_messages", { id: F.M7 });
+  });
+
+  it("18. invitee update guard leaves the legal paths working", async () => {
+    // Invitee answers a pending invitation directly (the Phase 1 session deny path).
+    const deny = await memberA2
+      .from("invitations")
+      .update({ status: "denied", denial_reason: "away", denial_count: 1, responded_at: new Date().toISOString() })
+      .eq("id", F.I_W1_A2_PENDING);
+    expect(deny.error).toBeNull();
+    const { data: denied } = await svc.from("invitations").select("status, denial_reason").eq("id", F.I_W1_A2_PENDING).single();
+    expect(denied).toEqual({ status: "denied", denial_reason: "away" });
+    // ...and the answer is then final for the invitee.
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W1_A2_PENDING, { status: "accepted" });
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W1_A2_PENDING, { denial_reason: "changed my mind" });
+
+    // Invitee accepts through the SECURITY DEFINER RPC (the guard must not
+    // fire inside it) and gains that week's chat.
+    const accept = await memberA2.rpc("accept_invitation", {
+      p_invitation_id: F.I_W7_A2_PENDING,
+      p_response_token: null,
+    });
+    expect(accept.error).toBeNull();
+    const { data: accepted } = await svc.from("invitations").select("status").eq("id", F.I_W7_A2_PENDING).single();
+    expect(accepted?.status).toBe("accepted");
+    await assertSelectAllowed(memberA2, "chat_rooms", { id: F.R7 });
+
+    // The deny RPC is likewise unaffected by the guard.
+    const rpcDeny = await memberA2.rpc("deny_invitation", {
+      p_invitation_id: F.I_W3_A2_PENDING,
+      p_response_token: null,
+      p_reason: "rpc deny",
+    });
+    expect(rpcDeny.error).toBeNull();
+    const { data: rpcDenied } = await svc.from("invitations").select("status").eq("id", F.I_W3_A2_PENDING).single();
+    expect(rpcDenied?.status).toBe("denied");
+    await assertSelectAllowed(memberA2, "chat_messages", { id: F.M7 });
+
+    // Leaders are not restricted: withdraw an accepted invitation and edit its note.
+    const withdraw = await leaderA
+      .from("invitations")
+      .update({ status: "withdrawn", role_note: "covered by someone else" })
+      .eq("id", F.I_W7_A2_PENDING);
+    expect(withdraw.error).toBeNull();
+    const { data: withdrawnRow } = await svc.from("invitations").select("status, role_note").eq("id", F.I_W7_A2_PENDING).single();
+    expect(withdrawnRow).toEqual({ status: "withdrawn", role_note: "covered by someone else" });
+    // Withdrawal revokes chat access immediately.
+    await assertSelectBlocked(memberA2, "chat_rooms", { id: F.R7 });
+
+    // The service role (and, like it, the SECURITY DEFINER RPCs) is not restricted either.
+    const svcUpdate = await svc.from("invitations").update({ status: "pending" }).eq("id", F.I_W7_A2_PENDING);
+    expect(svcUpdate.error).toBeNull();
+  });
+
+  it("19. privileged users columns: nobody can self-promote, change church or re-bind an account by direct update", async () => {
+    const B = IDS.churches.B;
+    // A member cannot make themselves a leader or admin...
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { role: "admin" });
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { role: "set_leader" });
+    // ...nor move to another church, alone or together with a role change.
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { church_group_id: B });
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { church_group_id: B, role: "admin" });
+    // ...nor take over another login.
+    await assertUpdateNoOp(memberA2, svc, "users", U.memberA2, { clerk_id: IDS.clerkIds.adminA });
+    // A guest is held to the same rule.
+    await assertUpdateNoOp(guestA, svc, "users", U.guestA, { role: "member" });
+    // A set leader may edit other rows but not grant roles, to others or to themselves.
+    await assertUpdateNoOp(leaderA, svc, "users", U.memberA2, { role: "admin" });
+    await assertUpdateNoOp(leaderA, svc, "users", U.leaderA, { role: "admin" });
+    // Even an admin cannot move a user between churches or re-bind a login.
+    await assertUpdateNoOp(adminA, svc, "users", U.memberA2, { church_group_id: B });
+    await assertUpdateNoOp(adminA, svc, "users", U.memberA2, { clerk_id: "forged_clerk_id" });
+
+    const direct = await memberA2.from("users").update({ role: "admin" }).eq("id", U.memberA2);
+    expect(direct.error).not.toBeNull();
+
+    // The attempts bought nothing: still not a member of a room they hold no
+    // accepted invitation for, and still bound by the invitation guard.
+    const still = await memberA2.rpc("is_chat_room_member", { p_chat_room_id: F.R6 });
+    expect(still.error).toBeNull();
+    expect(still.data).toBe(false);
+    await assertUpdateNoOp(memberA2, svc, "invitations", F.I_W6_A2_WITHDRAWN, { status: "accepted" });
+  });
+
+  it("20. privileged users columns: ordinary edits and admin role changes still work", async () => {
+    // Positive controls, so the no-ops above mean "blocked", not "all updates fail".
+    const own = await memberA2.from("users").update({ name: "Member A2 (self-edited)" }).eq("id", U.memberA2);
+    expect(own.error).toBeNull();
+    const byLeader = await leaderA.from("users").update({ name: "Member A2 (leader-edited)" }).eq("id", U.memberA2);
+    expect(byLeader.error).toBeNull();
+    const { data: named } = await svc.from("users").select("name").eq("id", U.memberA2).single();
+    expect(named?.name).toBe("Member A2 (leader-edited)");
+
+    // An admin changes a role (the role-change handler's path) and it takes effect.
+    const promote = await adminA.from("users").update({ role: "set_leader" }).eq("id", U.memberA2);
+    expect(promote.error).toBeNull();
+    const { data: promoted } = await svc.from("users").select("role").eq("id", U.memberA2).single();
+    expect(promoted?.role).toBe("set_leader");
+
+    // Restore, as admin again, so later suites see the seeded state.
+    const demote = await adminA.from("users").update({ role: "member", name: "Member A2" }).eq("id", U.memberA2);
+    expect(demote.error).toBeNull();
+    const { data: restored } = await svc.from("users").select("role, name").eq("id", U.memberA2).single();
+    expect(restored).toEqual({ role: "member", name: "Member A2" });
+
+    // The service role (and the SECURITY DEFINER RPCs, which also do not run
+    // as `authenticated`) is not restricted.
+    const svcUpdate = await svc.from("users").update({ church_group_id: A }).eq("id", U.memberA2);
+    expect(svcUpdate.error).toBeNull();
+  });
+});

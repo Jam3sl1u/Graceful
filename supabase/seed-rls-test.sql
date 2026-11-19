@@ -11,6 +11,7 @@
 -- ============ TRUNCATE (idempotent re-seed) ============
 
 TRUNCATE
+  chat_mentions, chat_messages, chat_rooms,
   audit_logs, google_calendar_tokens, notification_preferences,
   notifications, availability, song_documents, songs,
   conflicts, event_attendees, invitations, events,
@@ -146,3 +147,14 @@ INSERT INTO song_documents (id, song_id, church_group_id, name, file_key, file_t
 INSERT INTO event_attendees (id, event_id, user_id) VALUES
   ('00000000-0000-4000-8012-000000000001', '00000000-0000-4000-8009-000000000001', '00000000-0000-4000-8001-000000000003'),
   ('00000000-0000-4000-8012-000000000002', '00000000-0000-4000-8009-000000000002', '00000000-0000-4000-8002-000000000001');
+
+-- ============ CHAT ROOMS / MESSAGES / MENTIONS (Church B) ============
+
+INSERT INTO chat_rooms (id, church_group_id, service_week_id) VALUES
+  ('00000000-0000-4000-8013-000000000001', '00000000-0000-4000-8000-000000000002', '00000000-0000-4000-8005-000000000002');
+
+INSERT INTO chat_messages (id, chat_room_id, church_group_id, user_id, content) VALUES
+  ('00000000-0000-4000-8014-000000000001', '00000000-0000-4000-8013-000000000001', '00000000-0000-4000-8000-000000000002', '00000000-0000-4000-8002-000000000001', 'Church B message');
+
+INSERT INTO chat_mentions (id, message_id, mentioned_user_id) VALUES
+  ('00000000-0000-4000-8015-000000000001', '00000000-0000-4000-8014-000000000001', '00000000-0000-4000-8002-000000000002');

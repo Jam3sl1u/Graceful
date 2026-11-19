@@ -15,6 +15,8 @@ export type VocalCapability = "lead" | "harmony" | "both" | "none";
 
 export type ChatPref = "sms" | "email" | "in_app";
 
+export type ChatMessageKind = "text" | "devotion";
+
 export type JobStatus = "queued" | "processing" | "succeeded" | "failed";
 
 export type AudioSource = "upload" | "spotify";

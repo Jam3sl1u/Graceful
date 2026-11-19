@@ -1,7 +1,7 @@
 /**
  * Cross-tenant bypass matrix (issue #33, AC-1).
  *
- * For every one of the 19 Sprint 0–1 tables, a Church A persona attempts all
+ * For every one of the 19 Sprint 0–1 tables plus the 3 chat tables (#208), a Church A persona attempts all
  * four verbs (SELECT / INSERT / UPDATE / DELETE) against Church B's rows.
  * Every attempt must fail to leak or mutate data:
  *   - SELECT must return zero rows (or a policy error).
@@ -664,6 +664,130 @@ describeRls("Cross-tenant bypass matrix (Church A → Church B)", () => {
 
     it("DELETE no-op (adminA)", async () => {
       await assertDeleteNoOp(adminA, serviceClient, "audit_logs", IDS.auditLogs.B);
+    });
+  });
+
+  // ── chat_rooms (also adminA) ──────────────────────────────────────────────
+
+  describe("chat_rooms", () => {
+    const evilRoom = {
+      church_group_id: IDS.churches.B,
+      service_week_id: IDS.serviceWeeks.B1,
+    };
+
+    it("SELECT blocked (memberA)", async () => {
+      await assertSelectBlocked(memberA, "chat_rooms", { church_group_id: IDS.churches.B });
+    });
+
+    it("SELECT blocked (adminA)", async () => {
+      await assertSelectBlocked(adminA, "chat_rooms", { church_group_id: IDS.churches.B });
+    });
+
+    it("INSERT denied (memberA)", async () => {
+      await assertInsertDenied(memberA, "chat_rooms", evilRoom);
+    });
+
+    it("INSERT denied (adminA)", async () => {
+      await assertInsertDenied(adminA, "chat_rooms", evilRoom);
+    });
+
+    it("UPDATE no-op (memberA)", async () => {
+      await assertUpdateNoOp(memberA, serviceClient, "chat_rooms", IDS.chatRooms.B, {
+        is_archived: true,
+      });
+    });
+
+    it("UPDATE no-op (adminA)", async () => {
+      await assertUpdateNoOp(adminA, serviceClient, "chat_rooms", IDS.chatRooms.B, {
+        is_archived: true,
+      });
+    });
+
+    it("DELETE no-op (memberA)", async () => {
+      await assertDeleteNoOp(memberA, serviceClient, "chat_rooms", IDS.chatRooms.B);
+    });
+
+    it("DELETE no-op (adminA)", async () => {
+      await assertDeleteNoOp(adminA, serviceClient, "chat_rooms", IDS.chatRooms.B);
+    });
+  });
+
+  // ── chat_messages (also adminA) ───────────────────────────────────────────
+
+  describe("chat_messages", () => {
+    const evilMessage = {
+      chat_room_id: IDS.chatRooms.B,
+      church_group_id: IDS.churches.B,
+      user_id: IDS.users.memberA,
+      content: "Evil",
+    };
+
+    it("SELECT blocked (memberA)", async () => {
+      await assertSelectBlocked(memberA, "chat_messages", { church_group_id: IDS.churches.B });
+    });
+
+    it("SELECT blocked (adminA)", async () => {
+      await assertSelectBlocked(adminA, "chat_messages", { church_group_id: IDS.churches.B });
+    });
+
+    it("INSERT denied (memberA)", async () => {
+      await assertInsertDenied(memberA, "chat_messages", evilMessage);
+    });
+
+    it("INSERT denied (adminA)", async () => {
+      await assertInsertDenied(adminA, "chat_messages", {
+        ...evilMessage,
+        user_id: IDS.users.adminA,
+      });
+    });
+
+    it("UPDATE no-op (memberA)", async () => {
+      await assertUpdateNoOp(memberA, serviceClient, "chat_messages", IDS.chatMessages.B, {
+        // is_deleted is the only column authenticated callers may write, so
+        // this is refused by the row policy rather than by column privilege.
+        is_deleted: true,
+      });
+    });
+
+    it("UPDATE no-op (adminA)", async () => {
+      await assertUpdateNoOp(adminA, serviceClient, "chat_messages", IDS.chatMessages.B, {
+        // is_deleted is the only column authenticated callers may write, so
+        // this is refused by the row policy rather than by column privilege.
+        is_deleted: true,
+      });
+    });
+
+    it("DELETE no-op (memberA)", async () => {
+      await assertDeleteNoOp(memberA, serviceClient, "chat_messages", IDS.chatMessages.B);
+    });
+
+    it("DELETE no-op (adminA)", async () => {
+      await assertDeleteNoOp(adminA, serviceClient, "chat_messages", IDS.chatMessages.B);
+    });
+  });
+
+  // ── chat_mentions (scoped through parent message; no church_group_id) ────
+
+  describe("chat_mentions", () => {
+    it("SELECT blocked", async () => {
+      await assertSelectBlocked(memberA, "chat_mentions", { id: IDS.chatMentions.B });
+    });
+
+    it("INSERT denied", async () => {
+      await assertInsertDenied(memberA, "chat_mentions", {
+        message_id: IDS.chatMessages.B,
+        mentioned_user_id: IDS.users.memberB,
+      });
+    });
+
+    it("UPDATE no-op", async () => {
+      await assertUpdateNoOp(memberA, serviceClient, "chat_mentions", IDS.chatMentions.B, {
+        mentioned_user_id: IDS.users.memberB,
+      });
+    });
+
+    it("DELETE no-op", async () => {
+      await assertDeleteNoOp(memberA, serviceClient, "chat_mentions", IDS.chatMentions.B);
     });
   });
 });
